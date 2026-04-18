@@ -1,0 +1,13 @@
+[project]
+name = "github_ai_catchbot"
+version = "0.1.0"
+description = "github_ai_catchbot initial implementation scaffold"
+requires-python = ">=3.11"
+dependencies = [
+  "alembic>=1.13,<2",
+  "sqlalchemy>=2.0,<3",
+  "psycopg[binary]>=3.1,<4",
+]
+
+[tool.alembic]
+script_location = "migrations"
