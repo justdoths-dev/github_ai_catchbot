@@ -1,124 +1,150 @@
-"""CLI entrypoint for the collector bootstrap skeleton."""
-
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 import json
 import logging
 import signal
-from typing import TextIO
+import sys
+from datetime import datetime, timezone
+from typing import Any, TextIO
 
 from .config import CollectorTelegramConfig
-from .exceptions import CollectorTelegramConfigError
+from .exceptions import ConfigurationError
+from .health import CollectorHealthService
+from .runtime import CollectorRuntime
 from .service import CollectorTelegramService
 
-logger = logging.getLogger(__name__)
-_RESERVED_LOG_RECORD_FIELDS = frozenset(logging.makeLogRecord({}).__dict__)
+
+_BASE_RECORD_KEYS = set(logging.makeLogRecord({}).__dict__.keys())
 
 
-class StructuredJsonFormatter(logging.Formatter):
-    """Serialize log records to a stable JSON shape."""
-
+class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        payload: dict[str, object] = {
-            "ts": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
+        payload: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
-            "service": getattr(record, "service", "collector-telegram"),
             "logger": record.name,
             "message": record.getMessage(),
         }
 
         for key, value in record.__dict__.items():
-            if key in _RESERVED_LOG_RECORD_FIELDS or key.startswith("_"):
+            if key in _BASE_RECORD_KEYS or key in {"message", "asctime"}:
                 continue
-            payload[key] = value
+            if key.startswith("_"):
+                continue
+            payload[key] = self._normalize(value)
 
         if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
+            payload["exc_info"] = self.formatException(record.exc_info)
 
-        return json.dumps(payload, default=str, sort_keys=True)
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _normalize(self, value: Any) -> Any:
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).isoformat()
+        if isinstance(value, dict):
+            return {str(k): self._normalize(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._normalize(v) for v in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
 
 
-def _resolve_log_level(log_level: str) -> int:
-    level_name = log_level.upper()
-    resolved_level = logging.getLevelName(level_name)
-    if isinstance(resolved_level, int):
-        return resolved_level
-    return logging.INFO
+def configure_logging(log_level: str, *, stream: TextIO | None = None) -> logging.Logger:
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    handler = logging.StreamHandler(stream or sys.stdout)
+    handler.setFormatter(JsonFormatter())
 
-
-def configure_logging(log_level: str, stream: TextIO | None = None) -> None:
     root_logger = logging.getLogger()
+    root_logger.setLevel(level)
     root_logger.handlers.clear()
-    root_logger.setLevel(_resolve_log_level(log_level))
-
-    handler = logging.StreamHandler(stream)
-    handler.setFormatter(StructuredJsonFormatter())
     root_logger.addHandler(handler)
 
+    for logger_name in ("collector_telegram", "services.collector_telegram"):
+        logger = logging.getLogger(logger_name)
+        logger.setLevel(level)
+        logger.handlers.clear()
+        logger.propagate = True
 
-def _install_signal_handlers(service: CollectorTelegramService) -> None:
-    loop = asyncio.get_running_loop()
-
-    def _request_stop(signame: str) -> None:
-        logger.info(
-            "collector_signal_received",
-            extra={
-                "service": "collector-telegram",
-                "event": "collector_signal_received",
-                "signal": signame,
-            },
-        )
-        service.request_stop(f"signal:{signame.lower()}")
-
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(
-                signum,
-                _request_stop,
-                signum.name,
-            )
-        except NotImplementedError:
-            signal.signal(
-                signum,
-                lambda _sig, _frame, signame=signum.name: _request_stop(signame),
-            )
+    return logging.getLogger("collector_telegram")
 
 
-async def _run_service(config: CollectorTelegramConfig) -> int:
-    service = CollectorTelegramService(config)
-    _install_signal_handlers(service)
-    await service.start()
-    await service.wait_closed()
-    return 0
+def build_logger(log_level: str) -> logging.Logger:
+    return configure_logging(log_level)
 
 
-def run() -> int:
+async def _run() -> int:
     try:
         config = CollectorTelegramConfig.from_env()
-    except CollectorTelegramConfigError as exc:
-        configure_logging("INFO")
-        logger.error(
-            "collector_configuration_error",
-            extra={
-                "service": "collector-telegram",
-                "event": "collector_configuration_error",
-                "error": str(exc),
-            },
+    except ConfigurationError as exc:
+        print(
+            json.dumps(
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "level": "ERROR",
+                    "service": "collector-telegram",
+                    "event": "collector_config_invalid",
+                    "stage": "collector_bootstrap",
+                    "error": str(exc),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
         )
         return 2
 
-    configure_logging(config.log_level)
+    logger = build_logger(config.log_level)
+    health = CollectorHealthService(logger=logger.getChild("health"))
+    runtime = CollectorRuntime(
+        config,
+        health=health,
+        logger=logger.getChild("runtime"),
+    )
+    service = CollectorTelegramService(config, runtime, logger=logger)
+
+    loop = asyncio.get_running_loop()
+
+    def _schedule_stop() -> None:
+        loop.create_task(service.stop())
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _schedule_stop)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: _schedule_stop())
+
     try:
-        return asyncio.run(_run_service(config))
-    except KeyboardInterrupt:
+        await service.run()
+    except asyncio.CancelledError:
         logger.info(
-            "collector_keyboard_interrupt",
-            extra={"service": "collector-telegram", "event": "collector_keyboard_interrupt"},
+            "collector_main_cancelled",
+            extra={
+                "service": "collector-telegram",
+                "event": "collector_main_cancelled",
+                "stage": "collector_bootstrap",
+            },
         )
-        return 130
+        return 0
+    except Exception:
+        logger.exception(
+            "collector_main_failed",
+            extra={
+                "service": "collector-telegram",
+                "event": "collector_main_failed",
+                "stage": "collector_bootstrap",
+            },
+        )
+        return 1
+
+    return 0
+
+
+def main() -> None:
+    raise SystemExit(asyncio.run(_run()))
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    main()

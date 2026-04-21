@@ -1,5 +1,3 @@
-"""Collector-specific exception hierarchy."""
-
 from __future__ import annotations
 
 
@@ -9,6 +7,10 @@ class CollectorError(Exception):
 
 class ConfigurationError(CollectorError):
     """Raised when configuration is invalid or incomplete."""
+
+
+# backward-compatibility for existing tests/imports
+CollectorTelegramConfigError = ConfigurationError
 
 
 class AuthorizationError(CollectorError):
@@ -41,16 +43,3 @@ class ReconcileRetryableError(CollectorError):
 
 class ReconcileTerminalError(CollectorError):
     """Raised when reconcile encountered a terminal condition."""
-
-
-class CollectorTelegramLifecycleError(CollectorError):
-    """Raised when the bootstrap service lifecycle is used in an invalid order."""
-
-
-class CollectorTelegramRuntimeError(CollectorError):
-    """Raised when the bootstrap runtime cannot stop gracefully."""
-
-
-# Backward-compatible aliases for the current C1 package names.
-CollectorTelegramError = CollectorError
-CollectorTelegramConfigError = ConfigurationError

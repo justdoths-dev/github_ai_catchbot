@@ -1,159 +1,208 @@
-"""Non-live runtime scaffold for the collector bootstrap."""
-
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from .config import CollectorTelegramConfig
-from .exceptions import CollectorTelegramLifecycleError
-from .models import CollectorLifecycleState, CollectorMode, RuntimeSnapshot
-
-logger = logging.getLogger(__name__)
-_RUNTIME_HEARTBEAT_INTERVAL_SECONDS = 0.05
+from .health import CollectorHealthService
+from .models import RuntimeSnapshot
 
 
-def _utcnow() -> datetime:
-    return datetime.now(tz=UTC)
+class CollectorRuntime:
+    """Runtime orchestration skeleton with health/observability wiring.
 
+    This stage still does not wire concrete TDLib/DB/update flows directly.
+    Its responsibility here is to make loop lifecycle and collector-local
+    observability explicit and stable.
+    """
 
-class CollectorTelegramRuntime:
-    """Single-process runtime loop scaffold for the collector service."""
-
-    def __init__(self, config: CollectorTelegramConfig) -> None:
+    def __init__(
+        self,
+        config: CollectorTelegramConfig,
+        *,
+        health: CollectorHealthService,
+        logger: logging.Logger | None = None,
+    ) -> None:
         self._config = config
-        self._state = CollectorLifecycleState.CREATED
+        self._health = health
+        self._logger = logger or logging.getLogger(__name__)
         self._stop_event = asyncio.Event()
-        self._started_at: datetime | None = None
-        self._stop_requested_at: datetime | None = None
-        self._last_tick_at: datetime | None = None
-        self._heartbeat_count = 0
-        self._stop_reason: str | None = None
-        self._pending_stop_reason: str | None = None
-        self._pending_stop_requested_at: datetime | None = None
+        self._tasks: list[asyncio.Task[None]] = []
+        self._snapshot = RuntimeSnapshot()
 
     @property
-    def state(self) -> CollectorLifecycleState:
-        return self._state
+    def snapshot(self) -> RuntimeSnapshot:
+        return self._snapshot
 
-    async def start(self) -> None:
-        if self._state not in {CollectorLifecycleState.CREATED, CollectorLifecycleState.STOPPED}:
-            raise CollectorTelegramLifecycleError(
-                f"runtime cannot start from {self._state.value}"
-            )
-
-        pending_stop_reason = self._pending_stop_reason
-        pending_stop_requested_at = self._pending_stop_requested_at
-        self._pending_stop_reason = None
-        self._pending_stop_requested_at = None
-
-        self._stop_event = asyncio.Event()
-        self._started_at = _utcnow()
-        self._stop_requested_at = None
-        self._last_tick_at = None
-        self._heartbeat_count = 0
-        self._stop_reason = None
-
-        self._state = CollectorLifecycleState.STARTING
-        if self._config.collector_mode is CollectorMode.LIVE:
-            logger.warning(
-                "collector_runtime_live_mode_stub",
-                extra={
-                    "service": "collector-telegram",
-                    "event": "collector_runtime_live_mode_stub",
-                    "collector_mode": self._config.collector_mode.value,
-                    "env": self._config.app_env.value,
-                    "note": "c1 remains bootstrap-only and side-effect free",
-                },
-            )
-        self._state = CollectorLifecycleState.RUNNING
-        logger.info(
-            "collector_runtime_started",
+    async def run_forever(self) -> None:
+        self._logger.info(
+            "collector_runtime_starting",
             extra={
                 "service": "collector-telegram",
-                "event": "collector_runtime_started",
-                "env": self._config.app_env.value,
-                "config": self._config.redacted(),
+                "event": "collector_runtime_starting",
+                "collector_mode": self._config.collector_mode,
+                "app_env": self._config.app_env,
+                "stage": "collector_runtime",
             },
         )
+        self._snapshot.started_at = datetime.now(timezone.utc)
+        self._snapshot.health_state = "starting"
 
-        if pending_stop_reason is not None:
-            self._stop_reason = pending_stop_reason
-            self._stop_requested_at = pending_stop_requested_at or _utcnow()
+        self._health.mark_starting(note="collector runtime booting")
+        self._health.mark_tracked_channels_active(0)
+        self._health.mark_authorization_state(None)
+
+        self._tasks = [
+            asyncio.create_task(self._authorization_loop(), name="collector.authorization"),
+            asyncio.create_task(self._update_ingest_loop(), name="collector.update_ingest"),
+            asyncio.create_task(self._reconcile_scheduler_loop(), name="collector.reconcile_scheduler"),
+            asyncio.create_task(self._registry_refresh_loop(), name="collector.registry_refresh"),
+            asyncio.create_task(self._health_publisher_loop(), name="collector.health"),
+        ]
+
+        self._snapshot.health_state = "ready"
+        self._health.mark_ready(note="collector runtime loops started")
+
+        try:
+            await self._stop_event.wait()
+        finally:
+            await self.shutdown()
+
+    async def shutdown(self) -> None:
+        already_stopping = self._stop_event.is_set()
+        if not already_stopping:
             self._stop_event.set()
 
-    async def serve(self) -> RuntimeSnapshot:
-        if self._state is not CollectorLifecycleState.RUNNING:
-            raise CollectorTelegramLifecycleError(
-                "runtime must be started before serve()"
-            )
+        self._snapshot.health_state = "stopped"
+        self._health.mark_stopped(note="collector runtime stopping")
 
-        try:
-            while not self._stop_event.is_set():
-                await self._tick_once()
-        except asyncio.CancelledError:
-            self.request_stop("task-cancelled")
-            raise
-        finally:
-            await self._shutdown()
+        current_task = asyncio.current_task()
+        for task in self._tasks:
+            if task is current_task:
+                continue
+            task.cancel()
 
-        return self.snapshot()
+        for task in self._tasks:
+            if task is current_task:
+                continue
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
-    def request_stop(self, reason: str = "stop-requested") -> None:
-        requested_at = _utcnow()
-
-        if self._state is CollectorLifecycleState.CREATED:
-            self._pending_stop_reason = reason
-            self._pending_stop_requested_at = requested_at
-            return
-
-        if self._state is CollectorLifecycleState.STOPPED or self._stop_event.is_set():
-            return
-
-        self._stop_reason = reason
-        self._stop_requested_at = requested_at
-        self._stop_event.set()
-
-    def snapshot(self) -> RuntimeSnapshot:
-        return RuntimeSnapshot(
-            lifecycle_state=self._state,
-            app_env=self._config.app_env,
-            collector_mode=self._config.collector_mode,
-            started_at=self._started_at,
-            stop_requested_at=self._stop_requested_at or self._pending_stop_requested_at,
-            last_tick_at=self._last_tick_at,
-            heartbeat_count=self._heartbeat_count,
-            tracked_chat_count=0,
-            pending_reconcile_count=0,
-            stop_reason=self._stop_reason or self._pending_stop_reason,
-        )
-
-    async def _tick_once(self) -> None:
-        self._heartbeat_count += 1
-        self._last_tick_at = _utcnow()
-        try:
-            await asyncio.wait_for(
-                self._stop_event.wait(),
-                timeout=_RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            return
-
-    async def _shutdown(self) -> None:
-        if self._state is CollectorLifecycleState.STOPPED:
-            return
-
-        self._state = CollectorLifecycleState.STOPPING
-        await asyncio.sleep(0)
-        self._state = CollectorLifecycleState.STOPPED
-        logger.info(
+        self._logger.info(
             "collector_runtime_stopped",
             extra={
                 "service": "collector-telegram",
                 "event": "collector_runtime_stopped",
-                "env": self._config.app_env.value,
-                "stop_reason": self._stop_reason or "completed",
-                "heartbeat_count": self._heartbeat_count,
+                "stage": "collector_runtime",
+            },
+        )
+
+    async def _authorization_loop(self) -> None:
+        await self._idle_loop(
+            loop_name="authorization_loop",
+            interval_sec=5,
+            on_tick=self._authorization_tick,
+        )
+
+    async def _update_ingest_loop(self) -> None:
+        await self._idle_loop(
+            loop_name="update_ingest_loop",
+            interval_sec=2,
+            on_tick=self._update_ingest_tick,
+        )
+
+    async def _reconcile_scheduler_loop(self) -> None:
+        await self._idle_loop(
+            loop_name="reconcile_scheduler_loop",
+            interval_sec=float(self._config.reconcile_interval_sec),
+            on_tick=self._reconcile_scheduler_tick,
+        )
+
+    async def _registry_refresh_loop(self) -> None:
+        await self._idle_loop(
+            loop_name="registry_refresh_loop",
+            interval_sec=60,
+            on_tick=self._registry_refresh_tick,
+        )
+
+    async def _health_publisher_loop(self) -> None:
+        await self._idle_loop(
+            loop_name="health_publisher_loop",
+            interval_sec=30,
+            on_tick=self._health_publisher_tick,
+        )
+
+    async def _idle_loop(self, loop_name: str, *, interval_sec: float, on_tick) -> None:
+        self._health.mark_runtime_loop_started(loop_name)
+        self._logger.info(
+            "collector_loop_started",
+            extra={
+                "service": "collector-telegram",
+                "event": "collector_loop_started",
+                "stage": "collector_runtime",
+                "loop_name": loop_name,
+                "interval_sec": interval_sec,
+            },
+        )
+
+        try:
+            while not self._stop_event.is_set():
+                self._snapshot.last_tick_at = datetime.now(timezone.utc)
+                self._health.heartbeat()
+                await on_tick()
+                await asyncio.sleep(interval_sec)
+        except asyncio.CancelledError:
+            self._logger.info(
+                "collector_loop_cancelled",
+                extra={
+                    "service": "collector-telegram",
+                    "event": "collector_loop_cancelled",
+                    "stage": "collector_runtime",
+                    "loop_name": loop_name,
+                },
+            )
+            raise
+        except Exception:
+            self._snapshot.health_state = "degraded"
+            self._health.mark_degraded(note=f"loop failure: {loop_name}")
+            self._logger.exception(
+                "collector_loop_failed",
+                extra={
+                    "service": "collector-telegram",
+                    "event": "collector_loop_failed",
+                    "stage": "collector_runtime",
+                    "loop_name": loop_name,
+                    "status": "failed",
+                },
+            )
+            raise
+        finally:
+            self._health.mark_runtime_loop_stopped(loop_name)
+
+    async def _authorization_tick(self) -> None:
+        # Placeholder until TDLib/auth FSM wiring is connected in the next integration pass.
+        if self._health.snapshot().tdlib_authorization_state is None:
+            self._health.mark_authorization_state("authorizationStateReady")
+
+    async def _update_ingest_tick(self) -> None:
+        return None
+
+    async def _reconcile_scheduler_tick(self) -> None:
+        return None
+
+    async def _registry_refresh_tick(self) -> None:
+        return None
+
+    async def _health_publisher_tick(self) -> None:
+        snapshot = self._health.snapshot_dict()
+        self._logger.info(
+            "collector_health_snapshot",
+            extra={
+                "service": "collector-telegram",
+                "event": "collector_health_snapshot",
+                "stage": "collector_observability",
+                **snapshot,
             },
         )
