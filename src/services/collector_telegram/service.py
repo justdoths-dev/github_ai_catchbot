@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from datetime import datetime, timezone
 
 from .config import CollectorTelegramConfig
 from .health import CollectorHealthService
 from .models import CollectorLifecycleState, CollectorServiceSnapshot
 from .runtime import CollectorRuntime
+from .singleton_guard import CollectorSingletonGuard
 
 
 class CollectorTelegramService:
@@ -17,23 +17,25 @@ class CollectorTelegramService:
         config: CollectorTelegramConfig,
         runtime: CollectorRuntime | None = None,
         *,
+        singleton_guard: CollectorSingletonGuard | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._config = config
         self._logger = logger or logging.getLogger(__name__)
         self._runtime = runtime or CollectorRuntime(
             config,
-            health=CollectorHealthService(),
+            health=CollectorHealthService(logger=self._logger.getChild("health")),
             logger=self._logger.getChild("runtime"),
         )
-
+        self._singleton_guard = singleton_guard or CollectorSingletonGuard(
+            lock_path=config.singleton_lock_path,
+        )
+        self._started = False
+        self._runtime_task: asyncio.Task[None] | None = None
+        self._stop_task: asyncio.Task[None] | None = None
         self._state = CollectorLifecycleState.CREATED
-        self._started_at: datetime | None = None
         self._stop_reason: str | None = None
         self._heartbeat_count = 0
-
-        self._runtime_task: asyncio.Task[None] | None = None
-        self._heartbeat_task: asyncio.Task[None] | None = None
 
     @property
     def state(self) -> CollectorLifecycleState:
@@ -46,104 +48,96 @@ class CollectorTelegramService:
             collector_mode=self._config.collector_mode,
             stop_reason=self._stop_reason,
             heartbeat_count=self._heartbeat_count,
-            started_at=self._started_at,
+            started_at=self._runtime.snapshot.started_at,
         )
 
     async def start(self) -> None:
-        if self._state in {
-            CollectorLifecycleState.STARTING,
-            CollectorLifecycleState.RUNNING,
-            CollectorLifecycleState.STOPPING,
-        }:
+        if self._started:
             return
 
+        self._state = CollectorLifecycleState.STARTING
         self._config.validate()
         self._config.ensure_runtime_dirs()
+
+        if self._config.collector_mode == "live":
+            self._singleton_guard.acquire()
 
         self._logger.info(
             "collector_service_starting",
             extra={
                 "service": "collector-telegram",
                 "event": "collector_service_starting",
-                "collector_mode": str(self._config.collector_mode),
-                "app_env": str(self._config.app_env),
+                "collector_mode": self._config.collector_mode,
+                "app_env": self._config.app_env,
+                "stage": "collector_acceptance_hardening",
             },
         )
 
-        self._started_at = self._started_at or datetime.now(timezone.utc)
-        self._state = CollectorLifecycleState.STARTING
+        try:
+            await self._runtime.startup_acceptance_check()
+        except Exception:
+            self._state = CollectorLifecycleState.FAILING
+            if self._config.collector_mode == "live":
+                self._singleton_guard.release()
+            raise
 
-        self._runtime_task = asyncio.create_task(
-            self._runtime.run_forever(),
-            name="collector-telegram-runtime",
-        )
-        self._heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(),
-            name="collector-telegram-heartbeat",
-        )
-
+        self._started = True
         self._state = CollectorLifecycleState.RUNNING
+        self._runtime_task = asyncio.create_task(self._run_runtime(), name="collector.service.runtime")
 
     async def run(self) -> None:
-        await self.start()
-        await self.wait_closed()
+        if not self._started:
+            await self.start()
 
-    def request_stop(self, reason: str = "requested") -> None:
-        if self._stop_reason is None:
-            self._stop_reason = reason
-
-        if self._state == CollectorLifecycleState.CREATED:
-            self._state = CollectorLifecycleState.STOPPED
-            return
-
-        if self._state in {
-            CollectorLifecycleState.STARTING,
-            CollectorLifecycleState.RUNNING,
-        }:
-            self._state = CollectorLifecycleState.STOPPING
-
-        if self._runtime_task is not None and not self._runtime_task.done():
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._runtime.shutdown())
-            except RuntimeError:
-                pass
+        if self._runtime_task is not None:
+            await self._runtime_task
 
     async def stop(self) -> None:
-        self.request_stop(self._stop_reason or "service_stop")
-        await self.wait_closed()
+        if not self._started and self._runtime_task is None:
+            return
 
-    async def wait_closed(self) -> CollectorServiceSnapshot:
-        if self._runtime_task is not None:
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._runtime_task
-
-        if self._heartbeat_task is not None:
-            self._heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._heartbeat_task
-
-        self._state = CollectorLifecycleState.STOPPED
-
+        self._state = CollectorLifecycleState.STOPPING
         self._logger.info(
-            "collector_service_stopped",
+            "collector_service_stopping",
             extra={
                 "service": "collector-telegram",
-                "event": "collector_service_stopped",
-                "stop_reason": self._stop_reason,
-                "heartbeat_count": self._heartbeat_count,
+                "event": "collector_service_stopping",
+                "stage": "collector_acceptance_hardening",
             },
         )
+        try:
+            await self._runtime.shutdown()
+            runtime_task = self._runtime_task
+            if runtime_task is not None and runtime_task is not asyncio.current_task():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await runtime_task
+        finally:
+            if self._config.collector_mode == "live":
+                self._singleton_guard.release()
+            self._started = False
+            self._runtime_task = None
+            self._stop_task = None
+            self._state = CollectorLifecycleState.STOPPED
+
+    def request_stop(self, reason: str) -> None:
+        self._stop_reason = reason
+        self._stop_task = asyncio.create_task(self.stop(), name="collector.service.stop")
+
+    async def wait_closed(self) -> CollectorServiceSnapshot:
+        stop_task = self._stop_task
+        if stop_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await stop_task
+        runtime_task = self._runtime_task
+        if runtime_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await runtime_task
         return self.snapshot()
 
-    async def _heartbeat_loop(self) -> None:
+    async def _run_runtime(self) -> None:
+        self._heartbeat_count += 1
         try:
-            while self._state in {
-                CollectorLifecycleState.STARTING,
-                CollectorLifecycleState.RUNNING,
-                CollectorLifecycleState.STOPPING,
-            }:
-                self._heartbeat_count += 1
-                await asyncio.sleep(0.02)
-        except asyncio.CancelledError:
+            await self._runtime.run_forever()
+        except Exception:
+            self._state = CollectorLifecycleState.FAILING
             raise

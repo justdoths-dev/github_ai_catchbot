@@ -9,7 +9,7 @@ class ConfigurationError(CollectorError):
     """Raised when configuration is invalid or incomplete."""
 
 
-# backward-compatibility for existing tests/imports
+# Backward-compatibility alias for existing repo tests/imports.
 CollectorTelegramConfigError = ConfigurationError
 
 
@@ -26,7 +26,10 @@ class TDLibTransportError(CollectorError):
 
 
 class RepositoryInvariantError(CollectorError):
-    """Raised when persistence invariants are broken."""
+    """Raised when persistence invariants are broken.
+
+    These are normally terminal and should fail fast.
+    """
 
 
 class UpdateApplyRetryableError(CollectorError):
@@ -43,3 +46,7 @@ class ReconcileRetryableError(CollectorError):
 
 class ReconcileTerminalError(CollectorError):
     """Raised when reconcile encountered a terminal condition."""
+
+
+class SingletonViolationError(CollectorError):
+    """Raised when prod single-instance collector guard is violated."""
