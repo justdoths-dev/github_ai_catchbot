@@ -134,3 +134,56 @@ async def test_candidate_proposal_flow_writes_artifacts_group_members_and_enrich
         repository.candidate_groups[0]["group_id"]
     }
     assert {event["artifact"].provider_route for event in repository.enrich_events} == {"github"}
+
+
+@pytest.mark.asyncio
+async def test_candidate_proposal_flow_emits_x_post_contract_to_enrichment_outbox() -> None:
+    trigger_event_id = uuid4()
+    source_message_id = uuid4()
+    event = OutboxEventRow(
+        event_id=trigger_event_id,
+        event_type="source_message.created.v1",
+        aggregate_type="source_message",
+        aggregate_id=source_message_id,
+        dedupe_key="srcmsg:create:x",
+        payload_json={"source_message_id": str(source_message_id), "current_version_no": 1},
+        status="published",
+        created_at=datetime.now(timezone.utc),
+    )
+    snapshot = SourceMessageSnapshot(
+        source_message_id=source_message_id,
+        source_version_no=1,
+        text_body="Watch this post",
+        caption_text=None,
+        text_surface="Watch this post",
+        entities_json=None,
+        url_surface_json=[
+            {
+                "observed_url": "https://x.com/someone/status/1881234567890123456?s=20",
+                "source_kind": "entity",
+            }
+        ],
+        raw_message_json={},
+    )
+    repository = FakeRepository(event=event, current_snapshot=snapshot)
+    service = RouterNormalizerService(_config(), repository=repository)
+
+    result = await service.process_stream_message(
+        RedisNormalizeMessage(
+            job_id=str(trigger_event_id),
+            stage_name="normalize",
+            root_object_type="source_message",
+            root_object_id=str(source_message_id),
+            idempotency_key="thin",
+            trigger_event_id=str(trigger_event_id),
+        )
+    )
+
+    assert result.candidate_eligible is True
+    assert set(repository.artifacts_by_id) == {"x:post:1881234567890123456"}
+    assert repository.candidate_groups[0]["dedupe_subject_key"] == "x:post:1881234567890123456"
+    assert len(repository.enrich_events) == 1
+    artifact = repository.enrich_events[0]["artifact"]
+    assert artifact.artifact_type == "x_post"
+    assert artifact.canonical_id == "x:post:1881234567890123456"
+    assert artifact.provider_route == "x"

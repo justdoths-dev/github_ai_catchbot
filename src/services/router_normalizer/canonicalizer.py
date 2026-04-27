@@ -213,7 +213,7 @@ def _canonicalize_x_post(
     canonical_url = f"https://x.com/{author}/status/{post_id}"
     return _artifact(
         artifact_type="x_post",
-        canonical_id=f"x_post:{post_id}",
+        canonical_id=f"x:post:{post_id}",
         canonical_url=canonical_url,
         normalized_host="x.com",
         artifact_key_json={"author": author, "post_id": post_id},
@@ -277,4 +277,3 @@ def _clean_github_segment(value: str) -> str:
 
 def _stable_url_hash(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()
-

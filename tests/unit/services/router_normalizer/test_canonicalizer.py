@@ -52,6 +52,5 @@ def test_canonicalizes_x_post_by_post_id() -> None:
     artifact = canonicalize_resolved_urls([_url("https://x.com/someone/status/1234567890?s=20")])[0]
 
     assert artifact.artifact_type == "x_post"
-    assert artifact.canonical_id == "x_post:1234567890"
+    assert artifact.canonical_id == "x:post:1234567890"
     assert artifact.provider_route == "x"
-
