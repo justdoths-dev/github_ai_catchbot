@@ -208,14 +208,6 @@ class RouterNormalizerService:
         artifacts: list[CanonicalArtifact],
         artifact_ids: dict[str, UUID],
     ) -> int:
-        for artifact in artifacts:
-            await self._repository.insert_enrichment_requested_outbox(
-                artifact_id=artifact_ids[artifact.canonical_id],
-                artifact=artifact,
-                source_message_id=snapshot.source_message_id,
-                source_version_no=snapshot.source_version_no,
-            )
-
         related_by_primary: dict[str, list[CanonicalArtifact]] = {}
         primary_by_id: dict[str, CanonicalArtifact] = {}
         for artifact in artifacts:
@@ -250,6 +242,14 @@ class RouterNormalizerService:
                     artifact_id=artifact_ids[member.canonical_id],
                     member_role="supporting",
                     member_order=order,
+                )
+            for artifact in [primary, *related]:
+                await self._repository.insert_enrichment_requested_outbox(
+                    candidate_group_id=group_id,
+                    artifact_id=artifact_ids[artifact.canonical_id],
+                    artifact=artifact,
+                    source_message_id=snapshot.source_message_id,
+                    source_version_no=snapshot.source_version_no,
                 )
             group_count += 1
         return group_count

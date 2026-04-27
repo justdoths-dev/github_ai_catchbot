@@ -130,4 +130,7 @@ async def test_candidate_proposal_flow_writes_artifacts_group_members_and_enrich
     assert repository.candidate_groups[0]["dedupe_subject_key"] == "github_repo:openai/openai-python"
     assert {member["member_role"] for member in repository.members} == {"primary", "supporting"}
     assert len(repository.enrich_events) == 2
+    assert {event["candidate_group_id"] for event in repository.enrich_events} == {
+        repository.candidate_groups[0]["group_id"]
+    }
     assert {event["artifact"].provider_route for event in repository.enrich_events} == {"github"}

@@ -406,6 +406,7 @@ class RouterNormalizerRepository:
     async def insert_enrichment_requested_outbox(
         self,
         *,
+        candidate_group_id: UUID,
         artifact_id: UUID,
         artifact: CanonicalArtifact,
         source_message_id: UUID,
@@ -413,12 +414,17 @@ class RouterNormalizerRepository:
     ) -> None:
         if artifact.provider_route is None:
             return
-        dedupe_key = f"artifact:enrich:{artifact.canonical_id}:{source_message_id}:{source_version_no}"
+        dedupe_key = (
+            f"artifact:enrich:{candidate_group_id}:{artifact.canonical_id}:{source_message_id}:{source_version_no}"
+        )
         payload = {
+            "candidate_group_id": str(candidate_group_id),
             "artifact_id": str(artifact_id),
             "artifact_type": artifact.artifact_type,
             "canonical_id": artifact.canonical_id,
             "provider_route": artifact.provider_route,
+            "refresh_mode": "standard",
+            "depth_budget": 1,
             "source_message_id": str(source_message_id),
             "source_version_no": source_version_no,
         }
