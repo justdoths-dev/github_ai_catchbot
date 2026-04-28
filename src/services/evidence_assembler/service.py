@@ -1,0 +1,348 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from typing import Any
+from uuid import UUID
+
+from .config import EvidenceAssemblerConfig
+from .models import (
+    AssemblyResult,
+    BundleMemberDraft,
+    BundleRefreshTarget,
+    CandidateGroupRecord,
+    CandidateMemberRecord,
+    DiscoveredLinkSummary,
+    EvidenceBundleDraft,
+    SnapshotRecord,
+)
+from .readiness import ReadinessEvaluator
+from .repositories import EvidenceAssemblerRepository
+from .reroot_rules import RerootRules
+from .text_idea_builder import TextIdeaBuilder
+from .token_budget import TokenBudgetProfiler
+
+
+class EvidenceAssemblerService:
+    def __init__(
+        self,
+        config: EvidenceAssemblerConfig,
+        *,
+        repository: EvidenceAssemblerRepository,
+        text_idea_builder: TextIdeaBuilder | None = None,
+        reroot_rules: RerootRules | None = None,
+        readiness: ReadinessEvaluator | None = None,
+        token_budget: TokenBudgetProfiler | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self._config = config
+        self._repository = repository
+        self._text_idea_builder = text_idea_builder or TextIdeaBuilder()
+        self._reroot_rules = reroot_rules or RerootRules()
+        self._readiness = readiness or ReadinessEvaluator()
+        self._token_budget = token_budget or TokenBudgetProfiler()
+        self._logger = logger or logging.getLogger(__name__)
+
+    async def handle_trigger_event(self, trigger_event_id: str | UUID) -> list[AssemblyResult]:
+        targets = await self._repository.resolve_refresh_targets(UUID(str(trigger_event_id)))
+        results: list[AssemblyResult] = []
+        for target in targets:
+            result = await self._refresh_one(target)
+            if result is not None:
+                results.append(result)
+        return results
+
+    async def _refresh_one(self, target: BundleRefreshTarget) -> AssemblyResult | None:
+        candidate = await self._repository.load_candidate_group(target.candidate_group_id)
+        if candidate is None:
+            return None
+
+        members = await self._repository.load_candidate_members(candidate.candidate_group_id)
+        if not members:
+            return None
+
+        member_artifact_ids = [member.artifact_id for member in members]
+        snapshots = await self._repository.load_current_snapshots(member_artifact_ids)
+        artifact_types = {member.artifact_id: member.artifact_type for member in members}
+
+        if self._config.enable_text_idea:
+            await self._materialize_existing_text_idea(candidate=candidate, members=members, snapshots=snapshots)
+
+        current_primary_artifact_id = candidate.current_primary_artifact_id
+        if self._config.enable_reroot:
+            decision = self._reroot_rules.decide(
+                current_primary_artifact_id=current_primary_artifact_id,
+                members=members,
+                current_snapshots=snapshots,
+            )
+            if decision.changed:
+                async with self._repository.transaction():
+                    await self._repository.append_reroot_event(
+                        candidate_group_id=candidate.candidate_group_id,
+                        from_artifact_id=decision.from_artifact_id,
+                        to_artifact_id=decision.to_artifact_id,
+                        reason_code=decision.reason_code or "reroot",
+                        trigger_snapshot_id=target.trigger_snapshot_id,
+                    )
+                    await self._repository.update_current_primary(
+                        candidate_group_id=candidate.candidate_group_id,
+                        artifact_id=decision.to_artifact_id,
+                    )
+                current_primary_artifact_id = decision.to_artifact_id
+
+        primary_snapshot = snapshots.get(current_primary_artifact_id)
+        discovered_links = await self._repository.load_discovered_links(
+            candidate_group_id=candidate.candidate_group_id,
+            parent_artifact_ids=member_artifact_ids,
+        )
+        bundle_members = self._bundle_members(
+            current_primary_artifact_id=current_primary_artifact_id,
+            members=members,
+            snapshots=snapshots,
+        )
+        supporting_snapshots = [
+            snapshots[member.artifact_id]
+            for member in members
+            if member.artifact_id != current_primary_artifact_id and member.artifact_id in snapshots
+        ]
+        token_budget_profile = self._token_budget.choose(
+            primary_snapshot=primary_snapshot,
+            supporting_snapshot_count=len(supporting_snapshots),
+            discovered_links_count=len(discovered_links),
+        )
+        ready_for_analysis = self._readiness.is_ready_for_analysis(
+            primary_snapshot=primary_snapshot,
+            bundle_members=bundle_members,
+            token_budget_profile=token_budget_profile,
+        )
+        evidence_limitations = self._collect_limitations(primary_snapshot, supporting_snapshots)
+        reroot_count = await self._repository.count_reroot_events(candidate.candidate_group_id)
+        bundle_input_hash = self._bundle_input_hash(
+            candidate_group_id=candidate.candidate_group_id,
+            current_primary_artifact_id=current_primary_artifact_id,
+            members=bundle_members,
+            reroot_count=reroot_count,
+            discovered_links=discovered_links,
+            bundle_profile_version=self._config.bundle_profile_version,
+        )
+
+        existing_bundle = await self._repository.load_existing_bundle(
+            candidate_group_id=candidate.candidate_group_id,
+            bundle_profile_version=self._config.bundle_profile_version,
+            bundle_input_hash=bundle_input_hash,
+        )
+        if existing_bundle is not None:
+            if candidate.current_bundle_id != existing_bundle.bundle_id:
+                async with self._repository.transaction():
+                    await self._repository.update_current_bundle(
+                        candidate_group_id=candidate.candidate_group_id,
+                        bundle_id=existing_bundle.bundle_id,
+                    )
+            return AssemblyResult(
+                candidate_group_id=candidate.candidate_group_id,
+                bundle_id=existing_bundle.bundle_id,
+                reused_existing_bundle=True,
+                ready_for_analysis=existing_bundle.ready_for_analysis,
+                emitted_analysis_requested=False,
+            )
+
+        judge_profile = self._judge_profile_for_primary(artifact_types.get(current_primary_artifact_id))
+        bundle_draft = EvidenceBundleDraft(
+            candidate_group_id=candidate.candidate_group_id,
+            initial_primary_artifact_id=candidate.initial_primary_artifact_id,
+            current_primary_artifact_id=current_primary_artifact_id,
+            bundle_profile_version=self._config.bundle_profile_version,
+            bundle_input_hash=bundle_input_hash,
+            reroot_count=reroot_count,
+            primary_summary=self._snapshot_summary(primary_snapshot, artifact_id=current_primary_artifact_id),
+            supporting_summaries_json=[
+                self._snapshot_summary(snapshot, artifact_id=snapshot.artifact_id) for snapshot in supporting_snapshots
+            ],
+            discovered_links_summary_json=[self._discovered_link_summary(item) for item in discovered_links],
+            evidence_limitations=evidence_limitations,
+            ready_for_analysis=ready_for_analysis,
+            token_budget_profile=token_budget_profile,
+            members=bundle_members,
+            judge_profile=judge_profile,
+        )
+
+        emitted_analysis_requested = False
+        async with self._repository.transaction():
+            bundle_version = await self._repository.next_bundle_version(candidate.candidate_group_id)
+            bundle_id = await self._repository.append_bundle(draft=bundle_draft, bundle_version=bundle_version)
+            await self._repository.update_current_bundle(
+                candidate_group_id=candidate.candidate_group_id,
+                bundle_id=bundle_id,
+            )
+            if bundle_draft.ready_for_analysis and bundle_draft.judge_profile:
+                await self._repository.insert_analysis_requested_outbox(
+                    candidate_group_id=candidate.candidate_group_id,
+                    bundle_id=bundle_id,
+                    judge_profile=bundle_draft.judge_profile,
+                    escalation_allowed=True,
+                )
+                emitted_analysis_requested = True
+
+        return AssemblyResult(
+            candidate_group_id=candidate.candidate_group_id,
+            bundle_id=bundle_id,
+            reused_existing_bundle=False,
+            ready_for_analysis=bundle_draft.ready_for_analysis,
+            emitted_analysis_requested=emitted_analysis_requested,
+        )
+
+    async def _materialize_existing_text_idea(
+        self,
+        *,
+        candidate: CandidateGroupRecord,
+        members: list[CandidateMemberRecord],
+        snapshots: dict[UUID, SnapshotRecord],
+    ) -> None:
+        text_idea_members = [member for member in members if member.artifact_type == "text_idea"]
+        if not text_idea_members:
+            return
+        usable_external = any(
+            member.artifact_type != "text_idea"
+            and member.artifact_id in snapshots
+            and snapshots[member.artifact_id].status in {"ready", "partial_ready", "low_evidence"}
+            for member in members
+        )
+        needs_text_idea = (
+            any(member.artifact_id == candidate.current_primary_artifact_id for member in text_idea_members)
+            or not usable_external
+        )
+        if not needs_text_idea:
+            return
+        text_surface = await self._repository.load_source_message_text_surface(
+            source_message_id=candidate.source_message_id,
+            source_version_no=candidate.source_version_no,
+        )
+        for member in text_idea_members:
+            if member.artifact_id in snapshots and snapshots[member.artifact_id].provider == "local_text_idea":
+                continue
+            draft = self._text_idea_builder.build(
+                artifact_id=member.artifact_id,
+                source_message_id=candidate.source_message_id,
+                source_version_no=candidate.source_version_no,
+                text_surface=text_surface,
+            )
+            if draft is None:
+                continue
+            async with self._repository.transaction():
+                snapshots[member.artifact_id] = await self._repository.ensure_text_idea_snapshot(draft)
+
+    def _bundle_members(
+        self,
+        *,
+        current_primary_artifact_id: UUID,
+        members: list[CandidateMemberRecord],
+        snapshots: dict[UUID, SnapshotRecord],
+    ) -> list[BundleMemberDraft]:
+        drafts = [
+            BundleMemberDraft(
+                artifact_id=member.artifact_id,
+                snapshot_id=snapshots[member.artifact_id].snapshot_id,
+                member_role="primary" if member.artifact_id == current_primary_artifact_id else "supporting",
+                member_order=0 if member.artifact_id == current_primary_artifact_id else member.member_order,
+            )
+            for member in members
+            if member.artifact_id in snapshots
+        ]
+        drafts.sort(
+            key=lambda item: (
+                0 if item.member_role == "primary" else 1,
+                item.member_order if item.member_order is not None else 999999,
+                str(item.artifact_id),
+            )
+        )
+        return drafts
+
+    def _collect_limitations(
+        self,
+        primary_snapshot: SnapshotRecord | None,
+        supporting_snapshots: list[SnapshotRecord],
+    ) -> list[str]:
+        values: list[str] = []
+        for snapshot in [primary_snapshot, *supporting_snapshots]:
+            if snapshot is None:
+                continue
+            for item in snapshot.evidence_limitations:
+                if item and item not in values:
+                    values.append(item)
+            if snapshot.status in {"partial_ready", "low_evidence"} and snapshot.status not in values:
+                values.append(snapshot.status)
+            if snapshot.status in {"failed_transient", "failed_permanent", "rate_limited", "access_denied", "unsupported"}:
+                limitation = f"snapshot_{snapshot.status}"
+                if limitation not in values:
+                    values.append(limitation)
+        return values
+
+    def _snapshot_summary(self, snapshot: SnapshotRecord | None, *, artifact_id: UUID) -> dict[str, Any]:
+        if snapshot is None:
+            return {"artifact_id": str(artifact_id), "status": "missing"}
+        projection = snapshot.normalized_projection or {}
+        return {
+            "artifact_id": str(snapshot.artifact_id),
+            "snapshot_id": str(snapshot.snapshot_id),
+            "provider": snapshot.provider,
+            "snapshot_type": snapshot.snapshot_type,
+            "status": snapshot.status,
+            "content_anchor": snapshot.content_anchor,
+            "headline": projection.get("title") or projection.get("description") or projection.get("display_surface"),
+        }
+
+    @staticmethod
+    def _discovered_link_summary(link: DiscoveredLinkSummary) -> dict[str, Any]:
+        return {
+            "parent_artifact_id": str(link.parent_artifact_id),
+            "parent_snapshot_id": str(link.parent_snapshot_id),
+            "context_path": link.context_path,
+            "observed_url": link.observed_url,
+            "discovery_reason": link.discovery_reason,
+        }
+
+    def _bundle_input_hash(
+        self,
+        *,
+        candidate_group_id: UUID,
+        current_primary_artifact_id: UUID,
+        members: list[BundleMemberDraft],
+        reroot_count: int,
+        discovered_links: list[DiscoveredLinkSummary],
+        bundle_profile_version: str,
+    ) -> str:
+        payload = {
+            "candidate_group_id": str(candidate_group_id),
+            "current_primary_artifact_id": str(current_primary_artifact_id),
+            "members": [
+                {
+                    "artifact_id": str(member.artifact_id),
+                    "snapshot_id": str(member.snapshot_id),
+                    "member_role": member.member_role,
+                    "member_order": member.member_order,
+                }
+                for member in members
+            ],
+            "reroot_count": reroot_count,
+            "discovered_links": [
+                {
+                    "parent_artifact_id": str(link.parent_artifact_id),
+                    "context_path": link.context_path,
+                    "observed_url": link.observed_url,
+                }
+                for link in discovered_links
+            ],
+            "bundle_profile_version": bundle_profile_version,
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _judge_profile_for_primary(self, artifact_type: str | None) -> str | None:
+        if artifact_type in {"github_repo", "github_subpath", "github_repo_page", "github_gist"}:
+            return "github_primary"
+        if artifact_type == "x_post":
+            return "x_primary"
+        if artifact_type in {"web_article", "text_idea"}:
+            return "text_idea_primary"
+        return None
