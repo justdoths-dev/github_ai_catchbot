@@ -1,0 +1,53 @@
+from __future__ import annotations
+
+
+class UnsupportedJudgeProfileError(ValueError):
+    pass
+
+
+class PromptLibrary:
+    _SUPPORTED = {"github_primary", "x_primary", "text_idea_primary"}
+
+    def render(self, *, judge_profile: str, prompt_version: str) -> str:
+        if judge_profile not in self._SUPPORTED:
+            raise UnsupportedJudgeProfileError(f"unsupported judge_profile: {judge_profile}")
+        if not prompt_version:
+            raise UnsupportedJudgeProfileError("prompt_version must not be empty")
+
+        profile_guidance = {
+            "github_primary": (
+                "Profile: github_primary. Evaluate GitHub-primary evidence. Focus on code quality "
+                "signals, maintenance signals, wrapper risk, adoption quality, and concrete comparables."
+            ),
+            "x_primary": (
+                "Profile: x_primary. Evaluate X-post-primary evidence. Focus on specificity, "
+                "reproducibility, hype risk, and whether linked artifacts carry the actual value."
+            ),
+            "text_idea_primary": (
+                "Profile: text_idea_primary. Evaluate a text-idea-primary candidate. Focus on "
+                "procedural specificity, execution realism, anti-hype skepticism, and commonness."
+            ),
+        }[judge_profile]
+
+        return "\n\n".join(
+            [
+                self._common_prefix(),
+                f"Prompt version: {prompt_version}",
+                profile_guidance,
+            ]
+        )
+
+    @staticmethod
+    def _common_prefix() -> str:
+        return "\n".join(
+            [
+                "You are the stage-6 OpenAI judge for a precision-first GitHub/X catch-bot.",
+                "Return only strict judge_output_v1 JSON matching the supplied schema.",
+                "Use only the supplied CandidateEvidenceBundle-derived context.",
+                "Do not browse, search, fetch, call tools, or assume facts outside the bundle.",
+                "Be negative-first: identify why the candidate may not be worth attention before upside.",
+                "Do not invent comparables, repo activity, social proof, dates, or evidence.",
+                "If evidence is weak, reflect that in scores, red flags, limitations, and confidence.",
+                "Do not compute the final verdict or delivery decision; deterministic services do that later.",
+            ]
+        )

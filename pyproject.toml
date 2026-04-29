@@ -9,6 +9,7 @@ dependencies = [
   "psycopg[binary]>=3.1,<4",
   "PyJWT[crypto]>=2,<3",
   "redis>=5,<6",
+  "openai>=1.99,<3",
 ]
 
 [tool.alembic]
