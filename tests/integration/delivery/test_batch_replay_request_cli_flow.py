@@ -27,6 +27,8 @@ async def test_batch_replay_request_cli_routes_to_one_shot_recovery(monkeypatch)
             "00000000-0000-0000-0000-000000000001",
             "--requested-by",
             "ops",
+            "--confirm",
+            "write",
         ]
     )
 

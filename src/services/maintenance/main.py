@@ -37,10 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
     replay = recovery_subcommands.add_parser("replay-selected")
     replay.add_argument("--plan-id", action="append", required=True)
     replay.add_argument("--requested-by", required=True)
+    replay.add_argument("--confirm", choices=["write"], required=True)
 
     retry = recovery_subcommands.add_parser("retry-selected-due")
     retry.add_argument("--plan-id", action="append", required=True)
     retry.add_argument("--requested-by", required=True)
+    retry.add_argument("--confirm", choices=["write"], required=True)
     return parser
 
 
@@ -126,7 +128,11 @@ async def _run_delivery_gate(config: MaintenanceConfig, args: argparse.Namespace
             runner = DeliveryGateRunner(config, repository=MaintenanceRepository(session))
             report = await runner.run(mode=args.mode, operator_review_passed=operator_review_passed)
             print(json.dumps(asdict(report), ensure_ascii=False, default=str, indent=2, sort_keys=False))
-            return 2 if report.gate_status == "fail" else 0
+            if report.gate_status == "pass":
+                return 0
+            if report.gate_status == "warn":
+                return 3
+            return 2
     finally:
         await engine.dispose()
 

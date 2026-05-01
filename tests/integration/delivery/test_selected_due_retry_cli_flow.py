@@ -27,6 +27,8 @@ async def test_selected_due_retry_cli_routes_to_one_shot_recovery(monkeypatch) -
             "00000000-0000-0000-0000-000000000002",
             "--requested-by",
             "ops",
+            "--confirm",
+            "write",
         ]
     )
 
