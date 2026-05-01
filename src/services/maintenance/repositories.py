@@ -11,6 +11,7 @@ import sqlalchemy as sa
 from .delivery_retry import MAINTENANCE_QUEUE_NAME
 from .delivery_replay import REPLAY_QUEUE_NAME
 from .models import (
+    DeliveryGateSnapshot,
     DeliveryResultEvent,
     LatestDeliveryRecord,
     NotificationPlanRecord,
@@ -18,6 +19,7 @@ from .models import (
     ReplayRequestedEvent,
     ReplayRequestRecord,
     RetryPromotionCandidate,
+    SelectedPlanRecoveryRow,
 )
 
 
@@ -227,7 +229,7 @@ class MaintenanceRepository:
                     :retry_count,
                     now(),
                     now(),
-                    'request_delivery_replay_after_operator_fix',
+                    'request_explicit_delivery_replay',
                     'delivery_replay_from_notification_plan'
                 )
                 """
@@ -315,6 +317,294 @@ class MaintenanceRepository:
                 "attempt_status": attempt_status,
                 "error_code": error_code,
             },
+        )
+
+    async def load_delivery_gate_snapshot(self) -> DeliveryGateSnapshot:
+        result = await self._session.execute(
+            sa.text(
+                """
+                WITH
+                success_1h AS (
+                    SELECT CASE
+                             WHEN COUNT(*) = 0 THEN NULL
+                             ELSE COUNT(*) FILTER (
+                               WHERE delivery_status IN (
+                                 'sent'::notification_status_enum,
+                                 'edited'::notification_status_enum
+                               )
+                             )::numeric / COUNT(*)
+                           END AS success_rate
+                    FROM notification_delivery_records
+                    WHERE created_at >= now() - interval '1 hour'
+                ),
+                success_24h AS (
+                    SELECT CASE
+                             WHEN COUNT(*) = 0 THEN NULL
+                             ELSE COUNT(*) FILTER (
+                               WHERE delivery_status IN (
+                                 'sent'::notification_status_enum,
+                                 'edited'::notification_status_enum
+                               )
+                             )::numeric / COUNT(*)
+                           END AS success_rate
+                    FROM notification_delivery_records
+                    WHERE created_at >= now() - interval '24 hours'
+                ),
+                high_source_p95 AS (
+                    WITH high_delivered AS (
+                        SELECT sm.posted_at AS source_posted_at,
+                               COALESCE(dr.sent_at, dr.edited_at) AS delivered_at
+                        FROM notification_plans np
+                        JOIN candidate_group_proposals cgp
+                          ON cgp.candidate_group_id = np.candidate_group_id
+                        JOIN source_messages sm
+                          ON sm.source_message_id = cgp.source_message_id
+                        JOIN LATERAL (
+                            SELECT ndr.sent_at, ndr.edited_at, ndr.created_at
+                            FROM notification_delivery_records ndr
+                            WHERE ndr.notification_plan_id = np.notification_plan_id
+                              AND ndr.delivery_status IN (
+                                'sent'::notification_status_enum,
+                                'edited'::notification_status_enum
+                              )
+                            ORDER BY ndr.created_at DESC
+                            LIMIT 1
+                        ) dr ON true
+                        WHERE np.urgency_profile = 'high'::urgency_profile_enum
+                    )
+                    SELECT percentile_cont(0.95)
+                           WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (delivered_at - source_posted_at)))
+                           AS value
+                    FROM high_delivered
+                    WHERE delivered_at IS NOT NULL
+                ),
+                plan_transport_p95 AS (
+                    WITH delivered AS (
+                        SELECT np.created_at AS plan_created_at,
+                               COALESCE(dr.sent_at, dr.edited_at) AS delivered_at
+                        FROM notification_plans np
+                        JOIN LATERAL (
+                            SELECT ndr.sent_at, ndr.edited_at, ndr.created_at
+                            FROM notification_delivery_records ndr
+                            WHERE ndr.notification_plan_id = np.notification_plan_id
+                              AND ndr.delivery_status IN (
+                                'sent'::notification_status_enum,
+                                'edited'::notification_status_enum
+                              )
+                            ORDER BY ndr.created_at DESC
+                            LIMIT 1
+                        ) dr ON true
+                    )
+                    SELECT percentile_cont(0.95)
+                           WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (delivered_at - plan_created_at)))
+                           AS value
+                    FROM delivered
+                    WHERE delivered_at IS NOT NULL
+                ),
+                due_retry AS (
+                    SELECT EXTRACT(EPOCH FROM (now() - MIN(send_after))) AS oldest_lag_sec
+                    FROM notification_plans
+                    WHERE status = 'failed_retryable'::notification_status_enum
+                      AND send_after IS NOT NULL
+                      AND send_after <= now()
+                ),
+                delivery_dlq AS (
+                    SELECT COUNT(*) AS open_count,
+                           EXTRACT(EPOCH FROM (now() - MIN(last_failed_at))) AS oldest_age_sec
+                    FROM dead_letter_entries
+                    WHERE root_object_type = 'notification_plan'
+                      AND queue_name IN ('q.notification.send', 'q.maintenance', 'q.replay')
+                ),
+                send_disabled AS (
+                    WITH latest_delivery AS (
+                        SELECT DISTINCT ON (notification_plan_id)
+                               delivery_status,
+                               telegram_response_json
+                        FROM notification_delivery_records
+                        ORDER BY notification_plan_id, created_at DESC
+                    )
+                    SELECT COUNT(*) AS row_count
+                    FROM latest_delivery
+                    WHERE delivery_status = 'suppressed'::notification_status_enum
+                      AND lower(telegram_response_json ->> 'send_disabled') = 'true'
+                ),
+                replay_guard AS (
+                    SELECT COUNT(*) AS row_count
+                    FROM replay_requests
+                    WHERE replay_type = 'delivery'::replay_type_enum
+                      AND root_object_type = 'notification_plan'
+                      AND status = 'rejected_by_env_guard'
+                      AND requested_at >= now() - interval '24 hours'
+                ),
+                retry_ceiling AS (
+                    SELECT COUNT(*) AS row_count
+                    FROM dead_letter_entries
+                    WHERE root_object_type = 'notification_plan'
+                      AND last_error_code = 'max_notification_retry_attempts_exceeded'
+                      AND last_failed_at >= now() - interval '24 hours'
+                ),
+                duplicate_noop AS (
+                    WITH duplicate_transitions AS (
+                        SELECT COUNT(*) AS duplicate_or_noop_count
+                        FROM state_transitions
+                        WHERE object_type = 'notification_plan'
+                          AND created_at >= now() - interval '24 hours'
+                          AND reason_code IN (
+                            'notification_duplicate_noop',
+                            'telegram_edit_not_modified_noop'
+                          )
+                    ),
+                    delivery_attempts AS (
+                        SELECT COUNT(*) AS delivery_attempt_count
+                        FROM notification_delivery_records
+                        WHERE created_at >= now() - interval '24 hours'
+                    )
+                    SELECT CASE
+                             WHEN delivery_attempt_count = 0 THEN NULL
+                             ELSE duplicate_or_noop_count::numeric / delivery_attempt_count
+                           END AS ratio
+                    FROM duplicate_transitions
+                    CROSS JOIN delivery_attempts
+                )
+                SELECT success_1h.success_rate AS success_rate_1h,
+                       success_24h.success_rate AS success_rate_24h,
+                       high_source_p95.value AS high_source_to_delivery_p95_sec,
+                       plan_transport_p95.value AS plan_to_transport_p95_sec,
+                       due_retry.oldest_lag_sec AS due_retry_oldest_lag_sec,
+                       delivery_dlq.open_count AS open_delivery_dlq_count,
+                       delivery_dlq.oldest_age_sec AS oldest_delivery_dlq_age_sec,
+                       send_disabled.row_count AS unexpected_send_disabled_count,
+                       replay_guard.row_count AS replay_guard_reject_count_24h,
+                       retry_ceiling.row_count AS retry_ceiling_exceeded_count_24h,
+                       duplicate_noop.ratio AS duplicate_noop_ratio_1h
+                FROM success_1h, success_24h, high_source_p95, plan_transport_p95,
+                     due_retry, delivery_dlq, send_disabled, replay_guard,
+                     retry_ceiling, duplicate_noop
+                """
+            )
+        )
+        row = result.mappings().one()
+        return DeliveryGateSnapshot(
+            success_rate_1h=_float_or_none(row["success_rate_1h"]),
+            success_rate_24h=_float_or_none(row["success_rate_24h"]),
+            high_source_to_delivery_p95_sec=_float_or_none(row["high_source_to_delivery_p95_sec"]),
+            plan_to_transport_p95_sec=_float_or_none(row["plan_to_transport_p95_sec"]),
+            due_retry_oldest_lag_sec=_float_or_none(row["due_retry_oldest_lag_sec"]),
+            open_delivery_dlq_count=int(row["open_delivery_dlq_count"] or 0),
+            oldest_delivery_dlq_age_sec=_float_or_none(row["oldest_delivery_dlq_age_sec"]),
+            unexpected_send_disabled_count=int(row["unexpected_send_disabled_count"] or 0),
+            replay_guard_reject_count_24h=int(row["replay_guard_reject_count_24h"] or 0),
+            retry_ceiling_exceeded_count_24h=int(row["retry_ceiling_exceeded_count_24h"] or 0),
+            duplicate_noop_ratio_1h=_float_or_none(row["duplicate_noop_ratio_1h"]),
+        )
+
+    async def load_selected_recovery_rows(self, notification_plan_ids: list[UUID]) -> list[SelectedPlanRecoveryRow]:
+        if not notification_plan_ids:
+            return []
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT np.notification_plan_id,
+                       np.analysis_id,
+                       np.candidate_group_id,
+                       np.status AS plan_status,
+                       np.delivery_decision,
+                       np.urgency_profile,
+                       np.target_chat_id,
+                       np.target_thread_id,
+                       np.render_profile,
+                       np.dedupe_subject_key,
+                       np.material_change_hash,
+                       np.send_after,
+                       ldr.telegram_chat_id,
+                       ldr.delivery_status,
+                       ldr.attempt_count,
+                       COALESCE(lower(ldr.telegram_response_json ->> 'send_disabled') = 'true', false) AS send_disabled,
+                       EXISTS (
+                         SELECT 1
+                         FROM replay_requests rr
+                         WHERE rr.replay_type = 'delivery'::replay_type_enum
+                           AND rr.root_object_type = 'notification_plan'
+                           AND rr.root_object_id = np.notification_plan_id
+                           AND rr.status IN ('requested', 'dispatched', 'pending')
+                       ) AS has_open_replay_request,
+                       EXISTS (
+                         SELECT 1
+                         FROM dead_letter_entries dle
+                         WHERE dle.root_object_type = 'notification_plan'
+                           AND dle.root_object_id = np.notification_plan_id
+                           AND dle.queue_name IN ('q.notification.send', 'q.maintenance', 'q.replay')
+                       ) AS has_delivery_dlq
+                FROM notification_plans np
+                LEFT JOIN LATERAL (
+                    SELECT ndr.telegram_chat_id,
+                           ndr.delivery_status,
+                           ndr.attempt_count,
+                           ndr.telegram_response_json,
+                           ndr.created_at
+                    FROM notification_delivery_records ndr
+                    WHERE ndr.notification_plan_id = np.notification_plan_id
+                    ORDER BY ndr.created_at DESC
+                    LIMIT 1
+                ) ldr ON true
+                WHERE np.notification_plan_id = ANY(CAST(:plan_ids AS uuid[]))
+                ORDER BY np.notification_plan_id
+                """
+            ),
+            {"plan_ids": [str(plan_id) for plan_id in notification_plan_ids]},
+        )
+        return [_selected_recovery_row_from_row(row) for row in result.mappings().all()]
+
+    async def insert_replay_requests_for_selected_plans(
+        self,
+        *,
+        plan_ids: list[UUID],
+        requested_by: str,
+    ) -> int:
+        if not plan_ids:
+            return 0
+        result = await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO replay_requests (
+                    replay_type, root_object_type, root_object_id, requested_by, requested_at, status
+                )
+                SELECT 'delivery'::replay_type_enum,
+                       'notification_plan',
+                       src.notification_plan_id,
+                       :requested_by,
+                       now(),
+                       'requested'
+                FROM (
+                    SELECT DISTINCT unnest(CAST(:plan_ids AS uuid[])) AS notification_plan_id
+                ) src
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM replay_requests rr
+                    WHERE rr.replay_type = 'delivery'::replay_type_enum
+                      AND rr.root_object_type = 'notification_plan'
+                      AND rr.root_object_id = src.notification_plan_id
+                      AND rr.status IN ('requested', 'dispatched', 'pending')
+                )
+                RETURNING replay_request_id
+                """
+            ),
+            {"plan_ids": [str(plan_id) for plan_id in plan_ids], "requested_by": requested_by},
+        )
+        return len(result.fetchall())
+
+    async def insert_manual_retry_intent_outbox(
+        self,
+        *,
+        row: SelectedPlanRecoveryRow,
+        recovery_batch_id: str,
+        dedupe_key: str,
+        payload_json: dict[str, Any],
+    ) -> bool:
+        return await self.insert_plan_created_outbox(
+            notification_plan_id=row.notification_plan_id,
+            dedupe_key=dedupe_key,
+            payload_json=payload_json,
         )
 
 
@@ -427,6 +717,15 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _float_or_none(value: Any) -> float | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _json_loads(value: Any) -> Any:
     if value is None:
         return None
@@ -454,3 +753,26 @@ def _string_or_none(value: Any) -> str | None:
         return None
     text = str(value)
     return text if text else None
+
+
+def _selected_recovery_row_from_row(row: Any) -> SelectedPlanRecoveryRow:
+    return SelectedPlanRecoveryRow(
+        notification_plan_id=UUID(str(row["notification_plan_id"])),
+        analysis_id=UUID(str(row["analysis_id"])),
+        candidate_group_id=UUID(str(row["candidate_group_id"])),
+        plan_status=str(row["plan_status"]),
+        delivery_status=_string_or_none(row["delivery_status"]),
+        attempt_count=_int_or_none(row["attempt_count"]),
+        send_after=row["send_after"],
+        telegram_chat_id=_int_or_none(row["telegram_chat_id"]),
+        target_chat_id=int(row["target_chat_id"]),
+        target_thread_id=_int_or_none(row["target_thread_id"]),
+        render_profile=_string_or_none(row["render_profile"]),
+        dedupe_subject_key=str(row["dedupe_subject_key"]),
+        material_change_hash=str(row["material_change_hash"]),
+        urgency_profile=str(row["urgency_profile"]),
+        delivery_decision=str(row["delivery_decision"]),
+        send_disabled=bool(row["send_disabled"]),
+        has_open_replay_request=bool(row["has_open_replay_request"]),
+        has_delivery_dlq=bool(row["has_delivery_dlq"]),
+    )

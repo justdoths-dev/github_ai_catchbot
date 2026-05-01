@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
@@ -8,6 +8,9 @@ from uuid import UUID
 
 DeliveryRetryAction = Literal["noop", "emit_retry_intent", "dead_letter_retry_ceiling"]
 ReplayAction = Literal["reject", "emit_replay_intent"]
+GateMode = Literal["restricted", "full"]
+GateStatus = Literal["pass", "fail", "warn"]
+RecoveryMode = Literal["replay-selected", "retry-selected-due"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -115,3 +118,73 @@ class DeliveryReplayDecision:
     reason_code: str
     dedupe_key: str | None = None
     payload: dict[str, Any] | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class DeliveryGateMetric:
+    metric_name: str
+    observed_value: float | int | str | bool | None
+    threshold: float | int | str | bool | None
+    comparator: str
+    passed: bool
+    severity: str = "block"
+
+
+@dataclass(slots=True, frozen=True)
+class DeliveryGateReportV1:
+    mode: GateMode
+    gate_status: GateStatus
+    blocking_reason_codes: list[str]
+    warning_reason_codes: list[str]
+    metrics: list[DeliveryGateMetric]
+    operator_review_required: bool
+    operator_review_passed: bool | None
+    recommended_flag_patch: dict[str, object]
+
+
+@dataclass(slots=True, frozen=True)
+class DeliveryGateSnapshot:
+    success_rate_1h: float | None
+    success_rate_24h: float | None
+    high_source_to_delivery_p95_sec: float | None
+    plan_to_transport_p95_sec: float | None
+    due_retry_oldest_lag_sec: float | None
+    open_delivery_dlq_count: int
+    oldest_delivery_dlq_age_sec: float | None
+    unexpected_send_disabled_count: int
+    replay_guard_reject_count_24h: int
+    retry_ceiling_exceeded_count_24h: int
+    duplicate_noop_ratio_1h: float | None
+
+
+@dataclass(slots=True, frozen=True)
+class SelectedPlanRecoveryRow:
+    notification_plan_id: UUID
+    analysis_id: UUID
+    candidate_group_id: UUID
+    plan_status: str
+    delivery_status: str | None
+    attempt_count: int | None
+    send_after: datetime | None
+    telegram_chat_id: int | None
+    target_chat_id: int
+    target_thread_id: int | None
+    render_profile: str | None
+    dedupe_subject_key: str
+    material_change_hash: str
+    urgency_profile: str
+    delivery_decision: str
+    send_disabled: bool = False
+    has_open_replay_request: bool = False
+    has_delivery_dlq: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class RecoveryBatchResult:
+    recovery_batch_id: str
+    recovery_mode: RecoveryMode
+    selected_count: int
+    accepted_count: int
+    skipped_count: int
+    emitted_count: int
+    skipped_reason_codes: dict[str, int] = field(default_factory=dict)
