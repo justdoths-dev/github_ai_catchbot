@@ -10,6 +10,11 @@ from services.notifier_telegram.service import NotifierTelegramService
 
 
 class Repo:
+    async def load_successful_delivery_for_material(
+        self, *, dedupe_subject_key: str, target_chat_id: int, material_change_hash: str
+    ):
+        return None
+
     async def load_recent_successful_delivery(self, *, dedupe_subject_key: str, target_chat_id: int):
         return None
 

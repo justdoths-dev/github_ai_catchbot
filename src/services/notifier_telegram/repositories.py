@@ -321,6 +321,56 @@ class NotifierTelegramRepository:
             created_at=row["created_at"],
         )
 
+    async def load_successful_delivery_for_material(
+        self,
+        *,
+        dedupe_subject_key: str,
+        target_chat_id: int,
+        material_change_hash: str,
+    ) -> ExistingRecentDelivery | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT p.notification_plan_id,
+                       p.material_change_hash,
+                       p.urgency_profile,
+                       p.render_profile,
+                       d.telegram_message_id,
+                       d.telegram_chat_id,
+                       d.created_at,
+                       ar.canonical_url AS primary_canonical_url
+                FROM notification_delivery_records d
+                JOIN notification_plans p ON p.notification_plan_id = d.notification_plan_id
+                LEFT JOIN candidate_group_proposals cgp ON cgp.candidate_group_id = p.candidate_group_id
+                LEFT JOIN artifact_registry ar ON ar.artifact_id = cgp.current_primary_artifact_id
+                WHERE p.dedupe_subject_key = :dedupe_subject_key
+                  AND p.target_chat_id = :target_chat_id
+                  AND p.material_change_hash = :material_change_hash
+                  AND d.delivery_status IN ('sent'::notification_status_enum, 'edited'::notification_status_enum)
+                ORDER BY d.created_at DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "dedupe_subject_key": dedupe_subject_key,
+                "target_chat_id": target_chat_id,
+                "material_change_hash": material_change_hash,
+            },
+        )
+        row = result.mappings().first()
+        if row is None:
+            return None
+        return ExistingRecentDelivery(
+            notification_plan_id=UUID(str(row["notification_plan_id"])),
+            telegram_message_id=_int_or_none(row["telegram_message_id"]),
+            telegram_chat_id=_int_or_none(row["telegram_chat_id"]),
+            material_change_hash=str(row["material_change_hash"]),
+            primary_canonical_url=_string_or_none(row["primary_canonical_url"]),
+            urgency_profile=_string_or_none(row["urgency_profile"]),
+            render_profile=_string_or_none(row["render_profile"]),
+            created_at=row["created_at"],
+        )
+
     async def has_previous_edit_restriction(self, *, notification_plan_id: UUID) -> bool:
         result = await self._session.execute(
             sa.text(

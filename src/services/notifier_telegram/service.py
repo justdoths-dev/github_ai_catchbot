@@ -37,6 +37,9 @@ class NotifierTelegramRepositoryProtocol(Protocol):
     async def load_analysis(self, analysis_id: UUID) -> AnalysisRenderContext | None: ...
     async def load_judge_output_render_fields(self, judge_output_id: UUID) -> JudgeOutputRenderContext | None: ...
     async def load_candidate_render_context(self, candidate_group_id: UUID) -> CandidateRenderContext | None: ...
+    async def load_successful_delivery_for_material(
+        self, *, dedupe_subject_key: str, target_chat_id: int, material_change_hash: str
+    ): ...
     async def load_recent_successful_delivery(self, *, dedupe_subject_key: str, target_chat_id: int): ...
     async def has_previous_edit_restriction(self, *, notification_plan_id: UUID) -> bool: ...
     async def count_delivery_attempts(self, *, notification_plan_id: UUID) -> int: ...
@@ -207,14 +210,19 @@ class NotifierTelegramService:
     ) -> DeliveryAction:
         if intent.delivery_decision != "send_now":
             return DeliveryAction(mode="noop", reason_code="notification_not_immediate_send")
+        existing_material = await self._repository.load_successful_delivery_for_material(
+            dedupe_subject_key=intent.dedupe_subject_key,
+            target_chat_id=intent.target_chat_id,
+            material_change_hash=intent.material_change_hash,
+        )
+        if existing_material is not None:
+            return DeliveryAction(mode="noop", reason_code="notification_duplicate_noop")
         recent = await self._repository.load_recent_successful_delivery(
             dedupe_subject_key=intent.dedupe_subject_key,
             target_chat_id=intent.target_chat_id,
         )
         if recent is None:
             return DeliveryAction(mode="send", reason_code="notification_no_recent_delivery")
-        if recent.material_change_hash == intent.material_change_hash:
-            return DeliveryAction(mode="noop", reason_code="notification_duplicate_noop")
         if not self._config.allow_edits:
             return DeliveryAction(mode="send", reason_code="notification_edits_disabled")
         if recent.telegram_message_id is None:

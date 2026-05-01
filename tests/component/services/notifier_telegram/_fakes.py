@@ -108,6 +108,41 @@ class FakeRepository:
             created_at=record.get("created_at") or datetime.now(timezone.utc),
         )
 
+    async def load_successful_delivery_for_material(
+        self,
+        *,
+        dedupe_subject_key: str,
+        target_chat_id: int,
+        material_change_hash: str,
+    ):
+        successful = []
+        for record in self.delivery_records:
+            if record["result_status"] not in {"sent", "edited"}:
+                continue
+            plan = self.plans.get(record["notification_plan_id"])
+            if plan is None:
+                continue
+            if (
+                plan.dedupe_subject_key == dedupe_subject_key
+                and plan.target_chat_id == target_chat_id
+                and plan.material_change_hash == material_change_hash
+            ):
+                successful.append((record, plan))
+        if not successful:
+            return None
+        record, plan = successful[-1]
+        candidate = self.candidates.get(plan.candidate_group_id)
+        return ExistingRecentDelivery(
+            notification_plan_id=plan.notification_plan_id,
+            telegram_message_id=record.get("telegram_message_id"),
+            telegram_chat_id=record.get("telegram_chat_id"),
+            material_change_hash=plan.material_change_hash,
+            primary_canonical_url=candidate.primary_canonical_url if candidate else None,
+            urgency_profile=plan.urgency_profile,
+            render_profile=plan.render_profile,
+            created_at=record.get("created_at") or datetime.now(timezone.utc),
+        )
+
     async def has_previous_edit_restriction(self, *, notification_plan_id: UUID) -> bool:
         return notification_plan_id in self.previous_edit_restrictions
 
