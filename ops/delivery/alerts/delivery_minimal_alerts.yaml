@@ -1,0 +1,77 @@
+version: 1
+scope: delivery_operations
+description: >
+  Stage 42 declarative delivery alert contract. These entries describe operator
+  signals only and do not require a specific alerting backend.
+
+alerts:
+  - id: q_notification_send_backlog_age_spike
+    title: q.notification.send backlog age spike
+    severity: warning_to_critical
+    signal:
+      query_anchor: current_unsent_backlog
+      threshold: oldest_plan_age_sec > 300 or high_oldest_plan_age_sec > 120
+      window: trailing_15m
+    operator_action:
+      - Check Telegram transport health and flood-control.
+      - Verify ENABLE_NOTIFICATION_SEND and dry-run environment state.
+      - Separate due rows from future send_after rows.
+
+  - id: retryable_backlog_due_not_promoted
+    title: retryable backlog due but not promoted
+    severity: warning
+    signal:
+      query_anchor: due_retry_backlog
+      threshold: due_retry_count > 0 and oldest_due_retry_lag_sec > 120
+      queue_name: q.maintenance
+    operator_action:
+      - Verify MAINTENANCE_ENABLE_NOTIFICATION_RETRY_PROMOTION.
+      - Check q.maintenance worker health.
+      - Inspect event_outbox append and dedupe conflicts.
+
+  - id: delivery_dlq_growth
+    title: delivery DLQ growth
+    severity: warning_to_critical
+    signal:
+      query_anchor: delivery_dlq_triage_view
+      threshold: open delivery dead-letter rows increase or oldest row age exceeds 900 seconds
+      root_object_type: notification_plan
+    operator_action:
+      - Triage by last_error_code and next_manual_action.
+      - Separate template/render issues from chat access issues.
+      - Choose explicit delivery replay or acknowledge no-recovery rows.
+
+  - id: send_disabled_suppress_while_rollout_send_should_be_on
+    title: send-disabled suppress rows while rollout send flag should be on
+    severity: critical
+    signal:
+      query_anchor: send_disabled_suppress_backlog_selection
+      threshold: count > 0 while ENABLE_NOTIFICATION_SEND is expected true
+    operator_action:
+      - Check compose and environment drift.
+      - Verify notifier container environment.
+      - Fail restricted and full rollout gates until the rows are explained.
+
+  - id: prod_replay_guard_rejects
+    title: prod replay guard rejects
+    severity: info_to_warning
+    signal:
+      query_anchor: full_replay_guard_reject_count
+      threshold: replay_guard_reject_count > 0
+      replay_request_status: rejected_by_env_guard
+    operator_action:
+      - Confirm whether the rejection was intended.
+      - If needed, approve ENABLE_REPLAY_TO_PROD_DB for a bounded recovery window.
+      - Narrow the replay request set before retrying.
+
+  - id: delivery_success_rate_drop
+    title: delivery success rate drop
+    severity: warning
+    signal:
+      query_anchor: restricted_delivery_success_rate_trailing_1h
+      threshold: success_rate < 0.99
+      window: trailing_1h
+    operator_action:
+      - Check 429 and 5xx transport classes.
+      - Inspect terminal failure code distribution.
+      - Verify render payload validity and entity formatting.
