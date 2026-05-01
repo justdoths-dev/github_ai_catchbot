@@ -1,0 +1,42 @@
+# Stage 40 delivery acceptance fragment.
+# Merge this into a stack that already provides PostgreSQL and Redis.
+# This file intentionally exposes no public inbound ports.
+
+services:
+  notifier-telegram:
+    image: ${APP_IMAGE:-github-ai-catchbot:local}
+    restart: unless-stopped
+    env_file:
+      - ./env/notifier.${APP_ENV:-dev}.env.example
+    environment:
+      PYTHONPATH: /app/src
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      NOTIFIER_TELEGRAM_QUEUE_NAME: ${NOTIFIER_TELEGRAM_QUEUE_NAME:-q.notification.send}
+      ENABLE_NOTIFICATION_SEND: ${ENABLE_NOTIFICATION_SEND:-false}
+      ENABLE_LATER_DELIVERY: ${ENABLE_LATER_DELIVERY:-true}
+      ENABLE_SILENT_LATER: ${ENABLE_SILENT_LATER:-true}
+      NOTIFIER_TELEGRAM_DRY_RUN: ${NOTIFIER_TELEGRAM_DRY_RUN:-true}
+      NOTIFIER_TELEGRAM_ALLOW_EDITS: ${NOTIFIER_TELEGRAM_ALLOW_EDITS:-false}
+    command: ["python", "-m", "services.notifier_telegram.main"]
+
+  maintenance:
+    image: ${APP_IMAGE:-github-ai-catchbot:local}
+    profiles: ["stage41-placeholder"]
+    restart: "no"
+    env_file:
+      - ./env/notifier.${APP_ENV:-dev}.env.example
+    environment:
+      PYTHONPATH: /app/src
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      MAINTENANCE_QUEUE_NAME: ${MAINTENANCE_QUEUE_NAME:-q.maintenance}
+      MAINTENANCE_ENABLE_NOTIFICATION_RETRY_PROMOTION: ${MAINTENANCE_ENABLE_NOTIFICATION_RETRY_PROMOTION:-false}
+    command:
+      - python
+      - -c
+      - |
+        import time
+        print("Stage 40 placeholder: maintenance retry promotion is documented and contract-tested, not implemented here.", flush=True)
+        time.sleep(3600)

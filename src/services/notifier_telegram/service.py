@@ -291,7 +291,7 @@ class NotifierTelegramService:
                 transport_error_class=None,
             )
         if not self._config.transport_enabled:
-            reason_code = "telegram_dry_run" if self._config.dry_run else "telegram_send_disabled"
+            reason_code = "dry_run_skip_transport" if self._config.dry_run else "notification_send_flag_disabled"
             return DeliveryResult(
                 delivery_status="suppressed",
                 telegram_chat_id=intent.target_chat_id,
@@ -301,6 +301,7 @@ class NotifierTelegramService:
                 transport_error_class=None,
                 telegram_response_json={
                     "dry_run": self._config.dry_run,
+                    "send_disabled": not self._config.enable_notification_send,
                     "send_enabled": self._config.enable_notification_send,
                     "transport_skipped": True,
                     "reason_code": reason_code,

@@ -30,12 +30,13 @@ async def test_transport_disabled_does_not_call_client() -> None:
 
     assert result.delivery_status == "suppressed"
     assert result.attempt_count == 0
-    assert result.transport_error_code == "telegram_dry_run"
+    assert result.transport_error_code == "dry_run_skip_transport"
     assert result.telegram_response_json == {
         "dry_run": True,
+        "send_disabled": False,
         "send_enabled": True,
         "transport_skipped": True,
-        "reason_code": "telegram_dry_run",
+        "reason_code": "dry_run_skip_transport",
         "delivery_action": "send",
     }
     assert client.calls == 0
@@ -50,12 +51,13 @@ async def test_send_disabled_non_dry_run_does_not_call_client() -> None:
 
     assert result.delivery_status == "suppressed"
     assert result.attempt_count == 0
-    assert result.transport_error_code == "telegram_send_disabled"
+    assert result.transport_error_code == "notification_send_flag_disabled"
     assert result.telegram_response_json == {
         "dry_run": False,
+        "send_disabled": True,
         "send_enabled": False,
         "transport_skipped": True,
-        "reason_code": "telegram_send_disabled",
+        "reason_code": "notification_send_flag_disabled",
         "delivery_action": "send",
     }
     assert client.calls == 0

@@ -64,7 +64,7 @@ async def test_dry_run_creates_render_delivery_record_and_outbox_without_transpo
     assert len(repository.delivery_records) == 1
     assert repository.delivery_records[0]["result_status"] == "suppressed"
     assert repository.delivery_records[0]["attempt_count"] == 0
-    assert repository.delivery_records[0]["telegram_response_json"]["reason_code"] == "telegram_dry_run"
+    assert repository.delivery_records[0]["telegram_response_json"]["reason_code"] == "dry_run_skip_transport"
     assert repository.delivery_records[0]["telegram_response_json"]["transport_skipped"] is True
     assert len(repository.delivery_outbox) == 1
     assert repository.delivery_outbox[0]["delivery_status"] == "suppressed"
@@ -80,8 +80,9 @@ async def test_disabled_send_path_does_not_call_telegram() -> None:
 
     assert client.calls == 0
     assert repository.delivery_records[0]["result_status"] == "suppressed"
-    assert repository.delivery_records[0]["transport_error_code"] == "telegram_send_disabled"
-    assert repository.delivery_records[0]["telegram_response_json"]["reason_code"] == "telegram_send_disabled"
+    assert repository.delivery_records[0]["transport_error_code"] == "notification_send_flag_disabled"
+    assert repository.delivery_records[0]["telegram_response_json"]["reason_code"] == "notification_send_flag_disabled"
+    assert repository.delivery_records[0]["telegram_response_json"]["send_disabled"] is True
     assert repository.delivery_records[0]["telegram_response_json"]["transport_skipped"] is True
 
 
