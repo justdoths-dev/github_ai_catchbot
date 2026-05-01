@@ -11,6 +11,7 @@ import sqlalchemy as sa
 from .models import (
     AnalysisRenderContext,
     CandidateRenderContext,
+    ExistingRecentDelivery,
     JudgeOutputRenderContext,
     NotificationIntentJob,
     NotificationPlanDraft,
@@ -84,7 +85,9 @@ class NotifierTelegramRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT notification_plan_id, analysis_id, target_chat_id, material_change_hash, status
+                SELECT notification_plan_id, analysis_id, candidate_group_id, target_chat_id,
+                       target_thread_id, render_profile, dedupe_subject_key,
+                       material_change_hash, send_after, status
                 FROM notification_plans
                 WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
                 """
@@ -104,7 +107,9 @@ class NotifierTelegramRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT notification_plan_id, analysis_id, target_chat_id, material_change_hash, status
+                SELECT notification_plan_id, analysis_id, candidate_group_id, target_chat_id,
+                       target_thread_id, render_profile, dedupe_subject_key,
+                       material_change_hash, send_after, status
                 FROM notification_plans
                 WHERE analysis_id = CAST(:analysis_id AS uuid)
                   AND target_chat_id = :target_chat_id
@@ -272,6 +277,78 @@ class NotifierTelegramRepository:
             source_text_surface=_string_or_none(row["source_text_surface"]),
         )
 
+    async def load_recent_successful_delivery(
+        self,
+        *,
+        dedupe_subject_key: str,
+        target_chat_id: int,
+    ) -> ExistingRecentDelivery | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT p.notification_plan_id,
+                       p.material_change_hash,
+                       p.urgency_profile,
+                       p.render_profile,
+                       d.telegram_message_id,
+                       d.telegram_chat_id,
+                       d.created_at,
+                       ar.canonical_url AS primary_canonical_url
+                FROM notification_delivery_records d
+                JOIN notification_plans p ON p.notification_plan_id = d.notification_plan_id
+                LEFT JOIN candidate_group_proposals cgp ON cgp.candidate_group_id = p.candidate_group_id
+                LEFT JOIN artifact_registry ar ON ar.artifact_id = cgp.current_primary_artifact_id
+                WHERE p.dedupe_subject_key = :dedupe_subject_key
+                  AND p.target_chat_id = :target_chat_id
+                  AND d.delivery_status IN ('sent'::notification_status_enum, 'edited'::notification_status_enum)
+                ORDER BY d.created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"dedupe_subject_key": dedupe_subject_key, "target_chat_id": target_chat_id},
+        )
+        row = result.mappings().first()
+        if row is None:
+            return None
+        return ExistingRecentDelivery(
+            notification_plan_id=UUID(str(row["notification_plan_id"])),
+            telegram_message_id=_int_or_none(row["telegram_message_id"]),
+            telegram_chat_id=_int_or_none(row["telegram_chat_id"]),
+            material_change_hash=str(row["material_change_hash"]),
+            primary_canonical_url=_string_or_none(row["primary_canonical_url"]),
+            urgency_profile=_string_or_none(row["urgency_profile"]),
+            render_profile=_string_or_none(row["render_profile"]),
+            created_at=row["created_at"],
+        )
+
+    async def has_previous_edit_restriction(self, *, notification_plan_id: UUID) -> bool:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT 1
+                FROM notification_delivery_records
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                  AND transport_error_code IN ('telegram_message_cannot_be_edited', 'telegram_edit_message_not_found')
+                LIMIT 1
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        return result.first() is not None
+
+    async def count_delivery_attempts(self, *, notification_plan_id: UUID) -> int:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM notification_delivery_records
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        return int(result.scalar_one())
+
     async def insert_notification_render(self, draft: NotificationRenderDraft) -> UUID | None:
         result = await self._session.execute(
             sa.text(
@@ -375,16 +452,23 @@ class NotifierTelegramRepository:
         )
         return UUID(str(result.scalar_one()))
 
-    async def update_plan_status(self, *, notification_plan_id: UUID, status: str) -> None:
+    async def update_plan_status(
+        self,
+        *,
+        notification_plan_id: UUID,
+        status: str,
+        send_after: datetime | None = None,
+    ) -> None:
         await self._session.execute(
             sa.text(
                 """
                 UPDATE notification_plans
-                SET status = CAST(:status AS notification_status_enum)
+                SET status = CAST(:status AS notification_status_enum),
+                    send_after = COALESCE(CAST(:send_after AS timestamptz), send_after)
                 WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
                 """
             ),
-            {"notification_plan_id": str(notification_plan_id), "status": status},
+            {"notification_plan_id": str(notification_plan_id), "status": status, "send_after": send_after},
         )
 
     async def insert_state_transition(

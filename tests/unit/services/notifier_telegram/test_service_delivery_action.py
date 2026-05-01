@@ -10,7 +10,11 @@ from services.notifier_telegram.service import NotifierTelegramService
 
 
 class Repo:
-    pass
+    async def load_recent_successful_delivery(self, *, dedupe_subject_key: str, target_chat_id: int):
+        return None
+
+    async def has_previous_edit_restriction(self, *, notification_plan_id):
+        return False
 
 
 def _config() -> NotifierTelegramConfig:
@@ -27,7 +31,9 @@ def _config() -> NotifierTelegramConfig:
         dry_run=True,
         allow_edits=False,
         enable_notification_send=False,
+        enable_digest_runtime=False,
         max_message_chars=3800,
+        edit_window_minutes=180,
         telegram_api_base_url="https://api.telegram.org",
         request_timeout_sec=10,
         log_level="INFO",

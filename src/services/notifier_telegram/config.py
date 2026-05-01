@@ -22,7 +22,9 @@ class NotifierTelegramConfig:
     dry_run: bool
     allow_edits: bool
     enable_notification_send: bool
+    enable_digest_runtime: bool
     max_message_chars: int
+    edit_window_minutes: int
     telegram_api_base_url: str
     request_timeout_sec: float
     log_level: str
@@ -46,9 +48,11 @@ class NotifierTelegramConfig:
                 batch_size=int(_read("NOTIFIER_TELEGRAM_BATCH_SIZE", "20")),
                 block_ms=int(_read("NOTIFIER_TELEGRAM_BLOCK_MS", "5000")),
                 dry_run=_bool_env(_read("NOTIFIER_TELEGRAM_DRY_RUN", "false" if is_prod else "true")),
-                allow_edits=_bool_env(_read("NOTIFIER_TELEGRAM_ALLOW_EDITS", "true" if is_prod else "false")),
+                allow_edits=_bool_env(_read("NOTIFIER_TELEGRAM_ALLOW_EDITS", "false")),
                 enable_notification_send=_bool_env(_read("ENABLE_NOTIFICATION_SEND", "false")),
+                enable_digest_runtime=_bool_env(_read("ENABLE_DIGEST_RUNTIME", "false")),
                 max_message_chars=int(_read("NOTIFIER_TELEGRAM_MAX_MESSAGE_CHARS", "3800")),
+                edit_window_minutes=int(_read("NOTIFIER_TELEGRAM_EDIT_WINDOW_MINUTES", "180")),
                 telegram_api_base_url=_read("TELEGRAM_API_BASE_URL", "https://api.telegram.org"),
                 request_timeout_sec=float(_read("NOTIFIER_TELEGRAM_REQUEST_TIMEOUT_SEC", "10")),
                 log_level=_read("LOG_LEVEL", "INFO").upper(),
@@ -79,6 +83,8 @@ class NotifierTelegramConfig:
             raise NotifierTelegramConfigurationError("NOTIFIER_TELEGRAM_BLOCK_MS must be > 0")
         if self.max_message_chars < 500 or self.max_message_chars > 4096:
             raise NotifierTelegramConfigurationError("NOTIFIER_TELEGRAM_MAX_MESSAGE_CHARS must be between 500 and 4096")
+        if self.edit_window_minutes <= 0:
+            raise NotifierTelegramConfigurationError("NOTIFIER_TELEGRAM_EDIT_WINDOW_MINUTES must be > 0")
         if self.transport_enabled and not self.telegram_bot_token:
             raise NotifierTelegramConfigurationError("TELEGRAM_BOT_TOKEN is required when Telegram transport is enabled")
 

@@ -6,7 +6,12 @@ from services.notifier_telegram.config import NotifierTelegramConfig
 from services.notifier_telegram.models import NotificationIntentJob, NotificationRenderDraft
 
 
-def config(*, dry_run: bool = True, enable_notification_send: bool = False) -> NotifierTelegramConfig:
+def config(
+    *,
+    dry_run: bool = True,
+    enable_notification_send: bool = False,
+    allow_edits: bool = False,
+) -> NotifierTelegramConfig:
     return NotifierTelegramConfig(
         app_env="test",
         database_url="postgresql+psycopg://example",
@@ -18,9 +23,11 @@ def config(*, dry_run: bool = True, enable_notification_send: bool = False) -> N
         batch_size=20,
         block_ms=100,
         dry_run=dry_run,
-        allow_edits=False,
+        allow_edits=allow_edits,
         enable_notification_send=enable_notification_send,
+        enable_digest_runtime=False,
         max_message_chars=3800,
+        edit_window_minutes=180,
         telegram_api_base_url="https://api.telegram.org",
         request_timeout_sec=10,
         log_level="INFO",

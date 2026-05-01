@@ -36,6 +36,7 @@ async def test_transport_disabled_does_not_call_client() -> None:
         "send_enabled": True,
         "transport_skipped": True,
         "reason_code": "telegram_dry_run",
+        "delivery_action": "send",
     }
     assert client.calls == 0
 
@@ -55,5 +56,6 @@ async def test_send_disabled_non_dry_run_does_not_call_client() -> None:
         "send_enabled": False,
         "transport_skipped": True,
         "reason_code": "telegram_send_disabled",
+        "delivery_action": "send",
     }
     assert client.calls == 0

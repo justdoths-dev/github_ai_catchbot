@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from services.notifier_telegram.config import NotifierTelegramConfig
 from services.notifier_telegram.models import (
     AnalysisRenderContext,
     CandidateRenderContext,
+    ExistingRecentDelivery,
     JudgeOutputRenderContext,
     NotificationIntentJob,
     NotificationPlanDraft,
@@ -37,6 +39,7 @@ class FakeRepository:
         self.delivery_outbox: list[dict] = []
         self.loaded_trigger_ids: list[UUID] = []
         self.operations: list[str] = []
+        self.previous_edit_restrictions: set[UUID] = set()
 
     def transaction(self):
         return Tx()
@@ -80,21 +83,60 @@ class FakeRepository:
     async def load_candidate_render_context(self, candidate_group_id: UUID):
         return self.candidates.get(candidate_group_id)
 
+    async def load_recent_successful_delivery(self, *, dedupe_subject_key: str, target_chat_id: int):
+        successful = []
+        for record in self.delivery_records:
+            if record["result_status"] not in {"sent", "edited"}:
+                continue
+            plan = self.plans.get(record["notification_plan_id"])
+            if plan is None:
+                continue
+            if plan.dedupe_subject_key == dedupe_subject_key and plan.target_chat_id == target_chat_id:
+                successful.append((record, plan))
+        if not successful:
+            return None
+        record, plan = successful[-1]
+        candidate = self.candidates.get(plan.candidate_group_id)
+        return ExistingRecentDelivery(
+            notification_plan_id=plan.notification_plan_id,
+            telegram_message_id=record.get("telegram_message_id"),
+            telegram_chat_id=record.get("telegram_chat_id"),
+            material_change_hash=plan.material_change_hash,
+            primary_canonical_url=candidate.primary_canonical_url if candidate else None,
+            urgency_profile=plan.urgency_profile,
+            render_profile=plan.render_profile,
+            created_at=record.get("created_at") or datetime.now(timezone.utc),
+        )
+
+    async def has_previous_edit_restriction(self, *, notification_plan_id: UUID) -> bool:
+        return notification_plan_id in self.previous_edit_restrictions
+
+    async def count_delivery_attempts(self, *, notification_plan_id: UUID) -> int:
+        return sum(1 for record in self.delivery_records if record["notification_plan_id"] == notification_plan_id)
+
     async def insert_notification_render(self, draft: NotificationRenderDraft):
+        for existing in self.renders:
+            if (
+                existing.notification_plan_id == draft.notification_plan_id
+                and existing.render_hash == draft.render_hash
+            ):
+                return None
         self.renders.append(draft)
         self.operations.append("render")
         return uuid4()
 
     async def insert_delivery_record(self, **kwargs):
         record_id = uuid4()
-        self.delivery_records.append({"notification_delivery_record_id": record_id, **kwargs})
+        self.delivery_records.append(
+            {"notification_delivery_record_id": record_id, "created_at": datetime.now(timezone.utc), **kwargs}
+        )
         self.operations.append("delivery_record")
         return record_id
 
-    async def update_plan_status(self, *, notification_plan_id: UUID, status: str) -> None:
+    async def update_plan_status(self, *, notification_plan_id: UUID, status: str, send_after=None) -> None:
         plan = self.plans.get(notification_plan_id)
         if plan is not None:
-            self.plans[notification_plan_id] = replace(plan, status=status)
+            self.plans[notification_plan_id] = replace(plan, status=status, send_after=send_after or plan.send_after)
         self.operations.append(f"status:{status}")
 
     async def insert_state_transition(self, **kwargs) -> None:
@@ -131,7 +173,12 @@ class RaisingTelegramClient:
         raise AssertionError("telegram client must not be called")
 
 
-def config(*, dry_run: bool = True, enable_notification_send: bool = False) -> NotifierTelegramConfig:
+def config(
+    *,
+    dry_run: bool = True,
+    enable_notification_send: bool = False,
+    allow_edits: bool = False,
+) -> NotifierTelegramConfig:
     return NotifierTelegramConfig(
         app_env="test",
         database_url="postgresql+psycopg://example",
@@ -143,9 +190,11 @@ def config(*, dry_run: bool = True, enable_notification_send: bool = False) -> N
         batch_size=20,
         block_ms=100,
         dry_run=dry_run,
-        allow_edits=False,
+        allow_edits=allow_edits,
         enable_notification_send=enable_notification_send,
+        enable_digest_runtime=False,
         max_message_chars=3800,
+        edit_window_minutes=180,
         telegram_api_base_url="https://api.telegram.org",
         request_timeout_sec=10,
         log_level="INFO",
@@ -223,6 +272,10 @@ def _plan_row(plan: NotificationPlanDraft) -> dict:
         "notification_plan_id": plan.notification_plan_id,
         "analysis_id": plan.analysis_id,
         "target_chat_id": plan.target_chat_id,
+        "target_thread_id": plan.target_thread_id,
+        "render_profile": plan.render_profile,
+        "dedupe_subject_key": plan.dedupe_subject_key,
         "material_change_hash": plan.material_change_hash,
+        "send_after": plan.send_after,
         "status": plan.status,
     }

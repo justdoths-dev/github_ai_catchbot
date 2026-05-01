@@ -32,7 +32,7 @@ def test_prod_defaults_disable_dry_run_but_still_require_send_flag(monkeypatch: 
     cfg = NotifierTelegramConfig.from_env()
 
     assert cfg.dry_run is False
-    assert cfg.allow_edits is True
+    assert cfg.allow_edits is False
     assert cfg.enable_notification_send is False
     assert cfg.transport_enabled is False
 

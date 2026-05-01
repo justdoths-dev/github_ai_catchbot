@@ -93,8 +93,21 @@ class NotificationRenderDraft:
 
 
 @dataclass(slots=True, frozen=True)
+class ExistingRecentDelivery:
+    notification_plan_id: UUID
+    telegram_message_id: int | None
+    telegram_chat_id: int | None
+    material_change_hash: str
+    primary_canonical_url: str | None
+    urgency_profile: str | None
+    render_profile: str | None
+    created_at: datetime
+
+
+@dataclass(slots=True, frozen=True)
 class DeliveryAction:
-    mode: Literal["send", "noop"]
+    mode: Literal["send", "edit", "noop"]
+    existing_message_id: int | None = None
     reason_code: str | None = None
 
 
@@ -107,6 +120,7 @@ class DeliveryResult:
     transport_error_code: str | None = None
     transport_error_class: str | None = None
     telegram_response_json: dict[str, Any] | None = None
+    retry_after_seconds: int | None = None
     edited: bool = False
 
 
