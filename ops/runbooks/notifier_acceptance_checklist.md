@@ -25,6 +25,9 @@ Environment safety:
 Recovery boundary:
 
 - Retryable failure leaves `notification_plans.status = failed_retryable` and `send_after = next_retry_at`.
-- Maintenance treats notification plans as read-only and emits a retry-intent outbox event when due.
+- Maintenance treats notification plans as read-only and emits a retry-intent `notification.plan.created.v1` outbox event when due.
+- Retry ceiling creates a dead-letter boundary; it does not mutate the plan.
+- Send-disabled rollback recovery uses explicit delivery replay, not automatic retry promotion.
 - Delivery replay root is `notification_plan` only.
+- Production delivery replay requires explicit operator approval and `ENABLE_REPLAY_TO_PROD_DB=true`.
 - Upstream source, artifact, candidate, bundle, judge, and analysis rows are not recomputed.

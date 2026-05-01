@@ -13,8 +13,9 @@ replay_type = delivery
 Allowed replay scope:
 
 - Rehydrate the existing notification plan.
-- Re-render the Telegram message if needed.
-- Retry notifier transport according to the current delivery flags.
+- Append a new `notification.plan.created.v1` replay-intent for the same `notification_plan_id`.
+- Let `notifier-telegram` rehydrate the plan and decide render / transport according to current delivery flags.
+- Update `replay_requests.status` only when the deployed schema supports it.
 
 Forbidden replay scope:
 
@@ -22,5 +23,6 @@ Forbidden replay scope:
 - Do not call judge/OpenAI or rewrite `judge_output`.
 - Do not rebuild evidence bundles, candidates, artifacts, or source messages.
 - Do not recompute `verdict` or `delivery_decision`.
+- Do not mutate `notification_plans`, `notification_renders`, or `notification_delivery_records` from maintenance.
 
-When production replay dispatch is implemented later, it must require explicit operator approval and `ENABLE_REPLAY_TO_PROD_DB=true`. The Stage 40 default is `ENABLE_REPLAY_TO_PROD_DB=false`.
+Production replay dispatch requires explicit operator approval and `ENABLE_REPLAY_TO_PROD_DB=true`. The default remains `ENABLE_REPLAY_TO_PROD_DB=false`.

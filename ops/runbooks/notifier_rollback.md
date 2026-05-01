@@ -17,6 +17,9 @@ Expected behavior:
 - Telegram send/edit transport is skipped.
 - Durable delivery records may be written with `delivery_status = suppressed`.
 - Reason metadata must distinguish rollback from dry-run with `notification_send_flag_disabled`.
-- Queue recovery is explicit delivery replay or retry promotion after the issue is fixed.
+- `notification_send_flag_disabled` and `dry_run_skip_transport` suppressed rows are not auto-retried.
+- Send-disabled rollback recovery uses explicit delivery replay from `notification_plan`.
+- Due `failed_retryable` recovery uses maintenance retry promotion after the issue is fixed.
+- Maintenance treats `notification_plans` as read-only and emits retry / replay intents only.
 
 Do not rerun collector, enrichment, judge, validator, or policy to recover delivery-only failures.
