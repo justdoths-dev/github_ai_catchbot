@@ -1,6 +1,6 @@
-"""0004_judge_delivery_observability
+"""0004_judge_delivery_obs
 
-Revision ID: 0004_judge_delivery_observability
+Revision ID: 0004_judge_delivery_obs
 Revises: 0003_enrichment_bundles
 Create Date: 2026-04-13 00:30:00
 
@@ -14,7 +14,7 @@ from sqlalchemy.dialects import postgresql
 
 
 # Revision identifiers, used by Alembic.
-revision = "0004_judge_delivery_observability"
+revision = "0004_judge_delivery_obs"
 down_revision = "0003_enrichment_bundles"
 branch_labels = None
 depends_on = None
