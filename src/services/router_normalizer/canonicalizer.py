@@ -123,7 +123,7 @@ def _canonicalize_github(
     repo_url = f"https://github.com/{owner_repo}"
     repo_anchor = _artifact(
         artifact_type="github_repo",
-        canonical_id=f"github_repo:{owner_repo}",
+        canonical_id=f"github:repo:{owner_repo}",
         canonical_url=repo_url,
         normalized_host="github.com",
         artifact_key_json={"owner": owner, "repo": repo, "repo_full_name": owner_repo},
@@ -141,7 +141,7 @@ def _canonicalize_github(
         canonical_url = f"{repo_url}/{prefix}/{ref}/{subpath}"
         return _artifact(
             artifact_type="github_subpath",
-            canonical_id=f"github_subpath:{owner_repo}:{prefix}:{ref}:{subpath}".lower(),
+            canonical_id=f"github:subpath:{owner_repo}:{ref}:{subpath}".lower(),
             canonical_url=canonical_url,
             normalized_host="github.com",
             artifact_key_json={
@@ -162,7 +162,7 @@ def _canonicalize_github(
         canonical_url = f"{repo_url}/{page_path}"
         return _artifact(
             artifact_type="github_repo_page",
-            canonical_id=f"github_repo_page:{owner_repo}:{page_path}".lower(),
+            canonical_id=f"github:repo_page:{owner_repo}:{page_path}".lower(),
             canonical_url=canonical_url,
             normalized_host="github.com",
             artifact_key_json={"owner": owner, "repo": repo, "repo_full_name": owner_repo, "page_path": page_path},
@@ -189,7 +189,7 @@ def _canonicalize_gist(
     canonical_url = f"https://gist.github.com/{owner}/{gist_id}"
     return _artifact(
         artifact_type="github_gist",
-        canonical_id=f"github_gist:{gist_id.lower()}",
+        canonical_id=f"github:gist:{gist_id.lower()}",
         canonical_url=canonical_url,
         normalized_host="gist.github.com",
         artifact_key_json={"owner": owner, "gist_id": gist_id},

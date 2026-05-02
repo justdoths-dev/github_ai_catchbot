@@ -122,12 +122,12 @@ async def test_candidate_proposal_flow_writes_artifacts_group_members_and_enrich
     assert result.candidate_eligible is True
     assert result.trigger_strength == "strong"
     assert set(repository.artifacts_by_id) == {
-        "github_repo:openai/openai-python",
-        "github_subpath:openai/openai-python:blob:main:src/openai/__init__.py",
+        "github:repo:openai/openai-python",
+        "github:subpath:openai/openai-python:main:src/openai/__init__.py",
     }
     assert len(repository.observations) == 2
     assert len(repository.candidate_groups) == 1
-    assert repository.candidate_groups[0]["dedupe_subject_key"] == "github_repo:openai/openai-python"
+    assert repository.candidate_groups[0]["dedupe_subject_key"] == "github:repo:openai/openai-python"
     assert {member["member_role"] for member in repository.members} == {"primary", "supporting"}
     assert len(repository.enrich_events) == 2
     assert {event["candidate_group_id"] for event in repository.enrich_events} == {

@@ -48,7 +48,7 @@ async def test_router_normalizer_enrich_payload_rehydrates_as_gh_enricher_job() 
     source_message_id = uuid4()
     artifact = CanonicalArtifact(
         artifact_type="github_repo",
-        canonical_id="github_repo:openai/openai-python",
+        canonical_id="github:repo:openai/openai-python",
         canonical_url="https://github.com/openai/openai-python",
         normalized_host="github.com",
         artifact_key_json={"owner": "openai", "repo": "openai-python"},
@@ -70,7 +70,7 @@ async def test_router_normalizer_enrich_payload_rehydrates_as_gh_enricher_job() 
         "candidate_group_id": str(candidate_group_id),
         "artifact_id": str(artifact_id),
         "artifact_type": "github_repo",
-        "canonical_id": "github_repo:openai/openai-python",
+        "canonical_id": "github:repo:openai/openai-python",
         "provider_route": "github",
         "refresh_mode": "standard",
         "depth_budget": 1,
@@ -78,7 +78,7 @@ async def test_router_normalizer_enrich_payload_rehydrates_as_gh_enricher_job() 
         "source_version_no": 7,
     }
     assert router_session.params["dedupe_key"] == (
-        f"artifact:enrich:{candidate_group_id}:github_repo:openai/openai-python:{source_message_id}:7"
+        f"artifact:enrich:{candidate_group_id}:github:repo:openai/openai-python:{source_message_id}:7"
     )
 
     gh_repository = GhEnricherRepository(
