@@ -107,7 +107,7 @@ The observed full-mode metric names must include:
 - No GitHub or X API call is made.
 - No external network call is made.
 - No feature flags or env files are mutated.
-- `recommended_flag_patch` is output-only and is not applied.
+- `recommended_flag_patch` is output-only and does not apply recommended flag patches.
 - No `event_outbox` rows are emitted by the gate runner.
 - No `notification_renders` rows are created by the gate runner.
 - No extra `notification_delivery_records` rows are created by the gate runner beyond the seeded fixture row.

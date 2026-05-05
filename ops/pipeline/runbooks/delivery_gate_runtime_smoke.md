@@ -2,7 +2,7 @@
 
 This runbook covers Post-Stage44 Control-Plane Verification Slice 12 for the existing delivery gate runner.
 
-This is a one-shot DB acceptance harness, not a runtime worker smoke. Redis is not required. It seeds a marker-scoped `restricted_pass_minimal` delivery-line fixture into a local smoke PostgreSQL database, runs the existing `DeliveryGateRunner` once in restricted mode, and prints a deterministic JSON report.
+This is a one-shot DB acceptance harness, not a runtime worker smoke, and does not authorize production rollout. Redis is not required. It seeds a marker-scoped `restricted_pass_minimal` delivery-line fixture into a local smoke PostgreSQL database, runs the existing `DeliveryGateRunner` once in restricted mode, and prints a deterministic JSON report.
 
 ## Command
 
@@ -35,7 +35,7 @@ The current runner also emits the Stage 43 compatibility metric `plan_to_transpo
 
 The smoke does not require Redis and does not start collector, outbox-relay, router-normalizer, enrichers, evidence-assembler, analysis-router, judge-openai, validator, policy-engine, notifier, maintenance workers, or Telegram transport.
 
-It does not call OpenAI, GitHub, X, Telegram Bot API, or external network. It does not read API credentials, does not mutate feature flags, write `.env` files, does not auto-apply `recommended_flag_patch`, create notification renders, publish `event_outbox`, create dead-letter rows, create replay requests, or create state transitions.
+It does not call OpenAI, GitHub, X, Telegram Bot API, or external network. It does not read API credentials, does not mutate feature flags, does not write `.env` files, does not auto-apply `recommended_flag_patch`, create notification renders, publish `event_outbox`, create dead-letter rows, create replay requests, or create state transitions.
 
 The local database gate window must be clean enough for deterministic restricted-pass scoring. If recent non-marker delivery rows, due retry plans, open delivery DLQ rows, or unexpected send-disabled rows are present, the harness exits non-zero with JSON rather than cleaning or modifying unrelated rows.
 
