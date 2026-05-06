@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from .exceptions import SingletonViolationError
+from .exceptions import CollectorSingletonAlreadyRunningError
 
 
 @dataclass(slots=True)
@@ -32,7 +32,7 @@ class CollectorSingletonGuard:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             os.close(fd)
-            raise SingletonViolationError(
+            raise CollectorSingletonAlreadyRunningError(
                 f"collector singleton already held: {self.lock_path}"
             ) from exc
 
@@ -49,8 +49,11 @@ class CollectorSingletonGuard:
             os.close(self._fd)
             self._fd = None
 
-    def is_held(self) -> bool:
+    def is_acquired(self) -> bool:
         return self._fd is not None
+
+    def is_held(self) -> bool:
+        return self.is_acquired()
 
     def __enter__(self) -> "CollectorSingletonGuard":
         self.acquire()

@@ -146,7 +146,7 @@ class CollectorTelegramConfig:
             object.__setattr__(
                 self,
                 "singleton_lock_path",
-                str(Path(self.tdlib_state_dir) / "collector-live.lock"),
+                str(Path(self.tdlib_state_dir) / "collector-telegram-live.lock"),
             )
 
     @classmethod
@@ -189,7 +189,7 @@ class CollectorTelegramConfig:
             history_page_limit=_read_int(effective_env, "HISTORY_PAGE_LIMIT", default=50),
             singleton_lock_path=(
                 (_env_get(effective_env, "COLLECTOR_SINGLETON_LOCK_PATH") or "").strip()
-                or str(Path(tdlib_state_dir) / "collector-live.lock")
+                or str(Path(tdlib_state_dir) / "collector-telegram-live.lock")
             ),
             startup_probe_timeout_sec=_read_int(effective_env, "STARTUP_PROBE_TIMEOUT_SEC", default=30),
             startup_warm_backfill_enabled=_read_bool(

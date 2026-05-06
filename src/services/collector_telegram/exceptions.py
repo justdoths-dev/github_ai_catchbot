@@ -50,3 +50,7 @@ class ReconcileTerminalError(CollectorError):
 
 class SingletonViolationError(CollectorError):
     """Raised when prod single-instance collector guard is violated."""
+
+
+class CollectorSingletonAlreadyRunningError(SingletonViolationError):
+    """Raised when another live collector already holds the singleton lock."""
