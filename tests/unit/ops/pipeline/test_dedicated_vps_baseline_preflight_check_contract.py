@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 import getpass
 import json
 import socket
@@ -35,6 +36,17 @@ def _synthetic_repo(tmp_path: Path, *, include_core: bool = True, include_venv: 
         python_path.write_text("# synthetic python marker\n", encoding="utf-8")
         python_path.chmod(0o700)
     return repo
+
+
+def _iter_json_string_values(obj: object) -> Iterator[str]:
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            yield from _iter_json_string_values(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _iter_json_string_values(value)
 
 
 def test_script_and_runbook_exist() -> None:
@@ -191,9 +203,15 @@ def test_current_host_mode_does_not_print_username_home_hostname_or_ip(tmp_path:
         "::1",
     }
 
+    parsed = json.loads(rendered)
+    string_values = tuple(_iter_json_string_values(parsed))
+    assert "deployment_topology" in parsed
+    assert all("deploy" not in value for value in _iter_json_string_values({"deployment_topology": "safe"}))
+    assert any("deploy" in value for value in _iter_json_string_values({"safe_key": "deploy-leak"}))
+
     for value in forbidden:
         if value:
-            assert value not in rendered
+            assert all(value not in string_value for string_value in string_values)
     assert report["redaction"]["hostname_printed"] is False
     assert report["redaction"]["username_printed"] is False
     assert report["redaction"]["home_path_printed"] is False
