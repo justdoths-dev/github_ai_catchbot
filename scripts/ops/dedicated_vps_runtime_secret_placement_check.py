@@ -218,6 +218,12 @@ REQUIRED_MARKERS: tuple[RequiredMarker, ...] = (
         "secret_values_printed=false",
     ),
     _marker(
+        "numeric_mode_extraction",
+        "Validation must use numeric permission extraction before comparing 750 and 640.",
+        "stat.S_IMODE(info.st_mode)",
+        'f"{stat.S_IMODE(info.st_mode):04o}"[-3:]',
+    ),
+    _marker(
         "db_password_placeholder_failure_check",
         "Validation must fail if the DB password placeholder remains.",
         'if "<DB_PASSWORD_FROM_PASSWORD_MANAGER>" in value',
@@ -231,6 +237,11 @@ REQUIRED_MARKERS: tuple[RequiredMarker, ...] = (
         "generic_placeholder_failure_check",
         "Validation must fail if any active value still contains a placeholder.",
         'if "<" in value and ">" in value',
+    ),
+    _marker(
+        "editor_placeholder_failure_check",
+        "Validation must fail if the editor-replacement placeholder remains.",
+        'if "<replace inside editor; do not print>" in value',
     ),
     _marker(
         "generic_placeholder_failure_message",
@@ -301,6 +312,11 @@ REQUIRED_MARKERS: tuple[RequiredMarker, ...] = (
         "no_source_runtime_env",
         "Forbid sourcing runtime.env.",
         "Do not `source /etc/github-ai-catchbot/runtime.env`",
+    ),
+    _marker(
+        "no_dot_source_runtime_env",
+        "Forbid dot-sourcing runtime.env.",
+        "Do not `. /etc/github-ai-catchbot/runtime.env`",
     ),
     _marker("no_export_database_url", "Forbid exporting DATABASE_URL.", "Do not `export DATABASE_URL`"),
     _marker("no_export_redis_url", "Forbid exporting REDIS_URL.", "Do not `export REDIS_URL`"),
@@ -384,6 +400,11 @@ FORBIDDEN_PATTERNS: tuple[ForbiddenPattern, ...] = (
         "export_redis_url",
         r"\bexport\s+REDIS_URL\b",
         "Do not include REDIS_URL export commands.",
+    ),
+    ForbiddenPattern(
+        "textual_filemode_permission_extraction",
+        r"stat\.filemode\(info\.st_mode\)\[-3:\]",
+        "Use numeric permission extraction instead of textual file-mode rendering.",
     ),
     ForbiddenPattern(
         "enable_notification_send_true",

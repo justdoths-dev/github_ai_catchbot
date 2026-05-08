@@ -328,7 +328,7 @@ def owner_group_mode(path: Path) -> tuple[str, str, str]:
     info = path.stat()
     owner = pwd.getpwuid(info.st_uid).pw_name
     group = grp.getgrgid(info.st_gid).gr_name
-    mode = stat.filemode(info.st_mode)[-3:]
+    mode = f"{stat.S_IMODE(info.st_mode):04o}"[-3:]
     return owner, group, mode
 
 
@@ -413,6 +413,8 @@ Expected safe output:
 
 - PASS line is present.
 - path and permission facts are printed.
+- permission validation uses numeric mode extraction and compares numeric modes
+  `750` and `640`.
 - allowed key names and optional key names may be printed.
 - no secret values are printed.
 - no PostgreSQL or Redis connection is made.
@@ -457,6 +459,11 @@ Compose, or systemd unit modification.
 
 Record only the failed check name, non-secret path facts, and redacted status.
 Do not paste secret values into ChatGPT.
+
+If permission validation fails unexpectedly, verify that the validation script
+extracts modes numerically and compares `750` for the parent directory and `640`
+for the runtime file. Do not replace numeric mode extraction with textual
+file-mode rendering.
 
 ## Rollback/cleanup
 

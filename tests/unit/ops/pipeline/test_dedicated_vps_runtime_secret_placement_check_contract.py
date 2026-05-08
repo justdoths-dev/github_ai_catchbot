@@ -288,6 +288,37 @@ def test_missing_db_password_placeholder_check_causes_failure(tmp_path: Path) ->
     _assert_required_marker_failure(tmp_path, text, "db_password_placeholder_failure_check")
 
 
+def test_missing_numeric_mode_extraction_marker_causes_failure(tmp_path: Path) -> None:
+    text = _valid_runbook_text().replace(
+        'mode = f"{stat.S_IMODE(info.st_mode):04o}"[-3:]',
+        "mode = str(info.st_mode)[-3:]",
+    )
+
+    _assert_required_marker_failure(tmp_path, text, "numeric_mode_extraction")
+
+
+def test_textual_filemode_as_only_mode_extraction_causes_failure(tmp_path: Path) -> None:
+    text = _valid_runbook_text().replace(
+        'mode = f"{stat.S_IMODE(info.st_mode):04o}"[-3:]',
+        "mode = stat.filemode(info.st_mode)[-3:]",
+    )
+    _write_runbook(tmp_path, text)
+
+    result = _module().generate_report(tmp_path)
+
+    assert result.exit_code == 1
+    assert "runbook.required_markers" in result.report["checks_failed"]
+    assert "runbook.forbidden_authorization" in result.report["checks_failed"]
+    assert any(
+        failure["check"] == "runbook.required_marker:numeric_mode_extraction"
+        for failure in result.report["failures"]
+    )
+    assert any(
+        failure["check"] == "runbook.forbidden_authorization:textual_filemode_permission_extraction"
+        for failure in result.report["failures"]
+    )
+
+
 def test_missing_generic_placeholder_check_causes_failure(tmp_path: Path) -> None:
     text = _valid_runbook_text().replace(
         'if "<" in value and ">" in value:',
@@ -295,6 +326,15 @@ def test_missing_generic_placeholder_check_causes_failure(tmp_path: Path) -> Non
     )
 
     _assert_required_marker_failure(tmp_path, text, "generic_placeholder_failure_check")
+
+
+def test_missing_replace_inside_editor_placeholder_check_causes_failure(tmp_path: Path) -> None:
+    text = _valid_runbook_text().replace(
+        'if "<replace inside editor; do not print>" in value:',
+        'if value == "__editor_placeholder_check_removed__":',
+    )
+
+    _assert_required_marker_failure(tmp_path, text, "editor_placeholder_failure_check")
 
 
 def test_missing_database_url_prefix_check_causes_failure(tmp_path: Path) -> None:
@@ -352,6 +392,49 @@ def test_runtime_env_cat_source_and_export_additions_cause_failure(tmp_path: Pat
         assert result.exit_code == 1, snippet
         assert "runbook.forbidden_authorization" in result.report["checks_failed"]
         assert any(expected_check in failure["check"] for failure in result.report["failures"])
+
+
+def test_missing_runtime_env_cat_source_dot_source_export_prohibitions_cause_failure(
+    tmp_path: Path,
+) -> None:
+    replacements = {
+        "no_cat_runtime_env": (
+            "Do not `cat /etc/github-ai-catchbot/runtime.env`",
+            "Avoid printing the runtime secret file",
+        ),
+        "no_source_runtime_env": (
+            "Do not `source /etc/github-ai-catchbot/runtime.env`",
+            "Avoid loading the runtime secret file in the shell",
+        ),
+        "no_export_database_url": (
+            "Do not `export DATABASE_URL`",
+            "Avoid exporting the database URL",
+        ),
+        "no_export_redis_url": (
+            "Do not `export REDIS_URL`",
+            "Avoid exporting the Redis URL",
+        ),
+    }
+
+    for marker_name, (old, new) in replacements.items():
+        text = _valid_runbook_text().replace(old, new)
+
+        _assert_required_marker_failure(tmp_path, text, marker_name)
+
+    text = _valid_runbook_text().replace(
+        "Do not `. /etc/github-ai-catchbot/runtime.env`",
+        "Avoid dot-sourcing the runtime secret file",
+    )
+    _write_runbook(tmp_path, text)
+
+    result = _module().generate_report(tmp_path)
+
+    assert result.exit_code == 1
+    assert "runbook.required_markers" in result.report["checks_failed"]
+    assert any(
+        failure["check"] == "runbook.required_marker:no_dot_source_runtime_env"
+        for failure in result.report["failures"]
+    )
 
 
 def test_runtime_authorization_wording_additions_cause_failure(tmp_path: Path) -> None:
