@@ -46,11 +46,12 @@ def test_help_works_without_live_env_or_runtime_connections() -> None:
     )
 
     output = f"{result.stdout}\n{result.stderr}"
+    normalized_output = " ".join(output.split())
     assert result.returncode == 0
     assert "usage:" in output
-    assert "current-env inspects current" in output
-    assert "process env name presence and path metadata only" in output
-    assert "never prints values" in output
+    assert "current-env inspects current" in normalized_output
+    assert "process env name presence and path metadata only" in normalized_output
+    assert "never prints values" in normalized_output
 
 
 def test_schema_report_generation_passes_against_current_repo_root() -> None:

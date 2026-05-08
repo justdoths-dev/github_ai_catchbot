@@ -46,11 +46,12 @@ def test_help_works_without_live_env_or_runtime_connections() -> None:
     )
 
     output = f"{result.stdout}\n{result.stderr}"
+    normalized_output = " ".join(output.split())
     assert result.returncode == 0
     assert "usage:" in output
     assert "--format {json}" in output
     assert "--mode {schema,current-env}" in output
-    assert "never prints values" in output
+    assert "never prints values" in normalized_output
     assert "uid/gid" in output
     assert "mode" in output
 
