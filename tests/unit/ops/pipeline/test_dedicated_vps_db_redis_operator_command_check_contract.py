@@ -130,7 +130,20 @@ def test_missing_docker_compose_future_candidate_not_discarded_wording_causes_fa
 
 
 def test_missing_postgresql_local_bind_command_causes_failure(tmp_path: Path) -> None:
-    text = _valid_runbook_text().replace("set listen_addresses '127.0.0.1'", "set listen_addresses 'localhost'")
+    text = _valid_runbook_text().replace("set listen_addresses \"'127.0.0.1'\"", "set listen_addresses 'localhost'")
+    _write_runbook(tmp_path, text)
+
+    result = _module().generate_report(tmp_path)
+
+    assert result.exit_code == 1
+    assert any("postgresql_listen_addresses_local" in failure["check"] for failure in result.report["failures"])
+
+
+def test_unquoted_postgresql_listen_addresses_command_causes_failure(tmp_path: Path) -> None:
+    text = _valid_runbook_text().replace(
+        "set listen_addresses \"'127.0.0.1'\"",
+        "set listen_addresses '127.0.0.1'",
+    )
     _write_runbook(tmp_path, text)
 
     result = _module().generate_report(tmp_path)
@@ -147,6 +160,26 @@ def test_missing_redis_local_bind_command_causes_failure(tmp_path: Path) -> None
 
     assert result.exit_code == 1
     assert any("redis_bind_loopback" in failure["check"] for failure in result.report["failures"])
+
+
+def test_redis_config_reads_must_use_sudo(tmp_path: Path) -> None:
+    text = (
+        _valid_runbook_text()
+        .replace("if sudo grep -qE '^[#[:space:]]*bind ' /etc/redis/redis.conf; then", "if grep -qE '^[#[:space:]]*bind ' /etc/redis/redis.conf; then")
+        .replace("if sudo grep -qE '^[#[:space:]]*protected-mode ' /etc/redis/redis.conf; then", "if grep -qE '^[#[:space:]]*protected-mode ' /etc/redis/redis.conf; then")
+        .replace("if sudo grep -qE '^[#[:space:]]*supervised ' /etc/redis/redis.conf; then", "if grep -qE '^[#[:space:]]*supervised ' /etc/redis/redis.conf; then")
+        .replace("sudo grep -E '^(bind|protected-mode|supervised) ' /etc/redis/redis.conf", "grep -E '^(bind|protected-mode|supervised) ' /etc/redis/redis.conf")
+    )
+    _write_runbook(tmp_path, text)
+
+    result = _module().generate_report(tmp_path)
+
+    assert result.exit_code == 1
+    failed = {failure["check"] for failure in result.report["failures"]}
+    assert any("redis_bind_sudo_grep" in check for check in failed)
+    assert any("redis_protected_mode_sudo_grep" in check for check in failed)
+    assert any("redis_supervised_sudo_grep" in check for check in failed)
+    assert any("redis_final_sudo_grep" in check for check in failed)
 
 
 def test_missing_no_public_5432_or_6379_wording_causes_failure(tmp_path: Path) -> None:
@@ -209,6 +242,51 @@ def test_missing_postgresql_cluster_count_guard_causes_failure(tmp_path: Path) -
     failed = {failure["check"] for failure in result.report["failures"]}
     assert any("postgresql_cluster_count_guard" in check for check in failed)
     assert any("postgresql_exactly_one_cluster_guard" in check for check in failed)
+
+
+def test_missing_postgresql_cluster_online_guard_causes_failure(tmp_path: Path) -> None:
+    text = (
+        _valid_runbook_text()
+        .replace('$4 == "online"', '$4 == "running"')
+        .replace("is not online", "is not ready")
+    )
+    _write_runbook(tmp_path, text)
+
+    result = _module().generate_report(tmp_path)
+
+    assert result.exit_code == 1
+    assert any("postgresql_cluster_online_guard" in failure["check"] for failure in result.report["failures"])
+
+
+def test_missing_postgresql_cluster_status_after_restart_causes_failure(tmp_path: Path) -> None:
+    text = _valid_runbook_text().replace(
+        'sudo systemctl restart postgresql redis-server\n\n'
+        'PG_CLUSTER_COUNT="$(pg_lsclusters --no-header | awk \'END {print NR}\')"',
+        'sudo systemctl restart postgresql redis-server\n\n'
+        'PG_CLUSTER_TOTAL="$(pg_lsclusters --no-header | awk \'END {print NR}\')"',
+    )
+    _write_runbook(tmp_path, text)
+
+    result = _module().generate_report(tmp_path)
+
+    assert result.exit_code == 1
+    assert any("postgresql_cluster_status_after_restart" in failure["check"] for failure in result.report["failures"])
+
+
+def test_missing_postgresql_readiness_after_restart_causes_failure(tmp_path: Path) -> None:
+    text = _valid_runbook_text().replace(
+        "pg_isready -h 127.0.0.1 -p 5432\nsudo systemctl is-active postgresql redis-server",
+        "sudo systemctl is-active postgresql redis-server",
+    )
+    _write_runbook(tmp_path, text)
+
+    result = _module().generate_report(tmp_path)
+
+    assert result.exit_code == 1
+    assert any(
+        "postgresql_restart_readiness_before_systemd_status" in failure["check"]
+        for failure in result.report["failures"]
+    )
 
 
 def test_missing_interactive_password_safe_command_causes_failure(tmp_path: Path) -> None:

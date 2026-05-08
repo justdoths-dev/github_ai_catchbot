@@ -107,7 +107,12 @@ REQUIRED_MARKERS: tuple[RequiredMarker, ...] = (
     _marker(
         "postgresql_listen_addresses_local",
         "Set PostgreSQL listen_addresses to local loopback only.",
-        "set listen_addresses '127.0.0.1'",
+        "set listen_addresses \"'127.0.0.1'\"",
+    ),
+    _marker(
+        "postgresql_listen_addresses_config_quoted",
+        "Document that PostgreSQL listen_addresses must be written as a quoted config value.",
+        "listen_addresses = '127.0.0.1'",
     ),
     _marker(
         "postgresql_cluster_count_guard",
@@ -125,7 +130,47 @@ REQUIRED_MARKERS: tuple[RequiredMarker, ...] = (
         "set password_encryption 'scram-sha-256'",
     ),
     _marker("redis_bind_loopback", "Set Redis bind to loopback addresses only.", "bind 127.0.0.1 ::1"),
+    _marker(
+        "redis_bind_sudo_grep",
+        "Use sudo when checking the Redis bind directive in /etc/redis/redis.conf.",
+        "if sudo grep -qe '^[#[:space:]]*bind ' /etc/redis/redis.conf; then",
+        "if sudo grep -qE '^[#[:space:]]*bind ' /etc/redis/redis.conf; then",
+    ),
     _marker("redis_protected_mode", "Set Redis protected-mode to yes.", "protected-mode yes"),
+    _marker(
+        "redis_protected_mode_sudo_grep",
+        "Use sudo when checking the Redis protected-mode directive in /etc/redis/redis.conf.",
+        "if sudo grep -qe '^[#[:space:]]*protected-mode ' /etc/redis/redis.conf; then",
+        "if sudo grep -qE '^[#[:space:]]*protected-mode ' /etc/redis/redis.conf; then",
+    ),
+    _marker(
+        "redis_supervised_sudo_grep",
+        "Use sudo when checking the Redis supervised directive in /etc/redis/redis.conf.",
+        "if sudo grep -qe '^[#[:space:]]*supervised ' /etc/redis/redis.conf; then",
+        "if sudo grep -qE '^[#[:space:]]*supervised ' /etc/redis/redis.conf; then",
+    ),
+    _marker(
+        "redis_final_sudo_grep",
+        "Use sudo when printing final Redis config directives from /etc/redis/redis.conf.",
+        "sudo grep -e '^(bind|protected-mode|supervised) ' /etc/redis/redis.conf",
+        "sudo grep -E '^(bind|protected-mode|supervised) ' /etc/redis/redis.conf",
+    ),
+    _marker(
+        "postgresql_cluster_online_guard",
+        "Require an explicit PostgreSQL cluster online check after restart.",
+        '$4 == "online"',
+        "is not online",
+    ),
+    _marker(
+        "postgresql_cluster_status_after_restart",
+        "Check PostgreSQL cluster status after restarting services.",
+        "sudo systemctl restart postgresql redis-server pg_cluster_count",
+    ),
+    _marker(
+        "postgresql_restart_readiness_before_systemd_status",
+        "Run local PostgreSQL readiness after restart before relying on umbrella systemd status.",
+        "pg_isready -h 127.0.0.1 -p 5432 sudo systemctl is-active postgresql redis-server",
+    ),
     _marker("postgresql_app_role", "Include the PostgreSQL app role name.", "github_ai_catchbot_app"),
     _marker("postgresql_app_database", "Include the PostgreSQL app database name.", "github_ai_catchbot"),
     _marker(

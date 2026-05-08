@@ -182,7 +182,7 @@ test -n "$PG_CLUSTER"
 PG_CONF="/etc/postgresql/${PG_VERSION}/${PG_CLUSTER}/postgresql.conf"
 sudo cp -a "$PG_CONF" "${PG_CONF}.operator-package.$(date -u +%Y%m%dT%H%M%SZ).bak"
 
-sudo pg_conftool "$PG_VERSION" "$PG_CLUSTER" set listen_addresses '127.0.0.1'
+sudo pg_conftool "$PG_VERSION" "$PG_CLUSTER" set listen_addresses "'127.0.0.1'"
 sudo pg_conftool "$PG_VERSION" "$PG_CLUSTER" set password_encryption 'scram-sha-256'
 sudo pg_conftool "$PG_VERSION" "$PG_CLUSTER" show listen_addresses
 sudo pg_conftool "$PG_VERSION" "$PG_CLUSTER" show password_encryption
@@ -193,7 +193,9 @@ Expected safe output:
 - `pg_lsclusters --no-header` returns exactly one PostgreSQL cluster; if not,
   `pg_lsclusters` is printed and the operator stops.
 - detected PostgreSQL version and cluster are non-empty.
-- `listen_addresses` reports `127.0.0.1`.
+- `listen_addresses` reports `127.0.0.1`; the PostgreSQL config value must be
+  written as `listen_addresses = '127.0.0.1'`, not as an unquoted numeric-looking
+  value.
 - `password_encryption` reports `scram-sha-256`.
 - no PostgreSQL version number is hardcoded.
 - no public bind address is configured.
@@ -205,25 +207,25 @@ Expected safe output:
 ```bash
 sudo cp -a /etc/redis/redis.conf "/etc/redis/redis.conf.operator-package.$(date -u +%Y%m%dT%H%M%SZ).bak"
 
-if grep -qE '^[#[:space:]]*bind ' /etc/redis/redis.conf; then
+if sudo grep -qE '^[#[:space:]]*bind ' /etc/redis/redis.conf; then
   sudo sed -i -E 's/^[#[:space:]]*bind .*/bind 127.0.0.1 ::1/' /etc/redis/redis.conf
 else
   printf '%s\n' 'bind 127.0.0.1 ::1' | sudo tee -a /etc/redis/redis.conf >/dev/null
 fi
 
-if grep -qE '^[#[:space:]]*protected-mode ' /etc/redis/redis.conf; then
+if sudo grep -qE '^[#[:space:]]*protected-mode ' /etc/redis/redis.conf; then
   sudo sed -i -E 's/^[#[:space:]]*protected-mode .*/protected-mode yes/' /etc/redis/redis.conf
 else
   printf '%s\n' 'protected-mode yes' | sudo tee -a /etc/redis/redis.conf >/dev/null
 fi
 
-if grep -qE '^[#[:space:]]*supervised ' /etc/redis/redis.conf; then
+if sudo grep -qE '^[#[:space:]]*supervised ' /etc/redis/redis.conf; then
   sudo sed -i -E 's/^[#[:space:]]*supervised .*/supervised systemd/' /etc/redis/redis.conf
 else
   printf '%s\n' 'supervised systemd' | sudo tee -a /etc/redis/redis.conf >/dev/null
 fi
 
-grep -E '^(bind|protected-mode|supervised) ' /etc/redis/redis.conf
+sudo grep -E '^(bind|protected-mode|supervised) ' /etc/redis/redis.conf
 ```
 
 Expected safe output:
@@ -239,6 +241,27 @@ Expected safe output:
 
 ```bash
 sudo systemctl restart postgresql redis-server
+
+PG_CLUSTER_COUNT="$(pg_lsclusters --no-header | awk 'END {print NR}')"
+if [ "$PG_CLUSTER_COUNT" -ne 1 ]; then
+  echo "FAIL: expected exactly one PostgreSQL cluster, found ${PG_CLUSTER_COUNT}"
+  pg_lsclusters
+  exit 1
+fi
+
+PG_VERSION="$(pg_lsclusters --no-header | awk 'NR==1 {print $1}')"
+PG_CLUSTER="$(pg_lsclusters --no-header | awk 'NR==1 {print $2}')"
+test -n "$PG_VERSION"
+test -n "$PG_CLUSTER"
+
+pg_lsclusters
+if ! pg_lsclusters --no-header | awk -v version="$PG_VERSION" -v cluster="$PG_CLUSTER" '$1 == version && $2 == cluster && $4 == "online" {found=1} END {exit found ? 0 : 1}'; then
+  echo "FAIL: PostgreSQL cluster ${PG_VERSION}/${PG_CLUSTER} is not online"
+  pg_lsclusters
+  exit 1
+fi
+
+pg_isready -h 127.0.0.1 -p 5432
 sudo systemctl is-active postgresql redis-server
 sudo systemctl is-enabled postgresql redis-server
 ```
@@ -247,6 +270,10 @@ Expected safe output:
 
 - both services report `active`.
 - both services report `enabled`.
+- `pg_lsclusters` shows the selected PostgreSQL cluster as `online`.
+- `pg_isready -h 127.0.0.1 -p 5432` succeeds after the restart.
+- the block fails if the selected PostgreSQL cluster is not `online`.
+- the block fails if local PostgreSQL readiness fails.
 - no app runtime is started.
 
 ### Command block 5: PostgreSQL app role and database creation
@@ -380,6 +407,8 @@ SUMMARY
 - [ ] Command block 3 sets Redis `bind 127.0.0.1 ::1`.
 - [ ] Command block 3 sets Redis `protected-mode yes`.
 - [ ] Command block 4 reports PostgreSQL and Redis active/enabled.
+- [ ] Command block 4 confirms the selected PostgreSQL cluster is online.
+- [ ] Command block 4 confirms local PostgreSQL readiness after restart.
 - [ ] Command block 5 creates or confirms `github_ai_catchbot_app`.
 - [ ] Command block 5 creates or confirms `github_ai_catchbot`.
 - [ ] Command block 5 keeps the password outside the repo and out of ChatGPT.
