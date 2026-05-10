@@ -155,6 +155,20 @@ Runner constraints:
 - Expected operator output is redacted JSON only.
 - If the runner fails, stop and bring the redacted JSON back to ChatGPT.
 
+## Completed redacted result record
+
+The separately approved dedicated VPS read-only DB acceptance smoke has since
+been executed and passed. The redacted result is recorded at:
+
+```text
+ops/pipeline/runbooks/dedicated_vps_post_migration_db_acceptance_smoke_result_record.md
+```
+
+That result record does not authorize app runtime, TDLib, Telegram, live
+collector, notifier transport, production rollout, Alembic mutation, DB
+mutation, Redis mutation, Docker, systemd changes, migration edits, or secret
+printing.
+
 Expected future JSON safety flags must include:
 
 ```json
@@ -244,6 +258,5 @@ printing.
 
 ## Next step
 
-If this package passes review, commit, and VPS pull, the next step is
-separately approved execution of the read-only post-migration DB acceptance
-smoke on the VPS.
+The current next recommended slice is
+`dedicated_vps_runtime_environment_consumer_preflight`.
