@@ -117,6 +117,44 @@ After separate approval only, the future smoke should:
 - Start no services.
 - Print only redacted JSON result.
 
+## Future separately approved runner command
+
+The future operator runner exists at:
+
+```text
+scripts/ops/dedicated_vps_post_migration_db_acceptance_smoke_runner.py
+```
+
+Codex must not execute this runner against the VPS DB. The runner must not be
+executed without separate operator approval, and the explicit approval flag is
+required for future read-only DB smoke execution.
+
+Future/separately approved only:
+
+```bash
+python scripts/ops/dedicated_vps_post_migration_db_acceptance_smoke_runner.py \
+  --approved-read-only-db-smoke \
+  --format json
+```
+
+Runner constraints:
+
+- Without `--approved-read-only-db-smoke`, the runner must not read
+  `/etc/github-ai-catchbot/runtime.env`, must not connect to PostgreSQL, must
+  not connect to Redis, must not run Alembic, and must return redacted JSON
+  indicating approval is required.
+- With `--approved-read-only-db-smoke`, the runner reads runtime.env inside
+  Python only. It must not `cat`, `source`, dot-source, or `export` values from
+  runtime.env.
+- The runner must not print `DATABASE_URL`, DB password, or secret values.
+- The runner is read-only and performs no writes.
+- The runner must not connect to Redis.
+- The runner must not run Alembic.
+- The runner must not start app runtime, TDLib, Telegram, live collector,
+  notifier transport, Docker, systemd, or production rollout.
+- Expected operator output is redacted JSON only.
+- If the runner fails, stop and bring the redacted JSON back to ChatGPT.
+
 Expected future JSON safety flags must include:
 
 ```json

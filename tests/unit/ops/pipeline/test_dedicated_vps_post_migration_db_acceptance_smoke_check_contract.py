@@ -133,6 +133,16 @@ def test_runbook_includes_read_only_scope_and_non_goals() -> None:
         assert phrase in text
 
 
+def test_runbook_mentions_future_runner_and_explicit_approval_flag() -> None:
+    text = _valid_runbook_text()
+
+    assert "dedicated_vps_post_migration_db_acceptance_smoke_runner.py" in text
+    assert "--approved-read-only-db-smoke" in text
+    assert "Codex must not execute this runner against the VPS DB" in text
+    assert "Future/separately approved only" in text
+    assert "indicating approval is required" in text
+
+
 def test_runbook_prohibits_secret_printing_and_runtime_env_shell_loading() -> None:
     text = _valid_runbook_text()
 
