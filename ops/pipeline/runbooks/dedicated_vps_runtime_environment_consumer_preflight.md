@@ -195,6 +195,16 @@ A passed preflight only means:
 
 The next slice after a passed preflight result record should be a separately reviewed app/runtime import/config preflight or TDLib auth package, depending on review.
 
+## Completed redacted result record
+
+The approved runtime environment consumer preflight PASS is recorded in
+`ops/pipeline/runbooks/dedicated_vps_runtime_environment_consumer_preflight_result_record.md`.
+
+The next bounded slice is
+`dedicated_vps_app_runtime_import_config_preflight`. This result record does not
+authorize TDLib auth, Telegram connection, live collector startup, notifier
+transport, or production rollout.
+
 ## What remains unauthorized
 
 This package does not authorize:
