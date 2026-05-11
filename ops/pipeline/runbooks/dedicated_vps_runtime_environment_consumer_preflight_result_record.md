@@ -235,6 +235,11 @@ Next likely slice:
 dedicated_vps_app_runtime_import_config_preflight
 ```
 
+That next slice is an app/runtime import/config preflight only. It must not
+start runtime, perform TDLib auth, connect to Telegram, start the live
+collector, enable notifier transport, connect DB/Redis, run Alembic, or
+authorize production rollout.
+
 Alternative later slice:
 
 ```text
