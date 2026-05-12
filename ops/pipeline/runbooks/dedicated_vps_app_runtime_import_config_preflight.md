@@ -149,6 +149,16 @@ python scripts/ops/dedicated_vps_app_runtime_import_config_preflight_runner.py \
 Codex must not run that command against the real VPS runtime env during
 implementation.
 
+## Completed redacted result record
+
+The separately approved app/runtime import-config preflight execution passed
+and is recorded in
+`ops/pipeline/runbooks/dedicated_vps_app_runtime_import_config_preflight_result_record.md`.
+
+That result record is redacted and records only the already-approved execution
+facts. It does not authorize TDLib auth, Telegram connection, live collector
+startup, notifier transport, or production rollout.
+
 ## Failure handling
 
 If the future approved preflight fails, stop and bring the redacted JSON back to
@@ -174,19 +184,19 @@ It does not prove service readiness.
 
 ## Next bounded slice
 
-If future approved execution passes, the next likely slice is:
+After the result record is committed, pushed, pulled, and repo-locally validated
+on the dedicated VPS, the next bounded slice is Telegram preparation only:
 
 ```text
-dedicated_vps_app_runtime_import_config_preflight_result_record
+dedicated_vps_telegram_credentials_acquisition_plan
 ```
 
-After that, a separately reviewed TDLib auth package may be considered.
-
-Do not skip directly to live collector or production rollout.
+Do not skip directly to TDLib auth, Telegram connection, live collector startup,
+notifier transport, or production rollout.
 
 ## Anti-overconservatism check
 
 If this package and its focused tests pass with no boundary violation, do not
 add another diagnostic, checker, or preflight for marginal certainty. Move next
-to the result record for approved execution or a TDLib auth package only after
-separate approval.
+to `dedicated_vps_telegram_credentials_acquisition_plan` only after the result
+record is committed, pushed, pulled, and validated.
