@@ -12,5 +12,10 @@ dependencies = [
   "openai>=1.99,<3",
 ]
 
+[project.optional-dependencies]
+test = [
+  "pytest-asyncio>=1,<2",
+]
+
 [tool.alembic]
 script_location = "migrations"
