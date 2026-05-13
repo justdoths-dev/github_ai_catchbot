@@ -14,6 +14,7 @@ MISSING_NEXT_SLICE = "dedicated_vps_tdlib_auth_entrypoint_implementation"
 AVAILABLE_NEXT_SLICE = "dedicated_vps_tdlib_auth_operator_execution"
 
 COLLECTOR_SOURCE_FILES = (
+    "src/services/collector_telegram/auth_entrypoint.py",
     "src/services/collector_telegram/auth_fsm.py",
     "src/services/collector_telegram/tdlib_client.py",
     "src/services/collector_telegram/runtime.py",
@@ -21,7 +22,13 @@ COLLECTOR_SOURCE_FILES = (
     "src/services/collector_telegram/main.py",
 )
 
+AUTH_ONLY_ENTRYPOINT_FILE = "src/services/collector_telegram/auth_entrypoint.py"
+AUTH_ONLY_ENTRYPOINT_LABEL = "src.services.collector_telegram.auth_entrypoint"
+
 AUTH_ONLY_ENTRYPOINT_MARKERS = (
+    "AUTH_ONLY_ENTRYPOINT_LABEL",
+    "TDLibAuthOnlyRunner",
+    "TDLibAuthOnlyResult",
     "tdlib_auth_operator_execution",
     "auth_only_entrypoint",
     "run_tdlib_auth_only",
@@ -93,21 +100,43 @@ def _inspect_auth_only_entrypoint(repo_root: Path) -> dict[str, Any]:
     main_text = _read_repo_text(repo_root / "src/services/collector_telegram/main.py")
     main_is_runtime_entrypoint = all(marker in main_text for marker in RUNTIME_ENTRYPOINT_MARKERS)
 
-    # Conservative decision: auth-building components are not a standalone
-    # operator entrypoint, and collector main remains runtime-bound.
+    auth_entrypoint_text = _read_repo_text(repo_root / AUTH_ONLY_ENTRYPOINT_FILE)
+    auth_entrypoint_has_markers = bool(auth_entrypoint_text) and all(
+        marker in auth_entrypoint_text
+        for marker in (
+            "TDLibAuthOnlyRunner",
+            "TDLibAuthOnlyResult",
+            "run_tdlib_auth_only_once",
+        )
+    )
+    auth_entrypoint_imports_runtime = any(
+        marker in auth_entrypoint_text
+        for marker in (
+            "CollectorTelegramService",
+            "CollectorRuntime",
+            "from .service import",
+            "from .runtime import",
+            "asyncio.run(",
+        )
+    )
+
+    # Auth-building components alone are not a standalone operator entrypoint.
+    # The dedicated auth_entrypoint module is acceptable only if it stays
+    # separate from collector runtime/service/main.
     available_hits = [
         hit
         for hit in marker_hits
-        if hit["file"] != "src/services/collector_telegram/main.py"
+        if hit["file"] == AUTH_ONLY_ENTRYPOINT_FILE
     ]
-    if available_hits and not main_is_runtime_entrypoint:
+    if auth_entrypoint_has_markers and available_hits and not auth_entrypoint_imports_runtime:
         return {
             "auth_only_entrypoint_status": "available",
-            "selected_entrypoint": available_hits[0]["file"],
+            "selected_entrypoint": AUTH_ONLY_ENTRYPOINT_LABEL,
             "entrypoint_evidence": available_hits,
             "inspected_source_files": inspected,
             "missing_source_files": missing_files,
             "collector_main_runtime_entrypoint": main_is_runtime_entrypoint,
+            "auth_entrypoint_imports_runtime": auth_entrypoint_imports_runtime,
         }
 
     return {
@@ -117,6 +146,7 @@ def _inspect_auth_only_entrypoint(repo_root: Path) -> dict[str, Any]:
         "inspected_source_files": inspected,
         "missing_source_files": missing_files,
         "collector_main_runtime_entrypoint": main_is_runtime_entrypoint,
+        "auth_entrypoint_imports_runtime": auth_entrypoint_imports_runtime,
     }
 
 
@@ -143,7 +173,17 @@ def generate_report(
                 ),
             }
         )
-    elif not approved_tdlib_auth_operator_execution:
+    elif approved_tdlib_auth_operator_execution:
+        checks_failed.append("approved_execution.deferred")
+        failures.append(
+            {
+                "check": "approved_execution.deferred",
+                "message": (
+                    "Approved TDLib auth execution is deferred to the next bounded slice."
+                ),
+            }
+        )
+    else:
         checks_failed.append("approval.required")
         failures.append(
             {
@@ -167,6 +207,7 @@ def generate_report(
         "likely_next_slice": AVAILABLE_NEXT_SLICE if available else MISSING_NEXT_SLICE,
         "entrypoint_assessment": {
             "collector_main_runtime_entrypoint": inspection["collector_main_runtime_entrypoint"],
+            "auth_entrypoint_imports_runtime": inspection["auth_entrypoint_imports_runtime"],
             "entrypoint_evidence": inspection["entrypoint_evidence"],
             "inspected_source_files": inspection["inspected_source_files"],
             "missing_source_files": inspection["missing_source_files"],

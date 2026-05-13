@@ -9,8 +9,9 @@ This slice does not execute TDLib auth. This wrapper is not approval to run TDLi
 
 The wrapper resolves the current execution-entrypoint ambiguity by reporting
 whether a standalone, auth-only TDLib entrypoint exists in the current
-repository. If none exists, the wrapper fails closed and names the next bounded
-implementation slice instead of reusing the collector runtime entrypoint.
+repository. The current auth-only entrypoint exists, so the wrapper reports it
+as available while still requiring separate explicit approval before any TDLib
+auth execution.
 
 ## Source-of-truth / architecture boundary
 
@@ -45,7 +46,9 @@ Layer boundaries remain unchanged:
 
 ## Current closed prerequisites
 
-- Latest expected repo HEAD:
+- Latest expected repo HEAD before this implementation slice:
+  `e205bf1 test(ops): add TDLib auth operator wrapper`.
+- Previous TDLib package:
   `90b2d9e test(ops): add TDLib auth package`.
 - Previous result record:
   `fc3ac3d docs(ops): record telegram runtime secret placement result`.
@@ -65,6 +68,9 @@ Layer boundaries remain unchanged:
   validator.
 - Runtime env values were not printed.
 - TDLib auth package is PASS.
+- TDLib auth operator wrapper is PASS.
+- Wrapper default/no-approval mode has no side effects.
+- Wrapper previously found no safe standalone TDLib-auth-only entrypoint.
 - TDLib auth has NOT been executed.
 - Telegram connection has NOT been established.
 - Live collector has NOT been started.
@@ -75,8 +81,9 @@ These conclusions are not reopened by this wrapper.
 
 ## Scope
 
-This slice adds one runbook, one repo-local wrapper script, and one focused
-unit test file.
+This slice updates the repo-local wrapper to detect the new standalone
+auth-only entrypoint, adds the auth-only entrypoint implementation, and adds
+focused fake-transport unit tests.
 
 The wrapper uses repository source text only. It does not import or start the
 collector runtime. It does not import collector `main.py`. It does not
@@ -128,25 +135,27 @@ Default mode prints JSON only and remains no-side-effect:
 
 The wrapper may accept the explicit future approval flag
 `--approved-tdlib-auth-operator-execution`, but this slice does not run that
-mode. If no safe auth-only entrypoint exists, the wrapper remains blocked even
-when approval is requested.
+mode. If a safe auth-only entrypoint exists, the wrapper still remains approval
+required in default mode and does not call the entrypoint.
 
 ## Auth-only entrypoint decision
 
-Current source inspection finds auth-related collector components, including
-`auth_fsm.py` and `tdlib_client.py`, but no standalone TDLib-auth-only operator
-entrypoint.
+Current source inspection finds the standalone TDLib-auth-only entrypoint:
+
+```text
+src.services.collector_telegram.auth_entrypoint
+```
+
+The entrypoint is separate from collector runtime/service/main and is designed
+to pump TDLib authorization states through injected auth-only boundaries.
 
 `src/services/collector_telegram/main.py` is the collector runtime entrypoint.
 It loads collector config, builds `CollectorRuntime` and
 `CollectorTelegramService`, installs signal handling, and runs the service.
 It is not an approved auth-only command for this wrapper.
 
-If no auth-only entrypoint exists, the next slice must implement one rather
-than misusing collector runtime main.
-
-If a future auth-only entrypoint exists, actual operator execution still
-requires separate explicit approval.
+The current auth-only entrypoint is `src.services.collector_telegram.auth_entrypoint`.
+Actual operator execution still requires separate explicit approval.
 
 ## Approved execution guard
 
@@ -160,9 +169,9 @@ The default report must set `approved_execution_requested` to false. The
 wrapper must not call any auth entrypoint unless this flag is present and a
 safe standalone auth-only entrypoint has been identified.
 
-This repository state has no such entrypoint, so the wrapper reports
-`auth_only_entrypoint_status: missing` and
-`contract_status: blocked`.
+This repository state has such an entrypoint, so the wrapper reports
+`auth_only_entrypoint_status: available` and
+`contract_status: approval_required` in default/no-approval mode.
 
 ## Redacted output shape
 
@@ -170,11 +179,11 @@ The wrapper prints a JSON object containing at least:
 
 ```yaml
 report_type: dedicated_vps_tdlib_auth_operator_execution_wrapper_v1
-contract_status: blocked
+contract_status: approval_required
 approval_required: true
 approved_execution_requested: false
-auth_only_entrypoint_status: missing
-selected_entrypoint: null
+auth_only_entrypoint_status: available
+selected_entrypoint: src.services.collector_telegram.auth_entrypoint
 runtime_env_path: /etc/github-ai-catchbot/runtime.env
 runtime_env_read: false
 runtime_env_values_printed: false
@@ -192,11 +201,11 @@ production_rollout_performed: false
 files_mutated: false
 network_called: false
 checks_failed:
-  - auth_only_entrypoint.missing
+  - approval.required
 failures:
-  - check: auth_only_entrypoint.missing
-    message: No safe standalone TDLib-auth-only entrypoint exists in the current repository.
-likely_next_slice: dedicated_vps_tdlib_auth_entrypoint_implementation
+  - check: approval.required
+    message: TDLib auth operator execution requires separate explicit approval.
+likely_next_slice: dedicated_vps_tdlib_auth_operator_execution
 ```
 
 No secret values, login codes, phone numbers, API hashes, runtime env contents,
@@ -231,10 +240,9 @@ assignments from shell commands.
 - Wrapper does not run Alembic.
 - Wrapper does not modify Docker/systemd.
 - Wrapper clearly reports whether a safe auth-only entrypoint is available.
-- If no safe auth-only entrypoint is available, wrapper fails closed and
-  recommends `dedicated_vps_tdlib_auth_entrypoint_implementation`.
-- If a safe auth-only entrypoint is available in a future repository state,
-  wrapper recommends `dedicated_vps_tdlib_auth_operator_execution`.
+- Safe auth-only entrypoint is available as
+  `src.services.collector_telegram.auth_entrypoint`.
+- Wrapper recommends `dedicated_vps_tdlib_auth_operator_execution`.
 - `TELEGRAM_BOT_TOKEN` is not treated as a TDLib auth credential.
 - Login code and 2FA prompt values are never recorded.
 - No service code, dependencies, migrations, DB/Redis/Alembic/Docker/systemd,
@@ -243,11 +251,11 @@ assignments from shell commands.
 
 ## Next bounded action
 
-Because the current repository has no safe standalone TDLib-auth-only
+Because the current repository now has a safe standalone TDLib-auth-only
 entrypoint, the next bounded action is:
 
 ```text
-dedicated_vps_tdlib_auth_entrypoint_implementation
+dedicated_vps_tdlib_auth_operator_execution
 ```
 
 The review sequence is:
@@ -255,7 +263,8 @@ The review sequence is:
 1. ChatGPT review bundle.
 2. Commit/push if approved.
 3. VPS pull and repo-local validation.
-4. Implement `dedicated_vps_tdlib_auth_entrypoint_implementation`.
+4. Create/approve `dedicated_vps_tdlib_auth_operator_execution`.
+5. After execution, create `dedicated_vps_tdlib_auth_result_record`.
 
 Actual TDLib auth execution remains a later, separately approved operator
 action after a safe auth-only entrypoint exists.

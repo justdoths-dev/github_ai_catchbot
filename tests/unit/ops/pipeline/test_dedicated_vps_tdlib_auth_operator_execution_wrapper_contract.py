@@ -95,10 +95,10 @@ FORBIDDEN_PATTERNS = {
     "source_runtime_env": re.compile(r"source /etc/github-ai-catchbot/runtime\.env"),
     "dot_source_runtime_env": re.compile(r"(?m)^\s*\.\s+/etc/github-ai-catchbot/runtime\.env"),
     "export_cat": re.compile(r"export \$\(cat"),
-    "postgresql_url": re.compile(r"postgresql://"),
-    "postgresql_psycopg_url": re.compile(r"postgresql\+psycopg://"),
-    "redis_url": re.compile(r"redis://"),
-    "echo_secret_append": re.compile(r"echo .*TELEGRAM_.*>>", re.IGNORECASE),
+    "postgresql_url": re.compile("postgresql" + r"://"),
+    "postgresql_psycopg_url": re.compile("postgresql" + r"\+psycopg://"),
+    "redis_url": re.compile("redis" + r"://"),
+    "echo_secret_append": re.compile(r"echo .*TELEGRAM" + r"_.*>" + r">", re.IGNORECASE),
     "tee_append_runtime_env": re.compile(r"tee -a /etc/github-ai-catchbot/runtime\.env"),
     "ipv4_literal": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
 }
@@ -126,6 +126,10 @@ def test_wrapper_default_no_approval_returns_json_and_no_side_effects() -> None:
     assert result.returncode != 0
     report = json.loads(result.stdout)
     assert report["report_type"] == "dedicated_vps_tdlib_auth_operator_execution_wrapper_v1"
+    assert report["auth_only_entrypoint_status"] == "available"
+    assert report["selected_entrypoint"] == "src.services.collector_telegram.auth_entrypoint"
+    assert report["contract_status"] == "approval_required"
+    assert report["likely_next_slice"] == "dedicated_vps_tdlib_auth_operator_execution"
     assert report["approval_required"] is True
     assert report["approved_execution_requested"] is False
     for key in SIDE_EFFECT_BOOLEAN_KEYS:
@@ -167,15 +171,11 @@ def test_telegram_bot_token_is_not_tdlib_auth_credential() -> None:
 def test_wrapper_reports_available_or_missing_and_next_slice_matches() -> None:
     report = _module().generate_report(ROOT).report
 
-    assert report["auth_only_entrypoint_status"] in {"available", "missing", "ambiguous"}
-    if report["auth_only_entrypoint_status"] in {"missing", "ambiguous"}:
-        assert report["contract_status"] == "blocked"
-        assert report["likely_next_slice"] == "dedicated_vps_tdlib_auth_entrypoint_implementation"
-        assert "auth_only_entrypoint.missing" in report["checks_failed"]
-    else:
-        assert report["contract_status"] == "approval_required"
-        assert report["likely_next_slice"] == "dedicated_vps_tdlib_auth_operator_execution"
-        assert report["selected_entrypoint"]
+    assert report["auth_only_entrypoint_status"] == "available"
+    assert report["selected_entrypoint"] == "src.services.collector_telegram.auth_entrypoint"
+    assert report["contract_status"] == "approval_required"
+    assert report["likely_next_slice"] == "dedicated_vps_tdlib_auth_operator_execution"
+    assert "approval.required" in report["checks_failed"]
 
 
 def test_tests_do_not_call_approved_execution_flag() -> None:
@@ -209,8 +209,8 @@ def test_runbook_exists_and_preserves_non_authorizations() -> None:
         "No live collector start occurs.",
         "No notifier transport or rollout occurs.",
         "This wrapper does not read `/etc/github-ai-catchbot/runtime.env`.",
-        "If no auth-only entrypoint exists, the next slice must implement one rather than misusing collector runtime main.",
-        "If a future auth-only entrypoint exists, actual operator execution still requires separate explicit approval.",
+        "The current auth-only entrypoint is `src.services.collector_telegram.auth_entrypoint`.",
+        "Actual operator execution still requires separate explicit approval.",
         "Telegram login code and 2FA prompt values must never be pasted into ChatGPT, Codex, GitHub, repo files, markdown, terminal history, or review bundles.",
     )
     for marker in required_markers:
@@ -233,5 +233,6 @@ def test_collector_main_is_not_treated_as_auth_only_when_runtime_bound() -> None
     report = _module().generate_report(ROOT).report
 
     assert report["entrypoint_assessment"]["collector_main_runtime_entrypoint"] is True
-    if report["auth_only_entrypoint_status"] != "available":
-        assert report["selected_entrypoint"] is None
+    assert report["auth_only_entrypoint_status"] == "available"
+    assert report["selected_entrypoint"] != "src.services.collector_telegram.main"
+    assert report["entrypoint_assessment"]["auth_entrypoint_imports_runtime"] is False
