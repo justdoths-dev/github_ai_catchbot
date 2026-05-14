@@ -87,7 +87,6 @@ def _assert_no_runtime_side_effects(payload: dict[str, Any]) -> None:
         "outbox_event_emitted",
         "collector_main_imported",
         "collector_runtime_started",
-        "telegram_connected",
         "session_state_created_or_reused",
     ):
         assert payload[key] is False
@@ -114,6 +113,7 @@ async def test_auth_only_runner_processes_fake_state_sequence_to_ready() -> None
     assert payload["auth_entrypoint_status"] == "ready"
     assert payload["tdlib_auth_attempted"] is True
     assert payload["tdlib_auth_completed"] is True
+    assert payload["telegram_connected"] is True
     assert payload["final_authorization_state"] == "ready"
     assert payload["requests_sent_count"] == 3
     assert [request["@type"] for request in transport.sent_requests] == [
@@ -186,7 +186,16 @@ async def test_result_side_effect_booleans_stay_false_for_ready_path() -> None:
         receive_timeout_sec=0,
     )
 
-    _assert_no_runtime_side_effects(result.to_redacted_dict())
+    payload = result.to_redacted_dict()
+    assert payload["tdlib_auth_completed"] is True
+    assert payload["telegram_connected"] is True
+    assert payload["live_collector_started"] is False
+    assert payload["app_runtime_started"] is False
+    assert payload["notifier_transport_enabled"] is False
+    assert payload["production_rollout_performed"] is False
+    assert payload["runtime_env_values_printed"] is False
+    assert payload["secret_values_printed"] is False
+    _assert_no_runtime_side_effects(payload)
 
 
 def test_auth_entrypoint_does_not_import_or_start_collector_runtime_entrypoints() -> None:

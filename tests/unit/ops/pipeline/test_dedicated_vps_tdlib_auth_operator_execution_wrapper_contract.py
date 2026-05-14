@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -42,13 +43,18 @@ REQUIRED_REPORT_KEYS = (
     "approved_execution_requested",
     "auth_only_entrypoint_status",
     "selected_entrypoint",
+    "blocked_reason",
     "runtime_env_path",
     "runtime_env_read",
     "runtime_env_values_printed",
+    "secret_values_printed",
     "tdlib_auth_attempted",
     "tdlib_auth_completed",
+    "manual_intervention_required",
     "telegram_connected",
     "session_state_created_or_reused",
+    "db_connected",
+    "redis_connected",
     "database_connected",
     "redis_connected",
     "alembic_run",
@@ -56,6 +62,10 @@ REQUIRED_REPORT_KEYS = (
     "live_collector_started",
     "notifier_transport_enabled",
     "production_rollout_performed",
+    "collector_main_used",
+    "collector_service_used",
+    "collector_runtime_used",
+    "systemd_or_docker_changed",
     "files_mutated",
     "network_called",
     "checks_failed",
@@ -108,6 +118,64 @@ def _module():
     from scripts.ops import dedicated_vps_tdlib_auth_operator_execution_wrapper as module
 
     return module
+
+
+class FakeAuthOnlyResult:
+    def __init__(
+        self,
+        *,
+        status: str = "manual_intervention_required",
+        attempted: bool = True,
+        completed: bool = False,
+        manual_intervention_required: bool = True,
+    ) -> None:
+        self.status = status
+        self.attempted = attempted
+        self.completed = completed
+        self.manual_intervention_required = manual_intervention_required
+
+    def to_redacted_dict(self) -> dict:
+        return {
+            "schema_version": "tdlib_auth_only_result_v1",
+            "auth_entrypoint_status": self.status,
+            "tdlib_auth_attempted": self.attempted,
+            "tdlib_auth_completed": self.completed,
+            "telegram_connected": False,
+            "session_state_created_or_reused": False,
+            "manual_intervention_required": self.manual_intervention_required,
+            "manual_intervention_reason": "Telegram login code required from operator",
+            "final_authorization_state": "waiting_code",
+            "requests_sent_count": 0,
+            "runtime_env_values_printed": False,
+            "database_connected": False,
+            "redis_connected": False,
+            "alembic_run": False,
+            "app_runtime_started": False,
+            "live_collector_started": False,
+            "notifier_transport_enabled": False,
+            "production_rollout_performed": False,
+            "secret_values_printed": False,
+            "source_message_persisted": False,
+            "outbox_event_emitted": False,
+            "collector_main_imported": False,
+            "collector_runtime_started": False,
+            "error": None,
+        }
+
+
+def _approved_env(tmp_path: Path) -> dict[str, str]:
+    return {
+        "APP_ENV": "dev",
+        "COLLECTOR_MODE": "replay",
+        "DATABASE_URL": "postgresql://collector:secret@localhost:5432/catchbot",
+        "TELEGRAM_API_ID": "12345",
+        "TELEGRAM_API_HASH": "fake-api-hash",
+        "TELEGRAM_PHONE_NUMBER": "+10000000000",
+        "TELEGRAM_2FA_PASSWORD": "",
+        "TDLIB_DB_ENCRYPTION_KEY": "fake-tdlib-key",
+        "TDLIB_STATE_DIR": str(tmp_path / "tdlib-state"),
+        "TDLIB_FILES_DIR": str(tmp_path / "tdlib-files"),
+    }
 
 
 def _run_default_wrapper() -> subprocess.CompletedProcess[str]:
@@ -179,17 +247,96 @@ def test_wrapper_reports_available_or_missing_and_next_slice_matches() -> None:
 
 
 def test_tests_do_not_call_approved_execution_flag() -> None:
-    text = Path(__file__).read_text(encoding="utf-8")
-    approval_flag = "--approved-tdlib-auth-" + "operator-execution"
+    env = dict(os.environ)
+    env["TDJSON_LIBRARY_PATH"] = "/definitely/missing/libtdjson.so"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--format",
+            "json",
+            "--approved-tdlib-auth-operator-execution",
+            "--runtime-env-path",
+            str(ROOT / "missing-runtime.env"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=env,
+    )
 
-    assert approval_flag not in text
+    report = json.loads(result.stdout)
+    assert result.returncode != 0
+    assert report["contract_status"] == "blocked_real_transport_missing"
+    assert report["blocked_reason"] == "blocked_real_transport_missing"
+    assert report["runtime_env_read"] is False
+    assert report["tdlib_auth_attempted"] is False
 
 
-def test_wrapper_does_not_import_runtime_or_instantiate_tdlib_client() -> None:
+def test_approved_mode_blocks_when_real_transport_missing_without_runtime_env_read() -> None:
+    def missing_transport() -> object:
+        raise RuntimeError("tdjson unavailable")
+
+    def forbidden_env_reader(path: str | Path) -> dict[str, str]:
+        raise AssertionError("runtime.env must not be read when real transport is missing")
+
+    result = _module().generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        real_transport_factory=missing_transport,
+        runtime_env_reader=forbidden_env_reader,
+    )
+
+    assert result.exit_code != 0
+    assert result.report["contract_status"] == "blocked_real_transport_missing"
+    assert result.report["blocked_reason"] == "blocked_real_transport_missing"
+    assert result.report["tdlib_auth_attempted"] is False
+    assert result.report["runtime_env_read"] is False
+
+
+def test_approved_mode_uses_auth_only_entrypoint_once_with_redacted_result(tmp_path: Path) -> None:
+    calls: list[dict] = []
+
+    async def fake_runner(*args, **kwargs) -> FakeAuthOnlyResult:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeAuthOnlyResult()
+
+    result = _module().generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        runtime_env_path=tmp_path / "runtime.env",
+        real_transport_factory=object,
+        runtime_env_reader=lambda path: _approved_env(tmp_path),
+        auth_runner=fake_runner,
+    )
+
+    rendered = json.dumps(result.report)
+    assert result.exit_code != 0
+    assert len(calls) == 1
+    assert result.report["contract_status"] == "manual_intervention_required"
+    assert result.report["auth_only_entrypoint_status"] == "manual_intervention_required"
+    assert result.report["selected_entrypoint"] == "src.services.collector_telegram.auth_entrypoint"
+    assert result.report["approved_execution_requested"] is True
+    assert result.report["tdlib_auth_attempted"] is True
+    assert result.report["manual_intervention_required"] is True
+    assert result.report["runtime_env_read"] is True
+    assert result.report["runtime_env_values_printed"] is False
+    assert result.report["secret_values_printed"] is False
+    assert result.report["collector_main_used"] is False
+    assert result.report["collector_service_used"] is False
+    assert result.report["collector_runtime_used"] is False
+    assert "fake-api-hash" not in rendered
+    assert "fake-tdlib-key" not in rendered
+
+
+def test_wrapper_imports_auth_entrypoint_only_for_approved_execution() -> None:
     script_text = SCRIPT.read_text(encoding="utf-8")
 
-    assert "from src.services.collector_telegram" not in script_text
-    assert "import src.services.collector_telegram" not in script_text
+    assert "from src.services.collector_telegram import auth_entrypoint" in script_text
+    assert "collector_telegram.main" not in script_text
+    assert "collector_telegram.service" not in script_text
+    assert "collector_telegram.runtime" not in script_text
     assert "TDLibClient(" not in script_text
     assert "CollectorTelegramService(" not in script_text
     assert "CollectorRuntime(" not in script_text

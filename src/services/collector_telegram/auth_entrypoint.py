@@ -13,7 +13,7 @@ from typing import Any
 from .auth_fsm import AuthorizationFSM
 from .config import CollectorTelegramConfig
 from .exceptions import AuthorizationError, TDLibTransportError
-from .tdlib_client import TDLibClient, TDLibTransportProtocol
+from .tdlib_client import TDJsonTransport, TDLibClient, TDLibTransportProtocol
 
 JsonDict = dict[str, Any]
 
@@ -148,6 +148,7 @@ class TDLibAuthOnlyRunner:
                         auth_entrypoint_status="ready",
                         tdlib_auth_attempted=attempted,
                         tdlib_auth_completed=True,
+                        telegram_connected=True,
                         final_authorization_state=transition.new_state,
                         requests_sent_count=requests_sent_count,
                     )
@@ -221,6 +222,12 @@ async def run_tdlib_auth_only_once(
         max_authorization_updates=max_authorization_updates,
     )
     return await runner.run_once()
+
+
+def build_real_tdlib_transport() -> TDLibTransportProtocol:
+    transport = TDJsonTransport()
+    transport.assert_available()
+    return transport
 
 
 def _extract_authorization_state(payload: JsonDict | None) -> JsonDict | None:

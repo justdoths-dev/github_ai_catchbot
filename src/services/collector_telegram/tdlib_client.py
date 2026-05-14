@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -22,6 +26,81 @@ class TDLibTransportProtocol(Protocol):
     async def receive(self, timeout: float) -> JsonDict | None: ...
 
     async def close(self) -> None: ...
+
+
+class TDJsonTransport:
+    """Async-shaped adapter around the official TDLib tdjson C interface."""
+
+    def __init__(self, *, library_path: str | None = None) -> None:
+        self._library_path = library_path
+        self._tdjson: ctypes.CDLL | None = None
+        self._client: ctypes.c_void_p | None = None
+
+    def assert_available(self) -> None:
+        self._load_tdjson()
+
+    async def initialize(self) -> None:
+        if self._client is not None:
+            return
+        tdjson = self._load_tdjson()
+        client = tdjson.td_json_client_create()
+        if not client:
+            raise TDLibTransportError("tdjson client creation failed")
+        self._tdjson = tdjson
+        self._client = client
+
+    async def send(self, request: JsonDict) -> None:
+        if self._tdjson is None or self._client is None:
+            raise TDLibTransportError("tdjson transport is not initialized")
+        payload = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._tdjson.td_json_client_send(self._client, payload)
+
+    async def receive(self, timeout: float) -> JsonDict | None:
+        if self._tdjson is None or self._client is None:
+            raise TDLibTransportError("tdjson transport is not initialized")
+        raw = self._tdjson.td_json_client_receive(self._client, float(timeout))
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise TDLibTransportError("tdjson returned an invalid JSON payload") from exc
+        if not isinstance(payload, dict):
+            raise TDLibTransportError("tdjson returned a non-object JSON payload")
+        return payload
+
+    async def close(self) -> None:
+        if self._tdjson is None or self._client is None:
+            return
+        client = self._client
+        self._client = None
+        try:
+            self._tdjson.td_json_client_destroy(client)
+        finally:
+            self._tdjson = None
+
+    def _load_tdjson(self) -> ctypes.CDLL:
+        candidate = (
+            self._library_path
+            or os.environ.get("TDJSON_LIBRARY_PATH")
+            or ctypes.util.find_library("tdjson")
+        )
+        if not candidate:
+            raise TDLibTransportError("tdjson library not found")
+        try:
+            tdjson = ctypes.CDLL(candidate)
+        except OSError as exc:
+            raise TDLibTransportError("tdjson library could not be loaded") from exc
+
+        try:
+            tdjson.td_json_client_create.restype = ctypes.c_void_p
+            tdjson.td_json_client_send.argtypes = (ctypes.c_void_p, ctypes.c_char_p)
+            tdjson.td_json_client_receive.argtypes = (ctypes.c_void_p, ctypes.c_double)
+            tdjson.td_json_client_receive.restype = ctypes.c_char_p
+            tdjson.td_json_client_destroy.argtypes = (ctypes.c_void_p,)
+        except AttributeError as exc:
+            raise TDLibTransportError("tdjson library is missing required client symbols") from exc
+        return tdjson
 
 
 @dataclass(slots=True, frozen=True)

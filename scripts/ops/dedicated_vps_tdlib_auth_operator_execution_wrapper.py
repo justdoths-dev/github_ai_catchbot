@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from types import ModuleType
+from typing import Any, Awaitable, Callable, Sequence
 
 
 REPORT_TYPE = "dedicated_vps_tdlib_auth_operator_execution_wrapper_v1"
@@ -47,20 +50,31 @@ RUNTIME_ENTRYPOINT_MARKERS = (
 SIDE_EFFECT_FLAGS = (
     "runtime_env_read",
     "runtime_env_values_printed",
+    "secret_values_printed",
     "tdlib_auth_attempted",
     "tdlib_auth_completed",
+    "manual_intervention_required",
     "telegram_connected",
     "session_state_created_or_reused",
-    "database_connected",
+    "db_connected",
     "redis_connected",
+    "database_connected",
     "alembic_run",
     "app_runtime_started",
     "live_collector_started",
     "notifier_transport_enabled",
     "production_rollout_performed",
+    "collector_main_used",
+    "collector_service_used",
+    "collector_runtime_used",
+    "systemd_or_docker_changed",
     "files_mutated",
     "network_called",
 )
+
+RealTransportFactory = Callable[[], Any]
+AuthRunner = Callable[..., Awaitable[Any]]
+RuntimeEnvReader = Callable[[str | Path], dict[str, str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +92,40 @@ def _read_repo_text(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return ""
+
+
+def _load_auth_entrypoint_module(repo_root: Path) -> ModuleType:
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    from src.services.collector_telegram import auth_entrypoint
+
+    return auth_entrypoint
+
+
+def _strip_optional_quotes(value: str) -> str:
+    stripped = value.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {"'", '"'}:
+        return stripped[1:-1]
+    return stripped
+
+
+def parse_runtime_env_text(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        values[key] = _strip_optional_quotes(raw_value)
+    return values
+
+
+def parse_runtime_env_file(path: str | Path) -> dict[str, str]:
+    return parse_runtime_env_text(Path(path).read_text(encoding="utf-8", errors="replace"))
 
 
 def _inspect_auth_only_entrypoint(repo_root: Path) -> dict[str, Any]:
@@ -154,6 +202,10 @@ def generate_report(
     repo_root: Path | None = None,
     *,
     approved_tdlib_auth_operator_execution: bool = False,
+    runtime_env_path: str | Path = RUNTIME_ENV_PATH,
+    real_transport_factory: RealTransportFactory | None = None,
+    auth_runner: AuthRunner | None = None,
+    runtime_env_reader: RuntimeEnvReader | None = None,
 ) -> WrapperResult:
     repo_root = repo_root or default_repo_root()
     inspection = _inspect_auth_only_entrypoint(repo_root)
@@ -162,49 +214,20 @@ def generate_report(
 
     checks_failed: list[str] = []
     failures: list[dict[str, str]] = []
-    if not available:
-        checks_failed.append("auth_only_entrypoint.missing")
-        failures.append(
-            {
-                "check": "auth_only_entrypoint.missing",
-                "message": (
-                    "No safe standalone TDLib-auth-only entrypoint exists in the "
-                    "current repository."
-                ),
-            }
-        )
-    elif approved_tdlib_auth_operator_execution:
-        checks_failed.append("approved_execution.deferred")
-        failures.append(
-            {
-                "check": "approved_execution.deferred",
-                "message": (
-                    "Approved TDLib auth execution is deferred to the next bounded slice."
-                ),
-            }
-        )
-    else:
-        checks_failed.append("approval.required")
-        failures.append(
-            {
-                "check": "approval.required",
-                "message": (
-                    "TDLib auth operator execution requires separate explicit approval."
-                ),
-            }
-        )
+    blocked_reason: str | None = None
 
     report: dict[str, Any] = {
         "report_type": REPORT_TYPE,
-        "contract_status": "approval_required" if available else "blocked",
-        "approval_required": True,
+        "contract_status": "approval_required",
+        "approval_required": not approved_tdlib_auth_operator_execution,
         "approved_execution_requested": approved_tdlib_auth_operator_execution,
         "auth_only_entrypoint_status": status,
         "selected_entrypoint": inspection["selected_entrypoint"],
-        "runtime_env_path": RUNTIME_ENV_PATH,
+        "runtime_env_path": str(runtime_env_path),
         "checks_failed": checks_failed,
         "failures": failures,
         "likely_next_slice": AVAILABLE_NEXT_SLICE if available else MISSING_NEXT_SLICE,
+        "blocked_reason": blocked_reason,
         "entrypoint_assessment": {
             "collector_main_runtime_entrypoint": inspection["collector_main_runtime_entrypoint"],
             "auth_entrypoint_imports_runtime": inspection["auth_entrypoint_imports_runtime"],
@@ -217,7 +240,132 @@ def generate_report(
     for flag in SIDE_EFFECT_FLAGS:
         report[flag] = False
 
-    return WrapperResult(exit_code=1 if failures else 0, report=report)
+    def fail(check: str, message: str, *, contract_status: str, reason: str | None = None) -> WrapperResult:
+        checks_failed.append(check)
+        failures.append({"check": check, "message": message})
+        report["contract_status"] = contract_status
+        report["blocked_reason"] = reason
+        return WrapperResult(exit_code=1, report=report)
+
+    if not available:
+        return fail(
+            "auth_only_entrypoint.missing",
+            (
+                "No safe standalone TDLib-auth-only entrypoint exists in the "
+                "current repository."
+            ),
+            contract_status="blocked",
+            reason="auth_only_entrypoint_missing",
+        )
+
+    if not approved_tdlib_auth_operator_execution:
+        return fail(
+            "approval.required",
+            "TDLib auth operator execution requires separate explicit approval.",
+            contract_status="approval_required",
+        )
+
+    auth_module = _load_auth_entrypoint_module(repo_root)
+    transport_factory = real_transport_factory or auth_module.build_real_tdlib_transport
+    try:
+        transport = transport_factory()
+    except Exception:
+        return fail(
+            "tdlib.real_transport_missing",
+            "Approved TDLib auth execution is blocked because the real tdjson transport is unavailable.",
+            contract_status="blocked_real_transport_missing",
+            reason="blocked_real_transport_missing",
+        )
+
+    env_reader = runtime_env_reader or parse_runtime_env_file
+    try:
+        runtime_env = env_reader(runtime_env_path)
+    except OSError:
+        return fail(
+            "runtime_env.unreadable",
+            "Approved TDLib auth execution could not read runtime.env inside Python.",
+            contract_status="blocked_runtime_env_unreadable",
+            reason="runtime_env_unreadable",
+        )
+    report["runtime_env_read"] = True
+
+    try:
+        config = auth_module.CollectorTelegramConfig.from_env(runtime_env)
+    except Exception as exc:
+        return fail(
+            "runtime_env.invalid",
+            f"Approved TDLib auth execution could not build collector config: {type(exc).__name__}.",
+            contract_status="blocked_runtime_env_invalid",
+            reason="runtime_env_invalid",
+        )
+
+    try:
+        config.ensure_runtime_dirs()
+        report["session_state_created_or_reused"] = True
+    except OSError:
+        return fail(
+            "tdlib.session_state_unavailable",
+            "Approved TDLib auth execution could not create or reuse TDLib session directories.",
+            contract_status="blocked_session_state_unavailable",
+            reason="session_state_unavailable",
+        )
+
+    runner = auth_runner or auth_module.run_tdlib_auth_only_once
+    try:
+        auth_result = asyncio.run(
+            runner(
+                config,
+                transport=transport,
+                receive_timeout_sec=1.0,
+                max_authorization_updates=20,
+            )
+        )
+    except Exception as exc:
+        return fail(
+            "auth_only_entrypoint.unhandled_error",
+            f"Auth-only entrypoint returned an unhandled error: {type(exc).__name__}.",
+            contract_status="auth_only_entrypoint_error",
+            reason="auth_only_entrypoint_error",
+        )
+
+    auth_payload = auth_result.to_redacted_dict()
+    report["auth_only_entrypoint_status"] = auth_payload["auth_entrypoint_status"]
+    report["tdlib_auth_attempted"] = bool(auth_payload["tdlib_auth_attempted"])
+    report["tdlib_auth_completed"] = bool(auth_payload["tdlib_auth_completed"])
+    report["manual_intervention_required"] = bool(auth_payload["manual_intervention_required"])
+    report["telegram_connected"] = bool(auth_payload["telegram_connected"])
+    report["runtime_env_values_printed"] = bool(auth_payload["runtime_env_values_printed"])
+    report["secret_values_printed"] = bool(auth_payload["secret_values_printed"])
+    report["database_connected"] = bool(auth_payload["database_connected"])
+    report["db_connected"] = bool(auth_payload["database_connected"])
+    report["redis_connected"] = bool(auth_payload["redis_connected"])
+    report["alembic_run"] = bool(auth_payload["alembic_run"])
+    report["app_runtime_started"] = bool(auth_payload["app_runtime_started"])
+    report["live_collector_started"] = bool(auth_payload["live_collector_started"])
+    report["notifier_transport_enabled"] = bool(auth_payload["notifier_transport_enabled"])
+    report["production_rollout_performed"] = bool(auth_payload["production_rollout_performed"])
+    report["collector_main_used"] = bool(auth_payload["collector_main_imported"])
+    report["collector_runtime_used"] = bool(auth_payload["collector_runtime_started"])
+    report["network_called"] = bool(auth_payload["tdlib_auth_attempted"])
+    report["auth_only_entrypoint_result"] = auth_payload
+
+    if auth_payload["tdlib_auth_completed"]:
+        report["contract_status"] = "tdlib_auth_completed"
+        return WrapperResult(exit_code=0, report=report)
+    if auth_payload["manual_intervention_required"]:
+        report["contract_status"] = "manual_intervention_required"
+        return WrapperResult(exit_code=1, report=report)
+
+    checks_failed.append("auth_only_entrypoint.not_completed")
+    failures.append(
+        {
+            "check": "auth_only_entrypoint.not_completed",
+            "message": "Auth-only entrypoint did not complete TDLib authorization.",
+        }
+    )
+    report["contract_status"] = "auth_only_entrypoint_not_completed"
+
+    return WrapperResult(exit_code=1, report=report)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -229,6 +377,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--format", choices=("json", "text"), default="json")
     parser.add_argument("--repo-root", default=None)
+    parser.add_argument("--runtime-env-path", default=RUNTIME_ENV_PATH)
     parser.add_argument("--approved-tdlib-auth-operator-execution", action="store_true")
     return parser
 
@@ -244,6 +393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = generate_report(
         repo_root=repo_root,
         approved_tdlib_auth_operator_execution=args.approved_tdlib_auth_operator_execution,
+        runtime_env_path=args.runtime_env_path,
     )
 
     if args.format == "json":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -10,8 +11,9 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from services.collector_telegram.config import CollectorTelegramConfig
+from services.collector_telegram.exceptions import TDLibTransportError
 from services.collector_telegram.models import CollectorEnvironment, CollectorMode
-from services.collector_telegram.tdlib_client import TDLibClient
+from services.collector_telegram.tdlib_client import TDJsonTransport, TDLibClient
 
 
 class StubTransport:
@@ -98,6 +100,11 @@ class TDLibClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history_req["@type"], "getChatHistory")
         self.assertEqual(history_req["chat_id"], 10)
         self.assertEqual(history_req["limit"], 20)
+
+    def test_real_tdjson_transport_reports_missing_library(self) -> None:
+        with patch("services.collector_telegram.tdlib_client.ctypes.util.find_library", return_value=None):
+            with self.assertRaises(TDLibTransportError):
+                TDJsonTransport().assert_available()
 
 
 if __name__ == "__main__":
