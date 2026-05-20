@@ -35,6 +35,8 @@ class FakeTransport:
         if not self.states:
             return None
         state = self.states.pop(0)
+        if state.get("@type") == "error":
+            return state
         return {
             "@type": "updateAuthorizationState",
             "authorization_state": state,
@@ -222,5 +224,110 @@ async def test_unsupported_state_returns_safe_degraded_result() -> None:
     assert payload["tdlib_auth_attempted"] is True
     assert payload["tdlib_auth_completed"] is False
     assert payload["error"] == "AuthorizationError"
+    assert payload["error_present"] is True
+    assert payload["error_type"] == "AuthorizationError"
+    assert payload["tdlib_error_present"] is False
+    assert payload["tdlib_error_categories"] == ["authorization_state_related"]
+    assert payload["completion_failure_category"] == "authorization_state_related"
     assert payload["requests_sent_count"] == 0
+    _assert_no_runtime_side_effects(payload)
+
+
+@pytest.mark.asyncio
+async def test_tdlib_error_payload_is_classified_without_exposing_raw_message() -> None:
+    raw_message = (
+        "setTdlibParameters failed for api_hash=fake-api-hash-secret "
+        "phone=+15555550123 encryption_key=fake-tdlib-key-secret "
+        "login_code=12345"
+    )
+    transport = FakeTransport(
+        [
+            _state("authorizationStateWaitTdlibParameters"),
+            {"@type": "error", "code": 400, "message": raw_message},
+        ]
+    )
+
+    result = await run_tdlib_auth_only_once(
+        _config(),
+        transport=transport,
+        receive_timeout_sec=0,
+    )
+
+    payload = result.to_redacted_dict()
+    rendered = json.dumps(payload, sort_keys=True)
+    assert payload["auth_entrypoint_status"] == "degraded"
+    assert payload["tdlib_auth_attempted"] is True
+    assert payload["tdlib_auth_completed"] is False
+    assert payload["error"] == "tdlib_error_redacted"
+    assert payload["error_present"] is True
+    assert payload["error_type"] == "tdlib_error"
+    assert payload["tdlib_error_present"] is True
+    assert payload["tdlib_error_code"] == 400
+    assert payload["tdlib_error_type"] == "error"
+    assert payload["tdlib_error_message_len"] == len(raw_message)
+    assert payload["tdlib_error_categories"] == [
+        "api_hash_related",
+        "encryption_key_related",
+        "tdlib_parameters_related",
+    ]
+    assert payload["completion_failure_category"] == "api_hash_related"
+    assert raw_message not in rendered
+    assert "fake-api-hash-secret" not in rendered
+    assert "fake-tdlib-key-secret" not in rendered
+    assert "+15555550123" not in rendered
+    assert "12345" not in rendered
+    _assert_no_runtime_side_effects(payload)
+
+
+@pytest.mark.asyncio
+async def test_waiting_tdlib_parameters_timeout_is_classified_as_parameter_response_gap() -> None:
+    transport = FakeTransport([_state("authorizationStateWaitTdlibParameters")])
+
+    result = await run_tdlib_auth_only_once(
+        _config(),
+        transport=transport,
+        receive_timeout_sec=0,
+        max_authorization_updates=2,
+    )
+
+    payload = result.to_redacted_dict()
+    assert payload["auth_entrypoint_status"] == "degraded"
+    assert payload["tdlib_auth_attempted"] is True
+    assert payload["tdlib_auth_completed"] is False
+    assert payload["final_authorization_state"] == "waiting_tdlib_parameters"
+    assert payload["requests_sent_count"] == 1
+    assert payload["error"] == "authorization_not_ready"
+    assert payload["error_present"] is True
+    assert payload["error_type"] == "completion_failure"
+    assert payload["tdlib_error_present"] is False
+    assert payload["tdlib_error_categories"] == [
+        "tdlib_parameters_related",
+        "timeout_or_no_update_related",
+    ]
+    assert payload["completion_failure_category"] == "tdlib_parameters_response_error_or_timeout"
+    _assert_no_runtime_side_effects(payload)
+
+
+@pytest.mark.asyncio
+async def test_max_updates_exhaustion_without_state_is_classified_as_not_ready() -> None:
+    transport = FakeTransport([])
+
+    result = await run_tdlib_auth_only_once(
+        _config(),
+        transport=transport,
+        receive_timeout_sec=0,
+        max_authorization_updates=1,
+    )
+
+    payload = result.to_redacted_dict()
+    assert payload["auth_entrypoint_status"] == "degraded"
+    assert payload["tdlib_auth_attempted"] is True
+    assert payload["tdlib_auth_completed"] is False
+    assert payload["final_authorization_state"] is None
+    assert payload["requests_sent_count"] == 0
+    assert payload["error_present"] is True
+    assert payload["error_type"] == "completion_failure"
+    assert payload["tdlib_error_present"] is False
+    assert payload["tdlib_error_categories"] == ["timeout_or_no_update_related"]
+    assert payload["completion_failure_category"] == "authorization_not_ready_before_max_updates"
     _assert_no_runtime_side_effects(payload)

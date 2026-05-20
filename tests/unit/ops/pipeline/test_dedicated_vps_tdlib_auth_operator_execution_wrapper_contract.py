@@ -129,14 +129,16 @@ class FakeAuthOnlyResult:
         attempted: bool = True,
         completed: bool = False,
         manual_intervention_required: bool = True,
+        extra_payload: dict | None = None,
     ) -> None:
         self.status = status
         self.attempted = attempted
         self.completed = completed
         self.manual_intervention_required = manual_intervention_required
+        self.extra_payload = extra_payload or {}
 
     def to_redacted_dict(self) -> dict:
-        return {
+        payload = {
             "schema_version": "tdlib_auth_only_result_v1",
             "auth_entrypoint_status": self.status,
             "tdlib_auth_attempted": self.attempted,
@@ -161,7 +163,17 @@ class FakeAuthOnlyResult:
             "collector_main_imported": False,
             "collector_runtime_started": False,
             "error": None,
+            "error_present": False,
+            "error_type": None,
+            "tdlib_error_present": False,
+            "tdlib_error_code": None,
+            "tdlib_error_type": None,
+            "tdlib_error_message_len": None,
+            "tdlib_error_categories": [],
+            "completion_failure_category": None,
         }
+        payload.update(self.extra_payload)
+        return payload
 
 
 def _approved_env(tmp_path: Path) -> dict[str, str]:
@@ -394,6 +406,70 @@ def test_approved_mode_uses_auth_only_entrypoint_once_with_redacted_result(tmp_p
     assert result.report["collector_runtime_used"] is False
     assert "fake-api-hash" not in rendered
     assert "fake-tdlib-key" not in rendered
+
+
+def test_wrapper_preserves_redacted_auth_error_classification_without_raw_message(tmp_path: Path) -> None:
+    raw_message = (
+        "setTdlibParameters rejected api_hash=fake-api-hash-secret "
+        "TDLIB_DB_ENCRYPTION_KEY=fake-tdlib-key-secret "
+        "TELEGRAM_PHONE_NUMBER=+15555550123 LOGIN_CODE=12345"
+    )
+
+    async def fake_runner(*args, **kwargs) -> FakeAuthOnlyResult:
+        return FakeAuthOnlyResult(
+            status="degraded",
+            manual_intervention_required=False,
+            extra_payload={
+                "manual_intervention_reason": None,
+                "final_authorization_state": "waiting_tdlib_parameters",
+                "requests_sent_count": 1,
+                "error": "tdlib_error_redacted",
+                "error_present": True,
+                "error_type": "tdlib_error",
+                "tdlib_error_present": True,
+                "tdlib_error_code": 400,
+                "tdlib_error_type": "error",
+                "tdlib_error_message_len": len(raw_message),
+                "tdlib_error_categories": [
+                    "api_hash_related",
+                    "encryption_key_related",
+                    "tdlib_parameters_related",
+                ],
+                "completion_failure_category": "api_hash_related",
+            },
+        )
+
+    result = _module().generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        runtime_env_path=tmp_path / "runtime.env",
+        real_transport_factory=object,
+        runtime_env_reader=lambda path: _approved_env(tmp_path),
+        auth_runner=fake_runner,
+    )
+
+    rendered = json.dumps(result.report, sort_keys=True)
+    auth_payload = result.report["auth_only_entrypoint_result"]
+    assert result.exit_code != 0
+    assert result.report["contract_status"] == "auth_only_entrypoint_not_completed"
+    assert auth_payload["error"] == "tdlib_error_redacted"
+    assert auth_payload["error_present"] is True
+    assert auth_payload["error_type"] == "tdlib_error"
+    assert auth_payload["tdlib_error_present"] is True
+    assert auth_payload["tdlib_error_code"] == 400
+    assert auth_payload["tdlib_error_type"] == "error"
+    assert auth_payload["tdlib_error_message_len"] == len(raw_message)
+    assert auth_payload["tdlib_error_categories"] == [
+        "api_hash_related",
+        "encryption_key_related",
+        "tdlib_parameters_related",
+    ]
+    assert auth_payload["completion_failure_category"] == "api_hash_related"
+    assert raw_message not in rendered
+    assert "fake-api-hash-secret" not in rendered
+    assert "fake-tdlib-key-secret" not in rendered
+    assert "+15555550123" not in rendered
+    assert "12345" not in rendered
 
 
 def test_wrapper_imports_auth_entrypoint_only_for_approved_execution() -> None:
