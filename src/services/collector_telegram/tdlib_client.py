@@ -7,6 +7,7 @@ import ctypes.util
 import json
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -14,6 +15,59 @@ from .config import CollectorTelegramConfig
 from .exceptions import TDLibTransportError
 
 JsonDict = dict[str, Any]
+
+
+def build_set_tdlib_parameters_payload(config: CollectorTelegramConfig) -> JsonDict:
+    return {
+        "@type": "setTdlibParameters",
+        "use_test_dc": False,
+        "database_directory": config.tdlib_state_dir,
+        "files_directory": config.tdlib_files_dir,
+        "use_file_database": True,
+        "use_chat_info_database": True,
+        "use_message_database": True,
+        "use_secret_chats": False,
+        "api_id": config.telegram_api_id,
+        "api_hash": config.telegram_api_hash,
+        "system_language_code": "en",
+        "device_model": "catchbot-vps",
+        "system_version": "linux",
+        "application_version": "0.1.0",
+        "database_encryption_key": config.tdlib_db_encryption_key,
+    }
+
+
+def tdlib_parameters_shape_errors(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    errors: list[str] = []
+
+    if payload.get("@type") != "setTdlibParameters":
+        errors.append("@type.invalid")
+
+    api_id = payload.get("api_id")
+    if isinstance(api_id, bool) or not isinstance(api_id, int) or api_id <= 0:
+        errors.append("api_id.invalid")
+
+    for field in (
+        "api_hash",
+        "database_directory",
+        "files_directory",
+        "database_encryption_key",
+    ):
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"{field}.empty")
+
+    expected_flags = {
+        "use_file_database": True,
+        "use_chat_info_database": True,
+        "use_message_database": True,
+        "use_secret_chats": False,
+    }
+    for field, expected in expected_flags.items():
+        if payload.get(field) is not expected:
+            errors.append(f"{field}.invalid")
+
+    return tuple(errors)
 
 
 class TDLibTransportProtocol(Protocol):
@@ -194,27 +248,7 @@ class TDLibClient:
             raise TDLibTransportError("TDLib client is closed")
 
     def build_set_tdlib_parameters_request(self) -> TDLibRequest:
-        return TDLibRequest(
-            {
-                "@type": "setTdlibParameters",
-                "parameters": {
-                    "use_test_dc": False,
-                    "database_directory": self._config.tdlib_state_dir,
-                    "files_directory": self._config.tdlib_files_dir,
-                    "use_file_database": True,
-                    "use_chat_info_database": True,
-                    "use_message_database": True,
-                    "use_secret_chats": False,
-                    "api_id": self._config.telegram_api_id,
-                    "api_hash": self._config.telegram_api_hash,
-                    "system_language_code": "en",
-                    "device_model": "catchbot-vps",
-                    "system_version": "linux",
-                    "application_version": "0.1.0",
-                    "database_encryption_key": self._config.tdlib_db_encryption_key,
-                },
-            }
-        )
+        return TDLibRequest(build_set_tdlib_parameters_payload(self._config))
 
     def build_check_database_encryption_key_request(self) -> TDLibRequest:
         return TDLibRequest(

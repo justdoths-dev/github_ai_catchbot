@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from .config import CollectorTelegramConfig
 from .exceptions import AuthorizationError, AuthorizationManualInterventionRequired
+from .tdlib_client import build_set_tdlib_parameters_payload
 
 JsonDict = dict[str, Any]
 
@@ -181,25 +182,7 @@ class AuthorizationFSM:
         )
 
     def _build_set_tdlib_parameters_request(self) -> JsonDict:
-        return {
-            "@type": "setTdlibParameters",
-            "parameters": {
-                "use_test_dc": False,
-                "database_directory": self._config.tdlib_state_dir,
-                "files_directory": self._config.tdlib_files_dir,
-                "use_file_database": True,
-                "use_chat_info_database": True,
-                "use_message_database": True,
-                "use_secret_chats": False,
-                "api_id": self._config.telegram_api_id,
-                "api_hash": self._config.telegram_api_hash,
-                "system_language_code": "en",
-                "device_model": "catchbot-vps",
-                "system_version": "linux",
-                "application_version": "0.1.0",
-                "database_encryption_key": self._config.tdlib_db_encryption_key,
-            },
-        }
+        return build_set_tdlib_parameters_payload(self._config)
 
     def _build_check_database_encryption_key_request(self) -> JsonDict:
         return {

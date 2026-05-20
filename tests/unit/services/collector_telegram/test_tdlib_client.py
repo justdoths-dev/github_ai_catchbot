@@ -13,7 +13,11 @@ if str(SRC_ROOT) not in sys.path:
 from services.collector_telegram.config import CollectorTelegramConfig
 from services.collector_telegram.exceptions import TDLibTransportError
 from services.collector_telegram.models import CollectorEnvironment, CollectorMode
-from services.collector_telegram.tdlib_client import TDJsonTransport, TDLibClient
+from services.collector_telegram.tdlib_client import (
+    TDJsonTransport,
+    TDLibClient,
+    tdlib_parameters_shape_errors,
+)
 
 
 class StubTransport:
@@ -89,8 +93,17 @@ class TDLibClientTests(unittest.IsolatedAsyncioTestCase):
 
         tdlib_params = client.build_set_tdlib_parameters_request().payload
         self.assertEqual(tdlib_params["@type"], "setTdlibParameters")
-        self.assertEqual(tdlib_params["parameters"]["api_id"], 12345)
-        self.assertEqual(tdlib_params["parameters"]["api_hash"], "hash-value")
+        self.assertNotIn("parameters", tdlib_params)
+        self.assertEqual(tdlib_params["api_id"], 12345)
+        self.assertEqual(tdlib_params["api_hash"], "hash-value")
+        self.assertEqual(tdlib_params["database_directory"], "/tmp/catchbot-tdlib-state")
+        self.assertEqual(tdlib_params["files_directory"], "/tmp/catchbot-tdlib-files")
+        self.assertEqual(tdlib_params["database_encryption_key"], "enc-key")
+        self.assertIs(tdlib_params["use_file_database"], True)
+        self.assertIs(tdlib_params["use_chat_info_database"], True)
+        self.assertIs(tdlib_params["use_message_database"], True)
+        self.assertIs(tdlib_params["use_secret_chats"], False)
+        self.assertEqual(tdlib_parameters_shape_errors(tdlib_params), ())
 
         phone_req = client.build_set_authentication_phone_number_request().payload
         self.assertEqual(phone_req["@type"], "setAuthenticationPhoneNumber")
@@ -105,6 +118,31 @@ class TDLibClientTests(unittest.IsolatedAsyncioTestCase):
         with patch("services.collector_telegram.tdlib_client.ctypes.util.find_library", return_value=None):
             with self.assertRaises(TDLibTransportError):
                 TDJsonTransport().assert_available()
+
+    def test_tdlib_parameter_shape_guard_rejects_default_like_payload(self) -> None:
+        invalid_payload = {
+            "@type": "setTdlibParameters",
+            "database_directory": "",
+            "files_directory": "",
+            "use_file_database": False,
+            "use_chat_info_database": False,
+            "use_message_database": False,
+            "use_secret_chats": False,
+            "api_id": 0,
+            "api_hash": "",
+            "database_encryption_key": "",
+        }
+
+        errors = tdlib_parameters_shape_errors(invalid_payload)
+
+        self.assertIn("api_id.invalid", errors)
+        self.assertIn("api_hash.empty", errors)
+        self.assertIn("database_directory.empty", errors)
+        self.assertIn("files_directory.empty", errors)
+        self.assertIn("database_encryption_key.empty", errors)
+        self.assertIn("use_file_database.invalid", errors)
+        self.assertIn("use_chat_info_database.invalid", errors)
+        self.assertIn("use_message_database.invalid", errors)
 
 
 if __name__ == "__main__":

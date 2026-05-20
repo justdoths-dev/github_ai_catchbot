@@ -40,7 +40,18 @@ class AuthorizationFSMTests(unittest.TestCase):
         result = fsm.handle_state({"@type": "authorizationStateWaitTdlibParameters"})
         self.assertEqual(result.new_state, "waiting_tdlib_parameters")
         self.assertFalse(result.requires_manual_intervention)
-        self.assertEqual(result.requests[0]["@type"], "setTdlibParameters")
+        request = result.requests[0]
+        self.assertEqual(request["@type"], "setTdlibParameters")
+        self.assertNotIn("parameters", request)
+        self.assertEqual(request["api_id"], 12345)
+        self.assertEqual(request["api_hash"], "hash-value")
+        self.assertEqual(request["database_directory"], "/tmp/catchbot-tdlib-state")
+        self.assertEqual(request["files_directory"], "/tmp/catchbot-tdlib-files")
+        self.assertEqual(request["database_encryption_key"], "enc-key")
+        self.assertIs(request["use_file_database"], True)
+        self.assertIs(request["use_chat_info_database"], True)
+        self.assertIs(request["use_message_database"], True)
+        self.assertIs(request["use_secret_chats"], False)
 
     def test_wait_code_requires_manual_intervention(self) -> None:
         fsm = AuthorizationFSM(self._config())

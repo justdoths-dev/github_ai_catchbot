@@ -236,6 +236,11 @@ def generate_report(
             "missing_source_files": inspection["missing_source_files"],
             "telegram_bot_token_used_for_tdlib_auth": False,
         },
+        "tdlib_parameters_shape_guard": {
+            "checked": False,
+            "valid": False,
+            "errors": [],
+        },
     }
     for flag in SIDE_EFFECT_FLAGS:
         report[flag] = False
@@ -266,16 +271,10 @@ def generate_report(
         )
 
     auth_module = _load_auth_entrypoint_module(repo_root)
-    transport_factory = real_transport_factory or auth_module.build_real_tdlib_transport
-    try:
-        transport = transport_factory()
-    except Exception:
-        return fail(
-            "tdlib.real_transport_missing",
-            "Approved TDLib auth execution is blocked because the real tdjson transport is unavailable.",
-            contract_status="blocked_real_transport_missing",
-            reason="blocked_real_transport_missing",
-        )
+    from src.services.collector_telegram.tdlib_client import (
+        build_set_tdlib_parameters_payload,
+        tdlib_parameters_shape_errors,
+    )
 
     env_reader = runtime_env_reader or parse_runtime_env_file
     try:
@@ -297,6 +296,35 @@ def generate_report(
             f"Approved TDLib auth execution could not build collector config: {type(exc).__name__}.",
             contract_status="blocked_runtime_env_invalid",
             reason="runtime_env_invalid",
+        )
+
+    parameter_payload = build_set_tdlib_parameters_payload(config)
+    parameter_errors = tdlib_parameters_shape_errors(parameter_payload)
+    report["tdlib_parameters_shape_guard"] = {
+        "checked": True,
+        "valid": not parameter_errors,
+        "errors": list(parameter_errors),
+    }
+    if parameter_errors:
+        return fail(
+            "tdlib_parameters.invalid",
+            (
+                "Approved TDLib auth execution blocked before TDLib invocation "
+                "because the redacted setTdlibParameters payload shape is invalid."
+            ),
+            contract_status="blocked_tdlib_parameters_invalid",
+            reason="tdlib_parameters_invalid",
+        )
+
+    transport_factory = real_transport_factory or auth_module.build_real_tdlib_transport
+    try:
+        transport = transport_factory()
+    except Exception:
+        return fail(
+            "tdlib.real_transport_missing",
+            "Approved TDLib auth execution is blocked because the real tdjson transport is unavailable.",
+            contract_status="blocked_real_transport_missing",
+            reason="blocked_real_transport_missing",
         )
 
     try:

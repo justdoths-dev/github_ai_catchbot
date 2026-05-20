@@ -71,6 +71,7 @@ REQUIRED_REPORT_KEYS = (
     "checks_failed",
     "failures",
     "likely_next_slice",
+    "tdlib_parameters_shape_guard",
 )
 
 REQUIRED_RUNBOOK_HEADINGS = (
@@ -268,31 +269,85 @@ def test_tests_do_not_call_approved_execution_flag() -> None:
 
     report = json.loads(result.stdout)
     assert result.returncode != 0
-    assert report["contract_status"] == "blocked_real_transport_missing"
-    assert report["blocked_reason"] == "blocked_real_transport_missing"
+    assert report["contract_status"] == "blocked_runtime_env_unreadable"
+    assert report["blocked_reason"] == "runtime_env_unreadable"
     assert report["runtime_env_read"] is False
     assert report["tdlib_auth_attempted"] is False
 
 
-def test_approved_mode_blocks_when_real_transport_missing_without_runtime_env_read() -> None:
+def test_approved_mode_blocks_when_real_transport_missing_after_redacted_shape_guard(tmp_path: Path) -> None:
     def missing_transport() -> object:
         raise RuntimeError("tdjson unavailable")
-
-    def forbidden_env_reader(path: str | Path) -> dict[str, str]:
-        raise AssertionError("runtime.env must not be read when real transport is missing")
 
     result = _module().generate_report(
         ROOT,
         approved_tdlib_auth_operator_execution=True,
         real_transport_factory=missing_transport,
-        runtime_env_reader=forbidden_env_reader,
+        runtime_env_reader=lambda path: _approved_env(tmp_path),
     )
 
     assert result.exit_code != 0
     assert result.report["contract_status"] == "blocked_real_transport_missing"
     assert result.report["blocked_reason"] == "blocked_real_transport_missing"
     assert result.report["tdlib_auth_attempted"] is False
-    assert result.report["runtime_env_read"] is False
+    assert result.report["runtime_env_read"] is True
+    assert result.report["session_state_created_or_reused"] is False
+    assert result.report["tdlib_parameters_shape_guard"] == {
+        "checked": True,
+        "valid": True,
+        "errors": [],
+    }
+
+
+def test_approved_mode_blocks_invalid_tdlib_parameters_before_transport_or_runner(tmp_path: Path) -> None:
+    transport_called = False
+    runner_called = False
+
+    def forbidden_transport() -> object:
+        nonlocal transport_called
+        transport_called = True
+        raise AssertionError("transport must not be built for invalid TDLib parameters")
+
+    async def forbidden_runner(*args, **kwargs) -> FakeAuthOnlyResult:
+        nonlocal runner_called
+        runner_called = True
+        raise AssertionError("runner must not be called for invalid TDLib parameters")
+
+    invalid_env = _approved_env(tmp_path)
+    invalid_env["TELEGRAM_API_ID"] = "0"
+    result = _module().generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        runtime_env_path=tmp_path / "runtime.env",
+        real_transport_factory=forbidden_transport,
+        runtime_env_reader=lambda path: invalid_env,
+        auth_runner=forbidden_runner,
+    )
+
+    rendered = json.dumps(result.report)
+    assert result.exit_code != 0
+    assert result.report["contract_status"] == "blocked_tdlib_parameters_invalid"
+    assert result.report["blocked_reason"] == "tdlib_parameters_invalid"
+    assert "tdlib_parameters.invalid" in result.report["checks_failed"]
+    assert result.report["tdlib_auth_attempted"] is False
+    assert result.report["tdlib_auth_completed"] is False
+    assert result.report["telegram_connected"] is False
+    assert result.report["runtime_env_read"] is True
+    assert result.report["runtime_env_values_printed"] is False
+    assert result.report["secret_values_printed"] is False
+    assert result.report["manual_intervention_required"] is False
+    assert result.report["session_state_created_or_reused"] is False
+    assert result.report["tdlib_parameters_shape_guard"]["checked"] is True
+    assert result.report["tdlib_parameters_shape_guard"]["valid"] is False
+    assert "api_id.invalid" in result.report["tdlib_parameters_shape_guard"]["errors"]
+    assert transport_called is False
+    assert runner_called is False
+    assert "fake-api-hash" not in rendered
+    assert "fake-tdlib-key" not in rendered
+    assert "+10000000000" not in rendered
+    assert "postgresql://collector:secret" not in rendered
+    assert str(tmp_path / "tdlib-state") not in rendered
+    assert str(tmp_path / "tdlib-files") not in rendered
 
 
 def test_approved_mode_uses_auth_only_entrypoint_once_with_redacted_result(tmp_path: Path) -> None:
@@ -314,6 +369,12 @@ def test_approved_mode_uses_auth_only_entrypoint_once_with_redacted_result(tmp_p
     rendered = json.dumps(result.report)
     assert result.exit_code != 0
     assert len(calls) == 1
+    config = calls[0]["args"][0]
+    assert config.telegram_api_id == 12345
+    assert config.telegram_api_hash == "fake-api-hash"
+    assert config.tdlib_state_dir == str(tmp_path / "tdlib-state")
+    assert config.tdlib_files_dir == str(tmp_path / "tdlib-files")
+    assert config.tdlib_db_encryption_key == "fake-tdlib-key"
     assert result.report["contract_status"] == "manual_intervention_required"
     assert result.report["auth_only_entrypoint_status"] == "manual_intervention_required"
     assert result.report["selected_entrypoint"] == "src.services.collector_telegram.auth_entrypoint"
@@ -321,6 +382,11 @@ def test_approved_mode_uses_auth_only_entrypoint_once_with_redacted_result(tmp_p
     assert result.report["tdlib_auth_attempted"] is True
     assert result.report["manual_intervention_required"] is True
     assert result.report["runtime_env_read"] is True
+    assert result.report["tdlib_parameters_shape_guard"] == {
+        "checked": True,
+        "valid": True,
+        "errors": [],
+    }
     assert result.report["runtime_env_values_printed"] is False
     assert result.report["secret_values_printed"] is False
     assert result.report["collector_main_used"] is False
