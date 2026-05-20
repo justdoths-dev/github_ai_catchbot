@@ -47,7 +47,7 @@ class AuthorizationFSMTests(unittest.TestCase):
         self.assertEqual(request["api_hash"], "hash-value")
         self.assertEqual(request["database_directory"], "/tmp/catchbot-tdlib-state")
         self.assertEqual(request["files_directory"], "/tmp/catchbot-tdlib-files")
-        self.assertEqual(request["database_encryption_key"], "enc-key")
+        self.assertEqual(request["database_encryption_key"], "ZW5jLWtleQ==")
         self.assertIs(request["use_file_database"], True)
         self.assertIs(request["use_chat_info_database"], True)
         self.assertIs(request["use_message_database"], True)
@@ -59,6 +59,14 @@ class AuthorizationFSMTests(unittest.TestCase):
         self.assertEqual(result.new_state, "waiting_code")
         self.assertTrue(result.requires_manual_intervention)
         self.assertTrue(fsm.requires_manual_intervention())
+
+    def test_wait_encryption_key_builds_tdlib_json_bytes_request(self) -> None:
+        fsm = AuthorizationFSM(self._config())
+        result = fsm.handle_state({"@type": "authorizationStateWaitEncryptionKey"})
+        self.assertEqual(result.new_state, "waiting_encryption_key")
+        request = result.requests[0]
+        self.assertEqual(request["@type"], "checkDatabaseEncryptionKey")
+        self.assertEqual(request["encryption_key"], "ZW5jLWtleQ==")
 
     def test_ready_then_regression_marks_degraded(self) -> None:
         fsm = AuthorizationFSM(self._config())

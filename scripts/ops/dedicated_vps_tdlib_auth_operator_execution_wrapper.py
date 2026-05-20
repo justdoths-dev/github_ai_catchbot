@@ -241,6 +241,11 @@ def generate_report(
             "valid": False,
             "errors": [],
         },
+        "tdlib_parameters_semantic_guard": {
+            "checked": False,
+            "valid": False,
+            "errors": [],
+        },
     }
     for flag in SIDE_EFFECT_FLAGS:
         report[flag] = False
@@ -273,6 +278,7 @@ def generate_report(
     auth_module = _load_auth_entrypoint_module(repo_root)
     from src.services.collector_telegram.tdlib_client import (
         build_set_tdlib_parameters_payload,
+        tdlib_parameters_semantic_errors,
         tdlib_parameters_shape_errors,
     )
 
@@ -314,6 +320,23 @@ def generate_report(
             ),
             contract_status="blocked_tdlib_parameters_invalid",
             reason="tdlib_parameters_invalid",
+        )
+
+    parameter_semantic_errors = tdlib_parameters_semantic_errors(parameter_payload)
+    report["tdlib_parameters_semantic_guard"] = {
+        "checked": True,
+        "valid": not parameter_semantic_errors,
+        "errors": list(parameter_semantic_errors),
+    }
+    if parameter_semantic_errors:
+        return fail(
+            "tdlib_parameters.semantic_invalid",
+            (
+                "Approved TDLib auth execution blocked before TDLib invocation "
+                "because the redacted setTdlibParameters payload semantics are invalid."
+            ),
+            contract_status="blocked_tdlib_parameters_semantic_invalid",
+            reason="tdlib_parameters_semantic_invalid",
         )
 
     transport_factory = real_transport_factory or auth_module.build_real_tdlib_transport

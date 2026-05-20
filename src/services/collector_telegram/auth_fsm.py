@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from .config import CollectorTelegramConfig
 from .exceptions import AuthorizationError, AuthorizationManualInterventionRequired
-from .tdlib_client import build_set_tdlib_parameters_payload
+from .tdlib_client import build_set_tdlib_parameters_payload, tdlib_json_bytes
 
 JsonDict = dict[str, Any]
 
@@ -187,7 +187,7 @@ class AuthorizationFSM:
     def _build_check_database_encryption_key_request(self) -> JsonDict:
         return {
             "@type": "checkDatabaseEncryptionKey",
-            "encryption_key": self._config.tdlib_db_encryption_key,
+            "encryption_key": tdlib_json_bytes(self._config.tdlib_db_encryption_key),
         }
 
     def _build_set_authentication_phone_number_request(self) -> JsonDict:

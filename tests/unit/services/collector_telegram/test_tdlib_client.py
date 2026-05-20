@@ -16,6 +16,7 @@ from services.collector_telegram.models import CollectorEnvironment, CollectorMo
 from services.collector_telegram.tdlib_client import (
     TDJsonTransport,
     TDLibClient,
+    tdlib_parameters_semantic_errors,
     tdlib_parameters_shape_errors,
 )
 
@@ -98,16 +99,25 @@ class TDLibClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tdlib_params["api_hash"], "hash-value")
         self.assertEqual(tdlib_params["database_directory"], "/tmp/catchbot-tdlib-state")
         self.assertEqual(tdlib_params["files_directory"], "/tmp/catchbot-tdlib-files")
-        self.assertEqual(tdlib_params["database_encryption_key"], "enc-key")
+        self.assertEqual(tdlib_params["database_encryption_key"], "ZW5jLWtleQ==")
+        self.assertEqual(tdlib_params["system_language_code"], "en")
+        self.assertEqual(tdlib_params["device_model"], "catchbot-vps")
+        self.assertEqual(tdlib_params["system_version"], "linux")
+        self.assertEqual(tdlib_params["application_version"], "0.1.0")
         self.assertIs(tdlib_params["use_file_database"], True)
         self.assertIs(tdlib_params["use_chat_info_database"], True)
         self.assertIs(tdlib_params["use_message_database"], True)
         self.assertIs(tdlib_params["use_secret_chats"], False)
         self.assertEqual(tdlib_parameters_shape_errors(tdlib_params), ())
+        self.assertEqual(tdlib_parameters_semantic_errors(tdlib_params), ())
 
         phone_req = client.build_set_authentication_phone_number_request().payload
         self.assertEqual(phone_req["@type"], "setAuthenticationPhoneNumber")
         self.assertEqual(phone_req["phone_number"], "+10000000000")
+
+        encryption_key_req = client.build_check_database_encryption_key_request().payload
+        self.assertEqual(encryption_key_req["@type"], "checkDatabaseEncryptionKey")
+        self.assertEqual(encryption_key_req["encryption_key"], "ZW5jLWtleQ==")
 
         history_req = client.build_get_chat_history_request(chat_id=10, limit=20).payload
         self.assertEqual(history_req["@type"], "getChatHistory")
@@ -143,6 +153,20 @@ class TDLibClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("use_file_database.invalid", errors)
         self.assertIn("use_chat_info_database.invalid", errors)
         self.assertIn("use_message_database.invalid", errors)
+
+    def test_tdlib_parameter_semantic_guard_rejects_invalid_base64_and_flag_implications(self) -> None:
+        transport = StubTransport()
+        client = TDLibClient(self._config(), transport=transport)
+        invalid_payload = dict(client.build_set_tdlib_parameters_request().payload)
+        invalid_payload["database_encryption_key"] = "enc-key"
+        invalid_payload["application_version"] = ""
+        invalid_payload["use_chat_info_database"] = False
+
+        errors = tdlib_parameters_semantic_errors(invalid_payload)
+
+        self.assertIn("database_encryption_key.invalid_base64", errors)
+        self.assertIn("application_version.semantic_empty", errors)
+        self.assertIn("use_message_database.requires_chat_info_database", errors)
 
 
 if __name__ == "__main__":

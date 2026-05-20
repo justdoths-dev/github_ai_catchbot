@@ -123,6 +123,8 @@ async def test_auth_only_runner_processes_fake_state_sequence_to_ready() -> None
         "checkDatabaseEncryptionKey",
         "setAuthenticationPhoneNumber",
     ]
+    assert transport.sent_requests[0]["database_encryption_key"] == "dGRsaWIta2V5LXJlZGFjdGVk"
+    assert transport.sent_requests[1]["encryption_key"] == "dGRsaWIta2V5LXJlZGFjdGVk"
     assert transport.initialized is True
     assert transport.closed is True
     _assert_no_runtime_side_effects(payload)

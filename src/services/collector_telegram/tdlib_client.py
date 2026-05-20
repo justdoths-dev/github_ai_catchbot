@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import ctypes
 import ctypes.util
 import json
@@ -15,6 +17,10 @@ from .config import CollectorTelegramConfig
 from .exceptions import TDLibTransportError
 
 JsonDict = dict[str, Any]
+
+
+def tdlib_json_bytes(value: str) -> str:
+    return base64.b64encode(value.encode("utf-8")).decode("ascii")
 
 
 def build_set_tdlib_parameters_payload(config: CollectorTelegramConfig) -> JsonDict:
@@ -33,7 +39,7 @@ def build_set_tdlib_parameters_payload(config: CollectorTelegramConfig) -> JsonD
         "device_model": "catchbot-vps",
         "system_version": "linux",
         "application_version": "0.1.0",
-        "database_encryption_key": config.tdlib_db_encryption_key,
+        "database_encryption_key": tdlib_json_bytes(config.tdlib_db_encryption_key),
     }
 
 
@@ -66,6 +72,36 @@ def tdlib_parameters_shape_errors(payload: Mapping[str, Any]) -> tuple[str, ...]
     for field, expected in expected_flags.items():
         if payload.get(field) is not expected:
             errors.append(f"{field}.invalid")
+
+    return tuple(errors)
+
+
+def tdlib_parameters_semantic_errors(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    errors: list[str] = []
+
+    for field in (
+        "database_directory",
+        "files_directory",
+        "system_language_code",
+        "device_model",
+        "system_version",
+        "application_version",
+    ):
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"{field}.semantic_empty")
+
+    database_encryption_key = payload.get("database_encryption_key")
+    if isinstance(database_encryption_key, str) and database_encryption_key.strip():
+        try:
+            base64.b64decode(database_encryption_key, validate=True)
+        except (binascii.Error, ValueError):
+            errors.append("database_encryption_key.invalid_base64")
+
+    if payload.get("use_message_database") is True and payload.get("use_chat_info_database") is not True:
+        errors.append("use_message_database.requires_chat_info_database")
+    if payload.get("use_chat_info_database") is True and payload.get("use_file_database") is not True:
+        errors.append("use_chat_info_database.requires_file_database")
 
     return tuple(errors)
 
@@ -254,7 +290,7 @@ class TDLibClient:
         return TDLibRequest(
             {
                 "@type": "checkDatabaseEncryptionKey",
-                "encryption_key": self._config.tdlib_db_encryption_key,
+                "encryption_key": tdlib_json_bytes(self._config.tdlib_db_encryption_key),
             }
         )
 

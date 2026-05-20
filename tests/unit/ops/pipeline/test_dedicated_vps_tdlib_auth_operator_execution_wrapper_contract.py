@@ -72,6 +72,7 @@ REQUIRED_REPORT_KEYS = (
     "failures",
     "likely_next_slice",
     "tdlib_parameters_shape_guard",
+    "tdlib_parameters_semantic_guard",
 )
 
 REQUIRED_RUNBOOK_HEADINGS = (
@@ -309,6 +310,11 @@ def test_approved_mode_blocks_when_real_transport_missing_after_redacted_shape_g
         "valid": True,
         "errors": [],
     }
+    assert result.report["tdlib_parameters_semantic_guard"] == {
+        "checked": True,
+        "valid": True,
+        "errors": [],
+    }
 
 
 def test_approved_mode_blocks_invalid_tdlib_parameters_before_transport_or_runner(tmp_path: Path) -> None:
@@ -352,6 +358,74 @@ def test_approved_mode_blocks_invalid_tdlib_parameters_before_transport_or_runne
     assert result.report["tdlib_parameters_shape_guard"]["checked"] is True
     assert result.report["tdlib_parameters_shape_guard"]["valid"] is False
     assert "api_id.invalid" in result.report["tdlib_parameters_shape_guard"]["errors"]
+    assert result.report["tdlib_parameters_semantic_guard"]["checked"] is False
+    assert transport_called is False
+    assert runner_called is False
+    assert "fake-api-hash" not in rendered
+    assert "fake-tdlib-key" not in rendered
+    assert "+10000000000" not in rendered
+    assert "postgresql://collector:secret" not in rendered
+    assert str(tmp_path / "tdlib-state") not in rendered
+    assert str(tmp_path / "tdlib-files") not in rendered
+
+
+def test_approved_mode_blocks_semantic_invalid_tdlib_parameters_before_transport_or_runner(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    transport_called = False
+    runner_called = False
+
+    def forbidden_transport() -> object:
+        nonlocal transport_called
+        transport_called = True
+        raise AssertionError("transport must not be built for semantically invalid TDLib parameters")
+
+    async def forbidden_runner(*args, **kwargs) -> FakeAuthOnlyResult:
+        nonlocal runner_called
+        runner_called = True
+        raise AssertionError("runner must not be called for semantically invalid TDLib parameters")
+
+    from src.services.collector_telegram import tdlib_client
+
+    monkeypatch.setattr(
+        tdlib_client,
+        "tdlib_parameters_semantic_errors",
+        lambda payload: ("database_encryption_key.invalid_base64",),
+    )
+
+    result = _module().generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        runtime_env_path=tmp_path / "runtime.env",
+        real_transport_factory=forbidden_transport,
+        runtime_env_reader=lambda path: _approved_env(tmp_path),
+        auth_runner=forbidden_runner,
+    )
+
+    rendered = json.dumps(result.report)
+    assert result.exit_code != 0
+    assert result.report["contract_status"] == "blocked_tdlib_parameters_semantic_invalid"
+    assert result.report["blocked_reason"] == "tdlib_parameters_semantic_invalid"
+    assert "tdlib_parameters.semantic_invalid" in result.report["checks_failed"]
+    assert result.report["tdlib_auth_attempted"] is False
+    assert result.report["tdlib_auth_completed"] is False
+    assert result.report["telegram_connected"] is False
+    assert result.report["runtime_env_read"] is True
+    assert result.report["runtime_env_values_printed"] is False
+    assert result.report["secret_values_printed"] is False
+    assert result.report["manual_intervention_required"] is False
+    assert result.report["session_state_created_or_reused"] is False
+    assert result.report["tdlib_parameters_shape_guard"] == {
+        "checked": True,
+        "valid": True,
+        "errors": [],
+    }
+    assert result.report["tdlib_parameters_semantic_guard"] == {
+        "checked": True,
+        "valid": False,
+        "errors": ["database_encryption_key.invalid_base64"],
+    }
     assert transport_called is False
     assert runner_called is False
     assert "fake-api-hash" not in rendered
@@ -395,6 +469,11 @@ def test_approved_mode_uses_auth_only_entrypoint_once_with_redacted_result(tmp_p
     assert result.report["manual_intervention_required"] is True
     assert result.report["runtime_env_read"] is True
     assert result.report["tdlib_parameters_shape_guard"] == {
+        "checked": True,
+        "valid": True,
+        "errors": [],
+    }
+    assert result.report["tdlib_parameters_semantic_guard"] == {
         "checked": True,
         "valid": True,
         "errors": [],
