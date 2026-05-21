@@ -61,7 +61,14 @@ _SPECIFIC_COMPLETION_CATEGORIES = (
 )
 
 _PARAMETERS_RESPONSE_ERROR_OR_TIMEOUT = "tdlib_parameters_response_error_or_timeout"
+_PARAMETERS_ACCEPTED_AUTH_STATE_NOT_ADVANCED = (
+    "tdlib_parameters_accepted_auth_state_not_advanced_before_max_updates"
+)
+_AUTH_STATE_NOT_ADVANCED = "tdlib_auth_state_not_advanced_before_max_updates"
 _AUTHORIZATION_NOT_READY = "authorization_not_ready_before_max_updates"
+_SAFE_RESPONSE_TYPE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._"
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -85,6 +92,12 @@ class TDLibAuthOnlyResult:
     manual_intervention_reason: str | None = None
     final_authorization_state: str | None = None
     requests_sent_count: int = 0
+    authorization_updates_seen_count: int = 0
+    non_auth_response_count: int = 0
+    tdlib_ok_seen: bool = False
+    last_non_auth_response_type: str | None = None
+    max_authorization_updates: int = 0
+    receive_timeout_sec: float = 0.0
     runtime_env_values_printed: bool = False
     database_connected: bool = False
     redis_connected: bool = False
@@ -120,6 +133,12 @@ class TDLibAuthOnlyResult:
             "manual_intervention_reason": self.manual_intervention_reason,
             "final_authorization_state": self.final_authorization_state,
             "requests_sent_count": self.requests_sent_count,
+            "authorization_updates_seen_count": self.authorization_updates_seen_count,
+            "non_auth_response_count": self.non_auth_response_count,
+            "tdlib_ok_seen": self.tdlib_ok_seen,
+            "last_non_auth_response_type": self.last_non_auth_response_type,
+            "max_authorization_updates": self.max_authorization_updates,
+            "receive_timeout_sec": self.receive_timeout_sec,
             "runtime_env_values_printed": self.runtime_env_values_printed,
             "database_connected": self.database_connected,
             "redis_connected": self.redis_connected,
@@ -171,8 +190,24 @@ class TDLibAuthOnlyRunner:
 
     async def run_once(self) -> TDLibAuthOnlyResult:
         requests_sent_count = 0
+        authorization_updates_seen_count = 0
+        non_auth_response_count = 0
+        tdlib_ok_seen = False
+        last_non_auth_response_type: str | None = None
         final_state: str | None = None
         attempted = False
+        set_tdlib_parameters_response_pending = False
+
+        def result(**kwargs: Any) -> TDLibAuthOnlyResult:
+            return TDLibAuthOnlyResult(
+                authorization_updates_seen_count=authorization_updates_seen_count,
+                non_auth_response_count=non_auth_response_count,
+                tdlib_ok_seen=tdlib_ok_seen,
+                last_non_auth_response_type=last_non_auth_response_type,
+                max_authorization_updates=self._max_authorization_updates,
+                receive_timeout_sec=self._receive_timeout_sec,
+                **kwargs,
+            )
 
         try:
             await self._client.initialize()
@@ -180,44 +215,62 @@ class TDLibAuthOnlyRunner:
 
             for _ in range(self._max_authorization_updates):
                 payload = await self._client.receive(self._receive_timeout_sec)
-                tdlib_error = _extract_tdlib_error(payload)
-                if tdlib_error is not None:
-                    classification = _classify_tdlib_error(
-                        tdlib_error,
-                        final_authorization_state=final_state,
-                        requests_sent_count=requests_sent_count,
-                    )
-                    return TDLibAuthOnlyResult(
-                        auth_entrypoint_status="degraded",
-                        tdlib_auth_attempted=attempted,
-                        manual_intervention_required=False,
-                        final_authorization_state=final_state,
-                        requests_sent_count=requests_sent_count,
-                        error="tdlib_error_redacted",
-                        error_present=True,
-                        error_type="tdlib_error",
-                        tdlib_error_present=True,
-                        tdlib_error_code=classification.code,
-                        tdlib_error_type=classification.tdlib_type,
-                        tdlib_error_message_len=classification.message_len,
-                        tdlib_error_categories=classification.categories,
-                        completion_failure_category=classification.completion_failure_category,
-                    )
-
                 auth_state = _extract_authorization_state(payload)
                 if auth_state is None:
+                    response_type = _extract_safe_response_type(payload)
+                    if response_type is not None:
+                        non_auth_response_count += 1
+                        last_non_auth_response_type = response_type
+                        if (
+                            response_type == "ok"
+                            and set_tdlib_parameters_response_pending
+                        ):
+                            tdlib_ok_seen = True
+                            set_tdlib_parameters_response_pending = False
+
+                    tdlib_error = _extract_tdlib_error(payload)
+                    if tdlib_error is not None:
+                        classification = _classify_tdlib_error(
+                            tdlib_error,
+                            final_authorization_state=final_state,
+                            requests_sent_count=requests_sent_count,
+                        )
+                        return result(
+                            auth_entrypoint_status="degraded",
+                            tdlib_auth_attempted=attempted,
+                            manual_intervention_required=False,
+                            final_authorization_state=final_state,
+                            requests_sent_count=requests_sent_count,
+                            error="tdlib_error_redacted",
+                            error_present=True,
+                            error_type="tdlib_error",
+                            tdlib_error_present=True,
+                            tdlib_error_code=classification.code,
+                            tdlib_error_type=classification.tdlib_type,
+                            tdlib_error_message_len=classification.message_len,
+                            tdlib_error_categories=classification.categories,
+                            completion_failure_category=(
+                                classification.completion_failure_category
+                            ),
+                        )
+
                     continue
 
+                authorization_updates_seen_count += 1
                 transition = self._fsm.handle_state(auth_state)
                 final_state = transition.new_state
+                if transition.new_state != "waiting_tdlib_parameters":
+                    set_tdlib_parameters_response_pending = False
 
                 for request in transition.requests:
                     _assert_auth_request(request)
                     await self._client.send(request)
                     requests_sent_count += 1
+                    if request.get("@type") == "setTdlibParameters":
+                        set_tdlib_parameters_response_pending = True
 
                 if transition.requires_manual_intervention:
-                    return TDLibAuthOnlyResult(
+                    return result(
                         auth_entrypoint_status="manual_intervention_required",
                         tdlib_auth_attempted=attempted,
                         manual_intervention_required=True,
@@ -227,7 +280,7 @@ class TDLibAuthOnlyRunner:
                     )
 
                 if transition.new_state == "ready":
-                    return TDLibAuthOnlyResult(
+                    return result(
                         auth_entrypoint_status="ready",
                         tdlib_auth_attempted=attempted,
                         tdlib_auth_completed=True,
@@ -237,7 +290,7 @@ class TDLibAuthOnlyRunner:
                     )
 
                 if transition.new_state in {"degraded", "closed"}:
-                    return TDLibAuthOnlyResult(
+                    return result(
                         auth_entrypoint_status=transition.new_state,
                         tdlib_auth_attempted=attempted,
                         manual_intervention_required=transition.requires_manual_intervention,
@@ -246,7 +299,7 @@ class TDLibAuthOnlyRunner:
                         requests_sent_count=requests_sent_count,
                     )
 
-            return TDLibAuthOnlyResult(
+            return result(
                 auth_entrypoint_status="degraded",
                 tdlib_auth_attempted=attempted,
                 manual_intervention_required=False,
@@ -263,6 +316,7 @@ class TDLibAuthOnlyRunner:
                 completion_failure_category=_completion_failure_category_for_not_ready(
                     final_authorization_state=final_state,
                     requests_sent_count=requests_sent_count,
+                    tdlib_ok_seen=tdlib_ok_seen,
                 ),
             )
         except (AuthorizationError, TDLibTransportError, ValueError) as exc:
@@ -277,7 +331,7 @@ class TDLibAuthOnlyRunner:
                 },
             )
             categories = _categories_for_exception(error_type)
-            return TDLibAuthOnlyResult(
+            return result(
                 auth_entrypoint_status="degraded",
                 tdlib_auth_attempted=attempted,
                 manual_intervention_required=False,
@@ -351,6 +405,19 @@ def _extract_tdlib_error(payload: JsonDict | None) -> JsonDict | None:
     return payload
 
 
+def _extract_safe_response_type(payload: JsonDict | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    raw_type = payload.get("@type")
+    if not isinstance(raw_type, str):
+        return None
+    if not raw_type or len(raw_type) > 80:
+        return "unrecognized"
+    if not all(char in _SAFE_RESPONSE_TYPE_CHARS for char in raw_type):
+        return "unrecognized"
+    return raw_type
+
+
 def _classify_tdlib_error(
     payload: JsonDict,
     *,
@@ -415,9 +482,12 @@ def _completion_failure_category_for_not_ready(
     *,
     final_authorization_state: str | None,
     requests_sent_count: int,
+    tdlib_ok_seen: bool,
 ) -> str:
     if final_authorization_state == "waiting_tdlib_parameters" and requests_sent_count == 1:
-        return _PARAMETERS_RESPONSE_ERROR_OR_TIMEOUT
+        if tdlib_ok_seen:
+            return _PARAMETERS_ACCEPTED_AUTH_STATE_NOT_ADVANCED
+        return _AUTH_STATE_NOT_ADVANCED
     return _AUTHORIZATION_NOT_READY
 
 

@@ -150,6 +150,12 @@ class FakeAuthOnlyResult:
             "manual_intervention_reason": "Telegram login code required from operator",
             "final_authorization_state": "waiting_code",
             "requests_sent_count": 0,
+            "authorization_updates_seen_count": 1,
+            "non_auth_response_count": 0,
+            "tdlib_ok_seen": False,
+            "last_non_auth_response_type": None,
+            "max_authorization_updates": 120,
+            "receive_timeout_sec": 1.0,
             "runtime_env_values_printed": False,
             "database_connected": False,
             "redis_connected": False,
@@ -456,6 +462,8 @@ def test_approved_mode_uses_auth_only_entrypoint_once_with_redacted_result(tmp_p
     assert result.exit_code != 0
     assert len(calls) == 1
     config = calls[0]["args"][0]
+    assert calls[0]["kwargs"]["receive_timeout_sec"] == 1.0
+    assert calls[0]["kwargs"]["max_authorization_updates"] == 120
     assert config.telegram_api_id == 12345
     assert config.telegram_api_hash == "fake-api-hash"
     assert config.tdlib_state_dir == str(tmp_path / "tdlib-state")
@@ -485,6 +493,59 @@ def test_approved_mode_uses_auth_only_entrypoint_once_with_redacted_result(tmp_p
     assert result.report["collector_runtime_used"] is False
     assert "fake-api-hash" not in rendered
     assert "fake-tdlib-key" not in rendered
+
+
+def test_wrapper_passes_through_auth_progress_fields_without_secret_payload(tmp_path: Path) -> None:
+    async def fake_runner(*args, **kwargs) -> FakeAuthOnlyResult:
+        return FakeAuthOnlyResult(
+            status="degraded",
+            manual_intervention_required=False,
+            extra_payload={
+                "manual_intervention_reason": None,
+                "final_authorization_state": "waiting_tdlib_parameters",
+                "requests_sent_count": 1,
+                "authorization_updates_seen_count": 1,
+                "non_auth_response_count": 1,
+                "tdlib_ok_seen": True,
+                "last_non_auth_response_type": "ok",
+                "max_authorization_updates": 120,
+                "receive_timeout_sec": 1.0,
+                "error": "authorization_not_ready",
+                "error_present": True,
+                "error_type": "completion_failure",
+                "completion_failure_category": (
+                    "tdlib_parameters_accepted_auth_state_not_advanced_before_max_updates"
+                ),
+            },
+        )
+
+    result = _module().generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        runtime_env_path=tmp_path / "runtime.env",
+        real_transport_factory=object,
+        runtime_env_reader=lambda path: _approved_env(tmp_path),
+        auth_runner=fake_runner,
+    )
+
+    rendered = json.dumps(result.report, sort_keys=True)
+    auth_payload = result.report["auth_only_entrypoint_result"]
+    assert result.exit_code != 0
+    assert result.report["contract_status"] == "auth_only_entrypoint_not_completed"
+    assert auth_payload["authorization_updates_seen_count"] == 1
+    assert auth_payload["non_auth_response_count"] == 1
+    assert auth_payload["tdlib_ok_seen"] is True
+    assert auth_payload["last_non_auth_response_type"] == "ok"
+    assert auth_payload["max_authorization_updates"] == 120
+    assert auth_payload["receive_timeout_sec"] == 1.0
+    assert (
+        auth_payload["completion_failure_category"]
+        == "tdlib_parameters_accepted_auth_state_not_advanced_before_max_updates"
+    )
+    assert "fake-api-hash" not in rendered
+    assert "fake-tdlib-key" not in rendered
+    assert "+10000000000" not in rendered
+    assert "postgresql://collector:secret" not in rendered
 
 
 def test_wrapper_preserves_redacted_auth_error_classification_without_raw_message(tmp_path: Path) -> None:

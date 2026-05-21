@@ -368,7 +368,7 @@ def generate_report(
                 config,
                 transport=transport,
                 receive_timeout_sec=1.0,
-                max_authorization_updates=20,
+                max_authorization_updates=120,
             )
         )
     except Exception as exc:
