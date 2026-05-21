@@ -14,6 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from services.collector_telegram import auth_entrypoint
+from services.collector_telegram.auth_fsm import AuthTransitionResult
 from services.collector_telegram.auth_entrypoint import run_tdlib_auth_only_once
 from services.collector_telegram.config import CollectorTelegramConfig
 
@@ -119,10 +120,19 @@ async def test_auth_only_runner_processes_fake_state_sequence_to_ready() -> None
     assert payload["telegram_connected"] is True
     assert payload["final_authorization_state"] == "ready"
     assert payload["requests_sent_count"] == 3
+    assert payload["auth_request_types_sent"] == [
+        "setTdlibParameters",
+        "checkDatabaseEncryptionKey",
+        "setAuthenticationPhoneNumber",
+    ]
+    assert payload["last_auth_request_type"] == "setAuthenticationPhoneNumber"
     assert payload["authorization_updates_seen_count"] == 4
     assert payload["non_auth_response_count"] == 0
     assert payload["tdlib_ok_seen"] is False
     assert payload["last_non_auth_response_type"] is None
+    assert payload["connection_state_updates_seen_count"] == 0
+    assert payload["last_connection_state_type"] is None
+    assert payload["connection_state_type_counts"] == {}
     assert payload["max_authorization_updates"] == 20
     assert payload["receive_timeout_sec"] == 0
     assert [request["@type"] for request in transport.sent_requests] == [
@@ -153,6 +163,8 @@ async def test_manual_login_code_state_requires_intervention_without_recording_c
     assert payload["manual_intervention_reason"] == "Telegram login code required from operator"
     assert payload["final_authorization_state"] == "waiting_code"
     assert payload["requests_sent_count"] == 0
+    assert payload["auth_request_types_sent"] == []
+    assert payload["last_auth_request_type"] is None
     rendered = json.dumps(payload)
     assert "login_code" not in rendered
     assert "checkAuthenticationCode" not in rendered
@@ -180,6 +192,8 @@ async def test_password_state_sends_request_without_exposing_password_in_result(
     assert payload["auth_entrypoint_status"] == "ready"
     assert payload["tdlib_auth_completed"] is True
     assert payload["requests_sent_count"] == 1
+    assert payload["auth_request_types_sent"] == ["checkAuthenticationPassword"]
+    assert payload["last_auth_request_type"] == "checkAuthenticationPassword"
     assert transport.sent_requests == [
         {"@type": "checkAuthenticationPassword", "password": password}
     ]
@@ -312,6 +326,7 @@ async def test_waiting_tdlib_parameters_without_tdlib_ok_is_classified_as_no_pro
     assert payload["tdlib_error_categories"] == [
         "tdlib_parameters_related",
         "timeout_or_no_update_related",
+        "connection_not_ready_before_max_updates",
     ]
     assert (
         payload["completion_failure_category"]
@@ -321,6 +336,8 @@ async def test_waiting_tdlib_parameters_without_tdlib_ok_is_classified_as_no_pro
     assert payload["non_auth_response_count"] == 0
     assert payload["tdlib_ok_seen"] is False
     assert payload["last_non_auth_response_type"] is None
+    assert payload["auth_request_types_sent"] == ["setTdlibParameters"]
+    assert payload["last_auth_request_type"] == "setTdlibParameters"
     assert payload["max_authorization_updates"] == 2
     assert payload["receive_timeout_sec"] == 0
     _assert_no_runtime_side_effects(payload)
@@ -351,6 +368,11 @@ async def test_waiting_tdlib_parameters_with_tdlib_ok_records_progress_category(
     assert payload["error_present"] is True
     assert payload["error_type"] == "completion_failure"
     assert payload["tdlib_error_present"] is False
+    assert payload["tdlib_error_categories"] == [
+        "tdlib_parameters_related",
+        "timeout_or_no_update_related",
+        "connection_not_ready_before_max_updates",
+    ]
     assert (
         payload["completion_failure_category"]
         == "tdlib_parameters_accepted_auth_state_not_advanced_before_max_updates"
@@ -359,6 +381,8 @@ async def test_waiting_tdlib_parameters_with_tdlib_ok_records_progress_category(
     assert payload["non_auth_response_count"] == 1
     assert payload["tdlib_ok_seen"] is True
     assert payload["last_non_auth_response_type"] == "ok"
+    assert payload["auth_request_types_sent"] == ["setTdlibParameters"]
+    assert payload["last_auth_request_type"] == "setTdlibParameters"
     assert payload["max_authorization_updates"] == 2
     assert payload["receive_timeout_sec"] == 0
     _assert_no_runtime_side_effects(payload)
@@ -392,6 +416,9 @@ async def test_non_auth_response_records_only_safe_type_without_raw_payload() ->
     rendered = json.dumps(payload, sort_keys=True)
     assert payload["non_auth_response_count"] == 1
     assert payload["last_non_auth_response_type"] == "updateOption"
+    assert payload["connection_state_updates_seen_count"] == 0
+    assert payload["last_connection_state_type"] is None
+    assert payload["connection_state_type_counts"] == {}
     assert payload["tdlib_ok_seen"] is False
     assert secret_like_value not in rendered
     assert "secret_option" not in rendered
@@ -441,9 +468,112 @@ async def test_max_updates_exhaustion_without_state_is_classified_as_not_ready()
     assert payload["tdlib_auth_completed"] is False
     assert payload["final_authorization_state"] is None
     assert payload["requests_sent_count"] == 0
+    assert payload["auth_request_types_sent"] == []
+    assert payload["last_auth_request_type"] is None
     assert payload["error_present"] is True
     assert payload["error_type"] == "completion_failure"
     assert payload["tdlib_error_present"] is False
-    assert payload["tdlib_error_categories"] == ["timeout_or_no_update_related"]
+    assert payload["tdlib_error_categories"] == [
+        "timeout_or_no_update_related",
+        "connection_not_ready_before_max_updates",
+    ]
     assert payload["completion_failure_category"] == "authorization_not_ready_before_max_updates"
+    _assert_no_runtime_side_effects(payload)
+
+
+@pytest.mark.asyncio
+async def test_waiting_phone_number_progress_records_request_and_connection_state_safely() -> None:
+    secret_like_value = "fake-api-hash-secret"
+    unsafe_state_type = "fake-phone-secret-+15555550123"
+    transport = FakeTransport(
+        [
+            _state("authorizationStateWaitTdlibParameters"),
+            _state("authorizationStateWaitEncryptionKey"),
+            _state("authorizationStateWaitPhoneNumber"),
+            {
+                "@type": "updateConnectionState",
+                "state": {
+                    "@type": "connectionStateWaitingForNetwork",
+                    "api_hash": secret_like_value,
+                },
+            },
+            {
+                "@type": "updateConnectionState",
+                "state": {
+                    "@type": unsafe_state_type,
+                    "phone_number": "+15555550123",
+                },
+            },
+        ]
+    )
+
+    result = await run_tdlib_auth_only_once(
+        _config(),
+        transport=transport,
+        receive_timeout_sec=0,
+        max_authorization_updates=5,
+    )
+
+    payload = result.to_redacted_dict()
+    rendered = json.dumps(payload, sort_keys=True)
+    assert payload["auth_entrypoint_status"] == "degraded"
+    assert payload["final_authorization_state"] == "waiting_phone_number"
+    assert payload["requests_sent_count"] == 3
+    assert payload["auth_request_types_sent"] == [
+        "setTdlibParameters",
+        "checkDatabaseEncryptionKey",
+        "setAuthenticationPhoneNumber",
+    ]
+    assert payload["last_auth_request_type"] == "setAuthenticationPhoneNumber"
+    assert payload["connection_state_updates_seen_count"] == 2
+    assert payload["last_connection_state_type"] == "unrecognized"
+    assert payload["connection_state_type_counts"] == {
+        "connectionStateWaitingForNetwork": 1,
+        "unrecognized": 1,
+    }
+    assert payload["tdlib_error_categories"] == [
+        "timeout_or_no_update_related",
+        "connection_not_ready_before_max_updates",
+    ]
+    assert (
+        payload["completion_failure_category"]
+        == "waiting_phone_number_request_sent_auth_state_not_advanced_before_max_updates"
+    )
+    assert secret_like_value not in rendered
+    assert unsafe_state_type not in rendered
+    assert "+15555550123" not in rendered
+    _assert_no_runtime_side_effects(payload)
+
+
+@pytest.mark.asyncio
+async def test_waiting_phone_number_without_phone_request_is_classified_separately() -> None:
+    class FakeWaitingPhoneFSM:
+        def handle_state(self, state: dict[str, Any]) -> AuthTransitionResult:
+            return AuthTransitionResult(new_state="waiting_phone_number", requests=[])
+
+    transport = FakeTransport([_state("authorizationStateWaitPhoneNumber")])
+    runner = auth_entrypoint.TDLibAuthOnlyRunner(
+        _config(),
+        transport=transport,
+        fsm=FakeWaitingPhoneFSM(),  # type: ignore[arg-type]
+        receive_timeout_sec=0,
+        max_authorization_updates=1,
+    )
+
+    result = await runner.run_once()
+
+    payload = result.to_redacted_dict()
+    assert payload["auth_entrypoint_status"] == "degraded"
+    assert payload["final_authorization_state"] == "waiting_phone_number"
+    assert payload["requests_sent_count"] == 0
+    assert payload["auth_request_types_sent"] == []
+    assert payload["last_auth_request_type"] is None
+    assert (
+        payload["completion_failure_category"]
+        == "waiting_phone_number_request_not_observed_before_max_updates"
+    )
+    assert payload["tdlib_error_categories"] == [
+        "timeout_or_no_update_related",
+        "connection_not_ready_before_max_updates",
+    ]
     _assert_no_runtime_side_effects(payload)

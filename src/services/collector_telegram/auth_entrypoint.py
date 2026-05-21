@@ -66,8 +66,24 @@ _PARAMETERS_ACCEPTED_AUTH_STATE_NOT_ADVANCED = (
 )
 _AUTH_STATE_NOT_ADVANCED = "tdlib_auth_state_not_advanced_before_max_updates"
 _AUTHORIZATION_NOT_READY = "authorization_not_ready_before_max_updates"
+_WAITING_PHONE_REQUEST_SENT_AUTH_STATE_NOT_ADVANCED = (
+    "waiting_phone_number_request_sent_auth_state_not_advanced_before_max_updates"
+)
+_WAITING_PHONE_REQUEST_NOT_OBSERVED = (
+    "waiting_phone_number_request_not_observed_before_max_updates"
+)
+_CONNECTION_NOT_READY = "connection_not_ready_before_max_updates"
 _SAFE_RESPONSE_TYPE_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._"
+)
+_SAFE_CONNECTION_STATE_TYPES = frozenset(
+    {
+        "connectionStateWaitingForNetwork",
+        "connectionStateConnecting",
+        "connectionStateConnectingToProxy",
+        "connectionStateReady",
+        "connectionStateUpdating",
+    }
 )
 
 
@@ -92,10 +108,15 @@ class TDLibAuthOnlyResult:
     manual_intervention_reason: str | None = None
     final_authorization_state: str | None = None
     requests_sent_count: int = 0
+    auth_request_types_sent: tuple[str, ...] = field(default_factory=tuple)
+    last_auth_request_type: str | None = None
     authorization_updates_seen_count: int = 0
     non_auth_response_count: int = 0
     tdlib_ok_seen: bool = False
     last_non_auth_response_type: str | None = None
+    connection_state_updates_seen_count: int = 0
+    last_connection_state_type: str | None = None
+    connection_state_type_counts: dict[str, int] = field(default_factory=dict)
     max_authorization_updates: int = 0
     receive_timeout_sec: float = 0.0
     runtime_env_values_printed: bool = False
@@ -133,10 +154,15 @@ class TDLibAuthOnlyResult:
             "manual_intervention_reason": self.manual_intervention_reason,
             "final_authorization_state": self.final_authorization_state,
             "requests_sent_count": self.requests_sent_count,
+            "auth_request_types_sent": list(self.auth_request_types_sent),
+            "last_auth_request_type": self.last_auth_request_type,
             "authorization_updates_seen_count": self.authorization_updates_seen_count,
             "non_auth_response_count": self.non_auth_response_count,
             "tdlib_ok_seen": self.tdlib_ok_seen,
             "last_non_auth_response_type": self.last_non_auth_response_type,
+            "connection_state_updates_seen_count": self.connection_state_updates_seen_count,
+            "last_connection_state_type": self.last_connection_state_type,
+            "connection_state_type_counts": dict(self.connection_state_type_counts),
             "max_authorization_updates": self.max_authorization_updates,
             "receive_timeout_sec": self.receive_timeout_sec,
             "runtime_env_values_printed": self.runtime_env_values_printed,
@@ -190,20 +216,31 @@ class TDLibAuthOnlyRunner:
 
     async def run_once(self) -> TDLibAuthOnlyResult:
         requests_sent_count = 0
+        auth_request_types_sent: list[str] = []
+        last_auth_request_type: str | None = None
         authorization_updates_seen_count = 0
         non_auth_response_count = 0
         tdlib_ok_seen = False
         last_non_auth_response_type: str | None = None
+        connection_state_updates_seen_count = 0
+        last_connection_state_type: str | None = None
+        connection_state_type_counts: dict[str, int] = {}
+        connection_state_ready_seen = False
         final_state: str | None = None
         attempted = False
         set_tdlib_parameters_response_pending = False
 
         def result(**kwargs: Any) -> TDLibAuthOnlyResult:
             return TDLibAuthOnlyResult(
+                auth_request_types_sent=tuple(auth_request_types_sent),
+                last_auth_request_type=last_auth_request_type,
                 authorization_updates_seen_count=authorization_updates_seen_count,
                 non_auth_response_count=non_auth_response_count,
                 tdlib_ok_seen=tdlib_ok_seen,
                 last_non_auth_response_type=last_non_auth_response_type,
+                connection_state_updates_seen_count=connection_state_updates_seen_count,
+                last_connection_state_type=last_connection_state_type,
+                connection_state_type_counts=dict(connection_state_type_counts),
                 max_authorization_updates=self._max_authorization_updates,
                 receive_timeout_sec=self._receive_timeout_sec,
                 **kwargs,
@@ -227,6 +264,16 @@ class TDLibAuthOnlyRunner:
                         ):
                             tdlib_ok_seen = True
                             set_tdlib_parameters_response_pending = False
+
+                    connection_state_type = _extract_safe_connection_state_type(payload)
+                    if connection_state_type is not None:
+                        connection_state_updates_seen_count += 1
+                        last_connection_state_type = connection_state_type
+                        connection_state_type_counts[connection_state_type] = (
+                            connection_state_type_counts.get(connection_state_type, 0) + 1
+                        )
+                        if connection_state_type == "connectionStateReady":
+                            connection_state_ready_seen = True
 
                     tdlib_error = _extract_tdlib_error(payload)
                     if tdlib_error is not None:
@@ -264,8 +311,12 @@ class TDLibAuthOnlyRunner:
 
                 for request in transition.requests:
                     _assert_auth_request(request)
+                    request_type = _extract_safe_auth_request_type(request)
                     await self._client.send(request)
                     requests_sent_count += 1
+                    if request_type is not None:
+                        auth_request_types_sent.append(request_type)
+                        last_auth_request_type = request_type
                     if request.get("@type") == "setTdlibParameters":
                         set_tdlib_parameters_response_pending = True
 
@@ -312,11 +363,13 @@ class TDLibAuthOnlyRunner:
                 tdlib_error_categories=_completion_categories_for_not_ready(
                     final_authorization_state=final_state,
                     requests_sent_count=requests_sent_count,
+                    connection_state_ready_seen=connection_state_ready_seen,
                 ),
                 completion_failure_category=_completion_failure_category_for_not_ready(
                     final_authorization_state=final_state,
                     requests_sent_count=requests_sent_count,
                     tdlib_ok_seen=tdlib_ok_seen,
+                    last_auth_request_type=last_auth_request_type,
                 ),
             )
         except (AuthorizationError, TDLibTransportError, ValueError) as exc:
@@ -418,6 +471,20 @@ def _extract_safe_response_type(payload: JsonDict | None) -> str | None:
     return raw_type
 
 
+def _extract_safe_connection_state_type(payload: JsonDict | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("@type") != "updateConnectionState":
+        return None
+    state = payload.get("state")
+    if not isinstance(state, dict):
+        return "unrecognized"
+    raw_type = state.get("@type")
+    if raw_type in _SAFE_CONNECTION_STATE_TYPES:
+        return raw_type
+    return "unrecognized"
+
+
 def _classify_tdlib_error(
     payload: JsonDict,
     *,
@@ -472,10 +539,16 @@ def _completion_categories_for_not_ready(
     *,
     final_authorization_state: str | None,
     requests_sent_count: int,
+    connection_state_ready_seen: bool,
 ) -> tuple[str, ...]:
+    categories: tuple[str, ...]
     if final_authorization_state == "waiting_tdlib_parameters" and requests_sent_count == 1:
-        return ("tdlib_parameters_related", "timeout_or_no_update_related")
-    return ("timeout_or_no_update_related",)
+        categories = ("tdlib_parameters_related", "timeout_or_no_update_related")
+    else:
+        categories = ("timeout_or_no_update_related",)
+    if not connection_state_ready_seen:
+        categories = _append_category(categories, _CONNECTION_NOT_READY)
+    return categories
 
 
 def _completion_failure_category_for_not_ready(
@@ -483,11 +556,16 @@ def _completion_failure_category_for_not_ready(
     final_authorization_state: str | None,
     requests_sent_count: int,
     tdlib_ok_seen: bool,
+    last_auth_request_type: str | None,
 ) -> str:
     if final_authorization_state == "waiting_tdlib_parameters" and requests_sent_count == 1:
         if tdlib_ok_seen:
             return _PARAMETERS_ACCEPTED_AUTH_STATE_NOT_ADVANCED
         return _AUTH_STATE_NOT_ADVANCED
+    if final_authorization_state == "waiting_phone_number":
+        if last_auth_request_type == "setAuthenticationPhoneNumber":
+            return _WAITING_PHONE_REQUEST_SENT_AUTH_STATE_NOT_ADVANCED
+        return _WAITING_PHONE_REQUEST_NOT_OBSERVED
     return _AUTHORIZATION_NOT_READY
 
 
@@ -518,3 +596,10 @@ def _assert_auth_request(request: JsonDict) -> None:
     request_type = request.get("@type")
     if request_type not in _AUTH_REQUEST_TYPES:
         raise ValueError(f"Non-auth TDLib request rejected: {request_type}")
+
+
+def _extract_safe_auth_request_type(request: JsonDict) -> str | None:
+    request_type = request.get("@type")
+    if request_type in _AUTH_REQUEST_TYPES:
+        return request_type
+    return None
