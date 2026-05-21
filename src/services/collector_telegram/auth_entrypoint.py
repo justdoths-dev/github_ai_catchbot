@@ -112,6 +112,7 @@ class TDLibAuthOnlyResult:
     last_auth_request_type: str | None = None
     authorization_updates_seen_count: int = 0
     non_auth_response_count: int = 0
+    non_auth_response_type_counts: dict[str, int] = field(default_factory=dict)
     tdlib_ok_seen: bool = False
     last_non_auth_response_type: str | None = None
     connection_state_updates_seen_count: int = 0
@@ -158,6 +159,7 @@ class TDLibAuthOnlyResult:
             "last_auth_request_type": self.last_auth_request_type,
             "authorization_updates_seen_count": self.authorization_updates_seen_count,
             "non_auth_response_count": self.non_auth_response_count,
+            "non_auth_response_type_counts": dict(self.non_auth_response_type_counts),
             "tdlib_ok_seen": self.tdlib_ok_seen,
             "last_non_auth_response_type": self.last_non_auth_response_type,
             "connection_state_updates_seen_count": self.connection_state_updates_seen_count,
@@ -220,6 +222,7 @@ class TDLibAuthOnlyRunner:
         last_auth_request_type: str | None = None
         authorization_updates_seen_count = 0
         non_auth_response_count = 0
+        non_auth_response_type_counts: dict[str, int] = {}
         tdlib_ok_seen = False
         last_non_auth_response_type: str | None = None
         connection_state_updates_seen_count = 0
@@ -236,6 +239,7 @@ class TDLibAuthOnlyRunner:
                 last_auth_request_type=last_auth_request_type,
                 authorization_updates_seen_count=authorization_updates_seen_count,
                 non_auth_response_count=non_auth_response_count,
+                non_auth_response_type_counts=dict(non_auth_response_type_counts),
                 tdlib_ok_seen=tdlib_ok_seen,
                 last_non_auth_response_type=last_non_auth_response_type,
                 connection_state_updates_seen_count=connection_state_updates_seen_count,
@@ -258,6 +262,9 @@ class TDLibAuthOnlyRunner:
                     if response_type is not None:
                         non_auth_response_count += 1
                         last_non_auth_response_type = response_type
+                        non_auth_response_type_counts[response_type] = (
+                            non_auth_response_type_counts.get(response_type, 0) + 1
+                        )
                         if (
                             response_type == "ok"
                             and set_tdlib_parameters_response_pending

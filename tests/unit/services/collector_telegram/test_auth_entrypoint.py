@@ -128,6 +128,7 @@ async def test_auth_only_runner_processes_fake_state_sequence_to_ready() -> None
     assert payload["last_auth_request_type"] == "setAuthenticationPhoneNumber"
     assert payload["authorization_updates_seen_count"] == 4
     assert payload["non_auth_response_count"] == 0
+    assert payload["non_auth_response_type_counts"] == {}
     assert payload["tdlib_ok_seen"] is False
     assert payload["last_non_auth_response_type"] is None
     assert payload["connection_state_updates_seen_count"] == 0
@@ -334,6 +335,7 @@ async def test_waiting_tdlib_parameters_without_tdlib_ok_is_classified_as_no_pro
     )
     assert payload["authorization_updates_seen_count"] == 1
     assert payload["non_auth_response_count"] == 0
+    assert payload["non_auth_response_type_counts"] == {}
     assert payload["tdlib_ok_seen"] is False
     assert payload["last_non_auth_response_type"] is None
     assert payload["auth_request_types_sent"] == ["setTdlibParameters"]
@@ -379,6 +381,7 @@ async def test_waiting_tdlib_parameters_with_tdlib_ok_records_progress_category(
     )
     assert payload["authorization_updates_seen_count"] == 1
     assert payload["non_auth_response_count"] == 1
+    assert payload["non_auth_response_type_counts"] == {"ok": 1}
     assert payload["tdlib_ok_seen"] is True
     assert payload["last_non_auth_response_type"] == "ok"
     assert payload["auth_request_types_sent"] == ["setTdlibParameters"]
@@ -415,6 +418,7 @@ async def test_non_auth_response_records_only_safe_type_without_raw_payload() ->
     payload = result.to_redacted_dict()
     rendered = json.dumps(payload, sort_keys=True)
     assert payload["non_auth_response_count"] == 1
+    assert payload["non_auth_response_type_counts"] == {"updateOption": 1}
     assert payload["last_non_auth_response_type"] == "updateOption"
     assert payload["connection_state_updates_seen_count"] == 0
     assert payload["last_connection_state_type"] is None
@@ -422,6 +426,69 @@ async def test_non_auth_response_records_only_safe_type_without_raw_payload() ->
     assert payload["tdlib_ok_seen"] is False
     assert secret_like_value not in rendered
     assert "secret_option" not in rendered
+    assert "optionValueString" not in rendered
+    _assert_no_runtime_side_effects(payload)
+
+
+@pytest.mark.asyncio
+async def test_non_auth_response_type_counts_are_aggregated_without_raw_payload() -> None:
+    secret_like_value = "fake-api-hash-secret"
+    unsafe_type = "fake-phone-secret-+15555550123"
+    transport = FakeTransport(
+        [
+            _state("authorizationStateWaitTdlibParameters"),
+            {
+                "@type": "updateOption",
+                "name": "api_hash",
+                "value": {
+                    "@type": "optionValueString",
+                    "value": secret_like_value,
+                },
+            },
+            {
+                "@type": "updateConnectionState",
+                "state": {"@type": "connectionStateConnecting"},
+            },
+            {"@type": "ok"},
+            {"@type": unsafe_type, "phone_number": "+15555550123"},
+            {
+                "@type": "updateOption",
+                "name": "tdlib_db_encryption_key",
+                "value": secret_like_value,
+            },
+            {
+                "@type": "updateConnectionState",
+                "state": {"@type": "connectionStateConnecting"},
+            },
+            {"@type": "ok"},
+        ]
+    )
+
+    result = await run_tdlib_auth_only_once(
+        _config(),
+        transport=transport,
+        receive_timeout_sec=0,
+        max_authorization_updates=8,
+    )
+
+    payload = result.to_redacted_dict()
+    rendered = json.dumps(payload, sort_keys=True)
+    assert payload["non_auth_response_count"] == 7
+    assert payload["non_auth_response_type_counts"] == {
+        "updateOption": 2,
+        "updateConnectionState": 2,
+        "ok": 2,
+        "unrecognized": 1,
+    }
+    assert payload["last_non_auth_response_type"] == "ok"
+    assert payload["connection_state_updates_seen_count"] == 2
+    assert payload["connection_state_type_counts"] == {
+        "connectionStateConnecting": 2,
+    }
+    assert secret_like_value not in rendered
+    assert unsafe_type not in rendered
+    assert "+15555550123" not in rendered
+    assert "tdlib_db_encryption_key" not in rendered
     assert "optionValueString" not in rendered
     _assert_no_runtime_side_effects(payload)
 
@@ -446,6 +513,7 @@ async def test_non_auth_response_type_is_sanitized_before_serialization() -> Non
     payload = result.to_redacted_dict()
     rendered = json.dumps(payload, sort_keys=True)
     assert payload["non_auth_response_count"] == 1
+    assert payload["non_auth_response_type_counts"] == {"unrecognized": 1}
     assert payload["last_non_auth_response_type"] == "unrecognized"
     assert secret_like_type not in rendered
     _assert_no_runtime_side_effects(payload)
@@ -525,6 +593,9 @@ async def test_waiting_phone_number_progress_records_request_and_connection_stat
         "setAuthenticationPhoneNumber",
     ]
     assert payload["last_auth_request_type"] == "setAuthenticationPhoneNumber"
+    assert payload["non_auth_response_type_counts"] == {
+        "updateConnectionState": 2,
+    }
     assert payload["connection_state_updates_seen_count"] == 2
     assert payload["last_connection_state_type"] == "unrecognized"
     assert payload["connection_state_type_counts"] == {

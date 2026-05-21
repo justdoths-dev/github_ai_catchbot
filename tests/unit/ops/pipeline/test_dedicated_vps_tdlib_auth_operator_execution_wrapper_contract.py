@@ -154,6 +154,7 @@ class FakeAuthOnlyResult:
             "last_auth_request_type": None,
             "authorization_updates_seen_count": 1,
             "non_auth_response_count": 0,
+            "non_auth_response_type_counts": {},
             "tdlib_ok_seen": False,
             "last_non_auth_response_type": None,
             "connection_state_updates_seen_count": 0,
@@ -517,6 +518,9 @@ def test_wrapper_passes_through_auth_progress_fields_without_secret_payload(tmp_
                 "last_auth_request_type": "setAuthenticationPhoneNumber",
                 "authorization_updates_seen_count": 3,
                 "non_auth_response_count": 2,
+                "non_auth_response_type_counts": {
+                    "updateConnectionState": 2,
+                },
                 "tdlib_ok_seen": True,
                 "last_non_auth_response_type": "updateConnectionState",
                 "connection_state_updates_seen_count": 2,
@@ -555,6 +559,9 @@ def test_wrapper_passes_through_auth_progress_fields_without_secret_payload(tmp_
     assert result.report["contract_status"] == "auth_only_entrypoint_not_completed"
     assert auth_payload["authorization_updates_seen_count"] == 3
     assert auth_payload["non_auth_response_count"] == 2
+    assert auth_payload["non_auth_response_type_counts"] == {
+        "updateConnectionState": 2,
+    }
     assert auth_payload["tdlib_ok_seen"] is True
     assert auth_payload["last_non_auth_response_type"] == "updateConnectionState"
     assert auth_payload["auth_request_types_sent"] == [
