@@ -28,6 +28,8 @@ _AUTH_REQUEST_TYPES = frozenset(
         "checkAuthenticationPassword",
     }
 )
+_UNATTRIBUTED_OK_RESPONSE_NO_EXTRA = "unattributed_no_extra"
+_UNATTRIBUTED_OK_RESPONSE_UNKNOWN_EXTRA = "unattributed_unknown_extra"
 
 _TDLIB_ERROR_CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("api_id_related", ("api_id", "api id")),
@@ -115,6 +117,10 @@ class TDLibAuthOnlyResult:
     non_auth_response_type_counts: dict[str, int] = field(default_factory=dict)
     tdlib_ok_seen: bool = False
     last_non_auth_response_type: str | None = None
+    ok_response_count: int = 0
+    ok_response_auth_request_types: tuple[str, ...] = field(default_factory=tuple)
+    last_ok_response_auth_request_type: str | None = None
+    pending_auth_request_types_at_timeout: tuple[str, ...] = field(default_factory=tuple)
     connection_state_updates_seen_count: int = 0
     last_connection_state_type: str | None = None
     connection_state_type_counts: dict[str, int] = field(default_factory=dict)
@@ -162,6 +168,16 @@ class TDLibAuthOnlyResult:
             "non_auth_response_type_counts": dict(self.non_auth_response_type_counts),
             "tdlib_ok_seen": self.tdlib_ok_seen,
             "last_non_auth_response_type": self.last_non_auth_response_type,
+            "ok_response_count": self.ok_response_count,
+            "ok_response_auth_request_types": list(
+                self.ok_response_auth_request_types
+            ),
+            "last_ok_response_auth_request_type": (
+                self.last_ok_response_auth_request_type
+            ),
+            "pending_auth_request_types_at_timeout": list(
+                self.pending_auth_request_types_at_timeout
+            ),
             "connection_state_updates_seen_count": self.connection_state_updates_seen_count,
             "last_connection_state_type": self.last_connection_state_type,
             "connection_state_type_counts": dict(self.connection_state_type_counts),
@@ -225,13 +241,17 @@ class TDLibAuthOnlyRunner:
         non_auth_response_type_counts: dict[str, int] = {}
         tdlib_ok_seen = False
         last_non_auth_response_type: str | None = None
+        ok_response_count = 0
+        ok_response_auth_request_types: list[str] = []
+        last_ok_response_auth_request_type: str | None = None
+        pending_auth_requests_by_extra: dict[str, str] = {}
+        auth_request_sequence = 0
         connection_state_updates_seen_count = 0
         last_connection_state_type: str | None = None
         connection_state_type_counts: dict[str, int] = {}
         connection_state_ready_seen = False
         final_state: str | None = None
         attempted = False
-        set_tdlib_parameters_response_pending = False
 
         def result(**kwargs: Any) -> TDLibAuthOnlyResult:
             return TDLibAuthOnlyResult(
@@ -242,6 +262,9 @@ class TDLibAuthOnlyRunner:
                 non_auth_response_type_counts=dict(non_auth_response_type_counts),
                 tdlib_ok_seen=tdlib_ok_seen,
                 last_non_auth_response_type=last_non_auth_response_type,
+                ok_response_count=ok_response_count,
+                ok_response_auth_request_types=tuple(ok_response_auth_request_types),
+                last_ok_response_auth_request_type=last_ok_response_auth_request_type,
                 connection_state_updates_seen_count=connection_state_updates_seen_count,
                 last_connection_state_type=last_connection_state_type,
                 connection_state_type_counts=dict(connection_state_type_counts),
@@ -265,12 +288,16 @@ class TDLibAuthOnlyRunner:
                         non_auth_response_type_counts[response_type] = (
                             non_auth_response_type_counts.get(response_type, 0) + 1
                         )
-                        if (
-                            response_type == "ok"
-                            and set_tdlib_parameters_response_pending
-                        ):
-                            tdlib_ok_seen = True
-                            set_tdlib_parameters_response_pending = False
+                        if response_type == "ok":
+                            ok_response_count += 1
+                            ok_request_type = _pop_ok_auth_request_type_by_extra(
+                                payload,
+                                pending_auth_requests_by_extra,
+                            )
+                            if ok_request_type == "setTdlibParameters":
+                                tdlib_ok_seen = True
+                            ok_response_auth_request_types.append(ok_request_type)
+                            last_ok_response_auth_request_type = ok_request_type
 
                     connection_state_type = _extract_safe_connection_state_type(payload)
                     if connection_state_type is not None:
@@ -313,19 +340,23 @@ class TDLibAuthOnlyRunner:
                 authorization_updates_seen_count += 1
                 transition = self._fsm.handle_state(auth_state)
                 final_state = transition.new_state
-                if transition.new_state != "waiting_tdlib_parameters":
-                    set_tdlib_parameters_response_pending = False
 
                 for request in transition.requests:
                     _assert_auth_request(request)
                     request_type = _extract_safe_auth_request_type(request)
-                    await self._client.send(request)
+                    if request_type is None:
+                        raise ValueError("Auth TDLib request type could not be sanitized")
+                    auth_request_sequence += 1
+                    extra = _build_auth_request_extra(
+                        sequence=auth_request_sequence,
+                        request_type=request_type,
+                    )
+                    request_with_extra = _auth_request_with_extra(request, extra)
+                    await self._client.send(request_with_extra)
                     requests_sent_count += 1
-                    if request_type is not None:
-                        auth_request_types_sent.append(request_type)
-                        last_auth_request_type = request_type
-                    if request.get("@type") == "setTdlibParameters":
-                        set_tdlib_parameters_response_pending = True
+                    auth_request_types_sent.append(request_type)
+                    last_auth_request_type = request_type
+                    pending_auth_requests_by_extra[extra] = request_type
 
                 if transition.requires_manual_intervention:
                     return result(
@@ -377,6 +408,9 @@ class TDLibAuthOnlyRunner:
                     requests_sent_count=requests_sent_count,
                     tdlib_ok_seen=tdlib_ok_seen,
                     last_auth_request_type=last_auth_request_type,
+                ),
+                pending_auth_request_types_at_timeout=tuple(
+                    pending_auth_requests_by_extra.values()
                 ),
             )
         except (AuthorizationError, TDLibTransportError, ValueError) as exc:
@@ -610,3 +644,32 @@ def _extract_safe_auth_request_type(request: JsonDict) -> str | None:
     if request_type in _AUTH_REQUEST_TYPES:
         return request_type
     return None
+
+
+def _build_auth_request_extra(*, sequence: int, request_type: str) -> str:
+    if request_type not in _AUTH_REQUEST_TYPES:
+        raise ValueError("Auth TDLib request type could not be sanitized")
+    return f"auth:{sequence}:{request_type}"
+
+
+def _auth_request_with_extra(request: JsonDict, extra: str) -> JsonDict:
+    request_with_extra = dict(request)
+    request_with_extra["@extra"] = extra
+    return request_with_extra
+
+
+def _pop_ok_auth_request_type_by_extra(
+    payload: JsonDict | None,
+    pending_auth_requests_by_extra: dict[str, str],
+) -> str:
+    if not isinstance(payload, dict) or "@extra" not in payload:
+        return _UNATTRIBUTED_OK_RESPONSE_NO_EXTRA
+
+    raw_extra = payload.get("@extra")
+    if not isinstance(raw_extra, str):
+        return _UNATTRIBUTED_OK_RESPONSE_UNKNOWN_EXTRA
+
+    request_type = pending_auth_requests_by_extra.pop(raw_extra, None)
+    if request_type is None:
+        return _UNATTRIBUTED_OK_RESPONSE_UNKNOWN_EXTRA
+    return request_type

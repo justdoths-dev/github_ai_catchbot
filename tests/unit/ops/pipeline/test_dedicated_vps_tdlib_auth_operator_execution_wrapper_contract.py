@@ -157,6 +157,10 @@ class FakeAuthOnlyResult:
             "non_auth_response_type_counts": {},
             "tdlib_ok_seen": False,
             "last_non_auth_response_type": None,
+            "ok_response_count": 0,
+            "ok_response_auth_request_types": [],
+            "last_ok_response_auth_request_type": None,
+            "pending_auth_request_types_at_timeout": [],
             "connection_state_updates_seen_count": 0,
             "last_connection_state_type": None,
             "connection_state_type_counts": {},
@@ -517,12 +521,22 @@ def test_wrapper_passes_through_auth_progress_fields_without_secret_payload(tmp_
                 ],
                 "last_auth_request_type": "setAuthenticationPhoneNumber",
                 "authorization_updates_seen_count": 3,
-                "non_auth_response_count": 2,
+                "non_auth_response_count": 3,
                 "non_auth_response_type_counts": {
+                    "ok": 1,
                     "updateConnectionState": 2,
                 },
                 "tdlib_ok_seen": True,
                 "last_non_auth_response_type": "updateConnectionState",
+                "ok_response_count": 1,
+                "ok_response_auth_request_types": [
+                    "setTdlibParameters",
+                ],
+                "last_ok_response_auth_request_type": "setTdlibParameters",
+                "pending_auth_request_types_at_timeout": [
+                    "checkDatabaseEncryptionKey",
+                    "setAuthenticationPhoneNumber",
+                ],
                 "connection_state_updates_seen_count": 2,
                 "last_connection_state_type": "unrecognized",
                 "connection_state_type_counts": {
@@ -558,12 +572,22 @@ def test_wrapper_passes_through_auth_progress_fields_without_secret_payload(tmp_
     assert result.exit_code != 0
     assert result.report["contract_status"] == "auth_only_entrypoint_not_completed"
     assert auth_payload["authorization_updates_seen_count"] == 3
-    assert auth_payload["non_auth_response_count"] == 2
+    assert auth_payload["non_auth_response_count"] == 3
     assert auth_payload["non_auth_response_type_counts"] == {
+        "ok": 1,
         "updateConnectionState": 2,
     }
     assert auth_payload["tdlib_ok_seen"] is True
     assert auth_payload["last_non_auth_response_type"] == "updateConnectionState"
+    assert auth_payload["ok_response_count"] == 1
+    assert auth_payload["ok_response_auth_request_types"] == [
+        "setTdlibParameters",
+    ]
+    assert auth_payload["last_ok_response_auth_request_type"] == "setTdlibParameters"
+    assert auth_payload["pending_auth_request_types_at_timeout"] == [
+        "checkDatabaseEncryptionKey",
+        "setAuthenticationPhoneNumber",
+    ]
     assert auth_payload["auth_request_types_sent"] == [
         "setTdlibParameters",
         "checkDatabaseEncryptionKey",
