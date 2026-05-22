@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import re
 import sys
 from dataclasses import dataclass
@@ -15,6 +16,11 @@ REPORT_TYPE = "dedicated_vps_tdlib_auth_operator_execution_wrapper_v1"
 RUNTIME_ENV_PATH = "/etc/github-ai-catchbot/runtime.env"
 MISSING_NEXT_SLICE = "dedicated_vps_tdlib_auth_entrypoint_implementation"
 AVAILABLE_NEXT_SLICE = "dedicated_vps_tdlib_auth_operator_execution"
+DEFAULT_TDLIB_AUTH_RECEIVE_TIMEOUT_SEC = 1.0
+DEFAULT_TDLIB_AUTH_MAX_AUTHORIZATION_UPDATES = 120
+MAX_TDLIB_AUTH_RECEIVE_TIMEOUT_SEC = 5.0
+MAX_TDLIB_AUTH_MAX_AUTHORIZATION_UPDATES = 600
+MAX_TDLIB_AUTH_RECEIVE_BUDGET_SECONDS = 600.0
 
 COLLECTOR_SOURCE_FILES = (
     "src/services/collector_telegram/auth_entrypoint.py",
@@ -83,6 +89,14 @@ class WrapperResult:
     report: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class ReceiveBudgetValidation:
+    receive_timeout_sec: float | None
+    max_authorization_updates: int | None
+    receive_budget_seconds: float | None
+    errors: tuple[str, ...]
+
+
 def default_repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -126,6 +140,65 @@ def parse_runtime_env_text(text: str) -> dict[str, str]:
 
 def parse_runtime_env_file(path: str | Path) -> dict[str, str]:
     return parse_runtime_env_text(Path(path).read_text(encoding="utf-8", errors="replace"))
+
+
+def _parse_receive_budget(
+    receive_timeout_sec_value: object,
+    max_authorization_updates_value: object,
+) -> ReceiveBudgetValidation:
+    errors: list[str] = []
+    receive_timeout_sec: float | None = None
+    max_authorization_updates: int | None = None
+    receive_budget_seconds: float | None = None
+
+    if isinstance(receive_timeout_sec_value, bool):
+        errors.append("receive_timeout_sec.invalid")
+    else:
+        try:
+            parsed_timeout = float(receive_timeout_sec_value)
+        except (TypeError, ValueError):
+            errors.append("receive_timeout_sec.invalid")
+        else:
+            if not math.isfinite(parsed_timeout):
+                errors.append("receive_timeout_sec.not_finite")
+            else:
+                receive_timeout_sec = parsed_timeout
+                if not 0 < receive_timeout_sec <= MAX_TDLIB_AUTH_RECEIVE_TIMEOUT_SEC:
+                    errors.append("receive_timeout_sec.out_of_bounds")
+
+    if isinstance(max_authorization_updates_value, bool):
+        errors.append("max_authorization_updates.invalid")
+    elif isinstance(max_authorization_updates_value, int):
+        max_authorization_updates = max_authorization_updates_value
+    elif isinstance(max_authorization_updates_value, str):
+        stripped_updates = max_authorization_updates_value.strip()
+        if re.fullmatch(r"[+-]?\d+", stripped_updates):
+            max_authorization_updates = int(stripped_updates)
+        else:
+            errors.append("max_authorization_updates.invalid")
+    else:
+        errors.append("max_authorization_updates.invalid")
+
+    if max_authorization_updates is not None and (
+        not 1 <= max_authorization_updates <= MAX_TDLIB_AUTH_MAX_AUTHORIZATION_UPDATES
+    ):
+        errors.append("max_authorization_updates.out_of_bounds")
+
+    if receive_timeout_sec is not None and max_authorization_updates is not None:
+        candidate_budget_seconds = receive_timeout_sec * max_authorization_updates
+        if math.isfinite(candidate_budget_seconds):
+            receive_budget_seconds = candidate_budget_seconds
+            if not errors and receive_budget_seconds > MAX_TDLIB_AUTH_RECEIVE_BUDGET_SECONDS:
+                errors.append("receive_budget_seconds.out_of_bounds")
+        elif not errors:
+            errors.append("receive_budget_seconds.out_of_bounds")
+
+    return ReceiveBudgetValidation(
+        receive_timeout_sec=receive_timeout_sec,
+        max_authorization_updates=max_authorization_updates,
+        receive_budget_seconds=receive_budget_seconds,
+        errors=tuple(errors),
+    )
 
 
 def _inspect_auth_only_entrypoint(repo_root: Path) -> dict[str, Any]:
@@ -203,6 +276,8 @@ def generate_report(
     *,
     approved_tdlib_auth_operator_execution: bool = False,
     runtime_env_path: str | Path = RUNTIME_ENV_PATH,
+    tdlib_auth_receive_timeout_sec: object = DEFAULT_TDLIB_AUTH_RECEIVE_TIMEOUT_SEC,
+    tdlib_auth_max_authorization_updates: object = DEFAULT_TDLIB_AUTH_MAX_AUTHORIZATION_UPDATES,
     real_transport_factory: RealTransportFactory | None = None,
     auth_runner: AuthRunner | None = None,
     runtime_env_reader: RuntimeEnvReader | None = None,
@@ -215,6 +290,13 @@ def generate_report(
     checks_failed: list[str] = []
     failures: list[dict[str, str]] = []
     blocked_reason: str | None = None
+    receive_budget = _parse_receive_budget(
+        tdlib_auth_receive_timeout_sec,
+        tdlib_auth_max_authorization_updates,
+    )
+    receive_timeout_sec = receive_budget.receive_timeout_sec
+    max_authorization_updates = receive_budget.max_authorization_updates
+    receive_budget_seconds = receive_budget.receive_budget_seconds
 
     report: dict[str, Any] = {
         "report_type": REPORT_TYPE,
@@ -224,6 +306,9 @@ def generate_report(
         "auth_only_entrypoint_status": status,
         "selected_entrypoint": inspection["selected_entrypoint"],
         "runtime_env_path": str(runtime_env_path),
+        "tdlib_auth_receive_timeout_sec": receive_timeout_sec,
+        "tdlib_auth_max_authorization_updates": max_authorization_updates,
+        "tdlib_auth_receive_budget_seconds": receive_budget_seconds,
         "checks_failed": checks_failed,
         "failures": failures,
         "likely_next_slice": AVAILABLE_NEXT_SLICE if available else MISSING_NEXT_SLICE,
@@ -257,6 +342,15 @@ def generate_report(
         report["blocked_reason"] = reason
         return WrapperResult(exit_code=1, report=report)
 
+    if receive_budget.errors:
+        report["tdlib_auth_receive_budget_errors"] = list(receive_budget.errors)
+        return fail(
+            "tdlib_auth_receive_budget.invalid",
+            "Approved TDLib auth receive budget override is outside bounded limits.",
+            contract_status="blocked_tdlib_auth_receive_budget_invalid",
+            reason="tdlib_auth_receive_budget_invalid",
+        )
+
     if not available:
         return fail(
             "auth_only_entrypoint.missing",
@@ -274,6 +368,9 @@ def generate_report(
             "TDLib auth operator execution requires separate explicit approval.",
             contract_status="approval_required",
         )
+
+    assert receive_timeout_sec is not None
+    assert max_authorization_updates is not None
 
     auth_module = _load_auth_entrypoint_module(repo_root)
     from src.services.collector_telegram.tdlib_client import (
@@ -367,8 +464,8 @@ def generate_report(
             runner(
                 config,
                 transport=transport,
-                receive_timeout_sec=1.0,
-                max_authorization_updates=120,
+                receive_timeout_sec=receive_timeout_sec,
+                max_authorization_updates=max_authorization_updates,
             )
         )
     except Exception as exc:
@@ -430,11 +527,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", default=None)
     parser.add_argument("--runtime-env-path", default=RUNTIME_ENV_PATH)
     parser.add_argument("--approved-tdlib-auth-operator-execution", action="store_true")
+    parser.add_argument(
+        "--tdlib-auth-receive-timeout-sec",
+        default=DEFAULT_TDLIB_AUTH_RECEIVE_TIMEOUT_SEC,
+    )
+    parser.add_argument(
+        "--tdlib-auth-max-authorization-updates",
+        default=DEFAULT_TDLIB_AUTH_MAX_AUTHORIZATION_UPDATES,
+    )
     return parser
 
 
 def render_json(report: dict[str, Any]) -> str:
-    return json.dumps(report, indent=2, sort_keys=True)
+    return json.dumps(report, allow_nan=False, indent=2, sort_keys=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -445,6 +550,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         repo_root=repo_root,
         approved_tdlib_auth_operator_execution=args.approved_tdlib_auth_operator_execution,
         runtime_env_path=args.runtime_env_path,
+        tdlib_auth_receive_timeout_sec=args.tdlib_auth_receive_timeout_sec,
+        tdlib_auth_max_authorization_updates=args.tdlib_auth_max_authorization_updates,
     )
 
     if args.format == "json":
@@ -453,6 +560,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"contract_status={result.report['contract_status']}")
         print(f"auth_only_entrypoint_status={result.report['auth_only_entrypoint_status']}")
         print(f"likely_next_slice={result.report['likely_next_slice']}")
+        print(f"tdlib_auth_receive_timeout_sec={result.report['tdlib_auth_receive_timeout_sec']}")
+        print(f"tdlib_auth_max_authorization_updates={result.report['tdlib_auth_max_authorization_updates']}")
+        print(f"tdlib_auth_receive_budget_seconds={result.report['tdlib_auth_receive_budget_seconds']}")
         for failure in result.report["failures"]:
             print(f"- {failure['check']}: {failure['message']}")
     return result.exit_code

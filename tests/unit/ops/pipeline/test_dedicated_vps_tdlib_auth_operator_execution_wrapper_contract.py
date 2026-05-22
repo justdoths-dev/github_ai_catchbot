@@ -45,6 +45,9 @@ REQUIRED_REPORT_KEYS = (
     "selected_entrypoint",
     "blocked_reason",
     "runtime_env_path",
+    "tdlib_auth_receive_timeout_sec",
+    "tdlib_auth_max_authorization_updates",
+    "tdlib_auth_receive_budget_seconds",
     "runtime_env_read",
     "runtime_env_values_printed",
     "secret_values_printed",
@@ -208,6 +211,99 @@ def _approved_env(tmp_path: Path) -> dict[str, str]:
     }
 
 
+def _sensitive_runtime_env(tmp_path: Path) -> dict[str, str]:
+    env = _approved_env(tmp_path)
+    env.update(
+        {
+            "DATABASE_URL": "postgresql://collector:secret@localhost:5432/catchbot",
+            "REDIS_URL": "redis://:redis-secret@localhost:6379/0",
+            "TELEGRAM_API_HASH": "0123456789abcdef0123456789abcdef",
+            "TELEGRAM_PHONE_NUMBER": "+15555550123",
+            "TELEGRAM_LOGIN_CODE": "12345",
+            "TELEGRAM_2FA_PASSWORD": "correct horse battery staple",
+            "TDLIB_DB_ENCRYPTION_KEY": "tdlib-secret-encryption-key",
+        }
+    )
+    return env
+
+
+def _assert_invalid_budget_blocks_without_runtime_or_secret_leak(
+    *,
+    tmp_path: Path,
+    receive_timeout_sec: object,
+    max_authorization_updates: object,
+    expected_receive_timeout_sec: float | None,
+    expected_max_authorization_updates: int | None,
+    expected_receive_budget_seconds: float | None,
+    forbidden_fragments: tuple[str, ...] = (),
+) -> None:
+    env_reader_called = False
+    transport_called = False
+    runner_called = False
+    sensitive_env = _sensitive_runtime_env(tmp_path)
+
+    def forbidden_env_reader(path: str | Path) -> dict[str, str]:
+        nonlocal env_reader_called
+        env_reader_called = True
+        return sensitive_env
+
+    def forbidden_transport() -> object:
+        nonlocal transport_called
+        transport_called = True
+        raise AssertionError("transport must not be built for invalid receive budget")
+
+    async def forbidden_runner(*args, **kwargs) -> FakeAuthOnlyResult:
+        nonlocal runner_called
+        runner_called = True
+        raise AssertionError("runner must not be called for invalid receive budget")
+
+    result = _module().generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        runtime_env_path=tmp_path / "runtime.env",
+        tdlib_auth_receive_timeout_sec=receive_timeout_sec,
+        tdlib_auth_max_authorization_updates=max_authorization_updates,
+        real_transport_factory=forbidden_transport,
+        runtime_env_reader=forbidden_env_reader,
+        auth_runner=forbidden_runner,
+    )
+
+    rendered = json.dumps(result.report, allow_nan=False, sort_keys=True)
+    assert json.loads(rendered) == result.report
+    assert result.exit_code != 0
+    assert result.report["contract_status"] == "blocked_tdlib_auth_receive_budget_invalid"
+    assert result.report["blocked_reason"] == "tdlib_auth_receive_budget_invalid"
+    assert "tdlib_auth_receive_budget.invalid" in result.report["checks_failed"]
+    assert result.report["tdlib_auth_attempted"] is False
+    assert result.report["tdlib_auth_completed"] is False
+    assert result.report["runtime_env_read"] is False
+    assert result.report["runtime_env_values_printed"] is False
+    assert result.report["secret_values_printed"] is False
+    assert env_reader_called is False
+    assert transport_called is False
+    assert runner_called is False
+    assert result.report["tdlib_auth_receive_timeout_sec"] == expected_receive_timeout_sec
+    assert result.report["tdlib_auth_max_authorization_updates"] == expected_max_authorization_updates
+    assert result.report["tdlib_auth_receive_budget_seconds"] == expected_receive_budget_seconds
+    assert "NaN" not in rendered
+    assert "Infinity" not in rendered
+    forbidden_values = (
+        sensitive_env["DATABASE_URL"],
+        sensitive_env["REDIS_URL"],
+        sensitive_env["TELEGRAM_API_HASH"],
+        sensitive_env["TELEGRAM_PHONE_NUMBER"],
+        sensitive_env["TELEGRAM_LOGIN_CODE"],
+        sensitive_env["TELEGRAM_2FA_PASSWORD"],
+        sensitive_env["TDLIB_DB_ENCRYPTION_KEY"],
+        sensitive_env["TDLIB_STATE_DIR"],
+        sensitive_env["TDLIB_FILES_DIR"],
+    )
+    for value in forbidden_values:
+        assert value not in rendered
+    for fragment in forbidden_fragments:
+        assert fragment not in rendered
+
+
 def _run_default_wrapper() -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPT), "--format", "json"],
@@ -239,6 +335,28 @@ def test_wrapper_output_includes_required_shape() -> None:
 
     for key in REQUIRED_REPORT_KEYS:
         assert key in report
+
+
+def test_wrapper_default_receive_budget_is_preserved() -> None:
+    report = _module().generate_report(ROOT).report
+
+    assert report["tdlib_auth_receive_timeout_sec"] == 1.0
+    assert report["tdlib_auth_max_authorization_updates"] == 120
+    assert report["tdlib_auth_receive_budget_seconds"] == 120.0
+
+
+def test_parser_accepts_receive_budget_override_options_as_raw_strings() -> None:
+    args = _module().build_parser().parse_args(
+        [
+            "--tdlib-auth-receive-timeout-sec",
+            "2.5",
+            "--tdlib-auth-max-authorization-updates",
+            "200",
+        ]
+    )
+
+    assert args.tdlib_auth_receive_timeout_sec == "2.5"
+    assert args.tdlib_auth_max_authorization_updates == "200"
 
 
 def test_wrapper_does_not_read_runtime_env() -> None:
@@ -474,6 +592,9 @@ def test_approved_mode_uses_auth_only_entrypoint_once_with_redacted_result(tmp_p
     config = calls[0]["args"][0]
     assert calls[0]["kwargs"]["receive_timeout_sec"] == 1.0
     assert calls[0]["kwargs"]["max_authorization_updates"] == 120
+    assert result.report["tdlib_auth_receive_timeout_sec"] == 1.0
+    assert result.report["tdlib_auth_max_authorization_updates"] == 120
+    assert result.report["tdlib_auth_receive_budget_seconds"] == 120.0
     assert config.telegram_api_id == 12345
     assert config.telegram_api_hash == "fake-api-hash"
     assert config.tdlib_state_dir == str(tmp_path / "tdlib-state")
@@ -503,6 +624,169 @@ def test_approved_mode_uses_auth_only_entrypoint_once_with_redacted_result(tmp_p
     assert result.report["collector_runtime_used"] is False
     assert "fake-api-hash" not in rendered
     assert "fake-tdlib-key" not in rendered
+
+
+def test_approved_mode_passes_custom_receive_budget_to_auth_runner(tmp_path: Path) -> None:
+    calls: list[dict] = []
+
+    async def fake_runner(*args, **kwargs) -> FakeAuthOnlyResult:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeAuthOnlyResult(
+            extra_payload={
+                "receive_timeout_sec": kwargs["receive_timeout_sec"],
+                "max_authorization_updates": kwargs["max_authorization_updates"],
+            }
+        )
+
+    result = _module().generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        runtime_env_path=tmp_path / "runtime.env",
+        tdlib_auth_receive_timeout_sec="2.5",
+        tdlib_auth_max_authorization_updates="200",
+        real_transport_factory=object,
+        runtime_env_reader=lambda path: _approved_env(tmp_path),
+        auth_runner=fake_runner,
+    )
+
+    auth_payload = result.report["auth_only_entrypoint_result"]
+    assert result.exit_code != 0
+    assert len(calls) == 1
+    assert calls[0]["kwargs"]["receive_timeout_sec"] == 2.5
+    assert calls[0]["kwargs"]["max_authorization_updates"] == 200
+    assert result.report["tdlib_auth_receive_timeout_sec"] == 2.5
+    assert result.report["tdlib_auth_max_authorization_updates"] == 200
+    assert result.report["tdlib_auth_receive_budget_seconds"] == 500.0
+    assert auth_payload["receive_timeout_sec"] == 2.5
+    assert auth_payload["max_authorization_updates"] == 200
+    assert result.report["contract_status"] == "manual_intervention_required"
+    assert result.report["runtime_env_values_printed"] is False
+    assert result.report["secret_values_printed"] is False
+
+
+def test_invalid_receive_timeout_blocks_before_transport_or_runner(tmp_path: Path) -> None:
+    _assert_invalid_budget_blocks_without_runtime_or_secret_leak(
+        tmp_path=tmp_path,
+        receive_timeout_sec=0.0,
+        max_authorization_updates=120,
+        expected_receive_timeout_sec=0.0,
+        expected_max_authorization_updates=120,
+        expected_receive_budget_seconds=0.0,
+    )
+
+
+def test_invalid_max_authorization_updates_blocks_before_transport_or_runner(tmp_path: Path) -> None:
+    _assert_invalid_budget_blocks_without_runtime_or_secret_leak(
+        tmp_path=tmp_path,
+        receive_timeout_sec=1.0,
+        max_authorization_updates=0,
+        expected_receive_timeout_sec=1.0,
+        expected_max_authorization_updates=0,
+        expected_receive_budget_seconds=0.0,
+    )
+
+
+def test_total_receive_budget_over_limit_blocks_before_transport_or_runner(tmp_path: Path) -> None:
+    _assert_invalid_budget_blocks_without_runtime_or_secret_leak(
+        tmp_path=tmp_path,
+        receive_timeout_sec=2.0,
+        max_authorization_updates=301,
+        expected_receive_timeout_sec=2.0,
+        expected_max_authorization_updates=301,
+        expected_receive_budget_seconds=602.0,
+    )
+
+
+def test_receive_budget_parse_invalid_cases_block_before_runtime_transport_or_runner(
+    tmp_path: Path,
+) -> None:
+    cases = (
+        ("not-a-number", 120, None, 120, None, ("not-a-number",)),
+        (1.0, "not-an-int", 1.0, None, None, ("not-an-int",)),
+        ("NaN", 120, None, 120, None, ("NaN",)),
+        ("Infinity", 120, None, 120, None, ("Infinity",)),
+        (0.0, 120, 0.0, 120, 0.0, ()),
+        (5.1, 120, 5.1, 120, 612.0, ()),
+        (1.0, 0, 1.0, 0, 0.0, ()),
+        (1.0, 601, 1.0, 601, 601.0, ()),
+        (5.0, 121, 5.0, 121, 605.0, ()),
+    )
+
+    for (
+        receive_timeout_sec,
+        max_authorization_updates,
+        expected_receive_timeout_sec,
+        expected_max_authorization_updates,
+        expected_receive_budget_seconds,
+        forbidden_fragments,
+    ) in cases:
+        _assert_invalid_budget_blocks_without_runtime_or_secret_leak(
+            tmp_path=tmp_path,
+            receive_timeout_sec=receive_timeout_sec,
+            max_authorization_updates=max_authorization_updates,
+            expected_receive_timeout_sec=expected_receive_timeout_sec,
+            expected_max_authorization_updates=expected_max_authorization_updates,
+            expected_receive_budget_seconds=expected_receive_budget_seconds,
+            forbidden_fragments=forbidden_fragments,
+        )
+
+
+def test_cli_invalid_receive_budget_values_return_wrapper_json_without_parser_stderr() -> None:
+    cases = (
+        (
+            "--tdlib-auth-receive-timeout-sec",
+            "not-a-number",
+            "not-a-number",
+        ),
+        (
+            "--tdlib-auth-max-authorization-updates",
+            "not-an-int",
+            "not-an-int",
+        ),
+        (
+            "--tdlib-auth-receive-timeout-sec",
+            "NaN",
+            "NaN",
+        ),
+        (
+            "--tdlib-auth-receive-timeout-sec",
+            "Infinity",
+            "Infinity",
+        ),
+    )
+
+    for option, value, forbidden_fragment in cases:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--format",
+                "json",
+                "--approved-tdlib-auth-operator-execution",
+                "--runtime-env-path",
+                str(ROOT / "missing-runtime.env"),
+                option,
+                value,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+
+        assert result.returncode != 0
+        assert result.stderr == ""
+        report = json.loads(result.stdout)
+        rendered = json.dumps(report, allow_nan=False, sort_keys=True)
+        assert report["contract_status"] == "blocked_tdlib_auth_receive_budget_invalid"
+        assert report["blocked_reason"] == "tdlib_auth_receive_budget_invalid"
+        assert "tdlib_auth_receive_budget.invalid" in report["checks_failed"]
+        assert report["tdlib_auth_attempted"] is False
+        assert report["runtime_env_read"] is False
+        assert report["runtime_env_values_printed"] is False
+        assert report["secret_values_printed"] is False
+        assert "argument --tdlib-auth" not in result.stderr
+        assert forbidden_fragment not in rendered
 
 
 def test_wrapper_passes_through_auth_progress_fields_without_secret_payload(tmp_path: Path) -> None:
