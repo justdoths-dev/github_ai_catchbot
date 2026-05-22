@@ -149,6 +149,22 @@ def parse_runtime_env_file(path: str | Path) -> dict[str, str]:
     return parse_runtime_env_text(Path(path).read_text(encoding="utf-8", errors="replace"))
 
 
+def _runtime_env_tdjson_library_path(runtime_env: dict[str, str]) -> str | None:
+    candidate = runtime_env.get("TDJSON_LIBRARY_PATH")
+    if not isinstance(candidate, str):
+        return None
+    stripped = candidate.strip()
+    return stripped or None
+
+
+def build_real_tdlib_transport_from_runtime_env(tdjson_library_path: str | None) -> Any:
+    from src.services.collector_telegram.tdlib_client import TDJsonTransport
+
+    transport = TDJsonTransport(library_path=tdjson_library_path)
+    transport.assert_available()
+    return transport
+
+
 def _parse_receive_budget(
     receive_timeout_sec_value: object,
     max_authorization_updates_value: object,
@@ -324,6 +340,9 @@ def generate_report(
         "failures": failures,
         "likely_next_slice": AVAILABLE_NEXT_SLICE if available else MISSING_NEXT_SLICE,
         "blocked_reason": blocked_reason,
+        "tdjson_library_path_present": False,
+        "tdjson_library_path_used": False,
+        "tdjson_available": False,
         "entrypoint_assessment": {
             "collector_main_runtime_entrypoint": inspection["collector_main_runtime_entrypoint"],
             "auth_entrypoint_imports_runtime": inspection["auth_entrypoint_imports_runtime"],
@@ -411,6 +430,8 @@ def generate_report(
             reason="runtime_env_unreadable",
         )
     report["runtime_env_read"] = True
+    tdjson_library_path = _runtime_env_tdjson_library_path(runtime_env)
+    report["tdjson_library_path_present"] = tdjson_library_path is not None
 
     try:
         config = auth_module.CollectorTelegramConfig.from_env(runtime_env)
@@ -457,9 +478,13 @@ def generate_report(
             reason="tdlib_parameters_semantic_invalid",
         )
 
-    transport_factory = real_transport_factory or auth_module.build_real_tdlib_transport
     try:
-        transport = transport_factory()
+        if real_transport_factory is None:
+            report["tdjson_library_path_used"] = tdjson_library_path is not None
+            transport = build_real_tdlib_transport_from_runtime_env(tdjson_library_path)
+        else:
+            transport = real_transport_factory()
+        report["tdjson_available"] = True
     except Exception:
         return fail(
             "tdlib.real_transport_missing",

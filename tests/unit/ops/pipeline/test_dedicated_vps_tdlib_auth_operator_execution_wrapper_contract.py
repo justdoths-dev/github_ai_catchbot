@@ -55,6 +55,9 @@ REQUIRED_REPORT_KEYS = (
     "tdlib_auth_receive_timeout_sec",
     "tdlib_auth_max_authorization_updates",
     "tdlib_auth_receive_budget_seconds",
+    "tdjson_library_path_present",
+    "tdjson_library_path_used",
+    "tdjson_available",
     "runtime_env_read",
     "runtime_env_values_printed",
     "secret_values_printed",
@@ -575,6 +578,118 @@ def test_approved_mode_blocks_when_real_transport_missing_after_redacted_shape_g
         "valid": True,
         "errors": [],
     }
+    assert result.report["tdjson_library_path_present"] is False
+    assert result.report["tdjson_library_path_used"] is False
+    assert result.report["tdjson_available"] is False
+
+
+def test_approved_mode_passes_runtime_env_tdjson_path_to_default_transport_without_printing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _module()
+    tdjson_path = "/opt/github-ai-catchbot/tdlib/lib/libtdjson.so"
+    runtime_env = _approved_env(tmp_path)
+    runtime_env["TDJSON_LIBRARY_PATH"] = tdjson_path
+    captured_paths: list[str | None] = []
+
+    def fake_transport_builder(library_path: str | None) -> object:
+        captured_paths.append(library_path)
+        return object()
+
+    async def fake_runner(*args, **kwargs) -> FakeAuthOnlyResult:
+        return FakeAuthOnlyResult()
+
+    monkeypatch.setattr(
+        module,
+        "build_real_tdlib_transport_from_runtime_env",
+        fake_transport_builder,
+    )
+
+    result = module.generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        runtime_env_path=tmp_path / "runtime.env",
+        runtime_env_reader=lambda path: runtime_env,
+        auth_runner=fake_runner,
+    )
+
+    rendered = json.dumps(result.report, sort_keys=True)
+    assert captured_paths == [tdjson_path]
+    assert result.report["tdjson_library_path_present"] is True
+    assert result.report["tdjson_library_path_used"] is True
+    assert result.report["tdjson_available"] is True
+    assert result.report["runtime_env_read"] is True
+    assert result.report["tdlib_auth_attempted"] is True
+    assert "TDJSON_LIBRARY_PATH" not in rendered
+    assert tdjson_path not in rendered
+    assert "fake-api-hash" not in rendered
+    assert "fake-tdlib-key" not in rendered
+    assert "+10000000000" not in rendered
+
+
+def test_approved_mode_invalid_runtime_env_tdjson_path_blocks_before_auth_runner_without_printing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _module()
+    tdjson_path = "/safe/missing/libtdjson.so"
+    runtime_env = _approved_env(tmp_path)
+    runtime_env["TDJSON_LIBRARY_PATH"] = tdjson_path
+    captured_paths: list[str | None] = []
+    runner_called = False
+
+    def missing_transport_builder(library_path: str | None) -> object:
+        captured_paths.append(library_path)
+        raise RuntimeError("tdjson unavailable")
+
+    async def forbidden_runner(*args, **kwargs) -> FakeAuthOnlyResult:
+        nonlocal runner_called
+        runner_called = True
+        raise AssertionError("auth runner must not be called when tdjson is unavailable")
+
+    monkeypatch.setattr(
+        module,
+        "build_real_tdlib_transport_from_runtime_env",
+        missing_transport_builder,
+    )
+
+    result = module.generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        runtime_env_path=tmp_path / "runtime.env",
+        runtime_env_reader=lambda path: runtime_env,
+        auth_runner=forbidden_runner,
+    )
+
+    rendered = json.dumps(result.report, sort_keys=True)
+    assert captured_paths == [tdjson_path]
+    assert result.exit_code != 0
+    assert result.report["contract_status"] == "blocked_real_transport_missing"
+    assert result.report["blocked_reason"] == "blocked_real_transport_missing"
+    assert result.report["tdjson_library_path_present"] is True
+    assert result.report["tdjson_library_path_used"] is True
+    assert result.report["tdjson_available"] is False
+    assert result.report["runtime_env_read"] is True
+    assert result.report["tdlib_auth_attempted"] is False
+    assert result.report["tdlib_auth_completed"] is False
+    assert result.report["session_state_created_or_reused"] is False
+    assert result.report["tdlib_parameters_shape_guard"] == {
+        "checked": True,
+        "valid": True,
+        "errors": [],
+    }
+    assert result.report["tdlib_parameters_semantic_guard"] == {
+        "checked": True,
+        "valid": True,
+        "errors": [],
+    }
+    assert runner_called is False
+    assert "TDJSON_LIBRARY_PATH" not in rendered
+    assert tdjson_path not in rendered
+    assert "fake-api-hash" not in rendered
+    assert "fake-tdlib-key" not in rendered
+    assert "+10000000000" not in rendered
 
 
 def test_approved_mode_blocks_invalid_tdlib_parameters_before_transport_or_runner(tmp_path: Path) -> None:

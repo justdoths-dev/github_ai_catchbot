@@ -17,6 +17,9 @@ from .config import CollectorTelegramConfig
 from .exceptions import TDLibTransportError
 
 JsonDict = dict[str, Any]
+DEFAULT_TDJSON_LIBRARY_PATH_CANDIDATES = (
+    "/opt/github-ai-catchbot/tdlib/lib/libtdjson.so",
+)
 
 
 def tdlib_json_bytes(value: str) -> str:
@@ -174,6 +177,7 @@ class TDJsonTransport:
             self._library_path
             or os.environ.get("TDJSON_LIBRARY_PATH")
             or ctypes.util.find_library("tdjson")
+            or self._default_library_path_candidate()
         )
         if not candidate:
             raise TDLibTransportError("tdjson library not found")
@@ -191,6 +195,13 @@ class TDJsonTransport:
         except AttributeError as exc:
             raise TDLibTransportError("tdjson library is missing required client symbols") from exc
         return tdjson
+
+    @staticmethod
+    def _default_library_path_candidate() -> str | None:
+        for candidate in DEFAULT_TDJSON_LIBRARY_PATH_CANDIDATES:
+            if os.path.exists(candidate):
+                return candidate
+        return None
 
 
 @dataclass(slots=True, frozen=True)

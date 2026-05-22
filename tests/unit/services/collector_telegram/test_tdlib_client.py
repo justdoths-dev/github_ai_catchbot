@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 import sys
 import unittest
-from unittest.mock import patch
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -14,11 +16,21 @@ from services.collector_telegram.config import CollectorTelegramConfig
 from services.collector_telegram.exceptions import TDLibTransportError
 from services.collector_telegram.models import CollectorEnvironment, CollectorMode
 from services.collector_telegram.tdlib_client import (
+    DEFAULT_TDJSON_LIBRARY_PATH_CANDIDATES,
     TDJsonTransport,
     TDLibClient,
     tdlib_parameters_semantic_errors,
     tdlib_parameters_shape_errors,
 )
+
+
+def _fake_tdjson_cdll() -> SimpleNamespace:
+    return SimpleNamespace(
+        td_json_client_create=SimpleNamespace(),
+        td_json_client_send=SimpleNamespace(),
+        td_json_client_receive=SimpleNamespace(),
+        td_json_client_destroy=SimpleNamespace(),
+    )
 
 
 class StubTransport:
@@ -126,8 +138,56 @@ class TDLibClientTests(unittest.IsolatedAsyncioTestCase):
 
     def test_real_tdjson_transport_reports_missing_library(self) -> None:
         with patch("services.collector_telegram.tdlib_client.ctypes.util.find_library", return_value=None):
-            with self.assertRaises(TDLibTransportError):
-                TDJsonTransport().assert_available()
+            with patch("services.collector_telegram.tdlib_client.os.path.exists", return_value=False):
+                with self.assertRaises(TDLibTransportError):
+                    TDJsonTransport().assert_available()
+
+    def test_real_tdjson_transport_uses_explicit_library_path_without_find_library(self) -> None:
+        explicit_path = "/safe/test/libtdjson.so"
+        fake_cdll = _fake_tdjson_cdll()
+
+        with patch(
+            "services.collector_telegram.tdlib_client.ctypes.util.find_library",
+            return_value=None,
+        ) as find_library:
+            with patch("services.collector_telegram.tdlib_client.ctypes.CDLL", return_value=fake_cdll) as cdll:
+                TDJsonTransport(library_path=explicit_path).assert_available()
+
+        find_library.assert_not_called()
+        cdll.assert_called_once_with(explicit_path)
+
+    def test_real_tdjson_transport_preserves_env_var_path_behavior(self) -> None:
+        env_path = "/safe/env/libtdjson.so"
+        fake_cdll = _fake_tdjson_cdll()
+
+        with patch.dict(os.environ, {"TDJSON_LIBRARY_PATH": env_path}, clear=False):
+            with patch(
+                "services.collector_telegram.tdlib_client.ctypes.util.find_library",
+                return_value=None,
+            ) as find_library:
+                with patch(
+                    "services.collector_telegram.tdlib_client.ctypes.CDLL",
+                    return_value=fake_cdll,
+                ) as cdll:
+                    TDJsonTransport().assert_available()
+
+        find_library.assert_not_called()
+        cdll.assert_called_once_with(env_path)
+
+    def test_real_tdjson_transport_uses_vps_default_path_candidate(self) -> None:
+        fake_cdll = _fake_tdjson_cdll()
+        default_path = DEFAULT_TDJSON_LIBRARY_PATH_CANDIDATES[0]
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("services.collector_telegram.tdlib_client.ctypes.util.find_library", return_value=None):
+                with patch("services.collector_telegram.tdlib_client.os.path.exists", return_value=True):
+                    with patch(
+                        "services.collector_telegram.tdlib_client.ctypes.CDLL",
+                        return_value=fake_cdll,
+                    ) as cdll:
+                        TDJsonTransport().assert_available()
+
+        cdll.assert_called_once_with(default_path)
 
     def test_tdlib_parameter_shape_guard_rejects_default_like_payload(self) -> None:
         invalid_payload = {
