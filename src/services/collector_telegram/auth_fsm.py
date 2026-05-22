@@ -202,6 +202,12 @@ class AuthorizationFSM:
             },
         }
 
+    def build_check_authentication_code_request(self, code: str) -> JsonDict:
+        return {
+            "@type": "checkAuthenticationCode",
+            "code": code,
+        }
+
     def _build_check_authentication_password_request(self, password: str) -> JsonDict:
         return {
             "@type": "checkAuthenticationPassword",

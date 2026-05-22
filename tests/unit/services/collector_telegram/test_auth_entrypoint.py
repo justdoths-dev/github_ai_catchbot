@@ -113,6 +113,8 @@ def _assert_no_runtime_side_effects(payload: dict[str, Any]) -> None:
         "collector_main_imported",
         "collector_runtime_started",
         "session_state_created_or_reused",
+        "login_code_value_printed",
+        "login_code_value_stored",
     ):
         assert payload[key] is False
 
@@ -196,10 +198,170 @@ async def test_manual_login_code_state_requires_intervention_without_recording_c
     assert payload["requests_sent_count"] == 0
     assert payload["auth_request_types_sent"] == []
     assert payload["last_auth_request_type"] is None
+    assert payload["login_code_prompted"] is False
+    assert payload["login_code_submitted"] is False
+    assert payload["login_code_value_printed"] is False
+    assert payload["login_code_value_stored"] is False
     rendered = json.dumps(payload)
-    assert "login_code" not in rendered
     assert "checkAuthenticationCode" not in rendered
     assert transport.sent_requests == []
+    _assert_no_runtime_side_effects(payload)
+
+
+@pytest.mark.asyncio
+async def test_approved_login_code_entry_prompts_and_submits_only_after_wait_code(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sensitive_code = "sensitive-code-for-test"
+    prompts: list[str] = []
+
+    def prompt(prompt_text: str) -> str:
+        prompts.append(prompt_text)
+        assert sensitive_code not in prompt_text
+        return sensitive_code
+
+    transport = FakeTransport(
+        [
+            _state("authorizationStateWaitCode"),
+            _state("authorizationStateReady"),
+        ]
+    )
+
+    result = await run_tdlib_auth_only_once(
+        _config(),
+        transport=transport,
+        receive_timeout_sec=0,
+        approved_tdlib_auth_code_entry=True,
+        login_code_prompt=prompt,
+        login_code_entry_is_interactive=lambda: True,
+    )
+
+    payload = result.to_redacted_dict()
+    rendered = json.dumps(payload, sort_keys=True)
+    captured = capsys.readouterr()
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert payload["auth_entrypoint_status"] == "ready"
+    assert payload["tdlib_auth_completed"] is True
+    assert payload["login_code_prompted"] is True
+    assert payload["login_code_submitted"] is True
+    assert payload["login_code_value_printed"] is False
+    assert payload["login_code_value_stored"] is False
+    assert payload["requests_sent_count"] == 1
+    assert payload["auth_request_types_sent"] == ["checkAuthenticationCode_redacted"]
+    assert payload["last_auth_request_type"] == "checkAuthenticationCode_redacted"
+    assert prompts == ["Telegram login code: "]
+    assert transport.sent_requests == [
+        {
+            "@type": "checkAuthenticationCode",
+            "code": sensitive_code,
+            "@extra": "auth:1:checkAuthenticationCode_redacted",
+        }
+    ]
+    assert sensitive_code not in rendered
+    assert sensitive_code not in captured.out
+    assert sensitive_code not in captured.err
+    assert sensitive_code not in logged
+    _assert_no_runtime_side_effects(payload)
+
+
+@pytest.mark.asyncio
+async def test_approved_login_code_entry_does_not_prompt_before_wait_code() -> None:
+    def forbidden_prompt(prompt_text: str) -> str:
+        raise AssertionError("login code prompt must not run before WaitCode")
+
+    transport = FakeTransport([_state("authorizationStateReady")])
+
+    result = await run_tdlib_auth_only_once(
+        _config(),
+        transport=transport,
+        receive_timeout_sec=0,
+        approved_tdlib_auth_code_entry=True,
+        login_code_prompt=forbidden_prompt,
+        login_code_entry_is_interactive=lambda: True,
+    )
+
+    payload = result.to_redacted_dict()
+    assert payload["auth_entrypoint_status"] == "ready"
+    assert payload["login_code_prompted"] is False
+    assert payload["login_code_submitted"] is False
+    assert transport.sent_requests == []
+    _assert_no_runtime_side_effects(payload)
+
+
+@pytest.mark.asyncio
+async def test_approved_login_code_entry_fails_closed_when_not_interactive() -> None:
+    def forbidden_prompt(prompt_text: str) -> str:
+        raise AssertionError("login code prompt must not run without an interactive terminal")
+
+    transport = FakeTransport([_state("authorizationStateWaitCode")])
+
+    result = await run_tdlib_auth_only_once(
+        _config(),
+        transport=transport,
+        receive_timeout_sec=0,
+        approved_tdlib_auth_code_entry=True,
+        login_code_prompt=forbidden_prompt,
+        login_code_entry_is_interactive=lambda: False,
+    )
+
+    payload = result.to_redacted_dict()
+    rendered = json.dumps(payload, sort_keys=True)
+    assert payload["auth_entrypoint_status"] == "blocked_tdlib_auth_code_entry_not_interactive"
+    assert payload["tdlib_auth_attempted"] is True
+    assert payload["manual_intervention_required"] is False
+    assert payload["final_authorization_state"] == "waiting_code"
+    assert payload["requests_sent_count"] == 0
+    assert payload["auth_request_types_sent"] == []
+    assert payload["login_code_prompted"] is False
+    assert payload["login_code_submitted"] is False
+    assert payload["login_code_value_printed"] is False
+    assert payload["login_code_value_stored"] is False
+    assert payload["error"] == "tdlib_auth_code_entry_not_interactive"
+    assert "sensitive-code-for-test" not in rendered
+    assert transport.sent_requests == []
+    _assert_no_runtime_side_effects(payload)
+
+
+@pytest.mark.asyncio
+async def test_approved_login_code_entry_allows_configured_2fa_after_code() -> None:
+    sensitive_code = "sensitive-code-for-test"
+    password = "fake-password-for-test"
+    transport = FakeTransport(
+        [
+            _state("authorizationStateWaitCode"),
+            _state("authorizationStateWaitPassword"),
+            _state("authorizationStateReady"),
+        ]
+    )
+
+    result = await run_tdlib_auth_only_once(
+        _config(password=password),
+        transport=transport,
+        receive_timeout_sec=0,
+        approved_tdlib_auth_code_entry=True,
+        login_code_prompt=lambda prompt_text: sensitive_code,
+        login_code_entry_is_interactive=lambda: True,
+    )
+
+    payload = result.to_redacted_dict()
+    rendered = json.dumps(payload, sort_keys=True)
+    assert payload["auth_entrypoint_status"] == "ready"
+    assert payload["tdlib_auth_completed"] is True
+    assert payload["login_code_prompted"] is True
+    assert payload["login_code_submitted"] is True
+    assert payload["auth_request_types_sent"] == [
+        "checkAuthenticationCode_redacted",
+        "checkAuthenticationPassword",
+    ]
+    assert [request["@type"] for request in transport.sent_requests] == [
+        "checkAuthenticationCode",
+        "checkAuthenticationPassword",
+    ]
+    assert transport.sent_requests[0]["code"] == sensitive_code
+    assert transport.sent_requests[1]["password"] == password
+    assert sensitive_code not in rendered
+    assert password not in rendered
     _assert_no_runtime_side_effects(payload)
 
 

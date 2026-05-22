@@ -58,7 +58,20 @@ class AuthorizationFSMTests(unittest.TestCase):
         result = fsm.handle_state({"@type": "authorizationStateWaitCode"})
         self.assertEqual(result.new_state, "waiting_code")
         self.assertTrue(result.requires_manual_intervention)
+        self.assertEqual(result.requests, [])
         self.assertTrue(fsm.requires_manual_intervention())
+
+    def test_check_authentication_code_request_builder_is_not_used_by_default(self) -> None:
+        fsm = AuthorizationFSM(self._config())
+        request = fsm.build_check_authentication_code_request("test-code-value")
+
+        self.assertEqual(
+            request,
+            {
+                "@type": "checkAuthenticationCode",
+                "code": "test-code-value",
+            },
+        )
 
     def test_wait_encryption_key_builds_tdlib_json_bytes_request(self) -> None:
         fsm = AuthorizationFSM(self._config())

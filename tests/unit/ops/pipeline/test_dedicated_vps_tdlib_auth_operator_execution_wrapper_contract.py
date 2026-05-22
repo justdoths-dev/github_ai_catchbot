@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = ROOT / "scripts" / "ops" / "dedicated_vps_tdlib_auth_operator_execution_wrapper.py"
@@ -21,6 +23,10 @@ RUNBOOK = (
 SIDE_EFFECT_BOOLEAN_KEYS = (
     "runtime_env_read",
     "runtime_env_values_printed",
+    "login_code_prompted",
+    "login_code_submitted",
+    "login_code_value_printed",
+    "login_code_value_stored",
     "tdlib_auth_attempted",
     "tdlib_auth_completed",
     "telegram_connected",
@@ -41,6 +47,7 @@ REQUIRED_REPORT_KEYS = (
     "contract_status",
     "approval_required",
     "approved_execution_requested",
+    "approved_tdlib_auth_code_entry_requested",
     "auth_only_entrypoint_status",
     "selected_entrypoint",
     "blocked_reason",
@@ -51,6 +58,10 @@ REQUIRED_REPORT_KEYS = (
     "runtime_env_read",
     "runtime_env_values_printed",
     "secret_values_printed",
+    "login_code_prompted",
+    "login_code_submitted",
+    "login_code_value_printed",
+    "login_code_value_stored",
     "tdlib_auth_attempted",
     "tdlib_auth_completed",
     "manual_intervention_required",
@@ -170,6 +181,10 @@ class FakeAuthOnlyResult:
             "max_authorization_updates": 120,
             "receive_timeout_sec": 1.0,
             "runtime_env_values_printed": False,
+            "login_code_prompted": False,
+            "login_code_submitted": False,
+            "login_code_value_printed": False,
+            "login_code_value_stored": False,
             "database_connected": False,
             "redis_connected": False,
             "alembic_run": False,
@@ -326,6 +341,7 @@ def test_wrapper_default_no_approval_returns_json_and_no_side_effects() -> None:
     assert report["likely_next_slice"] == "dedicated_vps_tdlib_auth_operator_execution"
     assert report["approval_required"] is True
     assert report["approved_execution_requested"] is False
+    assert report["approved_tdlib_auth_code_entry_requested"] is False
     for key in SIDE_EFFECT_BOOLEAN_KEYS:
         assert report[key] is False
 
@@ -357,6 +373,28 @@ def test_parser_accepts_receive_budget_override_options_as_raw_strings() -> None
 
     assert args.tdlib_auth_receive_timeout_sec == "2.5"
     assert args.tdlib_auth_max_authorization_updates == "200"
+
+
+def test_parser_accepts_approved_code_entry_flag_without_code_value_options() -> None:
+    parser = _module().build_parser()
+    args = parser.parse_args(["--approved-tdlib-auth-code-entry"])
+    option_strings = {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+    }
+
+    assert args.approved_tdlib_auth_code_entry is True
+    assert "--approved-tdlib-auth-code-entry" in option_strings
+    for forbidden_option in (
+        "--telegram-login-code",
+        "--tdlib-auth-login-code",
+        "--tdlib-auth-code",
+        "--auth-code",
+    ):
+        assert forbidden_option not in option_strings
+        with pytest.raises(SystemExit):
+            parser.parse_args([forbidden_option, "sensitive-code-for-test"])
 
 
 def test_wrapper_does_not_read_runtime_env() -> None:
@@ -420,6 +458,94 @@ def test_tests_do_not_call_approved_execution_flag() -> None:
     assert report["blocked_reason"] == "runtime_env_unreadable"
     assert report["runtime_env_read"] is False
     assert report["tdlib_auth_attempted"] is False
+
+
+def test_code_entry_flag_noninteractive_blocks_before_runtime_or_auth(tmp_path: Path) -> None:
+    env_reader_called = False
+    transport_called = False
+    runner_called = False
+    prompt_called = False
+
+    def forbidden_env_reader(path: str | Path) -> dict[str, str]:
+        nonlocal env_reader_called
+        env_reader_called = True
+        return _sensitive_runtime_env(tmp_path)
+
+    def forbidden_transport() -> object:
+        nonlocal transport_called
+        transport_called = True
+        raise AssertionError("transport must not be built without an interactive terminal")
+
+    async def forbidden_runner(*args, **kwargs) -> FakeAuthOnlyResult:
+        nonlocal runner_called
+        runner_called = True
+        raise AssertionError("runner must not be called without an interactive terminal")
+
+    def forbidden_prompt(prompt_text: str) -> str:
+        nonlocal prompt_called
+        prompt_called = True
+        raise AssertionError("prompt must not run without an interactive terminal")
+
+    result = _module().generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        approved_tdlib_auth_code_entry=True,
+        runtime_env_path=tmp_path / "runtime.env",
+        real_transport_factory=forbidden_transport,
+        runtime_env_reader=forbidden_env_reader,
+        auth_runner=forbidden_runner,
+        login_code_prompt=forbidden_prompt,
+        code_entry_interactive_checker=lambda: False,
+    )
+
+    rendered = json.dumps(result.report, sort_keys=True)
+    assert result.exit_code != 0
+    assert result.report["contract_status"] == "blocked_tdlib_auth_code_entry_not_interactive"
+    assert result.report["blocked_reason"] == "tdlib_auth_code_entry_not_interactive"
+    assert "tdlib_auth_code_entry.not_interactive" in result.report["checks_failed"]
+    assert result.report["approved_tdlib_auth_code_entry_requested"] is True
+    assert result.report["tdlib_auth_attempted"] is False
+    assert result.report["runtime_env_read"] is False
+    assert result.report["login_code_prompted"] is False
+    assert result.report["login_code_submitted"] is False
+    assert result.report["login_code_value_printed"] is False
+    assert result.report["login_code_value_stored"] is False
+    assert env_reader_called is False
+    assert transport_called is False
+    assert runner_called is False
+    assert prompt_called is False
+    assert "sensitive-code-for-test" not in rendered
+
+
+def test_cli_code_entry_noninteractive_returns_redacted_json_without_prompt_stderr() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--format",
+            "json",
+            "--approved-tdlib-auth-operator-execution",
+            "--approved-tdlib-auth-code-entry",
+            "--runtime-env-path",
+            str(ROOT / "missing-runtime.env"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    report = json.loads(result.stdout)
+    assert result.returncode != 0
+    assert result.stderr == ""
+    assert report["contract_status"] == "blocked_tdlib_auth_code_entry_not_interactive"
+    assert report["blocked_reason"] == "tdlib_auth_code_entry_not_interactive"
+    assert report["runtime_env_read"] is False
+    assert report["tdlib_auth_attempted"] is False
+    assert report["login_code_prompted"] is False
+    assert report["login_code_submitted"] is False
+    assert report["login_code_value_printed"] is False
+    assert report["login_code_value_stored"] is False
 
 
 def test_approved_mode_blocks_when_real_transport_missing_after_redacted_shape_guard(tmp_path: Path) -> None:
@@ -624,6 +750,57 @@ def test_approved_mode_uses_auth_only_entrypoint_once_with_redacted_result(tmp_p
     assert result.report["collector_runtime_used"] is False
     assert "fake-api-hash" not in rendered
     assert "fake-tdlib-key" not in rendered
+
+
+def test_approved_code_entry_passes_only_prompt_function_and_safe_booleans(tmp_path: Path) -> None:
+    calls: list[dict] = []
+    sensitive_code = "sensitive-code-for-test"
+
+    def prompt(prompt_text: str) -> str:
+        raise AssertionError("wrapper unit test fake runner must own prompt timing")
+
+    async def fake_runner(*args, **kwargs) -> FakeAuthOnlyResult:
+        calls.append({"args": args, "kwargs": kwargs})
+        return FakeAuthOnlyResult(
+            extra_payload={
+                "requests_sent_count": 1,
+                "auth_request_types_sent": ["checkAuthenticationCode_redacted"],
+                "last_auth_request_type": "checkAuthenticationCode_redacted",
+                "login_code_prompted": True,
+                "login_code_submitted": True,
+                "login_code_value_printed": False,
+                "login_code_value_stored": False,
+            }
+        )
+
+    result = _module().generate_report(
+        ROOT,
+        approved_tdlib_auth_operator_execution=True,
+        approved_tdlib_auth_code_entry=True,
+        runtime_env_path=tmp_path / "runtime.env",
+        real_transport_factory=object,
+        runtime_env_reader=lambda path: _approved_env(tmp_path),
+        auth_runner=fake_runner,
+        login_code_prompt=prompt,
+        code_entry_interactive_checker=lambda: True,
+    )
+
+    rendered = json.dumps(result.report, sort_keys=True)
+    auth_payload = result.report["auth_only_entrypoint_result"]
+    assert result.exit_code != 0
+    assert len(calls) == 1
+    assert calls[0]["kwargs"]["approved_tdlib_auth_code_entry"] is True
+    assert calls[0]["kwargs"]["login_code_prompt"] is prompt
+    assert calls[0]["kwargs"]["login_code_entry_is_interactive"]() is True
+    assert result.report["approved_tdlib_auth_code_entry_requested"] is True
+    assert result.report["login_code_prompted"] is True
+    assert result.report["login_code_submitted"] is True
+    assert result.report["login_code_value_printed"] is False
+    assert result.report["login_code_value_stored"] is False
+    assert auth_payload["auth_request_types_sent"] == ["checkAuthenticationCode_redacted"]
+    assert auth_payload["last_auth_request_type"] == "checkAuthenticationCode_redacted"
+    assert "code" not in auth_payload
+    assert sensitive_code not in rendered
 
 
 def test_approved_mode_passes_custom_receive_budget_to_auth_runner(tmp_path: Path) -> None:

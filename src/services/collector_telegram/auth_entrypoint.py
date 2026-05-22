@@ -6,9 +6,11 @@ It only pumps TDLib authorization states through an injected transport or client
 
 from __future__ import annotations
 
+import getpass
 import logging
+import sys
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from .auth_fsm import AuthorizationFSM
 from .config import CollectorTelegramConfig
@@ -25,9 +27,18 @@ _AUTH_REQUEST_TYPES = frozenset(
         "setTdlibParameters",
         "checkDatabaseEncryptionKey",
         "setAuthenticationPhoneNumber",
+        "checkAuthenticationCode",
         "checkAuthenticationPassword",
     }
 )
+_SENSITIVE_AUTH_REQUEST_TYPE_MARKERS = {
+    "checkAuthenticationCode": "checkAuthenticationCode_redacted",
+}
+_SAFE_AUTH_REQUEST_TYPE_MARKERS = frozenset(
+    request_type
+    for request_type in _AUTH_REQUEST_TYPES
+    if request_type not in _SENSITIVE_AUTH_REQUEST_TYPE_MARKERS
+) | frozenset(_SENSITIVE_AUTH_REQUEST_TYPE_MARKERS.values())
 _UNATTRIBUTED_OK_RESPONSE_NO_EXTRA = "unattributed_no_extra"
 _UNATTRIBUTED_OK_RESPONSE_UNKNOWN_EXTRA = "unattributed_unknown_extra"
 
@@ -148,6 +159,10 @@ class TDLibAuthOnlyResult:
     tdlib_error_message_len: int | None = None
     tdlib_error_categories: tuple[str, ...] = field(default_factory=tuple)
     completion_failure_category: str | None = None
+    login_code_prompted: bool = False
+    login_code_submitted: bool = False
+    login_code_value_printed: bool = False
+    login_code_value_stored: bool = False
 
     def to_redacted_dict(self) -> dict[str, Any]:
         return {
@@ -205,6 +220,10 @@ class TDLibAuthOnlyResult:
             "tdlib_error_message_len": self.tdlib_error_message_len,
             "tdlib_error_categories": list(self.tdlib_error_categories),
             "completion_failure_category": self.completion_failure_category,
+            "login_code_prompted": self.login_code_prompted,
+            "login_code_submitted": self.login_code_submitted,
+            "login_code_value_printed": self.login_code_value_printed,
+            "login_code_value_stored": self.login_code_value_stored,
         }
 
 
@@ -221,6 +240,9 @@ class TDLibAuthOnlyRunner:
         logger: logging.Logger | None = None,
         receive_timeout_sec: float = 1.0,
         max_authorization_updates: int = 20,
+        approved_tdlib_auth_code_entry: bool = False,
+        login_code_prompt: Callable[[str], str] | None = None,
+        login_code_entry_is_interactive: Callable[[], bool] | None = None,
     ) -> None:
         if client is None and transport is None:
             raise ValueError("TDLibAuthOnlyRunner requires an injected transport or client")
@@ -231,6 +253,11 @@ class TDLibAuthOnlyRunner:
         self._logger = logger or logging.getLogger(__name__)
         self._receive_timeout_sec = receive_timeout_sec
         self._max_authorization_updates = max_authorization_updates
+        self._approved_tdlib_auth_code_entry = approved_tdlib_auth_code_entry
+        self._login_code_prompt = login_code_prompt or getpass.getpass
+        self._login_code_entry_is_interactive = (
+            login_code_entry_is_interactive or sys.stdin.isatty
+        )
 
     async def run_once(self) -> TDLibAuthOnlyResult:
         requests_sent_count = 0
@@ -252,6 +279,8 @@ class TDLibAuthOnlyRunner:
         connection_state_ready_seen = False
         final_state: str | None = None
         attempted = False
+        login_code_prompted = False
+        login_code_submitted = False
 
         def result(**kwargs: Any) -> TDLibAuthOnlyResult:
             return TDLibAuthOnlyResult(
@@ -270,8 +299,33 @@ class TDLibAuthOnlyRunner:
                 connection_state_type_counts=dict(connection_state_type_counts),
                 max_authorization_updates=self._max_authorization_updates,
                 receive_timeout_sec=self._receive_timeout_sec,
+                login_code_prompted=login_code_prompted,
+                login_code_submitted=login_code_submitted,
+                login_code_value_printed=False,
+                login_code_value_stored=False,
                 **kwargs,
             )
+
+        async def send_auth_request(request: JsonDict) -> None:
+            nonlocal auth_request_sequence
+            nonlocal last_auth_request_type
+            nonlocal requests_sent_count
+
+            _assert_auth_request(request)
+            request_type = _extract_safe_auth_request_type(request)
+            if request_type is None:
+                raise ValueError("Auth TDLib request type could not be sanitized")
+            auth_request_sequence += 1
+            extra = _build_auth_request_extra(
+                sequence=auth_request_sequence,
+                request_type=request_type,
+            )
+            request_with_extra = _auth_request_with_extra(request, extra)
+            await self._client.send(request_with_extra)
+            requests_sent_count += 1
+            auth_request_types_sent.append(request_type)
+            last_auth_request_type = request_type
+            pending_auth_requests_by_extra[extra] = request_type
 
         try:
             await self._client.initialize()
@@ -342,23 +396,40 @@ class TDLibAuthOnlyRunner:
                 final_state = transition.new_state
 
                 for request in transition.requests:
-                    _assert_auth_request(request)
-                    request_type = _extract_safe_auth_request_type(request)
-                    if request_type is None:
-                        raise ValueError("Auth TDLib request type could not be sanitized")
-                    auth_request_sequence += 1
-                    extra = _build_auth_request_extra(
-                        sequence=auth_request_sequence,
-                        request_type=request_type,
-                    )
-                    request_with_extra = _auth_request_with_extra(request, extra)
-                    await self._client.send(request_with_extra)
-                    requests_sent_count += 1
-                    auth_request_types_sent.append(request_type)
-                    last_auth_request_type = request_type
-                    pending_auth_requests_by_extra[extra] = request_type
+                    await send_auth_request(request)
 
                 if transition.requires_manual_intervention:
+                    if (
+                        self._approved_tdlib_auth_code_entry
+                        and auth_state.get("@type") == "authorizationStateWaitCode"
+                    ):
+                        if not self._login_code_entry_is_interactive():
+                            return result(
+                                auth_entrypoint_status="blocked_tdlib_auth_code_entry_not_interactive",
+                                tdlib_auth_attempted=attempted,
+                                manual_intervention_required=False,
+                                manual_intervention_reason=(
+                                    "Telegram login code entry requires an interactive terminal"
+                                ),
+                                final_authorization_state=transition.new_state,
+                                requests_sent_count=requests_sent_count,
+                                error="tdlib_auth_code_entry_not_interactive",
+                                error_present=True,
+                                error_type="tdlib_auth_code_entry_not_interactive",
+                                completion_failure_category=(
+                                    "tdlib_auth_code_entry_not_interactive"
+                                ),
+                            )
+
+                        login_code_prompted = True
+                        login_code = self._login_code_prompt("Telegram login code: ")
+                        await send_auth_request(
+                            self._fsm.build_check_authentication_code_request(login_code)
+                        )
+                        del login_code
+                        login_code_submitted = True
+                        continue
+
                     return result(
                         auth_entrypoint_status="manual_intervention_required",
                         tdlib_auth_attempted=attempted,
@@ -462,6 +533,9 @@ async def run_tdlib_auth_only_once(
     logger: logging.Logger | None = None,
     receive_timeout_sec: float = 1.0,
     max_authorization_updates: int = 20,
+    approved_tdlib_auth_code_entry: bool = False,
+    login_code_prompt: Callable[[str], str] | None = None,
+    login_code_entry_is_interactive: Callable[[], bool] | None = None,
 ) -> TDLibAuthOnlyResult:
     runner = TDLibAuthOnlyRunner(
         config,
@@ -470,6 +544,9 @@ async def run_tdlib_auth_only_once(
         logger=logger,
         receive_timeout_sec=receive_timeout_sec,
         max_authorization_updates=max_authorization_updates,
+        approved_tdlib_auth_code_entry=approved_tdlib_auth_code_entry,
+        login_code_prompt=login_code_prompt,
+        login_code_entry_is_interactive=login_code_entry_is_interactive,
     )
     return await runner.run_once()
 
@@ -641,13 +718,16 @@ def _assert_auth_request(request: JsonDict) -> None:
 
 def _extract_safe_auth_request_type(request: JsonDict) -> str | None:
     request_type = request.get("@type")
-    if request_type in _AUTH_REQUEST_TYPES:
+    sensitive_marker = _SENSITIVE_AUTH_REQUEST_TYPE_MARKERS.get(request_type)
+    if sensitive_marker is not None:
+        return sensitive_marker
+    if request_type in _SAFE_AUTH_REQUEST_TYPE_MARKERS:
         return request_type
     return None
 
 
 def _build_auth_request_extra(*, sequence: int, request_type: str) -> str:
-    if request_type not in _AUTH_REQUEST_TYPES:
+    if request_type not in _SAFE_AUTH_REQUEST_TYPE_MARKERS:
         raise ValueError("Auth TDLib request type could not be sanitized")
     return f"auth:{sequence}:{request_type}"
 

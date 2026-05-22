@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
 import math
 import re
@@ -57,6 +58,10 @@ SIDE_EFFECT_FLAGS = (
     "runtime_env_read",
     "runtime_env_values_printed",
     "secret_values_printed",
+    "login_code_prompted",
+    "login_code_submitted",
+    "login_code_value_printed",
+    "login_code_value_stored",
     "tdlib_auth_attempted",
     "tdlib_auth_completed",
     "manual_intervention_required",
@@ -81,6 +86,8 @@ SIDE_EFFECT_FLAGS = (
 RealTransportFactory = Callable[[], Any]
 AuthRunner = Callable[..., Awaitable[Any]]
 RuntimeEnvReader = Callable[[str | Path], dict[str, str]]
+LoginCodePrompt = Callable[[str], str]
+InteractivityChecker = Callable[[], bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,12 +282,15 @@ def generate_report(
     repo_root: Path | None = None,
     *,
     approved_tdlib_auth_operator_execution: bool = False,
+    approved_tdlib_auth_code_entry: bool = False,
     runtime_env_path: str | Path = RUNTIME_ENV_PATH,
     tdlib_auth_receive_timeout_sec: object = DEFAULT_TDLIB_AUTH_RECEIVE_TIMEOUT_SEC,
     tdlib_auth_max_authorization_updates: object = DEFAULT_TDLIB_AUTH_MAX_AUTHORIZATION_UPDATES,
     real_transport_factory: RealTransportFactory | None = None,
     auth_runner: AuthRunner | None = None,
     runtime_env_reader: RuntimeEnvReader | None = None,
+    login_code_prompt: LoginCodePrompt | None = None,
+    code_entry_interactive_checker: InteractivityChecker | None = None,
 ) -> WrapperResult:
     repo_root = repo_root or default_repo_root()
     inspection = _inspect_auth_only_entrypoint(repo_root)
@@ -303,6 +313,7 @@ def generate_report(
         "contract_status": "approval_required",
         "approval_required": not approved_tdlib_auth_operator_execution,
         "approved_execution_requested": approved_tdlib_auth_operator_execution,
+        "approved_tdlib_auth_code_entry_requested": approved_tdlib_auth_code_entry,
         "auth_only_entrypoint_status": status,
         "selected_entrypoint": inspection["selected_entrypoint"],
         "runtime_env_path": str(runtime_env_path),
@@ -368,6 +379,16 @@ def generate_report(
             "TDLib auth operator execution requires separate explicit approval.",
             contract_status="approval_required",
         )
+
+    if approved_tdlib_auth_code_entry:
+        is_interactive = code_entry_interactive_checker or sys.stdin.isatty
+        if not is_interactive():
+            return fail(
+                "tdlib_auth_code_entry.not_interactive",
+                "Approved TDLib auth code entry requires an interactive terminal.",
+                contract_status="blocked_tdlib_auth_code_entry_not_interactive",
+                reason="tdlib_auth_code_entry_not_interactive",
+            )
 
     assert receive_timeout_sec is not None
     assert max_authorization_updates is not None
@@ -459,6 +480,8 @@ def generate_report(
         )
 
     runner = auth_runner or auth_module.run_tdlib_auth_only_once
+    prompt = login_code_prompt or getpass.getpass
+    is_interactive = code_entry_interactive_checker or sys.stdin.isatty
     try:
         auth_result = asyncio.run(
             runner(
@@ -466,6 +489,9 @@ def generate_report(
                 transport=transport,
                 receive_timeout_sec=receive_timeout_sec,
                 max_authorization_updates=max_authorization_updates,
+                approved_tdlib_auth_code_entry=approved_tdlib_auth_code_entry,
+                login_code_prompt=prompt,
+                login_code_entry_is_interactive=is_interactive,
             )
         )
     except Exception as exc:
@@ -484,6 +510,10 @@ def generate_report(
     report["telegram_connected"] = bool(auth_payload["telegram_connected"])
     report["runtime_env_values_printed"] = bool(auth_payload["runtime_env_values_printed"])
     report["secret_values_printed"] = bool(auth_payload["secret_values_printed"])
+    report["login_code_prompted"] = bool(auth_payload["login_code_prompted"])
+    report["login_code_submitted"] = bool(auth_payload["login_code_submitted"])
+    report["login_code_value_printed"] = bool(auth_payload["login_code_value_printed"])
+    report["login_code_value_stored"] = bool(auth_payload["login_code_value_stored"])
     report["database_connected"] = bool(auth_payload["database_connected"])
     report["db_connected"] = bool(auth_payload["database_connected"])
     report["redis_connected"] = bool(auth_payload["redis_connected"])
@@ -500,6 +530,17 @@ def generate_report(
     if auth_payload["tdlib_auth_completed"]:
         report["contract_status"] = "tdlib_auth_completed"
         return WrapperResult(exit_code=0, report=report)
+    if auth_payload["auth_entrypoint_status"] == "blocked_tdlib_auth_code_entry_not_interactive":
+        checks_failed.append("tdlib_auth_code_entry.not_interactive")
+        failures.append(
+            {
+                "check": "tdlib_auth_code_entry.not_interactive",
+                "message": "Approved TDLib auth code entry requires an interactive terminal.",
+            }
+        )
+        report["contract_status"] = "blocked_tdlib_auth_code_entry_not_interactive"
+        report["blocked_reason"] = "tdlib_auth_code_entry_not_interactive"
+        return WrapperResult(exit_code=1, report=report)
     if auth_payload["manual_intervention_required"]:
         report["contract_status"] = "manual_intervention_required"
         return WrapperResult(exit_code=1, report=report)
@@ -527,6 +568,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", default=None)
     parser.add_argument("--runtime-env-path", default=RUNTIME_ENV_PATH)
     parser.add_argument("--approved-tdlib-auth-operator-execution", action="store_true")
+    parser.add_argument("--approved-tdlib-auth-code-entry", action="store_true")
     parser.add_argument(
         "--tdlib-auth-receive-timeout-sec",
         default=DEFAULT_TDLIB_AUTH_RECEIVE_TIMEOUT_SEC,
@@ -549,6 +591,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     result = generate_report(
         repo_root=repo_root,
         approved_tdlib_auth_operator_execution=args.approved_tdlib_auth_operator_execution,
+        approved_tdlib_auth_code_entry=args.approved_tdlib_auth_code_entry,
         runtime_env_path=args.runtime_env_path,
         tdlib_auth_receive_timeout_sec=args.tdlib_auth_receive_timeout_sec,
         tdlib_auth_max_authorization_updates=args.tdlib_auth_max_authorization_updates,
