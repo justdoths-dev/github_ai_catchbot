@@ -1,0 +1,7 @@
+# Repo-local Codex hints for github_ai_catchbot.
+# Do not put secrets in this file.
+
+project_name = "github_ai_catchbot"
+review_bundle_output_root = "/mnt/c/Users/dev/Desktop/codex-review-bundles"
+writable_roots = ["/mnt/c/Users/dev/Desktop/codex-review-bundles"]
+
