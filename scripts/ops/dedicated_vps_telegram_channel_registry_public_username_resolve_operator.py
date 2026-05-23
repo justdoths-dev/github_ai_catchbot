@@ -7,7 +7,7 @@ import re
 import sys
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -27,15 +27,27 @@ TDLIB_BOOTSTRAP_AUTH_STATES = frozenset(
         "authorizationStateWaitEncryptionKey",
     }
 )
-TDLIB_BLOCKED_AUTH_STATES = frozenset(
+TDLIB_MANUAL_INTERVENTION_AUTH_STATES = frozenset(
     {
         "authorizationStateWaitPhoneNumber",
         "authorizationStateWaitCode",
         "authorizationStateWaitOtherDeviceConfirmation",
         "authorizationStateWaitPassword",
+    }
+)
+TDLIB_CLOSED_AUTH_STATES = frozenset(
+    {
         "authorizationStateLoggingOut",
         "authorizationStateClosing",
         "authorizationStateClosed",
+    }
+)
+TDLIB_BLOCKED_AUTH_STATES = TDLIB_MANUAL_INTERVENTION_AUTH_STATES | TDLIB_CLOSED_AUTH_STATES
+TDLIB_READY_PROBE_REQUEST_TYPES = frozenset(
+    {
+        "getAuthorizationState",
+        "setTdlibParameters",
+        "checkDatabaseEncryptionKey",
     }
 )
 
@@ -186,6 +198,91 @@ class PublicUsernameResolveResult:
     chat_type: str | None = None
 
 
+@dataclass(slots=True)
+class TDLibReadyProbeSummary:
+    attempted: bool = False
+    status: str = "not_attempted"
+    observation_count: int = 0
+    request_types_sent: list[str] = field(default_factory=list)
+    update_types_seen: list[str] = field(default_factory=list)
+    authorization_states_seen: list[str] = field(default_factory=list)
+    final_authorization_state: str | None = None
+    error_class: str | None = None
+    error_code: int | None = None
+    manual_intervention_required: bool = False
+
+    def mark_attempted(self) -> None:
+        self.attempted = True
+        if self.status == "not_attempted":
+            self.status = "probing"
+
+    def record_request(self, request: Mapping[str, Any]) -> None:
+        request_type = request.get("@type")
+        if isinstance(request_type, str) and request_type in TDLIB_READY_PROBE_REQUEST_TYPES:
+            _append_unique(self.request_types_sent, request_type)
+
+    def record_payload(self, payload: Mapping[str, Any]) -> None:
+        self.observation_count += 1
+        payload_type = payload.get("@type")
+        if isinstance(payload_type, str) and payload_type.startswith("update"):
+            _append_unique(self.update_types_seen, payload_type)
+        if payload_type == "error":
+            self.error_class = "tdlib_error"
+            self.error_code = _safe_error_code(payload.get("code"))
+            if self.status not in {"ready", "manual_intervention_required"}:
+                self.status = "tdlib_error"
+
+        state_type = _authorization_state_type_from_payload(payload)
+        if state_type is not None:
+            self.record_authorization_state(state_type)
+
+    def record_authorization_state(self, state_type: str) -> None:
+        _append_unique(self.authorization_states_seen, state_type)
+        self.final_authorization_state = state_type
+        if state_type == TDLIB_READY_STATE:
+            self.status = "ready"
+        elif state_type in TDLIB_MANUAL_INTERVENTION_AUTH_STATES:
+            self.manual_intervention_required = True
+            self.status = "manual_intervention_required"
+        elif state_type in TDLIB_CLOSED_AUTH_STATES:
+            self.status = "not_ready"
+
+    def mark_timed_out(self) -> None:
+        if self.status not in {
+            "ready",
+            "manual_intervention_required",
+            "not_ready",
+            "tdlib_error",
+            "transport_error",
+        }:
+            self.status = "timed_out"
+
+    def mark_transport_error(self, exc: Exception) -> None:
+        self.error_class = type(exc).__name__
+        if self.status not in {"ready", "manual_intervention_required", "not_ready"}:
+            self.status = "transport_error"
+
+    def as_report_fields(self) -> dict[str, Any]:
+        return {
+            "tdlib_ready_probe_attempted": self.attempted,
+            "tdlib_ready_probe_status": self.status,
+            "tdlib_ready_probe_observation_count_bucket": _bucket_count(
+                self.observation_count
+            ),
+            "tdlib_ready_probe_request_types_sent": list(self.request_types_sent),
+            "tdlib_ready_probe_update_types_seen": list(self.update_types_seen),
+            "tdlib_ready_probe_authorization_states_seen": list(
+                self.authorization_states_seen
+            ),
+            "tdlib_ready_probe_final_authorization_state": self.final_authorization_state,
+            "tdlib_ready_probe_error_class": self.error_class,
+            "tdlib_ready_probe_error_code": self.error_code,
+            "tdlib_ready_probe_manual_intervention_required": (
+                self.manual_intervention_required
+            ),
+        }
+
+
 class TDLibTransportUnavailable(RuntimeError):
     pass
 
@@ -256,13 +353,45 @@ def _side_effects() -> dict[str, bool]:
     return {flag: False for flag in SIDE_EFFECT_FLAG_NAMES}
 
 
+def _empty_ready_probe_report_fields() -> dict[str, Any]:
+    return TDLibReadyProbeSummary().as_report_fields()
+
+
+def _append_unique(values: list[str], value: str) -> None:
+    if value not in values:
+        values.append(value)
+
+
+def _safe_error_code(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _authorization_state_type_from_payload(payload: Mapping[str, Any]) -> str | None:
+    payload_type = payload.get("@type")
+    if payload_type == "updateAuthorizationState":
+        state = payload.get("authorization_state")
+        if isinstance(state, Mapping):
+            state_type = state.get("@type")
+            return state_type if isinstance(state_type, str) else None
+    if isinstance(payload_type, str) and payload_type.startswith("authorizationState"):
+        return payload_type
+    return None
+
+
 def _base_report(
     *,
     dry_run: bool,
     approved_tdlib_public_username_resolve: bool,
     approved_registry_resolve_mutation: bool,
 ) -> dict[str, Any]:
-    return {
+    report = {
         "schema_version": SCHEMA_VERSION,
         "script_name": SCRIPT_NAME,
         "contract_status": "blocked_runtime_env_unreadable",
@@ -288,6 +417,8 @@ def _base_report(
         ),
         "side_effects": _side_effects(),
     }
+    report.update(_empty_ready_probe_report_fields())
+    return report
 
 
 def _set_status(report: dict[str, Any], status: str, check: str | None = None) -> None:
@@ -605,8 +736,13 @@ class TDLibPublicUsernameResolver:
             self._transport.assert_available()
         self._client = TDLibClient(self._config, transport=self._transport)
         self._request_sequence = 0
+        self._ready_probe_summary = TDLibReadyProbeSummary()
         self.tdlib_send_called = False
         self.tdlib_receive_called = False
+
+    @property
+    def tdlib_ready_probe_summary(self) -> Mapping[str, Any]:
+        return self._ready_probe_summary.as_report_fields()
 
     async def initialize(self) -> None:
         try:
@@ -616,6 +752,7 @@ class TDLibPublicUsernameResolver:
         except TDLibNotReady:
             raise
         except Exception as exc:
+            self._ready_probe_summary.mark_transport_error(exc)
             raise TDLibTransportUnavailable("TDLib transport unavailable") from exc
 
     async def close(self) -> None:
@@ -636,15 +773,12 @@ class TDLibPublicUsernameResolver:
         return _resolve_result_from_tdlib_payload(response)
 
     async def _wait_until_ready(self) -> None:
-        if self._client.is_ready():
-            return
+        self._ready_probe_summary.mark_attempted()
 
         probe_pending = False
         probe_due = True
 
         for _ in range(DEFAULT_TDLIB_AUTH_MAX_UPDATES):
-            if self._client.is_ready():
-                return
             if probe_due:
                 await self._send_get_authorization_state_probe()
                 probe_pending = True
@@ -652,12 +786,16 @@ class TDLibPublicUsernameResolver:
 
             payload = await self._receive(DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC)
             if payload is None:
+                if self._client.is_ready():
+                    self._ready_probe_summary.record_authorization_state(TDLIB_READY_STATE)
+                    return
                 if probe_pending:
                     probe_pending = False
                     probe_due = True
                 continue
             if not isinstance(payload, dict):
                 continue
+            self._ready_probe_summary.record_payload(payload)
             if payload.get("@type") == "error":
                 raise TDLibNotReady("TDLib returned an authorization error")
 
@@ -682,6 +820,10 @@ class TDLibPublicUsernameResolver:
 
             if state_type in TDLIB_BLOCKED_AUTH_STATES:
                 raise TDLibNotReady("TDLib authorization is not ready")
+            if self._client.is_ready():
+                self._ready_probe_summary.record_authorization_state(TDLIB_READY_STATE)
+                return
+        self._ready_probe_summary.mark_timed_out()
         raise TDLibNotReady("TDLib authorization did not become ready")
 
     async def _receive_response(self, extra: str) -> dict[str, Any]:
@@ -707,29 +849,29 @@ class TDLibPublicUsernameResolver:
         return await self._client.receive(timeout_sec)
 
     async def _send_get_authorization_state_probe(self) -> None:
-        await self._send(
-            {
-                "@type": "getAuthorizationState",
-                "@extra": self._next_extra("authorization_state_probe"),
-            }
-        )
+        request = {
+            "@type": "getAuthorizationState",
+            "@extra": self._next_extra("authorization_state_probe"),
+        }
+        self._ready_probe_summary.record_request(request)
+        await self._send(request)
 
     async def _send_bootstrap_request_for_state(self, state_type: str) -> None:
         if state_type == "authorizationStateWaitTdlibParameters":
-            await self._send(
-                {
-                    **self._client.build_set_tdlib_parameters_request().payload,
-                    "@extra": self._next_extra("tdlib_parameters"),
-                }
-            )
+            request = {
+                **self._client.build_set_tdlib_parameters_request().payload,
+                "@extra": self._next_extra("tdlib_parameters"),
+            }
+            self._ready_probe_summary.record_request(request)
+            await self._send(request)
             return
         if state_type == "authorizationStateWaitEncryptionKey":
-            await self._send(
-                {
-                    **self._client.build_check_database_encryption_key_request().payload,
-                    "@extra": self._next_extra("encryption_key"),
-                }
-            )
+            request = {
+                **self._client.build_check_database_encryption_key_request().payload,
+                "@extra": self._next_extra("encryption_key"),
+            }
+            self._ready_probe_summary.record_request(request)
+            await self._send(request)
 
     @staticmethod
     def _authorization_state_from_payload(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -830,6 +972,11 @@ def _merge_resolver_side_effects(
     for flag_name in ("tdlib_send_called", "tdlib_receive_called"):
         if getattr(resolver, flag_name, False) is True:
             report["side_effects"][flag_name] = True
+    ready_probe_summary = getattr(resolver, "tdlib_ready_probe_summary", None)
+    if isinstance(ready_probe_summary, Mapping):
+        for key in _empty_ready_probe_report_fields():
+            if key in ready_probe_summary:
+                report[key] = ready_probe_summary[key]
 
 
 async def _resolve_rows(
