@@ -10,7 +10,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-from scripts.ops import (
+
+def _repo_root_for_imports() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+ROOT = _repo_root_for_imports()
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.ops import (  # noqa: E402
     dedicated_vps_tdlib_session_reuse_collector_readiness_preflight as session_preflight,
 )
 
@@ -116,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def default_repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return ROOT
 
 
 def _side_effects() -> dict[str, bool]:

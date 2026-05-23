@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +58,19 @@ def _runtime_env(tmp_path: Path, **overrides: str | None) -> dict[str, str]:
         else:
             values[key] = value
     return values
+
+
+def _subprocess_env_without_pythonpath() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    return env
+
+
+def _write_runtime_env_file(path: Path, values: dict[str, str]) -> None:
+    path.write_text(
+        "".join(f"{key}={value}\n" for key, value in sorted(values.items())),
+        encoding="utf-8",
+    )
 
 
 def _tdjson_ok(_values: dict[str, str]) -> dict[str, bool]:
@@ -115,6 +131,58 @@ def _builder(payload: dict[str, Any]):
         return dict(payload)
 
     return build
+
+
+def test_direct_help_execution_succeeds_without_pythonpath() -> None:
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT), "--help"],
+        cwd=ROOT,
+        env=_subprocess_env_without_pythonpath(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "usage:" in result.stdout
+    assert "ModuleNotFoundError" not in result.stderr
+    assert "No module named 'scripts'" not in result.stderr
+
+
+def test_direct_json_execution_imports_repo_modules_without_pythonpath(
+    tmp_path: Path,
+) -> None:
+    tdjson_library = tmp_path / "libtdjson.so"
+    tdjson_library.write_text("unit tdjson placeholder", encoding="utf-8")
+    runtime_env_file = tmp_path / "runtime.env"
+    _write_runtime_env_file(
+        runtime_env_file,
+        _runtime_env(tmp_path, TDJSON_LIBRARY_PATH=str(tdjson_library)),
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--runtime-env-path",
+            str(runtime_env_file),
+        ],
+        cwd=ROOT,
+        env=_subprocess_env_without_pythonpath(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "ModuleNotFoundError" not in result.stderr
+    assert "No module named 'scripts'" not in result.stderr
+    report = json.loads(result.stdout)
+    assert report["contract_status"] == "tdlib_parameters_redacted_config_diagnostic_passed"
+    assert report["auth_path_parameters_inspected"] is True
+    assert report["resolve_path_parameters_inspected"] is True
+    assert report["tdjson_available"] is True
+    assert all(value is False for value in report["side_effects"].values())
 
 
 def test_matching_auth_and_resolve_shapes_pass_with_default_builders(tmp_path: Path) -> None:
