@@ -51,6 +51,9 @@ READY_PROBE_FIELD_NAMES = (
     "tdlib_ready_probe_encryption_key_response_type",
     "tdlib_ready_probe_encryption_key_error_code",
     "tdlib_ready_probe_encryption_key_error_class",
+    "tdlib_ready_helper_reused",
+    "tdlib_ready_helper_status",
+    "tdlib_ready_helper_manual_intervention_required",
 )
 
 
@@ -411,13 +414,6 @@ def _response_for_last_request(
     return response
 
 
-def _ready_probe_response() -> TransportPayloadFactory:
-    return _response_for_last_request(
-        "getAuthorizationState",
-        {"@type": "authorizationStateReady"},
-    )
-
-
 def _public_chat_response() -> TransportPayloadFactory:
     return _response_for_last_request(
         "searchPublicChat",
@@ -498,6 +494,9 @@ def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutat
     assert report["tdlib_ready_probe_encryption_key_response_type"] is None
     assert report["tdlib_ready_probe_encryption_key_error_code"] is None
     assert report["tdlib_ready_probe_encryption_key_error_class"] is None
+    assert report["tdlib_ready_helper_reused"] is False
+    assert report["tdlib_ready_helper_status"] == "not_attempted"
+    assert report["tdlib_ready_helper_manual_intervention_required"] is False
 
 
 def test_without_approval_flags_stays_dry_run_and_blocks_tdlib_and_db_mutation() -> None:
@@ -579,17 +578,20 @@ def test_tdlib_ready_update_allows_public_username_resolve_without_mutation(
     assert transport.closed is True
     assert resolver.tdlib_send_called is True
     assert resolver.tdlib_receive_called is True
-    assert _sent_request_types(transport) == ["getAuthorizationState", "searchPublicChat"]
+    assert _sent_request_types(transport) == ["searchPublicChat"]
     assert report["tdlib_ready_probe_attempted"] is True
     assert report["tdlib_ready_probe_status"] == "ready"
     assert report["tdlib_ready_probe_observation_count_bucket"] == "one"
-    assert report["tdlib_ready_probe_request_types_sent"] == ["getAuthorizationState"]
+    assert report["tdlib_ready_probe_request_types_sent"] == []
     assert report["tdlib_ready_probe_update_types_seen"] == ["updateAuthorizationState"]
     assert report["tdlib_ready_probe_authorization_states_seen"] == ["authorizationStateReady"]
     assert report["tdlib_ready_probe_final_authorization_state"] == "authorizationStateReady"
     assert report["tdlib_ready_probe_error_class"] is None
     assert report["tdlib_ready_probe_error_code"] is None
     assert report["tdlib_ready_probe_manual_intervention_required"] is False
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] == "ready"
+    assert report["tdlib_ready_helper_manual_intervention_required"] is False
     assert db.update_attempts == 0
     assert db.transaction.rolled_back is True
     assert report["tdlib_resolve_attempted"] is True
@@ -601,12 +603,12 @@ def test_tdlib_ready_update_allows_public_username_resolve_without_mutation(
     assert report["side_effects"]["telegram_channel_registry_updated"] is False
 
 
-def test_tdlib_get_authorization_state_ready_without_ready_update_allows_resolve(
+def test_tdlib_auth_ready_helper_update_allows_resolve_without_local_probe(
     tmp_path: Path,
 ) -> None:
     transport = FakeTDLibTransport(
         [
-            _ready_probe_response(),
+            _auth_update("authorizationStateReady"),
             _public_chat_response(),
         ]
     )
@@ -618,12 +620,12 @@ def test_tdlib_get_authorization_state_ready_without_ready_update_allows_resolve
     )
 
     assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
-    assert _sent_request_types(transport) == ["getAuthorizationState", "searchPublicChat"]
+    assert _sent_request_types(transport) == ["searchPublicChat"]
     assert report["tdlib_ready_probe_attempted"] is True
     assert report["tdlib_ready_probe_status"] == "ready"
     assert report["tdlib_ready_probe_observation_count_bucket"] == "one"
-    assert report["tdlib_ready_probe_request_types_sent"] == ["getAuthorizationState"]
-    assert report["tdlib_ready_probe_update_types_seen"] == []
+    assert report["tdlib_ready_probe_request_types_sent"] == []
+    assert report["tdlib_ready_probe_update_types_seen"] == ["updateAuthorizationState"]
     assert report["tdlib_ready_probe_authorization_states_seen"] == ["authorizationStateReady"]
     assert report["tdlib_ready_probe_final_authorization_state"] == "authorizationStateReady"
     assert db.update_attempts == 0
@@ -640,7 +642,7 @@ def test_tdlib_bootstrap_readiness_requests_are_summarized_without_values(
         [
             _auth_update("authorizationStateWaitTdlibParameters"),
             _auth_update("authorizationStateWaitEncryptionKey"),
-            _ready_probe_response(),
+            _auth_update("authorizationStateReady"),
             _public_chat_response(),
         ]
     )
@@ -654,15 +656,11 @@ def test_tdlib_bootstrap_readiness_requests_are_summarized_without_values(
     assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
     rendered = _render(report)
     assert _sent_request_types(transport) == [
-        "getAuthorizationState",
         "setTdlibParameters",
-        "getAuthorizationState",
         "checkDatabaseEncryptionKey",
-        "getAuthorizationState",
         "searchPublicChat",
     ]
     assert report["tdlib_ready_probe_request_types_sent"] == [
-        "getAuthorizationState",
         "setTdlibParameters",
         "checkDatabaseEncryptionKey",
     ]
@@ -675,8 +673,20 @@ def test_tdlib_bootstrap_readiness_requests_are_summarized_without_values(
     assert report["tdlib_ready_probe_status"] == "ready"
     assert report["tdlib_ready_probe_parameter_bootstrap_attempted"] is True
     assert report["tdlib_ready_probe_encryption_key_check_attempted"] is True
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] == "ready"
+    assert all(
+        str(request.get("@extra", "")).startswith("auth:")
+        for request in transport.sent_requests
+        if request.get("@type") in {"setTdlibParameters", "checkDatabaseEncryptionKey"}
+    )
+    assert not any(
+        str(request.get("@extra", "")).startswith(_module().SCRIPT_NAME)
+        for request in transport.sent_requests
+        if request.get("@type") in {"setTdlibParameters", "checkDatabaseEncryptionKey"}
+    )
     assert report["tdlib_ready_probe_transport_closed"] is False
-    assert report["tdlib_ready_probe_last_tdlib_object_type"] == "authorizationStateReady"
+    assert report["tdlib_ready_probe_last_tdlib_object_type"] == "updateAuthorizationState"
     assert report["tdlib_ready_probe_timed_out_after_state"] is None
     assert db.update_attempts == 0
     _assert_sensitive_values_absent(rendered, tmp_path)
@@ -712,9 +722,7 @@ def test_tdlib_set_parameters_error_is_sanitized_and_blocks_before_key_check(
     assert report["contract_status"] == "blocked_tdlib_not_ready"
     assert "tdlib.not_ready" in report["checks_failed"]
     assert _sent_request_types(transport) == [
-        "getAuthorizationState",
         "setTdlibParameters",
-        "getAuthorizationState",
     ]
     assert "checkDatabaseEncryptionKey" not in _sent_request_types(transport)
     assert "searchPublicChat" not in _sent_request_types(transport)
@@ -732,6 +740,8 @@ def test_tdlib_set_parameters_error_is_sanitized_and_blocks_before_key_check(
     assert report["tdlib_ready_probe_authorization_states_seen"] == [
         "authorizationStateWaitTdlibParameters",
     ]
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] == "degraded"
     assert report["tdlib_resolve_attempted"] is False
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
@@ -762,10 +772,7 @@ def test_tdlib_set_parameters_ok_without_wait_encryption_key_times_out_without_s
 
     assert report["contract_status"] == "blocked_tdlib_not_ready"
     assert _sent_request_types(transport) == [
-        "getAuthorizationState",
         "setTdlibParameters",
-        "getAuthorizationState",
-        "getAuthorizationState",
     ]
     assert "checkDatabaseEncryptionKey" not in _sent_request_types(transport)
     assert "searchPublicChat" not in _sent_request_types(transport)
@@ -787,6 +794,8 @@ def test_tdlib_set_parameters_ok_without_wait_encryption_key_times_out_without_s
         report["tdlib_ready_probe_timed_out_after_state"]
         == "authorizationStateWaitTdlibParameters"
     )
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] == "degraded"
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
 
@@ -822,11 +831,8 @@ def test_tdlib_encryption_key_error_is_sanitized_and_blocks_before_search(
 
     assert report["contract_status"] == "blocked_tdlib_not_ready"
     assert _sent_request_types(transport) == [
-        "getAuthorizationState",
         "setTdlibParameters",
-        "getAuthorizationState",
         "checkDatabaseEncryptionKey",
-        "getAuthorizationState",
     ]
     assert "searchPublicChat" not in _sent_request_types(transport)
     assert db.update_attempts == 0
@@ -840,6 +846,8 @@ def test_tdlib_encryption_key_error_is_sanitized_and_blocks_before_search(
     assert report["tdlib_ready_probe_encryption_key_error_class"] == "tdlib_error"
     assert report["tdlib_ready_probe_parameter_bootstrap_attempted"] is True
     assert report["tdlib_ready_probe_encryption_key_check_attempted"] is True
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] == "degraded"
     assert report["tdlib_resolve_attempted"] is False
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
@@ -855,7 +863,7 @@ def test_tdlib_parameter_and_encryption_key_ok_then_ready_allows_search(
             _response_for_last_request("setTdlibParameters", {"@type": "ok"}),
             _auth_update("authorizationStateWaitEncryptionKey"),
             _response_for_last_request("checkDatabaseEncryptionKey", {"@type": "ok"}),
-            _ready_probe_response(),
+            _auth_update("authorizationStateReady"),
             _public_chat_response(),
         ]
     )
@@ -868,11 +876,8 @@ def test_tdlib_parameter_and_encryption_key_ok_then_ready_allows_search(
 
     assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
     assert _sent_request_types(transport) == [
-        "getAuthorizationState",
         "setTdlibParameters",
-        "getAuthorizationState",
         "checkDatabaseEncryptionKey",
-        "getAuthorizationState",
         "searchPublicChat",
     ]
     assert db.update_attempts == 0
@@ -889,6 +894,8 @@ def test_tdlib_parameter_and_encryption_key_ok_then_ready_allows_search(
         "authorizationStateWaitEncryptionKey",
         "authorizationStateReady",
     ]
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] == "ready"
     assert report["tdlib_resolve_attempted"] is True
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
     assert report["side_effects"]["database_mutation_performed"] is False
@@ -918,10 +925,7 @@ def test_tdlib_set_parameters_without_transition_blocks_with_bootstrap_diagnosti
     assert report["contract_status"] == "blocked_tdlib_not_ready"
     assert "tdlib.not_ready" in report["checks_failed"]
     assert _sent_request_types(transport) == [
-        "getAuthorizationState",
         "setTdlibParameters",
-        "getAuthorizationState",
-        "getAuthorizationState",
     ]
     assert "checkDatabaseEncryptionKey" not in _sent_request_types(transport)
     assert "searchPublicChat" not in _sent_request_types(transport)
@@ -941,6 +945,8 @@ def test_tdlib_set_parameters_without_transition_blocks_with_bootstrap_diagnosti
         == "authorizationStateWaitTdlibParameters"
     )
     assert report["tdlib_ready_probe_last_tdlib_object_type"] == "updateAuthorizationState"
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] == "degraded"
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
 
@@ -968,10 +974,7 @@ def test_tdlib_encryption_key_check_without_ready_blocks_with_key_diagnostics(
 
     assert report["contract_status"] == "blocked_tdlib_not_ready"
     assert _sent_request_types(transport) == [
-        "getAuthorizationState",
         "checkDatabaseEncryptionKey",
-        "getAuthorizationState",
-        "getAuthorizationState",
     ]
     assert "setTdlibParameters" not in _sent_request_types(transport)
     assert "searchPublicChat" not in _sent_request_types(transport)
@@ -990,6 +993,8 @@ def test_tdlib_encryption_key_check_without_ready_blocks_with_key_diagnostics(
         report["tdlib_ready_probe_timed_out_after_state"]
         == "authorizationStateWaitEncryptionKey"
     )
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] == "degraded"
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
 
@@ -1019,14 +1024,14 @@ def test_manual_tdlib_authorization_states_fail_closed_without_auth_submission(
     assert report["contract_status"] == "blocked_tdlib_not_ready"
     assert "tdlib.not_ready" in report["checks_failed"]
     assert db.update_attempts == 0
-    assert "getAuthorizationState" in sent_types
+    assert sent_types == []
     assert "searchPublicChat" not in sent_types
     assert "setAuthenticationPhoneNumber" not in sent_types
     assert "checkAuthenticationCode" not in sent_types
     assert "checkAuthenticationPassword" not in sent_types
     assert report["tdlib_ready_probe_attempted"] is True
     assert report["tdlib_ready_probe_status"] == "manual_intervention_required"
-    assert report["tdlib_ready_probe_request_types_sent"] == ["getAuthorizationState"]
+    assert report["tdlib_ready_probe_request_types_sent"] == []
     assert report["tdlib_ready_probe_update_types_seen"] == ["updateAuthorizationState"]
     assert report["tdlib_ready_probe_authorization_states_seen"] == [state_type]
     assert report["tdlib_ready_probe_final_authorization_state"] == state_type
@@ -1035,7 +1040,10 @@ def test_manual_tdlib_authorization_states_fail_closed_without_auth_submission(
     assert report["tdlib_ready_probe_encryption_key_check_attempted"] is False
     assert report["tdlib_ready_probe_transport_closed"] is False
     assert report["tdlib_ready_probe_timed_out_after_state"] is None
-    assert report["side_effects"]["tdlib_send_called"] is True
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] == "manual_intervention_required"
+    assert report["tdlib_ready_helper_manual_intervention_required"] is True
+    assert report["side_effects"]["tdlib_send_called"] is False
     assert report["side_effects"]["tdlib_receive_called"] is True
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
@@ -1069,13 +1077,15 @@ def test_closed_or_closing_tdlib_authorization_states_fail_closed(
     assert "joinChatByInviteLink" not in sent_types
     assert report["tdlib_ready_probe_attempted"] is True
     assert report["tdlib_ready_probe_status"] == "not_ready"
-    assert report["tdlib_ready_probe_request_types_sent"] == ["getAuthorizationState"]
+    assert report["tdlib_ready_probe_request_types_sent"] == []
     assert report["tdlib_ready_probe_update_types_seen"] == ["updateAuthorizationState"]
     assert report["tdlib_ready_probe_authorization_states_seen"] == [state_type]
     assert report["tdlib_ready_probe_final_authorization_state"] == state_type
     assert report["tdlib_ready_probe_manual_intervention_required"] is False
     assert report["tdlib_ready_probe_transport_closed"] is True
     assert report["tdlib_ready_probe_timed_out_after_state"] is None
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] in {"closed", "degraded"}
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
 
@@ -1097,21 +1107,23 @@ def test_tdlib_readiness_probe_times_out_with_bounded_receive_budget(
 
     sent_types = _sent_request_types(transport)
     assert report["contract_status"] == "blocked_tdlib_not_ready"
-    assert sent_types == ["getAuthorizationState", "getAuthorizationState", "getAuthorizationState"]
+    assert sent_types == []
     assert len(transport.receive_timeouts) == 3
     assert db.update_attempts == 0
     assert report["tdlib_ready_probe_attempted"] is True
     assert report["tdlib_ready_probe_status"] == "timed_out"
     assert report["tdlib_ready_probe_observation_count_bucket"] == "zero"
-    assert report["tdlib_ready_probe_request_types_sent"] == ["getAuthorizationState"]
+    assert report["tdlib_ready_probe_request_types_sent"] == []
     assert report["tdlib_ready_probe_update_types_seen"] == []
     assert report["tdlib_ready_probe_authorization_states_seen"] == []
     assert report["tdlib_ready_probe_final_authorization_state"] is None
     assert report["tdlib_ready_probe_parameter_bootstrap_attempted"] is False
     assert report["tdlib_ready_probe_encryption_key_check_attempted"] is False
     assert report["tdlib_ready_probe_timed_out_after_state"] is None
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] == "degraded"
     assert report["side_effects"]["tdlib_initialized"] is True
-    assert report["side_effects"]["tdlib_send_called"] is True
+    assert report["side_effects"]["tdlib_send_called"] is False
     assert report["side_effects"]["tdlib_receive_called"] is True
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
@@ -1138,15 +1150,17 @@ def test_tdlib_readiness_error_reports_only_redacted_error_fields(
     rendered = _render(report)
 
     assert report["contract_status"] == "blocked_tdlib_not_ready"
-    assert _sent_request_types(transport) == ["getAuthorizationState"]
+    assert _sent_request_types(transport) == []
     assert report["tdlib_ready_probe_attempted"] is True
     assert report["tdlib_ready_probe_status"] == "tdlib_error"
     assert report["tdlib_ready_probe_observation_count_bucket"] == "one"
-    assert report["tdlib_ready_probe_request_types_sent"] == ["getAuthorizationState"]
+    assert report["tdlib_ready_probe_request_types_sent"] == []
     assert report["tdlib_ready_probe_update_types_seen"] == []
     assert report["tdlib_ready_probe_authorization_states_seen"] == []
     assert report["tdlib_ready_probe_error_class"] == "tdlib_error"
     assert report["tdlib_ready_probe_error_code"] == 401
+    assert report["tdlib_ready_helper_reused"] is True
+    assert report["tdlib_ready_helper_status"] == "degraded"
     assert "searchPublicChat" not in _sent_request_types(transport)
     assert db.update_attempts == 0
     assert RAW_PUBLIC_USERNAME not in rendered
