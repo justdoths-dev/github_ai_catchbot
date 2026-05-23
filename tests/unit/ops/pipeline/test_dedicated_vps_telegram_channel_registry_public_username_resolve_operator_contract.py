@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[4]
 SCRIPT = (
@@ -196,6 +198,37 @@ class FakeResolver:
         self.closed = True
 
 
+TransportPayload = dict[str, Any] | None
+TransportPayloadFactory = Any
+
+
+class FakeTDLibTransport:
+    def __init__(self, payloads: list[TransportPayload | TransportPayloadFactory]) -> None:
+        self.payloads = list(payloads)
+        self.initialized = False
+        self.closed = False
+        self.sent_requests: list[dict[str, Any]] = []
+        self.receive_timeouts: list[float] = []
+
+    async def initialize(self) -> None:
+        self.initialized = True
+
+    async def send(self, request: dict[str, Any]) -> None:
+        self.sent_requests.append(request)
+
+    async def receive(self, timeout: float) -> dict[str, Any] | None:
+        self.receive_timeouts.append(timeout)
+        if not self.payloads:
+            return None
+        payload = self.payloads.pop(0)
+        if callable(payload):
+            payload = payload(self)
+        return payload
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def _module():
     from scripts.ops import (
         dedicated_vps_telegram_channel_registry_public_username_resolve_operator as module,
@@ -218,6 +251,14 @@ def _runtime_env(_path: str | Path) -> dict[str, str]:
         "TDLIB_STATE_DIR": "/safe/unit/tdlib-state",
         "TDLIB_FILES_DIR": "/safe/unit/tdlib-files",
     }
+
+
+def _runtime_env_for_tdlib_transport(tmp_path: Path) -> dict[str, str]:
+    values = _runtime_env("/safe/unit/runtime.env")
+    values["TDLIB_STATE_DIR"] = str(tmp_path / "tdlib-state")
+    values["TDLIB_FILES_DIR"] = str(tmp_path / "tdlib-files")
+    values["COLLECTOR_SINGLETON_LOCK_PATH"] = str(tmp_path / "tdlib-state" / "collector.lock")
+    return values
 
 
 def _registry_row(
@@ -295,6 +336,79 @@ def _run_report(
         ),
     )
     return result.report, fake_db, fake_resolver
+
+
+def _run_report_with_tdlib_transport(
+    *,
+    tmp_path: Path,
+    transport: FakeTDLibTransport,
+    db: FakeDatabaseConnection | None = None,
+    approved_mutation: bool = False,
+) -> tuple[dict[str, Any], FakeDatabaseConnection, Any]:
+    module = _module()
+    fake_db = db or FakeDatabaseConnection([_registry_row("registry-1")])
+    resolver_holder: dict[str, Any] = {}
+
+    def resolver_factory(values: dict[str, str]) -> Any:
+        resolver = module.TDLibPublicUsernameResolver(values, transport=transport)
+        resolver_holder["resolver"] = resolver
+        return resolver
+
+    result = module.generate_report(
+        runtime_env_path="/safe/unit/runtime.env",
+        dry_run=False,
+        approved_tdlib_public_username_resolve=True,
+        approved_registry_resolve_mutation=approved_mutation,
+        runtime_env_reader=lambda _path: _runtime_env_for_tdlib_transport(tmp_path),
+        database_connection_factory=lambda _database_url: fake_db,
+        public_username_resolver_factory=resolver_factory,
+    )
+    return result.report, fake_db, resolver_holder["resolver"]
+
+
+def _auth_update(state_type: str) -> dict[str, Any]:
+    return {
+        "@type": "updateAuthorizationState",
+        "authorization_state": {"@type": state_type},
+    }
+
+
+def _response_for_last_request(
+    request_type: str,
+    payload: dict[str, Any],
+) -> TransportPayloadFactory:
+    def response(transport: FakeTDLibTransport) -> dict[str, Any]:
+        for request in reversed(transport.sent_requests):
+            if request.get("@type") == request_type:
+                extra = request.get("@extra")
+                return {**payload, "@extra": extra}
+        raise AssertionError(f"{request_type} was not sent")
+
+    return response
+
+
+def _ready_probe_response() -> TransportPayloadFactory:
+    return _response_for_last_request(
+        "getAuthorizationState",
+        {"@type": "authorizationStateReady"},
+    )
+
+
+def _public_chat_response() -> TransportPayloadFactory:
+    return _response_for_last_request(
+        "searchPublicChat",
+        {
+            "@type": "chat",
+            "id": RAW_CHAT_ID,
+            "title": "Resolved Alpha",
+            "usernames": {"active_usernames": ["ResolvedAlphaChannel"]},
+            "type": {"@type": "chatTypeSupergroup", "is_channel": True},
+        },
+    )
+
+
+def _sent_request_types(transport: FakeTDLibTransport) -> list[str]:
+    return [request.get("@type", "") for request in transport.sent_requests]
 
 
 def _render(report: dict[str, Any]) -> str:
@@ -378,6 +492,157 @@ def test_approved_tdlib_resolve_without_mutation_calls_fake_resolver_only() -> N
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
     assert report["side_effects"]["database_mutation_performed"] is False
     assert report["side_effects"]["telegram_channel_registry_updated"] is False
+
+
+def test_tdlib_ready_update_allows_public_username_resolve_without_mutation(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
+    assert transport.initialized is True
+    assert transport.closed is True
+    assert resolver.tdlib_send_called is True
+    assert resolver.tdlib_receive_called is True
+    assert _sent_request_types(transport) == ["getAuthorizationState", "searchPublicChat"]
+    assert db.update_attempts == 0
+    assert db.transaction.rolled_back is True
+    assert report["tdlib_resolve_attempted"] is True
+    assert report["side_effects"]["tdlib_initialized"] is True
+    assert report["side_effects"]["tdlib_send_called"] is True
+    assert report["side_effects"]["tdlib_receive_called"] is True
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert report["side_effects"]["telegram_channel_registry_updated"] is False
+
+
+def test_tdlib_get_authorization_state_ready_without_ready_update_allows_resolve(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _ready_probe_response(),
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
+    assert _sent_request_types(transport) == ["getAuthorizationState", "searchPublicChat"]
+    assert db.update_attempts == 0
+    assert report["side_effects"]["tdlib_initialized"] is True
+    assert report["side_effects"]["tdlib_send_called"] is True
+    assert report["side_effects"]["tdlib_receive_called"] is True
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
+
+
+@pytest.mark.parametrize(
+    "state_type",
+    [
+        "authorizationStateWaitPhoneNumber",
+        "authorizationStateWaitCode",
+        "authorizationStateWaitPassword",
+        "authorizationStateWaitOtherDeviceConfirmation",
+    ],
+)
+def test_manual_tdlib_authorization_states_fail_closed_without_auth_submission(
+    tmp_path: Path,
+    state_type: str,
+) -> None:
+    transport = FakeTDLibTransport([_auth_update(state_type)])
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=True,
+    )
+
+    sent_types = _sent_request_types(transport)
+    assert report["contract_status"] == "blocked_tdlib_not_ready"
+    assert "tdlib.not_ready" in report["checks_failed"]
+    assert db.update_attempts == 0
+    assert "getAuthorizationState" in sent_types
+    assert "searchPublicChat" not in sent_types
+    assert "setAuthenticationPhoneNumber" not in sent_types
+    assert "checkAuthenticationCode" not in sent_types
+    assert "checkAuthenticationPassword" not in sent_types
+    assert report["side_effects"]["tdlib_send_called"] is True
+    assert report["side_effects"]["tdlib_receive_called"] is True
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+
+
+@pytest.mark.parametrize(
+    "state_type",
+    [
+        "authorizationStateClosing",
+        "authorizationStateClosed",
+        "authorizationStateLoggingOut",
+    ],
+)
+def test_closed_or_closing_tdlib_authorization_states_fail_closed(
+    tmp_path: Path,
+    state_type: str,
+) -> None:
+    transport = FakeTDLibTransport([_auth_update(state_type)])
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=True,
+    )
+
+    sent_types = _sent_request_types(transport)
+    assert report["contract_status"] == "blocked_tdlib_not_ready"
+    assert db.update_attempts == 0
+    assert "searchPublicChat" not in sent_types
+    assert "joinChat" not in sent_types
+    assert "joinChatByInviteLink" not in sent_types
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+
+
+def test_tdlib_readiness_probe_times_out_with_bounded_receive_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_AUTH_MAX_UPDATES", 3)
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC", 0)
+    transport = FakeTDLibTransport([None, None, None])
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=True,
+    )
+
+    sent_types = _sent_request_types(transport)
+    assert report["contract_status"] == "blocked_tdlib_not_ready"
+    assert sent_types == ["getAuthorizationState", "getAuthorizationState", "getAuthorizationState"]
+    assert len(transport.receive_timeouts) == 3
+    assert db.update_attempts == 0
+    assert report["side_effects"]["tdlib_initialized"] is True
+    assert report["side_effects"]["tdlib_send_called"] is True
+    assert report["side_effects"]["tdlib_receive_called"] is True
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
 
 
 def test_approved_tdlib_resolve_with_mutation_updates_only_successful_rows() -> None:
@@ -566,6 +831,8 @@ def test_tdlib_auth_code_password_join_and_history_paths_are_not_called() -> Non
                 called_names.append(node.func.id)
 
     for forbidden_call in (
+        "build_set_authentication_phone_number_request",
+        "setAuthenticationPhoneNumber",
         "build_check_authentication_code_request",
         "build_check_authentication_password_request",
         "checkAuthenticationCode",

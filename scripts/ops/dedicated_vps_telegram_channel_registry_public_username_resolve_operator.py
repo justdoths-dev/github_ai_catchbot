@@ -20,6 +20,24 @@ DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC = 1.0
 DEFAULT_TDLIB_AUTH_MAX_UPDATES = 80
 DEFAULT_TDLIB_RPC_TIMEOUT_SEC = 15.0
 DEFAULT_TDLIB_RPC_MAX_UPDATES = 120
+TDLIB_READY_STATE = "authorizationStateReady"
+TDLIB_BOOTSTRAP_AUTH_STATES = frozenset(
+    {
+        "authorizationStateWaitTdlibParameters",
+        "authorizationStateWaitEncryptionKey",
+    }
+)
+TDLIB_BLOCKED_AUTH_STATES = frozenset(
+    {
+        "authorizationStateWaitPhoneNumber",
+        "authorizationStateWaitCode",
+        "authorizationStateWaitOtherDeviceConfirmation",
+        "authorizationStateWaitPassword",
+        "authorizationStateLoggingOut",
+        "authorizationStateClosing",
+        "authorizationStateClosed",
+    }
+)
 
 SELECT_ONE_QUERY = "SELECT 1"
 SET_TRANSACTION_READ_ONLY_QUERY = "SET TRANSACTION READ ONLY"
@@ -587,6 +605,8 @@ class TDLibPublicUsernameResolver:
             self._transport.assert_available()
         self._client = TDLibClient(self._config, transport=self._transport)
         self._request_sequence = 0
+        self.tdlib_send_called = False
+        self.tdlib_receive_called = False
 
     async def initialize(self) -> None:
         try:
@@ -609,63 +629,64 @@ class TDLibPublicUsernameResolver:
         extra = self._next_extra("public_username_resolve")
         request = {**request, "@extra": extra}
         try:
-            await self._client.send(request)
+            await self._send(request)
             response = await self._receive_response(extra)
         except Exception as exc:
             raise TDLibTransportUnavailable("TDLib public username resolve failed") from exc
         return _resolve_result_from_tdlib_payload(response)
 
     async def _wait_until_ready(self) -> None:
-        from src.services.collector_telegram.tdlib_client import tdlib_json_bytes
+        if self._client.is_ready():
+            return
+
+        probe_pending = False
+        probe_due = True
 
         for _ in range(DEFAULT_TDLIB_AUTH_MAX_UPDATES):
-            payload = await self._client.receive(DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC)
+            if self._client.is_ready():
+                return
+            if probe_due:
+                await self._send_get_authorization_state_probe()
+                probe_pending = True
+                probe_due = False
+
+            payload = await self._receive(DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC)
+            if payload is None:
+                if probe_pending:
+                    probe_pending = False
+                    probe_due = True
+                continue
             if not isinstance(payload, dict):
                 continue
             if payload.get("@type") == "error":
                 raise TDLibNotReady("TDLib returned an authorization error")
-            if payload.get("@type") != "updateAuthorizationState":
+
+            if probe_pending and self._payload_is_authorization_state_probe_response(payload):
+                probe_pending = False
+
+            state = self._authorization_state_from_payload(payload)
+            if state is None:
+                if not probe_pending:
+                    probe_due = True
                 continue
-            state = payload.get("authorization_state")
-            if not isinstance(state, dict):
-                continue
+
             state_type = state.get("@type")
-            if state_type == "authorizationStateReady":
+            if state_type == TDLIB_READY_STATE:
                 return
-            if state_type == "authorizationStateWaitTdlibParameters":
-                await self._client.send(
-                    {
-                        **self._client.build_set_tdlib_parameters_request().payload,
-                        "@extra": self._next_extra("tdlib_parameters"),
-                    }
-                )
+
+            if state_type in TDLIB_BOOTSTRAP_AUTH_STATES:
+                await self._send_bootstrap_request_for_state(state_type)
+                probe_pending = False
+                probe_due = True
                 continue
-            if state_type == "authorizationStateWaitEncryptionKey":
-                await self._client.send(
-                    {
-                        "@type": "checkDatabaseEncryptionKey",
-                        "encryption_key": tdlib_json_bytes(
-                            self._config.tdlib_db_encryption_key
-                        ),
-                        "@extra": self._next_extra("encryption_key"),
-                    }
-                )
-                continue
-            if state_type in {
-                "authorizationStateWaitPhoneNumber",
-                "authorizationStateWaitCode",
-                "authorizationStateWaitOtherDeviceConfirmation",
-                "authorizationStateWaitPassword",
-                "authorizationStateLoggingOut",
-                "authorizationStateClosing",
-                "authorizationStateClosed",
-            }:
+
+            if state_type in TDLIB_BLOCKED_AUTH_STATES:
                 raise TDLibNotReady("TDLib authorization is not ready")
         raise TDLibNotReady("TDLib authorization did not become ready")
 
     async def _receive_response(self, extra: str) -> dict[str, Any]:
         for _ in range(DEFAULT_TDLIB_RPC_MAX_UPDATES):
-            payload = await self._client.receive(DEFAULT_TDLIB_RPC_TIMEOUT_SEC)
+            payload = await self._receive(DEFAULT_TDLIB_RPC_TIMEOUT_SEC)
             if not isinstance(payload, dict):
                 continue
             if payload.get("@extra") == extra:
@@ -673,9 +694,57 @@ class TDLibPublicUsernameResolver:
             if payload.get("@type") == "updateAuthorizationState":
                 state = payload.get("authorization_state")
                 state_type = state.get("@type") if isinstance(state, dict) else None
-                if state_type != "authorizationStateReady":
+                if state_type != TDLIB_READY_STATE:
                     raise TDLibNotReady("TDLib authorization left ready state")
         raise TDLibTransportUnavailable("TDLib public username resolve timed out")
+
+    async def _send(self, request: Mapping[str, Any]) -> None:
+        self.tdlib_send_called = True
+        await self._client.send(dict(request))
+
+    async def _receive(self, timeout_sec: float) -> dict[str, Any] | None:
+        self.tdlib_receive_called = True
+        return await self._client.receive(timeout_sec)
+
+    async def _send_get_authorization_state_probe(self) -> None:
+        await self._send(
+            {
+                "@type": "getAuthorizationState",
+                "@extra": self._next_extra("authorization_state_probe"),
+            }
+        )
+
+    async def _send_bootstrap_request_for_state(self, state_type: str) -> None:
+        if state_type == "authorizationStateWaitTdlibParameters":
+            await self._send(
+                {
+                    **self._client.build_set_tdlib_parameters_request().payload,
+                    "@extra": self._next_extra("tdlib_parameters"),
+                }
+            )
+            return
+        if state_type == "authorizationStateWaitEncryptionKey":
+            await self._send(
+                {
+                    **self._client.build_check_database_encryption_key_request().payload,
+                    "@extra": self._next_extra("encryption_key"),
+                }
+            )
+
+    @staticmethod
+    def _authorization_state_from_payload(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        payload_type = payload.get("@type")
+        if payload_type == "updateAuthorizationState":
+            state = payload.get("authorization_state")
+            return state if isinstance(state, Mapping) else None
+        if isinstance(payload_type, str) and payload_type.startswith("authorizationState"):
+            return payload
+        return None
+
+    @staticmethod
+    def _payload_is_authorization_state_probe_response(payload: Mapping[str, Any]) -> bool:
+        extra = payload.get("@extra")
+        return isinstance(extra, str) and ".authorization_state_probe." in extra
 
     def _next_extra(self, label: str) -> str:
         self._request_sequence += 1
@@ -750,6 +819,17 @@ def _extract_chat_type_summary(chat_payload: Mapping[str, Any]) -> str | None:
     if type_name == "chatTypeBasicGroup":
         return "basic_group"
     return None
+
+
+def _merge_resolver_side_effects(
+    report: dict[str, Any],
+    resolver: PublicUsernameResolver | None,
+) -> None:
+    if resolver is None:
+        return
+    for flag_name in ("tdlib_send_called", "tdlib_receive_called"):
+        if getattr(resolver, flag_name, False) is True:
+            report["side_effects"][flag_name] = True
 
 
 async def _resolve_rows(
@@ -962,9 +1042,11 @@ def generate_report(
             awaitable = resolver.initialize()
             asyncio.run(awaitable)
             report["side_effects"]["tdlib_initialized"] = True
+            _merge_resolver_side_effects(report, resolver)
         except TDLibNotReady:
             _set_status(report, "blocked_tdlib_not_ready", "tdlib.not_ready")
             report["side_effects"]["tdlib_initialized"] = True
+            _merge_resolver_side_effects(report, resolver)
             return ScriptResult(exit_code=1, report=report)
         except Exception:
             _set_status(
@@ -972,6 +1054,7 @@ def generate_report(
                 "blocked_tdlib_transport_unavailable",
                 "tdlib.transport_unavailable",
             )
+            _merge_resolver_side_effects(report, resolver)
             return ScriptResult(exit_code=1, report=report)
 
         try:
@@ -992,7 +1075,9 @@ def generate_report(
             )
         except TDLibNotReady:
             _set_status(report, "blocked_tdlib_not_ready", "tdlib.not_ready")
+            _merge_resolver_side_effects(report, resolver)
             return ScriptResult(exit_code=1, report=report)
+        _merge_resolver_side_effects(report, resolver)
 
         _apply_count_buckets(
             report,
