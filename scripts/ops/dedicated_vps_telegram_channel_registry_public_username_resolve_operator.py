@@ -50,6 +50,12 @@ TDLIB_READY_PROBE_REQUEST_TYPES = frozenset(
         "checkDatabaseEncryptionKey",
     }
 )
+TDLIB_BOOTSTRAP_FUNCTION_REQUEST_TYPES = frozenset(
+    {
+        "setTdlibParameters",
+        "checkDatabaseEncryptionKey",
+    }
+)
 
 SELECT_ONE_QUERY = "SELECT 1"
 SET_TRANSACTION_READ_ONLY_QUERY = "SET TRANSACTION READ ONLY"
@@ -208,13 +214,20 @@ class TDLibReadyProbeSummary:
     authorization_states_seen: list[str] = field(default_factory=list)
     final_authorization_state: str | None = None
     error_class: str | None = None
-    error_code: int | None = None
+    error_code: int | str | None = None
     manual_intervention_required: bool = False
     parameter_bootstrap_attempted: bool = False
     encryption_key_check_attempted: bool = False
     transport_closed: bool = False
     last_tdlib_object_type: str | None = None
     timed_out_after_state: str | None = None
+    function_response_types_seen: list[str] = field(default_factory=list)
+    set_parameters_response_type: str | None = None
+    set_parameters_error_code: int | str | None = None
+    set_parameters_error_class: str | None = None
+    encryption_key_response_type: str | None = None
+    encryption_key_error_code: int | str | None = None
+    encryption_key_error_class: str | None = None
 
     def mark_attempted(self) -> None:
         self.attempted = True
@@ -245,6 +258,30 @@ class TDLibReadyProbeSummary:
         state_type = _authorization_state_type_from_payload(payload)
         if state_type is not None:
             self.record_authorization_state(state_type)
+
+    def record_function_response(
+        self,
+        request_type: str | None,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if request_type not in TDLIB_BOOTSTRAP_FUNCTION_REQUEST_TYPES:
+            return
+        response_type = _safe_tdlib_object_type(payload.get("@type"))
+        if response_type is None:
+            return
+
+        _append_unique(self.function_response_types_seen, response_type)
+        error_class = "tdlib_error" if response_type == "error" else None
+        error_code = _safe_error_code(payload.get("code")) if response_type == "error" else None
+
+        if request_type == "setTdlibParameters":
+            self.set_parameters_response_type = response_type
+            self.set_parameters_error_code = error_code
+            self.set_parameters_error_class = error_class
+        elif request_type == "checkDatabaseEncryptionKey":
+            self.encryption_key_response_type = response_type
+            self.encryption_key_error_code = error_code
+            self.encryption_key_error_class = error_class
 
     def record_authorization_state(self, state_type: str) -> None:
         _append_unique(self.authorization_states_seen, state_type)
@@ -301,6 +338,27 @@ class TDLibReadyProbeSummary:
             "tdlib_ready_probe_transport_closed": self.transport_closed,
             "tdlib_ready_probe_last_tdlib_object_type": self.last_tdlib_object_type,
             "tdlib_ready_probe_timed_out_after_state": self.timed_out_after_state,
+            "tdlib_ready_probe_function_response_types_seen": list(
+                self.function_response_types_seen
+            ),
+            "tdlib_ready_probe_set_parameters_response_type": (
+                self.set_parameters_response_type
+            ),
+            "tdlib_ready_probe_set_parameters_error_code": (
+                self.set_parameters_error_code
+            ),
+            "tdlib_ready_probe_set_parameters_error_class": (
+                self.set_parameters_error_class
+            ),
+            "tdlib_ready_probe_encryption_key_response_type": (
+                self.encryption_key_response_type
+            ),
+            "tdlib_ready_probe_encryption_key_error_code": (
+                self.encryption_key_error_code
+            ),
+            "tdlib_ready_probe_encryption_key_error_class": (
+                self.encryption_key_error_class
+            ),
         }
 
 
@@ -383,7 +441,7 @@ def _append_unique(values: list[str], value: str) -> None:
         values.append(value)
 
 
-def _safe_error_code(value: Any) -> int | None:
+def _safe_error_code(value: Any) -> int | str | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -391,6 +449,8 @@ def _safe_error_code(value: Any) -> int | None:
     try:
         return int(value)
     except (TypeError, ValueError):
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", value):
+            return value
         return None
 
 
@@ -837,26 +897,16 @@ class TDLibPublicUsernameResolver:
             if not isinstance(payload, dict):
                 continue
             self._ready_probe_summary.record_payload(payload)
-            response_request_type = self._pop_ok_response_request_type(
+            response_request_type = self._pop_response_request_type(
                 payload,
                 pending_request_types_by_extra,
             )
+            self._ready_probe_summary.record_function_response(
+                response_request_type,
+                payload,
+            )
             if payload.get("@type") == "error":
                 raise TDLibNotReady("TDLib returned an authorization error")
-
-            if (
-                response_request_type == "setTdlibParameters"
-                and not self._ready_probe_summary.encryption_key_check_attempted
-            ):
-                sent = await self._send_bootstrap_request_for_state(
-                    {"@type": "authorizationStateWaitEncryptionKey"}
-                )
-                if sent is not None:
-                    extra, request_type = sent
-                    pending_request_types_by_extra[extra] = request_type
-                probe_pending = False
-                probe_due = True
-                continue
 
             if probe_pending and self._payload_is_authorization_state_probe_response(payload):
                 probe_pending = False
@@ -969,12 +1019,10 @@ class TDLibPublicUsernameResolver:
         return isinstance(extra, str) and ".authorization_state_probe." in extra
 
     @staticmethod
-    def _pop_ok_response_request_type(
+    def _pop_response_request_type(
         payload: Mapping[str, Any],
         pending_request_types_by_extra: dict[str, str],
     ) -> str | None:
-        if payload.get("@type") != "ok":
-            return None
         extra = payload.get("@extra")
         if not isinstance(extra, str):
             return None
