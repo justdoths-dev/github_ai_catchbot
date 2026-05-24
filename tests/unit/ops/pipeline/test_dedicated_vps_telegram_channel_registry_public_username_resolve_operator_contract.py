@@ -105,8 +105,12 @@ POST_READY_DRAIN_FIELD_NAMES = (
     "tdlib_post_ready_drain_attempted",
     "tdlib_post_ready_drain_max_updates",
     "tdlib_post_ready_drain_timeout_sec",
+    "tdlib_post_ready_drain_quiet_empty_receive_target",
+    "tdlib_post_ready_drain_quiet_timeout_sec",
     "tdlib_post_ready_drain_receive_attempt_count_bucket",
     "tdlib_post_ready_drain_observation_count_bucket",
+    "tdlib_post_ready_drain_empty_receive_count_bucket",
+    "tdlib_post_ready_drain_quiet_empty_receive_streak_bucket",
     "tdlib_post_ready_drain_inbound_object_types_seen",
     "tdlib_post_ready_drain_function_response_types_seen",
     "tdlib_post_ready_drain_update_types_seen",
@@ -116,6 +120,7 @@ POST_READY_DRAIN_FIELD_NAMES = (
     "tdlib_post_ready_drain_response_wrong_extra_count_bucket",
     "tdlib_post_ready_drain_budget_exhausted",
     "tdlib_post_ready_drain_authorization_lost",
+    "tdlib_post_ready_drain_quiet_window_reached",
 )
 
 
@@ -476,6 +481,8 @@ def _run_report_with_tdlib_transport(
     tdlib_overall_timeout_sec: float | None = None,
     tdlib_post_ready_drain_max_updates: int | None = None,
     tdlib_post_ready_drain_timeout_sec: float | None = None,
+    tdlib_post_ready_drain_quiet_empty_receives: int | None = None,
+    tdlib_post_ready_drain_quiet_timeout_sec: float | None = None,
     diagnose_single_resolve_rpc: bool = False,
 ) -> tuple[dict[str, Any], FakeDatabaseConnection, Any]:
     module = _module()
@@ -506,6 +513,16 @@ def _run_report_with_tdlib_transport(
         if tdlib_post_ready_drain_timeout_sec is None
         else tdlib_post_ready_drain_timeout_sec
     )
+    post_ready_drain_quiet_empty_receives = (
+        module.DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_EMPTY_RECEIVES
+        if tdlib_post_ready_drain_quiet_empty_receives is None
+        else tdlib_post_ready_drain_quiet_empty_receives
+    )
+    post_ready_drain_quiet_timeout_sec = (
+        module.DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC
+        if tdlib_post_ready_drain_quiet_timeout_sec is None
+        else tdlib_post_ready_drain_quiet_timeout_sec
+    )
 
     def resolver_factory(values: dict[str, str]) -> Any:
         resolver = module.TDLibPublicUsernameResolver(
@@ -516,6 +533,10 @@ def _run_report_with_tdlib_transport(
             overall_timeout_sec=overall_timeout_sec,
             post_ready_drain_max_updates=post_ready_drain_max_updates,
             post_ready_drain_timeout_sec=post_ready_drain_timeout_sec,
+            post_ready_drain_quiet_empty_receives=(
+                post_ready_drain_quiet_empty_receives
+            ),
+            post_ready_drain_quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
         )
         resolver_holder["resolver"] = resolver
         return resolver
@@ -531,6 +552,10 @@ def _run_report_with_tdlib_transport(
         tdlib_overall_timeout_sec=overall_timeout_sec,
         tdlib_post_ready_drain_max_updates=post_ready_drain_max_updates,
         tdlib_post_ready_drain_timeout_sec=post_ready_drain_timeout_sec,
+        tdlib_post_ready_drain_quiet_empty_receives=(
+            post_ready_drain_quiet_empty_receives
+        ),
+        tdlib_post_ready_drain_quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
         runtime_env_reader=lambda _path: _runtime_env_for_tdlib_transport(tmp_path),
         database_connection_factory=lambda _database_url: fake_db,
         public_username_resolver_factory=resolver_factory,
@@ -683,6 +708,10 @@ def test_cli_tdlib_readiness_budget_options_are_passed_to_report_generation(
             "11",
             "--tdlib-post-ready-drain-timeout-sec",
             "0.05",
+            "--tdlib-post-ready-drain-quiet-empty-receives",
+            "4",
+            "--tdlib-post-ready-drain-quiet-timeout-sec",
+            "0.15",
         ]
     )
     stdout = capsys.readouterr().out
@@ -694,6 +723,8 @@ def test_cli_tdlib_readiness_budget_options_are_passed_to_report_generation(
     assert captured_kwargs["tdlib_overall_timeout_sec"] == 9.5
     assert captured_kwargs["tdlib_post_ready_drain_max_updates"] == 11
     assert captured_kwargs["tdlib_post_ready_drain_timeout_sec"] == 0.05
+    assert captured_kwargs["tdlib_post_ready_drain_quiet_empty_receives"] == 4
+    assert captured_kwargs["tdlib_post_ready_drain_quiet_timeout_sec"] == 0.15
 
 
 def test_cli_help_includes_single_resolve_rpc_diagnostic_flag() -> None:
@@ -729,6 +760,8 @@ def test_cli_help_includes_post_ready_drain_options() -> None:
     assert result.returncode == 0
     assert "--tdlib-post-ready-drain-max-updates" in result.stdout
     assert "--tdlib-post-ready-drain-timeout-sec" in result.stdout
+    assert "--tdlib-post-ready-drain-quiet-empty-receives" in result.stdout
+    assert "--tdlib-post-ready-drain-quiet-timeout-sec" in result.stdout
 
 
 def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutation() -> None:
@@ -1762,6 +1795,8 @@ def test_public_username_resolve_wrong_extra_is_counted_without_resolving(
         [
             _auth_update("authorizationStateReady"),
             None,
+            None,
+            None,
             {
                 "@type": "chat",
                 "@extra": "wrong-public-username-extra",
@@ -1801,6 +1836,8 @@ def test_public_username_resolve_without_extra_is_counted_without_resolving(
         [
             _auth_update("authorizationStateReady"),
             None,
+            None,
+            None,
             {
                 "@type": "chat",
                 "id": RAW_CHAT_ID,
@@ -1833,6 +1870,8 @@ def test_public_username_resolve_authorization_lost_is_classified_without_mutati
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
+            None,
+            None,
             None,
             _auth_update("authorizationStateClosing"),
         ]
@@ -2016,12 +2055,90 @@ def test_post_ready_drain_consumes_update_noise_before_single_rpc_search(
     )
     assert report["tdlib_post_ready_drain_attempted"] is True
     assert report["tdlib_post_ready_drain_observation_count_bucket"] == "one"
+    assert report["tdlib_post_ready_drain_empty_receive_count_bucket"] == "two_to_five"
+    assert (
+        report["tdlib_post_ready_drain_quiet_empty_receive_streak_bucket"]
+        == "two_to_five"
+    )
+    assert report["tdlib_post_ready_drain_quiet_window_reached"] is True
+    assert report["tdlib_post_ready_drain_budget_exhausted"] is False
     assert report["tdlib_post_ready_drain_update_types_seen"] == ["updateOption"]
     assert report["tdlib_post_ready_drain_authorization_lost"] is False
     assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
     assert report["single_resolve_rpc_result_class"] == "resolved"
     assert db.update_attempts == 0
     _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_post_ready_drain_stops_after_configured_quiet_empty_receives(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            None,
+            None,
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        tdlib_post_ready_drain_timeout_sec=0.05,
+        tdlib_post_ready_drain_quiet_empty_receives=2,
+        tdlib_post_ready_drain_quiet_timeout_sec=0.15,
+    )
+
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
+    assert report["tdlib_post_ready_drain_quiet_empty_receive_target"] == 2
+    assert report["tdlib_post_ready_drain_quiet_timeout_sec"] == 0.15
+    assert report["tdlib_post_ready_drain_receive_attempt_count_bucket"] == "two_to_five"
+    assert report["tdlib_post_ready_drain_empty_receive_count_bucket"] == "two_to_five"
+    assert (
+        report["tdlib_post_ready_drain_quiet_empty_receive_streak_bucket"]
+        == "two_to_five"
+    )
+    assert report["tdlib_post_ready_drain_quiet_window_reached"] is True
+    assert report["tdlib_post_ready_drain_budget_exhausted"] is False
+    assert transport.receive_timeouts[1:3] == [0.05, 0.15]
+    assert _sent_request_types(transport) == ["searchPublicChat"]
+    assert db.update_attempts == 0
+
+
+def test_post_ready_drain_non_empty_update_resets_quiet_streak(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            None,
+            {"@type": "updateConnectionState"},
+            None,
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        tdlib_post_ready_drain_max_updates=3,
+        tdlib_post_ready_drain_quiet_empty_receives=2,
+    )
+
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
+    assert report["tdlib_post_ready_drain_receive_attempt_count_bucket"] == "two_to_five"
+    assert report["tdlib_post_ready_drain_empty_receive_count_bucket"] == "two_to_five"
+    assert report["tdlib_post_ready_drain_quiet_empty_receive_streak_bucket"] == "one"
+    assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
+    assert report["tdlib_post_ready_drain_budget_exhausted"] is True
+    assert report["tdlib_post_ready_drain_update_types_seen"] == [
+        "updateConnectionState"
+    ]
+    assert _sent_request_types(transport) == ["searchPublicChat"]
+    assert db.update_attempts == 0
 
 
 def test_post_ready_drain_stale_ok_does_not_count_as_single_rpc_response(
@@ -2045,6 +2162,8 @@ def test_post_ready_drain_stale_ok_does_not_count_as_single_rpc_response(
     rendered = _render(report)
 
     assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert report["tdlib_post_ready_drain_quiet_window_reached"] is True
+    assert report["tdlib_post_ready_drain_empty_receive_count_bucket"] == "two_to_five"
     assert report["tdlib_post_ready_drain_function_response_types_seen"] == ["ok"]
     assert report["tdlib_post_ready_drain_response_wrong_extra_count_bucket"] == "one"
     assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
@@ -2053,6 +2172,41 @@ def test_post_ready_drain_stale_ok_does_not_count_as_single_rpc_response(
     assert report["single_resolve_rpc_result_class"] == "resolved"
     assert db.update_attempts == 0
     assert "stale-public-username-extra" not in rendered
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_post_ready_drain_stale_function_response_resets_quiet_streak(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            None,
+            {"@type": "ok", "@extra": "stale-public-username-extra"},
+            None,
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        diagnose_single_resolve_rpc=True,
+        tdlib_post_ready_drain_max_updates=3,
+        tdlib_post_ready_drain_quiet_empty_receives=2,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert report["tdlib_post_ready_drain_quiet_empty_receive_streak_bucket"] == "one"
+    assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
+    assert report["tdlib_post_ready_drain_budget_exhausted"] is True
+    assert report["tdlib_post_ready_drain_function_response_types_seen"] == ["ok"]
+    assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
+    assert report["single_resolve_rpc_response_wrong_extra_count_bucket"] == "zero"
+    assert "stale-public-username-extra" not in rendered
+    assert db.update_attempts == 0
     _assert_sensitive_values_absent(rendered, tmp_path)
 
 
@@ -2078,6 +2232,7 @@ def test_post_ready_drain_budget_exhaustion_with_stable_ready_allows_search(
 
     assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
     assert report["tdlib_post_ready_drain_budget_exhausted"] is True
+    assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
     assert report["tdlib_post_ready_drain_authorization_lost"] is False
     assert report["tdlib_post_ready_drain_update_types_seen"] == [
         "updateOption",
@@ -2110,6 +2265,7 @@ def test_post_ready_drain_authorization_lost_blocks_search_and_mutation(
     assert "tdlib.post_ready_drain_authorization_lost" in report["checks_failed"]
     assert report["tdlib_post_ready_drain_attempted"] is True
     assert report["tdlib_post_ready_drain_authorization_lost"] is True
+    assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
     assert report["tdlib_post_ready_drain_authorization_states_seen"] == [
         "authorizationStateClosing"
     ]
@@ -2148,6 +2304,7 @@ def test_normal_no_mutation_resolve_uses_drain_before_first_search(
     assert report["tdlib_post_ready_drain_update_types_seen"] == [
         "updateConnectionState"
     ]
+    assert report["tdlib_post_ready_drain_quiet_window_reached"] is True
     assert report["resolve_function_response_types_seen"] == ["chat"]
     assert db.update_attempts == 0
 
@@ -2265,6 +2422,8 @@ def test_single_resolve_rpc_diagnostic_wrong_extra_chat_is_bucketed_without_matc
         [
             _auth_update("authorizationStateReady"),
             None,
+            None,
+            None,
             {
                 "@type": "chat",
                 "@extra": "wrong-public-username-extra",
@@ -2305,6 +2464,8 @@ def test_single_resolve_rpc_diagnostic_response_without_extra_is_bucketed_withou
         [
             _auth_update("authorizationStateReady"),
             None,
+            None,
+            None,
             {
                 "@type": "chat",
                 "id": RAW_CHAT_ID,
@@ -2338,6 +2499,8 @@ def test_single_resolve_rpc_diagnostic_authorization_lost_reports_no_mutation(
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
+            None,
+            None,
             None,
             _auth_update("authorizationStateClosing"),
         ]

@@ -24,6 +24,8 @@ DEFAULT_TDLIB_RPC_TIMEOUT_SEC = 15.0
 DEFAULT_TDLIB_RPC_MAX_UPDATES = 120
 DEFAULT_TDLIB_POST_READY_DRAIN_MAX_UPDATES = 200
 DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC = 0.0
+DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_EMPTY_RECEIVES = 3
+DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC = 0.25
 TDLIB_READY_STATE = "authorizationStateReady"
 TDLIB_BOOTSTRAP_AUTH_STATES = frozenset(
     {
@@ -562,8 +564,14 @@ class TDLibPostReadyDrainSummary:
     attempted: bool = False
     max_updates: int = DEFAULT_TDLIB_POST_READY_DRAIN_MAX_UPDATES
     timeout_sec: float = DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC
+    quiet_empty_receive_target: int = (
+        DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_EMPTY_RECEIVES
+    )
+    quiet_timeout_sec: float = DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC
     receive_attempt_count: int = 0
     observation_count: int = 0
+    empty_receive_count: int = 0
+    quiet_empty_receive_streak: int = 0
     inbound_object_types_seen: list[str] = field(default_factory=list)
     function_response_types_seen: list[str] = field(default_factory=list)
     update_types_seen: list[str] = field(default_factory=list)
@@ -573,6 +581,7 @@ class TDLibPostReadyDrainSummary:
     response_wrong_extra_count: int = 0
     budget_exhausted: bool = False
     authorization_lost: bool = False
+    quiet_window_reached: bool = False
 
     def mark_attempted(self) -> None:
         self.attempted = True
@@ -581,6 +590,7 @@ class TDLibPostReadyDrainSummary:
 
     def record_payload(self, payload: Mapping[str, Any]) -> None:
         self.observation_count += 1
+        self.quiet_empty_receive_streak = 0
         payload_type = _safe_tdlib_object_type(payload.get("@type"))
         if payload_type is not None:
             _append_unique(self.inbound_object_types_seen, payload_type)
@@ -605,16 +615,32 @@ class TDLibPostReadyDrainSummary:
         else:
             self.response_without_extra_count += 1
 
+    def record_empty_receive(self) -> None:
+        self.empty_receive_count += 1
+        self.quiet_empty_receive_streak += 1
+        if self.quiet_empty_receive_streak >= self.quiet_empty_receive_target:
+            self.quiet_window_reached = True
+
     def as_report_fields(self) -> dict[str, Any]:
         return {
             "tdlib_post_ready_drain_attempted": self.attempted,
             "tdlib_post_ready_drain_max_updates": self.max_updates,
             "tdlib_post_ready_drain_timeout_sec": self.timeout_sec,
+            "tdlib_post_ready_drain_quiet_empty_receive_target": (
+                self.quiet_empty_receive_target
+            ),
+            "tdlib_post_ready_drain_quiet_timeout_sec": self.quiet_timeout_sec,
             "tdlib_post_ready_drain_receive_attempt_count_bucket": _bucket_count(
                 self.receive_attempt_count
             ),
             "tdlib_post_ready_drain_observation_count_bucket": _bucket_count(
                 self.observation_count
+            ),
+            "tdlib_post_ready_drain_empty_receive_count_bucket": _bucket_count(
+                self.empty_receive_count
+            ),
+            "tdlib_post_ready_drain_quiet_empty_receive_streak_bucket": _bucket_count(
+                self.quiet_empty_receive_streak
             ),
             "tdlib_post_ready_drain_inbound_object_types_seen": list(
                 self.inbound_object_types_seen
@@ -637,6 +663,9 @@ class TDLibPostReadyDrainSummary:
             ),
             "tdlib_post_ready_drain_budget_exhausted": self.budget_exhausted,
             "tdlib_post_ready_drain_authorization_lost": self.authorization_lost,
+            "tdlib_post_ready_drain_quiet_window_reached": (
+                self.quiet_window_reached
+            ),
         }
 
 
@@ -700,6 +729,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--tdlib-post-ready-drain-timeout-sec",
         type=_non_negative_float_named("tdlib-post-ready-drain-timeout-sec"),
         default=DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC,
+    )
+    parser.add_argument(
+        "--tdlib-post-ready-drain-quiet-empty-receives",
+        type=_positive_int_named("tdlib-post-ready-drain-quiet-empty-receives"),
+        default=DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_EMPTY_RECEIVES,
+    )
+    parser.add_argument(
+        "--tdlib-post-ready-drain-quiet-timeout-sec",
+        type=_non_negative_float_named("tdlib-post-ready-drain-quiet-timeout-sec"),
+        default=DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC,
     )
     return parser
 
@@ -1420,6 +1459,12 @@ class TDLibPublicUsernameResolver:
         overall_timeout_sec: float = DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC,
         post_ready_drain_max_updates: int = DEFAULT_TDLIB_POST_READY_DRAIN_MAX_UPDATES,
         post_ready_drain_timeout_sec: float = DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC,
+        post_ready_drain_quiet_empty_receives: int = (
+            DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_EMPTY_RECEIVES
+        ),
+        post_ready_drain_quiet_timeout_sec: float = (
+            DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC
+        ),
     ) -> None:
         from src.services.collector_telegram.auth_entrypoint import TDLibAuthOnlyRunner
         from src.services.collector_telegram.auth_fsm import (
@@ -1464,6 +1509,8 @@ class TDLibPublicUsernameResolver:
         self._post_ready_drain_summary = TDLibPostReadyDrainSummary(
             max_updates=post_ready_drain_max_updates,
             timeout_sec=post_ready_drain_timeout_sec,
+            quiet_empty_receive_target=post_ready_drain_quiet_empty_receives,
+            quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
         )
         self._ready_helper_reused = False
         self._ready_helper_status = "not_attempted"
@@ -1535,14 +1582,23 @@ class TDLibPublicUsernameResolver:
         self._post_ready_drain_summary.mark_attempted()
         for _ in range(self._post_ready_drain_summary.max_updates):
             self._post_ready_drain_summary.receive_attempt_count += 1
+            timeout_sec = (
+                self._post_ready_drain_summary.quiet_timeout_sec
+                if self._post_ready_drain_summary.quiet_empty_receive_streak > 0
+                else self._post_ready_drain_summary.timeout_sec
+            )
             try:
-                payload = await self._receive(self._post_ready_drain_summary.timeout_sec)
+                payload = await self._receive(timeout_sec)
             except Exception as exc:
                 self._ready_probe_summary.mark_transport_error(exc)
                 raise TDLibTransportUnavailable("TDLib transport unavailable") from exc
             if payload is None:
-                break
+                self._post_ready_drain_summary.record_empty_receive()
+                if self._post_ready_drain_summary.quiet_window_reached:
+                    break
+                continue
             if not isinstance(payload, Mapping):
+                self._post_ready_drain_summary.quiet_empty_receive_streak = 0
                 continue
             self._post_ready_drain_summary.record_payload(payload)
             if self._post_ready_drain_summary.authorization_lost:
@@ -1790,6 +1846,8 @@ def _default_resolver_factory(
     overall_timeout_sec: float,
     post_ready_drain_max_updates: int,
     post_ready_drain_timeout_sec: float,
+    post_ready_drain_quiet_empty_receives: int,
+    post_ready_drain_quiet_timeout_sec: float,
 ) -> PublicUsernameResolver:
     return TDLibPublicUsernameResolver(
         runtime_env,
@@ -1798,6 +1856,8 @@ def _default_resolver_factory(
         overall_timeout_sec=overall_timeout_sec,
         post_ready_drain_max_updates=post_ready_drain_max_updates,
         post_ready_drain_timeout_sec=post_ready_drain_timeout_sec,
+        post_ready_drain_quiet_empty_receives=post_ready_drain_quiet_empty_receives,
+        post_ready_drain_quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
     )
 
 
@@ -2217,6 +2277,12 @@ def generate_report(
     tdlib_post_ready_drain_timeout_sec: float = (
         DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC
     ),
+    tdlib_post_ready_drain_quiet_empty_receives: int = (
+        DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_EMPTY_RECEIVES
+    ),
+    tdlib_post_ready_drain_quiet_timeout_sec: float = (
+        DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC
+    ),
     runtime_env_reader: RuntimeEnvReader | None = None,
     database_connection_factory: DatabaseConnectionFactory | None = None,
     public_username_resolver_factory: PublicUsernameResolverFactory | None = None,
@@ -2355,6 +2421,12 @@ def generate_report(
                     overall_timeout_sec=tdlib_overall_timeout_sec,
                     post_ready_drain_max_updates=tdlib_post_ready_drain_max_updates,
                     post_ready_drain_timeout_sec=tdlib_post_ready_drain_timeout_sec,
+                    post_ready_drain_quiet_empty_receives=(
+                        tdlib_post_ready_drain_quiet_empty_receives
+                    ),
+                    post_ready_drain_quiet_timeout_sec=(
+                        tdlib_post_ready_drain_quiet_timeout_sec
+                    ),
                 )
             else:
                 resolver = public_username_resolver_factory(values)
@@ -2521,6 +2593,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         tdlib_overall_timeout_sec=args.tdlib_overall_timeout_sec,
         tdlib_post_ready_drain_max_updates=args.tdlib_post_ready_drain_max_updates,
         tdlib_post_ready_drain_timeout_sec=args.tdlib_post_ready_drain_timeout_sec,
+        tdlib_post_ready_drain_quiet_empty_receives=(
+            args.tdlib_post_ready_drain_quiet_empty_receives
+        ),
+        tdlib_post_ready_drain_quiet_timeout_sec=(
+            args.tdlib_post_ready_drain_quiet_timeout_sec
+        ),
     )
     sys.stdout.write(render_json(result.report))
     sys.stdout.write("\n")
