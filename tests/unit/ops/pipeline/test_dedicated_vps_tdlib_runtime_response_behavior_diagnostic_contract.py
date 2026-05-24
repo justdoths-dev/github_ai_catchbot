@@ -395,6 +395,73 @@ def test_approved_probe_reports_sanitized_set_parameters_error(
     _assert_non_tdlib_side_effects_false(report)
 
 
+def test_set_parameters_absent_response_ready_transition_completes_without_timeout(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateWaitTdlibParameters"),
+            _auth_update("authorizationStateReady"),
+        ]
+    )
+
+    report, _used_transport = _run_report(tmp_path=tmp_path, transport=transport)
+
+    assert report["contract_status"] == "tdlib_runtime_response_diagnostic_completed"
+    assert report["set_parameters_request_sent"] is True
+    assert report["set_parameters_response_seen"] is False
+    assert report["set_parameters_response_extra_matched"] is False
+    assert report["timed_out_waiting_for_set_parameters_response"] is False
+    assert "set_parameters.response_timeout" not in report["checks_failed"]
+    assert report["authorization_states_seen"] == [
+        "authorizationStateWaitTdlibParameters",
+        "authorizationStateReady",
+    ]
+    assert report["final_authorization_state"] == "authorizationStateReady"
+    assert report["transition_after_set_parameters"] == "authorizationStateReady"
+    assert report["unmatched_response_types_seen"] == []
+    assert report["response_correlation_gap_detected"] is False
+    assert "authorizationStateReady" in report["operator_next_action"]
+    assert "public username resolve readiness" in report["operator_next_action"]
+    assert "parameter shape" in report["operator_next_action"]
+    _assert_non_tdlib_side_effects_false(report)
+
+
+def test_set_parameters_absent_response_wait_encryption_key_progresses_without_timeout(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateWaitTdlibParameters"),
+            _auth_update("authorizationStateWaitEncryptionKey"),
+        ]
+    )
+
+    report, _used_transport = _run_report(tmp_path=tmp_path, transport=transport)
+
+    assert report["contract_status"] == "tdlib_runtime_response_diagnostic_progress"
+    assert report["set_parameters_request_sent"] is True
+    assert report["set_parameters_response_seen"] is False
+    assert report["set_parameters_response_extra_matched"] is False
+    assert report["timed_out_waiting_for_set_parameters_response"] is False
+    assert "set_parameters.response_timeout" not in report["checks_failed"]
+    assert report["authorization_states_seen"] == [
+        "authorizationStateWaitTdlibParameters",
+        "authorizationStateWaitEncryptionKey",
+    ]
+    assert report["final_authorization_state"] == "authorizationStateWaitEncryptionKey"
+    assert (
+        report["transition_after_set_parameters"]
+        == "authorizationStateWaitEncryptionKey"
+    )
+    assert report["unmatched_response_types_seen"] == []
+    assert report["response_correlation_gap_detected"] is False
+    assert "setTdlibParameters was accepted" in report["operator_next_action"]
+    assert "encryption-key handling" in report["operator_next_action"]
+    assert "checkDatabaseEncryptionKey" not in _sent_request_types(transport)
+    _assert_non_tdlib_side_effects_false(report)
+
+
 def test_approved_probe_times_out_after_set_parameters_without_correlated_response(
     tmp_path: Path,
 ) -> None:

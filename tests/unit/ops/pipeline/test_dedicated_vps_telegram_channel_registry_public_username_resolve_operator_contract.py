@@ -635,6 +635,67 @@ def test_tdlib_auth_ready_helper_update_allows_resolve_without_local_probe(
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
 
 
+def test_tdlib_ready_after_set_parameters_without_function_response_allows_resolve(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            {
+                "@type": "updateOption",
+                "name": "version",
+                "value": {"@type": "optionValueString"},
+            },
+            _auth_update("authorizationStateWaitTdlibParameters"),
+            {
+                "@type": "updateOption",
+                "name": "connection_state",
+                "value": {"@type": "optionValueEmpty"},
+            },
+            _auth_update("authorizationStateReady"),
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
+    assert _sent_request_types(transport) == [
+        "setTdlibParameters",
+        "searchPublicChat",
+    ]
+    assert "checkDatabaseEncryptionKey" not in _sent_request_types(transport)
+    assert "joinChat" not in _sent_request_types(transport)
+    assert "getChatHistory" not in _sent_request_types(transport)
+    assert db.update_attempts == 0
+    assert db.transaction.rolled_back is True
+    assert report["tdlib_ready_probe_status"] == "ready"
+    assert report["tdlib_ready_probe_request_types_sent"] == ["setTdlibParameters"]
+    assert report["tdlib_ready_probe_update_types_seen"] == [
+        "updateOption",
+        "updateAuthorizationState",
+    ]
+    assert report["tdlib_ready_probe_authorization_states_seen"] == [
+        "authorizationStateWaitTdlibParameters",
+        "authorizationStateReady",
+    ]
+    assert report["tdlib_ready_probe_final_authorization_state"] == "authorizationStateReady"
+    assert report["tdlib_ready_probe_function_response_types_seen"] == []
+    assert report["tdlib_ready_probe_set_parameters_response_type"] is None
+    assert report["tdlib_ready_probe_encryption_key_check_attempted"] is False
+    assert report["tdlib_ready_helper_status"] == "ready"
+    assert report["tdlib_resolve_attempted"] is True
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
+    assert report["side_effects"]["tdlib_join_called"] is False
+    assert report["side_effects"]["tdlib_history_fetch_called"] is False
+    assert report["side_effects"]["live_collector_started"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+
+
 def test_tdlib_bootstrap_readiness_requests_are_summarized_without_values(
     tmp_path: Path,
 ) -> None:

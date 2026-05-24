@@ -721,6 +721,33 @@ def _apply_final_probe_status(report: dict[str, Any]) -> None:
         )
         return
 
+    transition_after_set_parameters = report["transition_after_set_parameters"]
+    if (
+        not report["set_parameters_response_seen"]
+        and transition_after_set_parameters == "authorizationStateReady"
+    ):
+        report["contract_status"] = "tdlib_runtime_response_diagnostic_completed"
+        report["operator_next_action"] = (
+            "The session reached authorizationStateReady after setTdlibParameters "
+            "without a correlated function response. The next bounded step can "
+            "inspect or execute public username resolve readiness; do not keep "
+            "changing parameter shape."
+        )
+        return
+
+    if (
+        not report["set_parameters_response_seen"]
+        and transition_after_set_parameters == "authorizationStateWaitEncryptionKey"
+    ):
+        report["contract_status"] = "tdlib_runtime_response_diagnostic_progress"
+        report["operator_next_action"] = (
+            "TDLib reached authorizationStateWaitEncryptionKey after "
+            "setTdlibParameters, so setTdlibParameters was accepted. The next "
+            "bounded step is encryption-key handling; this diagnostic slice does "
+            "not send checkDatabaseEncryptionKey."
+        )
+        return
+
     if not report["set_parameters_response_seen"]:
         report["contract_status"] = "blocked_set_parameters_response_timeout"
         report["timed_out_waiting_for_set_parameters_response"] = True
@@ -834,7 +861,11 @@ def generate_report(
     _apply_final_probe_status(report)
     return ScriptResult(
         exit_code=0
-        if report["contract_status"] == "tdlib_runtime_response_diagnostic_completed"
+        if report["contract_status"]
+        in {
+            "tdlib_runtime_response_diagnostic_completed",
+            "tdlib_runtime_response_diagnostic_progress",
+        }
         else 1,
         report=report,
     )
