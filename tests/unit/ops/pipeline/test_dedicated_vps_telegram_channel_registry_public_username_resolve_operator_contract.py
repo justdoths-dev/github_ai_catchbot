@@ -1399,7 +1399,7 @@ def test_approved_tdlib_resolve_without_mutation_calls_fake_resolver_only() -> N
 
     assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
     assert resolver.initialized is True
-    assert resolver.drain_calls == 1
+    assert resolver.drain_calls == 0
     assert resolver.closed is True
     assert resolver.calls == [RAW_PUBLIC_USERNAME]
     assert report["tdlib_resolve_attempted"] is True
@@ -1414,7 +1414,7 @@ def test_approved_tdlib_resolve_without_mutation_calls_fake_resolver_only() -> N
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
     assert report["side_effects"]["database_mutation_performed"] is False
     assert report["side_effects"]["telegram_channel_registry_updated"] is False
-    assert report["tdlib_post_ready_drain_attempted"] is True
+    assert report["tdlib_post_ready_drain_attempted"] is False
 
 
 def test_tdlib_ready_update_allows_public_username_resolve_without_mutation(
@@ -2271,11 +2271,7 @@ def test_public_username_resolve_unknown_tdlib_error_reports_sanitized_code_only
 
 def test_public_username_resolve_timeout_is_classified_without_matching_response(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _module()
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
@@ -2288,6 +2284,8 @@ def test_public_username_resolve_timeout_is_classified_without_matching_response
         tmp_path=tmp_path,
         transport=transport,
         approved_mutation=False,
+        tdlib_single_rpc_max_updates=2,
+        tdlib_single_rpc_receive_timeout_sec=0,
     )
 
     assert report["contract_status"] == "public_username_resolve_partial"
@@ -2300,11 +2298,7 @@ def test_public_username_resolve_timeout_is_classified_without_matching_response
 
 def test_public_username_resolve_wrong_extra_is_counted_without_resolving(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _module()
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
@@ -2325,6 +2319,8 @@ def test_public_username_resolve_wrong_extra_is_counted_without_resolving(
         tmp_path=tmp_path,
         transport=transport,
         approved_mutation=False,
+        tdlib_single_rpc_max_updates=4,
+        tdlib_single_rpc_receive_timeout_sec=0,
     )
     rendered = _render(report)
 
@@ -2341,11 +2337,7 @@ def test_public_username_resolve_wrong_extra_is_counted_without_resolving(
 
 def test_public_username_resolve_without_extra_is_counted_without_resolving(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _module()
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
@@ -2365,6 +2357,8 @@ def test_public_username_resolve_without_extra_is_counted_without_resolving(
         tmp_path=tmp_path,
         transport=transport,
         approved_mutation=False,
+        tdlib_single_rpc_max_updates=4,
+        tdlib_single_rpc_receive_timeout_sec=0,
     )
     rendered = _render(report)
 
@@ -2640,18 +2634,21 @@ def test_single_rpc_diagnostic_sends_search_before_stale_function_response(
     _assert_sensitive_values_absent(rendered, tmp_path)
 
 
-def test_post_ready_drain_consumes_update_noise_before_normal_search(
+def test_normal_no_mutation_resolve_sends_search_before_update_backlog(
     tmp_path: Path,
 ) -> None:
+    update_backlog = [
+        {
+            "@type": "updateOption",
+            "name": RAW_TDLIB_PAYLOAD_VALUE,
+            "value": {"@type": "optionValueString", "value": RAW_PUBLIC_USERNAME},
+        }
+        for _ in range(25)
+    ]
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
-            {
-                "@type": "updateOption",
-                "name": RAW_TDLIB_PAYLOAD_VALUE,
-                "value": {"@type": "optionValueString", "value": RAW_PUBLIC_USERNAME},
-            },
-            None,
+            *update_backlog,
             _public_chat_response(),
         ]
     )
@@ -2664,70 +2661,67 @@ def test_post_ready_drain_consumes_update_noise_before_normal_search(
     rendered = _render(report)
 
     assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
-    assert transport.events.index("receive:updateOption") < transport.events.index(
-        "send:searchPublicChat"
+    assert transport.events.index("send:searchPublicChat") < transport.events.index(
+        "receive:updateOption"
     )
-    assert report["tdlib_post_ready_drain_attempted"] is True
-    assert report["tdlib_post_ready_drain_observation_count_bucket"] == "one"
-    assert report["tdlib_post_ready_drain_empty_receive_count_bucket"] == "two_to_five"
-    assert (
-        report["tdlib_post_ready_drain_quiet_empty_receive_streak_bucket"]
-        == "two_to_five"
-    )
-    assert report["tdlib_post_ready_drain_quiet_window_reached"] is True
+    assert report["tdlib_post_ready_drain_attempted"] is False
+    assert report["tdlib_post_ready_drain_observation_count_bucket"] == "zero"
+    assert report["tdlib_post_ready_drain_empty_receive_count_bucket"] == "zero"
+    assert report["tdlib_post_ready_drain_quiet_empty_receive_streak_bucket"] == "zero"
+    assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
     assert report["tdlib_post_ready_drain_budget_exhausted"] is False
-    assert report["tdlib_post_ready_drain_update_types_seen"] == ["updateOption"]
+    assert report["tdlib_post_ready_drain_update_types_seen"] == []
     assert report["tdlib_post_ready_drain_authorization_lost"] is False
     assert report["resolve_function_response_types_seen"] == ["chat"]
+    assert report["resolve_response_extra_matched_count_bucket"] == "one"
     assert db.update_attempts == 0
     _assert_sensitive_values_absent(rendered, tmp_path)
 
 
-def test_post_ready_drain_stops_after_configured_quiet_empty_receives(
+def test_normal_no_mutation_resolve_update_budget_exhaustion_is_response_timeout(
     tmp_path: Path,
 ) -> None:
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
-            None,
-            None,
-            _public_chat_response(),
-        ]
-    )
-
-    report, db, _resolver = _run_report_with_tdlib_transport(
-        tmp_path=tmp_path,
-        transport=transport,
-        approved_mutation=False,
-        tdlib_post_ready_drain_timeout_sec=0.05,
-        tdlib_post_ready_drain_quiet_empty_receives=2,
-        tdlib_post_ready_drain_quiet_timeout_sec=0.15,
-    )
-
-    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
-    assert report["tdlib_post_ready_drain_quiet_empty_receive_target"] == 2
-    assert report["tdlib_post_ready_drain_quiet_timeout_sec"] == 0.15
-    assert report["tdlib_post_ready_drain_receive_attempt_count_bucket"] == "two_to_five"
-    assert report["tdlib_post_ready_drain_empty_receive_count_bucket"] == "two_to_five"
-    assert (
-        report["tdlib_post_ready_drain_quiet_empty_receive_streak_bucket"]
-        == "two_to_five"
-    )
-    assert report["tdlib_post_ready_drain_quiet_window_reached"] is True
-    assert report["tdlib_post_ready_drain_budget_exhausted"] is False
-    assert transport.receive_timeouts[1:3] == [0.05, 0.15]
-    assert _sent_request_types(transport) == ["searchPublicChat"]
-    assert db.update_attempts == 0
-
-
-def test_post_ready_drain_non_empty_update_resets_quiet_streak(
-    tmp_path: Path,
-) -> None:
-    transport = FakeTDLibTransport(
-        [
-            _auth_update("authorizationStateReady"),
-            None,
             {"@type": "updateConnectionState"},
+            {"@type": "updateOption", "name": "version"},
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        tdlib_single_rpc_max_updates=2,
+        tdlib_single_rpc_receive_timeout_sec=0,
+    )
+
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert transport.events.index("send:searchPublicChat") < transport.events.index(
+        "receive:updateConnectionState"
+    )
+    assert report["resolve_response_timeout_count_bucket"] == "one"
+    assert report["failed_resolve_count_bucket"] == "one"
+    assert report["resolve_failure_classes_seen"] == ["response_timeout"]
+    assert report["tdlib_post_ready_drain_attempted"] is False
+    assert len(transport.receive_timeouts) == 3
+    assert _sent_request_types(transport) == ["searchPublicChat"]
+    assert db.update_attempts == 0
+    assert report["registry_resolve_mutation_performed"] is False
+
+
+def test_normal_no_mutation_resolve_duration_exhaustion_is_response_timeout(
+    tmp_path: Path,
+) -> None:
+    clock_values = iter([0.0, 0.0, 2.0])
+
+    def monotonic_clock() -> float:
+        return next(clock_values, 2.0)
+
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
             None,
             _public_chat_response(),
         ]
@@ -2737,31 +2731,36 @@ def test_post_ready_drain_non_empty_update_resets_quiet_streak(
         tmp_path=tmp_path,
         transport=transport,
         approved_mutation=False,
-        tdlib_post_ready_drain_max_updates=3,
-        tdlib_post_ready_drain_quiet_empty_receives=2,
+        tdlib_single_rpc_max_updates=50,
+        tdlib_single_rpc_receive_timeout_sec=1.0,
+        tdlib_single_rpc_max_duration_sec=1.0,
+        monotonic_clock=monotonic_clock,
     )
 
-    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
-    assert report["tdlib_post_ready_drain_receive_attempt_count_bucket"] == "two_to_five"
-    assert report["tdlib_post_ready_drain_empty_receive_count_bucket"] == "two_to_five"
-    assert report["tdlib_post_ready_drain_quiet_empty_receive_streak_bucket"] == "one"
-    assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
-    assert report["tdlib_post_ready_drain_budget_exhausted"] is True
-    assert report["tdlib_post_ready_drain_update_types_seen"] == [
-        "updateConnectionState"
-    ]
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert report["resolve_response_timeout_count_bucket"] == "one"
+    assert report["failed_resolve_count_bucket"] == "one"
+    assert report["resolve_failure_classes_seen"] == ["response_timeout"]
+    assert report["resolve_response_extra_matched_count_bucket"] == "zero"
+    assert report["tdlib_post_ready_drain_attempted"] is False
+    assert transport.receive_timeouts[1:] == [1.0]
     assert _sent_request_types(transport) == ["searchPublicChat"]
     assert db.update_attempts == 0
 
 
-def test_post_ready_drain_stale_ok_does_not_count_as_normal_resolve_response(
+def test_normal_no_mutation_resolve_counts_wrong_and_without_extra_responses(
     tmp_path: Path,
 ) -> None:
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
             {"@type": "ok", "@extra": "stale-public-username-extra"},
-            None,
+            {
+                "@type": "chat",
+                "id": RAW_CHAT_ID,
+                "title": RAW_TDLIB_PAYLOAD_VALUE,
+                "type": {"@type": "chatTypeSupergroup", "is_channel": True},
+            },
             _public_chat_response(),
         ]
     )
@@ -2774,128 +2773,61 @@ def test_post_ready_drain_stale_ok_does_not_count_as_normal_resolve_response(
     rendered = _render(report)
 
     assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
-    assert report["tdlib_post_ready_drain_quiet_window_reached"] is True
-    assert report["tdlib_post_ready_drain_empty_receive_count_bucket"] == "two_to_five"
-    assert report["tdlib_post_ready_drain_function_response_types_seen"] == ["ok"]
-    assert report["tdlib_post_ready_drain_response_wrong_extra_count_bucket"] == "one"
-    assert report["resolve_function_response_types_seen"] == ["chat"]
-    assert report["resolve_response_wrong_extra_count_bucket"] == "zero"
+    assert report["tdlib_post_ready_drain_attempted"] is False
+    assert report["tdlib_post_ready_drain_function_response_types_seen"] == []
+    assert report["resolve_function_response_types_seen"] == ["ok", "chat"]
+    assert report["resolve_response_wrong_extra_count_bucket"] == "one"
+    assert report["resolve_response_without_extra_count_bucket"] == "one"
     assert report["resolve_response_extra_matched_count_bucket"] == "one"
     assert db.update_attempts == 0
     assert "stale-public-username-extra" not in rendered
     _assert_sensitive_values_absent(rendered, tmp_path)
 
 
-def test_post_ready_drain_stale_function_response_resets_quiet_streak_before_normal_resolve(
+def test_normal_mutation_resolve_authorization_lost_rolls_back_prior_update(
     tmp_path: Path,
 ) -> None:
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
-            None,
-            {"@type": "ok", "@extra": "stale-public-username-extra"},
-            None,
             _public_chat_response(),
-        ]
-    )
-
-    report, db, _resolver = _run_report_with_tdlib_transport(
-        tmp_path=tmp_path,
-        transport=transport,
-        approved_mutation=False,
-        tdlib_post_ready_drain_max_updates=3,
-        tdlib_post_ready_drain_quiet_empty_receives=2,
-    )
-    rendered = _render(report)
-
-    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
-    assert report["tdlib_post_ready_drain_quiet_empty_receive_streak_bucket"] == "one"
-    assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
-    assert report["tdlib_post_ready_drain_budget_exhausted"] is True
-    assert report["tdlib_post_ready_drain_function_response_types_seen"] == ["ok"]
-    assert report["resolve_function_response_types_seen"] == ["chat"]
-    assert report["resolve_response_wrong_extra_count_bucket"] == "zero"
-    assert "stale-public-username-extra" not in rendered
-    assert db.update_attempts == 0
-    _assert_sensitive_values_absent(rendered, tmp_path)
-
-
-def test_post_ready_drain_budget_exhaustion_with_stable_ready_allows_search(
-    tmp_path: Path,
-) -> None:
-    transport = FakeTDLibTransport(
-        [
-            _auth_update("authorizationStateReady"),
-            {"@type": "updateOption", "name": "version"},
-            {"@type": "updateChatLastMessage", "chat_id": RAW_CHAT_ID},
-            _public_chat_response(),
-        ]
-    )
-
-    report, db, _resolver = _run_report_with_tdlib_transport(
-        tmp_path=tmp_path,
-        transport=transport,
-        approved_mutation=False,
-        tdlib_post_ready_drain_max_updates=2,
-    )
-    rendered = _render(report)
-
-    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
-    assert report["tdlib_post_ready_drain_budget_exhausted"] is True
-    assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
-    assert report["tdlib_post_ready_drain_authorization_lost"] is False
-    assert report["tdlib_post_ready_drain_update_types_seen"] == [
-        "updateOption",
-        "updateChatLastMessage",
-    ]
-    assert report["resolve_function_response_types_seen"] == ["chat"]
-    assert _sent_request_types(transport) == ["searchPublicChat"]
-    assert db.update_attempts == 0
-    _assert_sensitive_values_absent(rendered, tmp_path)
-
-
-def test_post_ready_drain_authorization_lost_blocks_search_and_mutation(
-    tmp_path: Path,
-) -> None:
-    transport = FakeTDLibTransport(
-        [
-            _auth_update("authorizationStateReady"),
             _auth_update("authorizationStateClosing"),
-            _public_chat_response(),
+        ]
+    )
+    db = FakeDatabaseConnection(
+        [
+            _registry_row("registry-1", RAW_PUBLIC_USERNAME),
+            _registry_row("registry-2", RAW_PUBLIC_USERNAME_TWO),
         ]
     )
 
     report, db, _resolver = _run_report_with_tdlib_transport(
         tmp_path=tmp_path,
         transport=transport,
+        db=db,
         approved_mutation=True,
     )
 
-    assert report["contract_status"] == "blocked_tdlib_post_ready_drain_authorization_lost"
-    assert "tdlib.post_ready_drain_authorization_lost" in report["checks_failed"]
-    assert report["tdlib_post_ready_drain_attempted"] is True
-    assert report["tdlib_post_ready_drain_authorization_lost"] is True
-    assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
-    assert report["tdlib_post_ready_drain_authorization_states_seen"] == [
-        "authorizationStateClosing"
-    ]
-    assert report["tdlib_resolve_attempted"] is False
-    assert _sent_request_types(transport) == []
-    assert db.update_attempts == 0
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert _sent_request_types(transport) == ["searchPublicChat", "searchPublicChat"]
+    assert db.update_attempts == 1
     assert db.transaction.rolled_back is True
     assert db.transaction.committed is False
+    assert report["resolve_authorization_lost_count_bucket"] == "one"
+    assert report["resolve_failure_classes_seen"] == ["authorization_lost"]
+    assert report["updated_row_count_bucket"] == "zero"
     assert report["registry_resolve_mutation_performed"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
-    assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
+    assert report["side_effects"]["telegram_channel_registry_updated"] is False
+    assert report["tdlib_post_ready_drain_attempted"] is False
 
 
-def test_normal_no_mutation_resolve_uses_drain_before_first_search(
+def test_normal_no_mutation_resolve_keeps_post_ready_drain_report_not_attempted(
     tmp_path: Path,
 ) -> None:
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
-            {"@type": "updateConnectionState"},
             None,
             _public_chat_response(),
         ]
@@ -2908,15 +2840,22 @@ def test_normal_no_mutation_resolve_uses_drain_before_first_search(
     )
 
     assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
-    assert transport.events.index("receive:updateConnectionState") < transport.events.index(
-        "send:searchPublicChat"
+    assert transport.events.index("send:searchPublicChat") < transport.events.index(
+        "receive:none"
     )
-    assert report["tdlib_post_ready_drain_update_types_seen"] == [
-        "updateConnectionState"
-    ]
-    assert report["tdlib_post_ready_drain_quiet_window_reached"] is True
+    assert report["tdlib_post_ready_drain_attempted"] is False
+    assert report["tdlib_post_ready_drain_receive_attempt_count_bucket"] == "zero"
+    assert report["tdlib_post_ready_drain_observation_count_bucket"] == "zero"
+    assert report["tdlib_post_ready_drain_empty_receive_count_bucket"] == "zero"
+    assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
+    assert report["tdlib_post_ready_drain_budget_exhausted"] is False
+    assert report["tdlib_post_ready_drain_authorization_lost"] is False
+    assert report["tdlib_post_ready_drain_update_types_seen"] == []
     assert report["resolve_function_response_types_seen"] == ["chat"]
     assert db.update_attempts == 0
+    assert db.transaction.rolled_back is True
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
 
 
 def test_single_resolve_rpc_diagnostic_sends_one_search_after_readiness(

@@ -347,6 +347,28 @@ class SingleResolveRpcDiagnosticResult:
 
 
 @dataclass(slots=True)
+class _SingleRpcWaitResult:
+    receive_attempt_count: int = 0
+    observation_count: int = 0
+    empty_receive_count: int = 0
+    inbound_object_types_seen: list[str] = field(default_factory=list)
+    function_response_types_seen: list[str] = field(default_factory=list)
+    update_types_seen: list[str] = field(default_factory=list)
+    update_budget_exhausted: bool = False
+    duration_exhausted: bool = False
+    update_pressure_observed: bool = False
+    authorization_states_seen: list[str] = field(default_factory=list)
+    final_authorization_state: str | None = None
+    response_extra_matched: bool = False
+    response_without_extra_count: int = 0
+    response_wrong_extra_count: int = 0
+    result_class: str = "response_timeout"
+    tdlib_error_codes_seen: list[int | str] = field(default_factory=list)
+    timed_out: bool = True
+    result: PublicUsernameResolveResult | None = None
+
+
+@dataclass(slots=True)
 class ResolveReportCounters:
     attempt_count: int = 0
     resolved_count: int = 0
@@ -1988,87 +2010,70 @@ class TDLibPublicUsernameResolver:
         )
 
     async def _receive_response(self, extra: str) -> PublicUsernameResolveResult:
-        response_without_extra_count = 0
-        response_wrong_extra_count = 0
-        function_response_types_seen: list[str] = []
-        for _ in range(DEFAULT_TDLIB_RPC_MAX_UPDATES):
-            try:
-                payload = await self._receive(DEFAULT_TDLIB_RPC_TIMEOUT_SEC)
-            except Exception:
-                return _resolve_failure_result(
-                    "transport_error",
-                    function_response_types_seen=function_response_types_seen,
-                    response_without_extra_count=response_without_extra_count,
-                    response_wrong_extra_count=response_wrong_extra_count,
-                )
-            if not isinstance(payload, dict):
-                continue
-            if payload.get("@extra") == extra:
-                _append_function_response_type(function_response_types_seen, payload)
-                return _resolve_result_from_tdlib_payload(
-                    payload,
-                    response_extra_matched=True,
-                    response_without_extra_count=response_without_extra_count,
-                    response_wrong_extra_count=response_wrong_extra_count,
-                    function_response_types_seen=function_response_types_seen,
-                )
-            if payload.get("@type") == "updateAuthorizationState":
-                state = payload.get("authorization_state")
-                state_type = state.get("@type") if isinstance(state, dict) else None
-                if state_type != TDLIB_READY_STATE:
-                    return _resolve_failure_result(
-                        "authorization_lost",
-                        function_response_types_seen=function_response_types_seen,
-                        response_without_extra_count=response_without_extra_count,
-                        response_wrong_extra_count=response_wrong_extra_count,
-                    )
-            response_type = _function_response_type_from_payload(payload)
-            if response_type is None:
-                continue
-            _append_unique(function_response_types_seen, response_type)
-            if isinstance(payload.get("@extra"), str):
-                response_wrong_extra_count += 1
-            else:
-                response_without_extra_count += 1
+        wait_result = await self._wait_for_matching_single_rpc_response(extra)
+        if wait_result.result is not None:
+            return wait_result.result
         return _resolve_failure_result(
-            "response_timeout",
-            function_response_types_seen=function_response_types_seen,
-            response_without_extra_count=response_without_extra_count,
-            response_wrong_extra_count=response_wrong_extra_count,
+            wait_result.result_class,
+            function_response_types_seen=wait_result.function_response_types_seen,
+            response_extra_matched=wait_result.response_extra_matched,
+            response_without_extra_count=wait_result.response_without_extra_count,
+            response_wrong_extra_count=wait_result.response_wrong_extra_count,
         )
 
     async def _receive_single_resolve_rpc_diagnostic(
         self,
         extra: str,
     ) -> SingleResolveRpcDiagnosticResult:
-        wait_config = self._single_rpc_wait_config
-        receive_attempt_count = 0
-        observation_count = 0
-        empty_receive_count = 0
-        response_without_extra_count = 0
-        response_wrong_extra_count = 0
-        inbound_object_types_seen: list[str] = []
-        function_response_types_seen: list[str] = []
-        update_types_seen: list[str] = []
-        authorization_states_seen: list[str] = []
-        tdlib_error_codes_seen: list[int | str] = []
-        final_authorization_state: str | None = None
+        wait_result = await self._wait_for_matching_single_rpc_response(extra)
+        return SingleResolveRpcDiagnosticResult(
+            enabled=True,
+            request_sent=True,
+            request_extra_present=True,
+            max_updates=self._single_rpc_wait_config.max_updates,
+            receive_timeout_sec=self._single_rpc_wait_config.receive_timeout_sec,
+            max_duration_sec=self._single_rpc_wait_config.max_duration_sec,
+            receive_attempt_count=wait_result.receive_attempt_count,
+            observation_count=wait_result.observation_count,
+            empty_receive_count=wait_result.empty_receive_count,
+            inbound_object_types_seen=tuple(wait_result.inbound_object_types_seen),
+            function_response_types_seen=tuple(
+                wait_result.function_response_types_seen
+            ),
+            update_types_seen=tuple(wait_result.update_types_seen),
+            update_budget_exhausted=wait_result.update_budget_exhausted,
+            duration_exhausted=wait_result.duration_exhausted,
+            update_pressure_observed=wait_result.update_pressure_observed,
+            authorization_states_seen=tuple(wait_result.authorization_states_seen),
+            final_authorization_state=wait_result.final_authorization_state,
+            response_extra_matched=wait_result.response_extra_matched,
+            response_without_extra_count=wait_result.response_without_extra_count,
+            response_wrong_extra_count=wait_result.response_wrong_extra_count,
+            result_class=wait_result.result_class,
+            tdlib_error_codes_seen=tuple(wait_result.tdlib_error_codes_seen),
+            timed_out=wait_result.timed_out,
+            operator_next_action=_single_resolve_rpc_next_action(
+                result_class=wait_result.result_class,
+                response_extra_matched=wait_result.response_extra_matched,
+                timed_out=wait_result.timed_out,
+            ),
+        )
 
-        result_class = "response_timeout"
-        response_extra_matched = False
-        timed_out = True
-        update_budget_exhausted = False
-        duration_exhausted = False
-        update_pressure_observed = False
+    async def _wait_for_matching_single_rpc_response(
+        self,
+        extra: str,
+    ) -> _SingleRpcWaitResult:
+        wait_config = self._single_rpc_wait_config
+        wait_result = _SingleRpcWaitResult()
 
         started_at = self._monotonic_clock()
         for _ in range(wait_config.max_updates):
             elapsed_sec = self._monotonic_clock() - started_at
             remaining_duration_sec = wait_config.max_duration_sec - elapsed_sec
             if remaining_duration_sec <= 0:
-                duration_exhausted = True
+                wait_result.duration_exhausted = True
                 break
-            receive_attempt_count += 1
+            wait_result.receive_attempt_count += 1
             receive_timeout_sec = min(
                 wait_config.receive_timeout_sec,
                 max(remaining_duration_sec, 0.0),
@@ -2076,58 +2081,93 @@ class TDLibPublicUsernameResolver:
             try:
                 payload = await self._receive(receive_timeout_sec)
             except Exception:
-                result_class = "transport_error"
-                timed_out = False
+                wait_result.result_class = "transport_error"
+                wait_result.timed_out = False
                 break
             if payload is None:
-                empty_receive_count += 1
+                wait_result.empty_receive_count += 1
                 continue
             if not isinstance(payload, Mapping):
                 continue
 
-            observation_count += 1
+            wait_result.observation_count += 1
             payload_type = _safe_tdlib_object_type(payload.get("@type"))
             if payload_type is not None:
-                _append_unique(inbound_object_types_seen, payload_type)
+                _append_unique(wait_result.inbound_object_types_seen, payload_type)
                 if payload_type.startswith("update"):
-                    _append_unique(update_types_seen, payload_type)
-                    update_pressure_observed = True
+                    _append_unique(wait_result.update_types_seen, payload_type)
+                    wait_result.update_pressure_observed = True
             if payload_type == "error":
-                _append_unique_safe_error_code(tdlib_error_codes_seen, payload.get("code"))
+                _append_unique_safe_error_code(
+                    wait_result.tdlib_error_codes_seen,
+                    payload.get("code"),
+                )
 
             state_type = _authorization_state_type_from_payload(payload)
             if state_type is not None:
                 safe_state_type = _safe_tdlib_object_type(state_type)
                 if safe_state_type == state_type:
-                    _append_unique(authorization_states_seen, state_type)
-                    final_authorization_state = state_type
+                    _append_unique(wait_result.authorization_states_seen, state_type)
+                    wait_result.final_authorization_state = state_type
                 if state_type != TDLIB_READY_STATE:
-                    result_class = "authorization_lost"
-                    timed_out = False
+                    wait_result.result_class = "authorization_lost"
+                    wait_result.timed_out = False
+                    wait_result.result = _resolve_failure_result(
+                        "authorization_lost",
+                        function_response_types_seen=(
+                            wait_result.function_response_types_seen
+                        ),
+                        response_without_extra_count=(
+                            wait_result.response_without_extra_count
+                        ),
+                        response_wrong_extra_count=(
+                            wait_result.response_wrong_extra_count
+                        ),
+                    )
                     break
 
             response_type = _function_response_type_from_payload(payload)
             if response_type is not None:
-                _append_unique(function_response_types_seen, response_type)
+                _append_unique(wait_result.function_response_types_seen, response_type)
 
             raw_extra = payload.get("@extra")
             if raw_extra == extra:
-                response_extra_matched = True
-                timed_out = False
+                wait_result.response_extra_matched = True
+                wait_result.timed_out = False
                 if response_type is None:
-                    result_class = "response_shape_error"
+                    wait_result.result_class = "response_shape_error"
+                    wait_result.result = _resolve_failure_result(
+                        "response_shape_error",
+                        response_extra_matched=True,
+                        response_without_extra_count=(
+                            wait_result.response_without_extra_count
+                        ),
+                        response_wrong_extra_count=(
+                            wait_result.response_wrong_extra_count
+                        ),
+                        function_response_types_seen=(
+                            wait_result.function_response_types_seen
+                        ),
+                    )
                 else:
                     result = _resolve_result_from_tdlib_payload(
                         payload,
                         response_extra_matched=True,
-                        response_without_extra_count=response_without_extra_count,
-                        response_wrong_extra_count=response_wrong_extra_count,
-                        function_response_types_seen=function_response_types_seen,
+                        response_without_extra_count=(
+                            wait_result.response_without_extra_count
+                        ),
+                        response_wrong_extra_count=(
+                            wait_result.response_wrong_extra_count
+                        ),
+                        function_response_types_seen=(
+                            wait_result.function_response_types_seen
+                        ),
                     )
-                    result_class = result.status
+                    wait_result.result = result
+                    wait_result.result_class = result.status
                     if result.tdlib_error_code is not None:
                         _append_unique_safe_error_code(
-                            tdlib_error_codes_seen,
+                            wait_result.tdlib_error_codes_seen,
                             result.tdlib_error_code,
                         )
                 break
@@ -2135,42 +2175,21 @@ class TDLibPublicUsernameResolver:
             if response_type is None:
                 continue
             if isinstance(raw_extra, str):
-                response_wrong_extra_count += 1
+                wait_result.response_wrong_extra_count += 1
             else:
-                response_without_extra_count += 1
+                wait_result.response_without_extra_count += 1
         else:
-            update_budget_exhausted = True
+            wait_result.update_budget_exhausted = True
 
-        return SingleResolveRpcDiagnosticResult(
-            enabled=True,
-            request_sent=True,
-            request_extra_present=True,
-            max_updates=wait_config.max_updates,
-            receive_timeout_sec=wait_config.receive_timeout_sec,
-            max_duration_sec=wait_config.max_duration_sec,
-            receive_attempt_count=receive_attempt_count,
-            observation_count=observation_count,
-            empty_receive_count=empty_receive_count,
-            inbound_object_types_seen=tuple(inbound_object_types_seen),
-            function_response_types_seen=tuple(function_response_types_seen),
-            update_types_seen=tuple(update_types_seen),
-            update_budget_exhausted=update_budget_exhausted,
-            duration_exhausted=duration_exhausted,
-            update_pressure_observed=update_pressure_observed,
-            authorization_states_seen=tuple(authorization_states_seen),
-            final_authorization_state=final_authorization_state,
-            response_extra_matched=response_extra_matched,
-            response_without_extra_count=response_without_extra_count,
-            response_wrong_extra_count=response_wrong_extra_count,
-            result_class=result_class,
-            tdlib_error_codes_seen=tuple(tdlib_error_codes_seen),
-            timed_out=timed_out,
-            operator_next_action=_single_resolve_rpc_next_action(
-                result_class=result_class,
-                response_extra_matched=response_extra_matched,
-                timed_out=timed_out,
-            ),
-        )
+        if wait_result.result is None:
+            wait_result.result = _resolve_failure_result(
+                wait_result.result_class,
+                function_response_types_seen=wait_result.function_response_types_seen,
+                response_extra_matched=wait_result.response_extra_matched,
+                response_without_extra_count=wait_result.response_without_extra_count,
+                response_wrong_extra_count=wait_result.response_wrong_extra_count,
+            )
+        return wait_result
 
     async def _send(self, request: Mapping[str, Any]) -> None:
         self.tdlib_send_called = True
@@ -2960,44 +2979,6 @@ def generate_report(
             _merge_resolver_side_effects(report, resolver)
             _set_status(report, _single_resolve_rpc_contract_status(diagnostic))
             return ScriptResult(exit_code=0, report=report)
-
-        try:
-            drain_summary = asyncio.run(
-                _drain_post_ready_updates(
-                    resolver=resolver,
-                    report=report,
-                )
-            )
-            _merge_resolver_side_effects(report, resolver)
-            if drain_summary.authorization_lost:
-                _set_status(
-                    report,
-                    "blocked_tdlib_post_ready_drain_authorization_lost",
-                    "tdlib.post_ready_drain_authorization_lost",
-                )
-                report["operator_next_action"] = (
-                    _post_ready_drain_authorization_lost_next_action()
-                )
-                return ScriptResult(exit_code=1, report=report)
-        except TDLibNotReady:
-            _set_status(
-                report,
-                "blocked_tdlib_post_ready_drain_authorization_lost",
-                "tdlib.post_ready_drain_authorization_lost",
-            )
-            _merge_resolver_side_effects(report, resolver)
-            report["operator_next_action"] = (
-                _post_ready_drain_authorization_lost_next_action()
-            )
-            return ScriptResult(exit_code=1, report=report)
-        except Exception:
-            _set_status(
-                report,
-                "blocked_tdlib_transport_unavailable",
-                "tdlib.post_ready_drain_transport_unavailable",
-            )
-            _merge_resolver_side_effects(report, resolver)
-            return ScriptResult(exit_code=1, report=report)
 
         try:
             resolve_counters = asyncio.run(
