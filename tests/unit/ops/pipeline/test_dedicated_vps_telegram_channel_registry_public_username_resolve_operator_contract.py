@@ -79,6 +79,28 @@ RESOLVE_CLASSIFICATION_FIELD_NAMES = (
     "resolve_response_without_extra_count_bucket",
     "resolve_response_wrong_extra_count_bucket",
 )
+SINGLE_RESOLVE_RPC_DIAGNOSTIC_FIELD_NAMES = (
+    "single_resolve_rpc_diagnostic_enabled",
+    "single_resolve_rpc_target_selected",
+    "single_resolve_rpc_target_index_bucket",
+    "single_resolve_rpc_request_sent",
+    "single_resolve_rpc_request_extra_present",
+    "single_resolve_rpc_send_error_class",
+    "single_resolve_rpc_receive_attempt_count_bucket",
+    "single_resolve_rpc_observation_count_bucket",
+    "single_resolve_rpc_inbound_object_types_seen",
+    "single_resolve_rpc_function_response_types_seen",
+    "single_resolve_rpc_update_types_seen",
+    "single_resolve_rpc_authorization_states_seen",
+    "single_resolve_rpc_final_authorization_state",
+    "single_resolve_rpc_response_extra_matched",
+    "single_resolve_rpc_response_without_extra_count_bucket",
+    "single_resolve_rpc_response_wrong_extra_count_bucket",
+    "single_resolve_rpc_result_class",
+    "single_resolve_rpc_tdlib_error_codes_seen",
+    "single_resolve_rpc_timed_out",
+    "single_resolve_rpc_operator_next_action",
+)
 
 
 class FakeResult:
@@ -232,6 +254,7 @@ class FakeResolver:
         self.auth_password_called = False
         self.join_called = False
         self.history_called = False
+        self.diagnostic_calls: list[str] = []
 
     async def initialize(self) -> None:
         if self.fail_initialize is not None:
@@ -240,6 +263,13 @@ class FakeResolver:
 
     async def resolve_public_username(self, username: str) -> Any:
         self.calls.append(username)
+        response = self.responses.get(username)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def diagnose_single_resolve_rpc(self, username: str) -> Any:
+        self.diagnostic_calls.append(username)
         response = self.responses.get(username)
         if isinstance(response, Exception):
             raise response
@@ -371,6 +401,7 @@ def _run_report(
     approved_mutation: bool = False,
     runtime_env_reader=_runtime_env,
     limit: int | None = None,
+    diagnose_single_resolve_rpc: bool = False,
 ) -> tuple[dict[str, Any], FakeDatabaseConnection, FakeResolver | None]:
     module = _module()
     fake_db = db or FakeDatabaseConnection([_registry_row("registry-1")])
@@ -380,6 +411,7 @@ def _run_report(
         dry_run=dry_run,
         approved_tdlib_public_username_resolve=approved_tdlib,
         approved_registry_resolve_mutation=approved_mutation,
+        diagnose_single_resolve_rpc=diagnose_single_resolve_rpc,
         limit=limit,
         runtime_env_reader=runtime_env_reader,
         database_connection_factory=lambda _database_url: fake_db,
@@ -399,6 +431,7 @@ def _run_report_with_tdlib_transport(
     tdlib_auth_max_updates: int | None = None,
     tdlib_receive_timeout_sec: float | None = None,
     tdlib_overall_timeout_sec: float | None = None,
+    diagnose_single_resolve_rpc: bool = False,
 ) -> tuple[dict[str, Any], FakeDatabaseConnection, Any]:
     module = _module()
     fake_db = db or FakeDatabaseConnection([_registry_row("registry-1")])
@@ -435,6 +468,7 @@ def _run_report_with_tdlib_transport(
         dry_run=False,
         approved_tdlib_public_username_resolve=True,
         approved_registry_resolve_mutation=approved_mutation,
+        diagnose_single_resolve_rpc=diagnose_single_resolve_rpc,
         tdlib_auth_max_updates=auth_max_updates,
         tdlib_receive_timeout_sec=receive_timeout_sec,
         tdlib_overall_timeout_sec=overall_timeout_sec,
@@ -531,6 +565,11 @@ def _assert_resolve_classification_fields_present(report: dict[str, Any]) -> Non
         assert field_name in report, field_name
 
 
+def _assert_single_resolve_rpc_diagnostic_fields_present(report: dict[str, Any]) -> None:
+    for field_name in SINGLE_RESOLVE_RPC_DIAGNOSTIC_FIELD_NAMES:
+        assert field_name in report, field_name
+
+
 def _render(report: dict[str, Any]) -> str:
     return _module().render_json(report)
 
@@ -587,6 +626,23 @@ def test_cli_tdlib_readiness_budget_options_are_passed_to_report_generation(
     assert captured_kwargs["tdlib_overall_timeout_sec"] == 9.5
 
 
+def test_cli_help_includes_single_resolve_rpc_diagnostic_flag() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--help",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0
+    assert "--diagnose-single-resolve-rpc" in result.stdout
+
+
 def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutation() -> None:
     report, db, resolver = _run_report()
 
@@ -610,6 +666,7 @@ def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutat
     assert report["side_effects"]["telegram_channel_registry_updated"] is False
     _assert_ready_probe_fields_present(report)
     _assert_resolve_classification_fields_present(report)
+    _assert_single_resolve_rpc_diagnostic_fields_present(report)
     assert report["tdlib_ready_probe_attempted"] is False
     assert report["tdlib_ready_probe_status"] == "not_attempted"
     assert report["tdlib_ready_probe_observation_count_bucket"] == "zero"
@@ -633,6 +690,10 @@ def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutat
     assert report["tdlib_ready_helper_reused"] is False
     assert report["tdlib_ready_helper_status"] == "not_attempted"
     assert report["tdlib_ready_helper_manual_intervention_required"] is False
+    assert report["single_resolve_rpc_diagnostic_enabled"] is False
+    assert report["single_resolve_rpc_target_selected"] is False
+    assert report["single_resolve_rpc_request_sent"] is False
+    assert report["single_resolve_rpc_result_class"] == "not_attempted"
 
 
 def test_without_approval_flags_stays_dry_run_and_blocks_tdlib_and_db_mutation() -> None:
@@ -664,6 +725,27 @@ def test_mutation_approval_without_tdlib_approval_fails_closed() -> None:
     assert "approval.tdlib_resolve_required" in report["checks_failed"]
     assert resolver.calls == []
     assert db.update_attempts == 0
+
+
+def test_single_resolve_rpc_diagnostic_requires_tdlib_approval_without_mutation() -> None:
+    resolver = FakeResolver({RAW_PUBLIC_USERNAME: _resolved()})
+    report, db, resolver = _run_report(
+        resolver=resolver,
+        dry_run=False,
+        approved_tdlib=False,
+        approved_mutation=False,
+        diagnose_single_resolve_rpc=True,
+    )
+
+    assert report["contract_status"] == "blocked_approval_required"
+    assert "approval.tdlib_resolve_required" in report["checks_failed"]
+    assert report["single_resolve_rpc_diagnostic_enabled"] is True
+    assert report["single_resolve_rpc_target_selected"] is False
+    assert resolver.calls == []
+    assert resolver.diagnostic_calls == []
+    assert db.update_attempts == 0
+    assert report["side_effects"]["telegram_api_called"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
 
 
 def test_approved_tdlib_resolve_without_mutation_calls_fake_resolver_only() -> None:
@@ -1806,6 +1888,252 @@ def test_public_username_resolve_success_classification_keeps_no_mutation_path(
     _assert_sensitive_values_absent(rendered, tmp_path)
 
 
+def test_single_resolve_rpc_diagnostic_sends_one_search_after_readiness(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        diagnose_single_resolve_rpc=True,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert _sent_request_types(transport) == ["searchPublicChat"]
+    assert report["single_resolve_rpc_diagnostic_enabled"] is True
+    assert report["single_resolve_rpc_target_selected"] is True
+    assert report["single_resolve_rpc_target_index_bucket"] == "one"
+    assert report["single_resolve_rpc_request_sent"] is True
+    assert report["single_resolve_rpc_request_extra_present"] is True
+    assert report["single_resolve_rpc_response_extra_matched"] is True
+    assert report["single_resolve_rpc_result_class"] == "resolved"
+    assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
+    assert report["single_resolve_rpc_receive_attempt_count_bucket"] == "one"
+    assert report["single_resolve_rpc_observation_count_bucket"] == "one"
+    assert report["tdlib_resolve_attempted"] is True
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_single_resolve_rpc_diagnostic_forces_no_mutation_even_when_requested(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=True,
+        diagnose_single_resolve_rpc=True,
+    )
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert report["approved_registry_resolve_mutation"] is True
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert report["side_effects"]["telegram_channel_registry_updated"] is False
+    assert db.update_attempts == 0
+    assert db.transaction.rolled_back is True
+    assert db.transaction.committed is False
+    assert any(
+        statement == _normalize(_module().SET_TRANSACTION_READ_ONLY_QUERY)
+        for statement in db.statements
+    )
+
+
+def test_single_resolve_rpc_diagnostic_timeout_reports_no_function_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            None,
+            None,
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=True,
+        diagnose_single_resolve_rpc=True,
+    )
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_response_timeout"
+    assert report["single_resolve_rpc_timed_out"] is True
+    assert report["single_resolve_rpc_result_class"] == "response_timeout"
+    assert report["single_resolve_rpc_function_response_types_seen"] == []
+    assert report["single_resolve_rpc_response_extra_matched"] is False
+    assert report["single_resolve_rpc_receive_attempt_count_bucket"] == "two_to_five"
+    assert report["single_resolve_rpc_observation_count_bucket"] == "zero"
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert db.update_attempts == 0
+
+
+def test_single_resolve_rpc_diagnostic_wrong_extra_chat_is_bucketed_without_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {
+                "@type": "chat",
+                "@extra": "wrong-public-username-extra",
+                "id": RAW_CHAT_ID,
+                "title": RAW_TDLIB_PAYLOAD_VALUE,
+                "type": {"@type": "chatTypeSupergroup", "is_channel": True},
+            },
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        diagnose_single_resolve_rpc=True,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_response_timeout"
+    assert report["single_resolve_rpc_result_class"] == "response_timeout"
+    assert report["single_resolve_rpc_response_extra_matched"] is False
+    assert report["single_resolve_rpc_response_wrong_extra_count_bucket"] == "one"
+    assert report["single_resolve_rpc_response_without_extra_count_bucket"] == "zero"
+    assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
+    assert db.update_attempts == 0
+    assert "wrong-public-username-extra" not in rendered
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_single_resolve_rpc_diagnostic_response_without_extra_is_bucketed_without_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {
+                "@type": "chat",
+                "id": RAW_CHAT_ID,
+                "title": RAW_TDLIB_PAYLOAD_VALUE,
+                "type": {"@type": "chatTypeSupergroup", "is_channel": True},
+            },
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        diagnose_single_resolve_rpc=True,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_response_timeout"
+    assert report["single_resolve_rpc_result_class"] == "response_timeout"
+    assert report["single_resolve_rpc_response_extra_matched"] is False
+    assert report["single_resolve_rpc_response_without_extra_count_bucket"] == "one"
+    assert report["single_resolve_rpc_response_wrong_extra_count_bucket"] == "zero"
+    assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_single_resolve_rpc_diagnostic_authorization_lost_reports_no_mutation(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _auth_update("authorizationStateClosing"),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=True,
+        diagnose_single_resolve_rpc=True,
+    )
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_authorization_lost"
+    assert report["single_resolve_rpc_result_class"] == "authorization_lost"
+    assert report["single_resolve_rpc_timed_out"] is False
+    assert report["single_resolve_rpc_authorization_states_seen"] == [
+        "authorizationStateClosing"
+    ]
+    assert report["single_resolve_rpc_final_authorization_state"] == (
+        "authorizationStateClosing"
+    )
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert db.update_attempts == 0
+    assert db.transaction.rolled_back is True
+
+
+def test_single_resolve_rpc_diagnostic_tdlib_error_reports_safe_code_only(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _public_chat_error_response(
+                code="SAFE_PUBLIC_CHAT_ERROR",
+                message=(
+                    f"{RAW_PUBLIC_USERNAME} {RAW_CHAT_ID} "
+                    f"{FAKE_TELEGRAM_SECRET} {RAW_TDLIB_PAYLOAD_VALUE}"
+                ),
+            ),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        diagnose_single_resolve_rpc=True,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert report["single_resolve_rpc_result_class"] == "tdlib_error"
+    assert report["single_resolve_rpc_tdlib_error_codes_seen"] == [
+        "SAFE_PUBLIC_CHAT_ERROR"
+    ]
+    assert report["single_resolve_rpc_function_response_types_seen"] == ["error"]
+    assert report["single_resolve_rpc_response_extra_matched"] is True
+    assert "SAFE_PUBLIC_CHAT_ERROR" in rendered
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
 def test_approved_tdlib_resolve_with_mutation_updates_only_successful_rows() -> None:
     db = FakeDatabaseConnection(
         [
@@ -2046,6 +2374,7 @@ def test_all_side_effect_fields_are_present_and_correct_across_modes() -> None:
         assert set(report["side_effects"]) == set(module.SIDE_EFFECT_FLAG_NAMES)
         _assert_ready_probe_fields_present(report)
         _assert_resolve_classification_fields_present(report)
+        _assert_single_resolve_rpc_diagnostic_fields_present(report)
 
     for value in dry_report["side_effects"].values():
         assert value is False

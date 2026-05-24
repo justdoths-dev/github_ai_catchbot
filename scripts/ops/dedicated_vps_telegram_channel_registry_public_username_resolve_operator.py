@@ -196,6 +196,11 @@ class PublicUsernameResolver(Protocol):
 
     async def resolve_public_username(self, username: str) -> "PublicUsernameResolveResult": ...
 
+    async def diagnose_single_resolve_rpc(
+        self,
+        username: str,
+    ) -> "SingleResolveRpcDiagnosticResult": ...
+
     async def close(self) -> None: ...
 
 
@@ -230,6 +235,72 @@ class PublicUsernameResolveResult:
     response_extra_matched: bool = False
     response_without_extra_count: int = 0
     response_wrong_extra_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class SingleResolveRpcDiagnosticResult:
+    enabled: bool = False
+    target_selected: bool = False
+    target_index_bucket: str = "zero"
+    request_sent: bool = False
+    request_extra_present: bool = False
+    send_error_class: str | None = None
+    receive_attempt_count: int = 0
+    observation_count: int = 0
+    inbound_object_types_seen: tuple[str, ...] = ()
+    function_response_types_seen: tuple[str, ...] = ()
+    update_types_seen: tuple[str, ...] = ()
+    authorization_states_seen: tuple[str, ...] = ()
+    final_authorization_state: str | None = None
+    response_extra_matched: bool = False
+    response_without_extra_count: int = 0
+    response_wrong_extra_count: int = 0
+    result_class: str = "not_attempted"
+    tdlib_error_codes_seen: tuple[int | str, ...] = ()
+    timed_out: bool = False
+    operator_next_action: str = "Single public username RPC diagnostic was not requested."
+
+    def as_report_fields(self) -> dict[str, Any]:
+        return {
+            "single_resolve_rpc_diagnostic_enabled": self.enabled,
+            "single_resolve_rpc_target_selected": self.target_selected,
+            "single_resolve_rpc_target_index_bucket": self.target_index_bucket,
+            "single_resolve_rpc_request_sent": self.request_sent,
+            "single_resolve_rpc_request_extra_present": self.request_extra_present,
+            "single_resolve_rpc_send_error_class": self.send_error_class,
+            "single_resolve_rpc_receive_attempt_count_bucket": _bucket_count(
+                self.receive_attempt_count
+            ),
+            "single_resolve_rpc_observation_count_bucket": _bucket_count(
+                self.observation_count
+            ),
+            "single_resolve_rpc_inbound_object_types_seen": list(
+                self.inbound_object_types_seen
+            ),
+            "single_resolve_rpc_function_response_types_seen": list(
+                self.function_response_types_seen
+            ),
+            "single_resolve_rpc_update_types_seen": list(self.update_types_seen),
+            "single_resolve_rpc_authorization_states_seen": list(
+                self.authorization_states_seen
+            ),
+            "single_resolve_rpc_final_authorization_state": (
+                self.final_authorization_state
+            ),
+            "single_resolve_rpc_response_extra_matched": self.response_extra_matched,
+            "single_resolve_rpc_response_without_extra_count_bucket": _bucket_count(
+                self.response_without_extra_count
+            ),
+            "single_resolve_rpc_response_wrong_extra_count_bucket": _bucket_count(
+                self.response_wrong_extra_count
+            ),
+            "single_resolve_rpc_result_class": self.result_class,
+            "single_resolve_rpc_tdlib_error_codes_seen": list(
+                self.tdlib_error_codes_seen
+            ),
+            "single_resolve_rpc_timed_out": self.timed_out,
+            "single_resolve_rpc_operator_next_action": self.operator_next_action,
+        }
 
 
 @dataclass(slots=True)
@@ -516,6 +587,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--approved-tdlib-public-username-resolve", action="store_true")
     parser.add_argument("--approved-registry-resolve-mutation", action="store_true")
+    parser.add_argument("--diagnose-single-resolve-rpc", action="store_true")
     parser.add_argument("--limit", type=_positive_int, default=None)
     parser.add_argument(
         "--tdlib-auth-max-updates",
@@ -628,9 +700,22 @@ def _empty_resolve_classification_report_fields() -> dict[str, Any]:
     }
 
 
+def _empty_single_resolve_rpc_diagnostic_report_fields(
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    return SingleResolveRpcDiagnosticResult(enabled=enabled).as_report_fields()
+
+
 def _append_unique(values: list[str], value: str) -> None:
     if value not in values:
         values.append(value)
+
+
+def _append_unique_safe_error_code(values: list[int | str], value: Any) -> None:
+    safe_value = _safe_error_code(value)
+    if safe_value is not None and safe_value not in values:
+        values.append(safe_value)
 
 
 def _safe_error_code(value: Any) -> int | str | None:
@@ -652,6 +737,10 @@ def _safe_tdlib_object_type(value: Any) -> str | None:
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", value):
         return value
     return "unrecognized"
+
+
+def _safe_exception_class(exc: Exception) -> str:
+    return _safe_tdlib_object_type(type(exc).__name__) or "unrecognized"
 
 
 def _safe_resolve_failure_class(value: Any) -> str:
@@ -727,6 +816,47 @@ def _append_function_response_type(
         _append_unique(values, response_type)
 
 
+def _single_resolve_rpc_next_action(
+    *,
+    result_class: str,
+    response_extra_matched: bool,
+    timed_out: bool,
+) -> str:
+    if result_class == "authorization_lost":
+        return (
+            "TDLib authorization changed away from ready during the single "
+            "searchPublicChat diagnostic. Keep registry mutation disabled and restore "
+            "a ready TDLib session before any broader resolve run."
+        )
+    if result_class == "transport_error":
+        return (
+            "A TDLib send or receive transport error occurred during the single "
+            "searchPublicChat diagnostic. Inspect transport class-level behavior only; "
+            "do not paste secrets, payloads, paths, or private stderr."
+        )
+    if timed_out:
+        return (
+            "The single searchPublicChat request was sent, but no matching function "
+            "response was observed inside the bounded receive loop. Keep registry "
+            "mutation disabled until TDLib response correlation is understood."
+        )
+    if result_class == "resolved" and response_extra_matched:
+        return (
+            "A matching sanitized searchPublicChat chat response was observed. Review "
+            "the diagnostic buckets before any separate approved registry mutation."
+        )
+    if result_class == "tdlib_error":
+        return (
+            "A matching TDLib error response was observed. Use only the sanitized safe "
+            "error code and keep registry mutation disabled."
+        )
+    return (
+        "The single searchPublicChat diagnostic completed. Review only the sanitized "
+        "result class, object-type buckets, and extra-correlation fields before the "
+        "next bounded action."
+    )
+
+
 def _authorization_state_type_from_payload(payload: Mapping[str, Any]) -> str | None:
     payload_type = payload.get("@type")
     if payload_type == "updateAuthorizationState":
@@ -744,6 +874,7 @@ def _base_report(
     dry_run: bool,
     approved_tdlib_public_username_resolve: bool,
     approved_registry_resolve_mutation: bool,
+    diagnose_single_resolve_rpc: bool,
 ) -> dict[str, Any]:
     report = {
         "schema_version": SCHEMA_VERSION,
@@ -774,6 +905,11 @@ def _base_report(
     report.update(_empty_ready_probe_report_fields())
     report.update(_empty_ready_helper_report_fields())
     report.update(_empty_resolve_classification_report_fields())
+    report.update(
+        _empty_single_resolve_rpc_diagnostic_report_fields(
+            enabled=diagnose_single_resolve_rpc
+        )
+    )
     return report
 
 
@@ -1283,6 +1419,30 @@ class TDLibPublicUsernameResolver:
             return _resolve_failure_result("transport_error")
         return await self._receive_response(extra)
 
+    async def diagnose_single_resolve_rpc(
+        self,
+        username: str,
+    ) -> SingleResolveRpcDiagnosticResult:
+        request = self._client.build_search_public_chat_request(username).payload
+        extra = self._next_extra("single_resolve_rpc")
+        request = {**request, "@extra": extra}
+        request_extra_present = isinstance(request.get("@extra"), str)
+        try:
+            await self._send(request)
+        except Exception as exc:
+            return SingleResolveRpcDiagnosticResult(
+                enabled=True,
+                request_extra_present=request_extra_present,
+                send_error_class=_safe_exception_class(exc),
+                result_class="transport_error",
+                operator_next_action=_single_resolve_rpc_next_action(
+                    result_class="transport_error",
+                    response_extra_matched=False,
+                    timed_out=False,
+                ),
+            )
+        return await self._receive_single_resolve_rpc_diagnostic(extra)
+
     def _apply_ready_helper_result(self, auth_result: Any) -> None:
         self._ready_helper_reused = True
         self._ready_helper_status = _safe_ready_helper_status(
@@ -1368,6 +1528,113 @@ class TDLibPublicUsernameResolver:
             function_response_types_seen=function_response_types_seen,
             response_without_extra_count=response_without_extra_count,
             response_wrong_extra_count=response_wrong_extra_count,
+        )
+
+    async def _receive_single_resolve_rpc_diagnostic(
+        self,
+        extra: str,
+    ) -> SingleResolveRpcDiagnosticResult:
+        receive_attempt_count = 0
+        observation_count = 0
+        response_without_extra_count = 0
+        response_wrong_extra_count = 0
+        inbound_object_types_seen: list[str] = []
+        function_response_types_seen: list[str] = []
+        update_types_seen: list[str] = []
+        authorization_states_seen: list[str] = []
+        tdlib_error_codes_seen: list[int | str] = []
+        final_authorization_state: str | None = None
+
+        result_class = "response_timeout"
+        response_extra_matched = False
+        timed_out = True
+
+        for _ in range(DEFAULT_TDLIB_RPC_MAX_UPDATES):
+            receive_attempt_count += 1
+            try:
+                payload = await self._receive(DEFAULT_TDLIB_RPC_TIMEOUT_SEC)
+            except Exception:
+                result_class = "transport_error"
+                timed_out = False
+                break
+            if not isinstance(payload, Mapping):
+                continue
+
+            observation_count += 1
+            payload_type = _safe_tdlib_object_type(payload.get("@type"))
+            if payload_type is not None:
+                _append_unique(inbound_object_types_seen, payload_type)
+                if payload_type.startswith("update"):
+                    _append_unique(update_types_seen, payload_type)
+            if payload_type == "error":
+                _append_unique_safe_error_code(tdlib_error_codes_seen, payload.get("code"))
+
+            state_type = _authorization_state_type_from_payload(payload)
+            if state_type is not None:
+                safe_state_type = _safe_tdlib_object_type(state_type)
+                if safe_state_type == state_type:
+                    _append_unique(authorization_states_seen, state_type)
+                    final_authorization_state = state_type
+                if state_type != TDLIB_READY_STATE:
+                    result_class = "authorization_lost"
+                    timed_out = False
+                    break
+
+            response_type = _function_response_type_from_payload(payload)
+            if response_type is not None:
+                _append_unique(function_response_types_seen, response_type)
+
+            raw_extra = payload.get("@extra")
+            if raw_extra == extra:
+                response_extra_matched = True
+                timed_out = False
+                if response_type is None:
+                    result_class = "response_shape_error"
+                else:
+                    result = _resolve_result_from_tdlib_payload(
+                        payload,
+                        response_extra_matched=True,
+                        response_without_extra_count=response_without_extra_count,
+                        response_wrong_extra_count=response_wrong_extra_count,
+                        function_response_types_seen=function_response_types_seen,
+                    )
+                    result_class = result.status
+                    if result.tdlib_error_code is not None:
+                        _append_unique_safe_error_code(
+                            tdlib_error_codes_seen,
+                            result.tdlib_error_code,
+                        )
+                break
+
+            if response_type is None:
+                continue
+            if isinstance(raw_extra, str):
+                response_wrong_extra_count += 1
+            else:
+                response_without_extra_count += 1
+
+        return SingleResolveRpcDiagnosticResult(
+            enabled=True,
+            request_sent=True,
+            request_extra_present=True,
+            receive_attempt_count=receive_attempt_count,
+            observation_count=observation_count,
+            inbound_object_types_seen=tuple(inbound_object_types_seen),
+            function_response_types_seen=tuple(function_response_types_seen),
+            update_types_seen=tuple(update_types_seen),
+            authorization_states_seen=tuple(authorization_states_seen),
+            final_authorization_state=final_authorization_state,
+            response_extra_matched=response_extra_matched,
+            response_without_extra_count=response_without_extra_count,
+            response_wrong_extra_count=response_wrong_extra_count,
+            result_class=result_class,
+            tdlib_error_codes_seen=tuple(tdlib_error_codes_seen),
+            timed_out=timed_out,
+            operator_next_action=_single_resolve_rpc_next_action(
+                result_class=result_class,
+                response_extra_matched=response_extra_matched,
+                timed_out=timed_out,
+            ),
         )
 
     async def _send(self, request: Mapping[str, Any]) -> None:
@@ -1536,6 +1803,92 @@ def _merge_resolver_side_effects(
                 report[key] = ready_probe_summary[key]
 
 
+def _apply_single_resolve_rpc_diagnostic(
+    report: dict[str, Any],
+    diagnostic: SingleResolveRpcDiagnosticResult,
+) -> None:
+    report.update(diagnostic.as_report_fields())
+    report["operator_next_action"] = diagnostic.operator_next_action
+
+
+def _single_resolve_rpc_contract_status(
+    diagnostic: SingleResolveRpcDiagnosticResult,
+) -> str:
+    if diagnostic.result_class == "authorization_lost":
+        return "single_resolve_rpc_diagnostic_authorization_lost"
+    if diagnostic.result_class == "transport_error":
+        return "single_resolve_rpc_diagnostic_transport_error"
+    if diagnostic.timed_out:
+        return "single_resolve_rpc_diagnostic_response_timeout"
+    return "single_resolve_rpc_diagnostic_completed"
+
+
+async def _diagnose_single_resolve_rpc(
+    *,
+    row: TargetRow,
+    resolver: PublicUsernameResolver,
+    report: dict[str, Any],
+) -> SingleResolveRpcDiagnosticResult:
+    report["tdlib_resolve_attempted"] = True
+    report["side_effects"]["telegram_api_called"] = True
+    report["side_effects"]["tdlib_public_username_resolve_called"] = True
+    try:
+        diagnostic = await resolver.diagnose_single_resolve_rpc(row.normalized_username)
+        if diagnostic.receive_attempt_count > 0:
+            report["side_effects"]["tdlib_receive_called"] = True
+    except TDLibNotReady:
+        diagnostic = SingleResolveRpcDiagnosticResult(
+            enabled=True,
+            result_class="authorization_lost",
+            operator_next_action=_single_resolve_rpc_next_action(
+                result_class="authorization_lost",
+                response_extra_matched=False,
+                timed_out=False,
+            ),
+        )
+    except TDLibTransportUnavailable:
+        diagnostic = SingleResolveRpcDiagnosticResult(
+            enabled=True,
+            result_class="transport_error",
+            operator_next_action=_single_resolve_rpc_next_action(
+                result_class="transport_error",
+                response_extra_matched=False,
+                timed_out=False,
+            ),
+        )
+    except Exception:
+        diagnostic = SingleResolveRpcDiagnosticResult(
+            enabled=True,
+            result_class="unknown_error",
+            operator_next_action=(
+                "The single searchPublicChat diagnostic hit an unexpected class-level "
+                "error. Keep registry mutation disabled and inspect code-level "
+                "diagnostic wiring only."
+            ),
+        )
+
+    if not isinstance(diagnostic, SingleResolveRpcDiagnosticResult):
+        diagnostic = SingleResolveRpcDiagnosticResult(
+            enabled=True,
+            result_class="response_shape_error",
+            operator_next_action=_single_resolve_rpc_next_action(
+                result_class="response_shape_error",
+                response_extra_matched=False,
+                timed_out=False,
+            ),
+        )
+
+    if diagnostic.request_sent or diagnostic.send_error_class is not None:
+        report["side_effects"]["tdlib_send_called"] = True
+
+    return replace(
+        diagnostic,
+        enabled=True,
+        target_selected=True,
+        target_index_bucket=_bucket_count(1),
+    )
+
+
 async def _resolve_rows(
     *,
     rows: Sequence[TargetRow],
@@ -1690,6 +2043,7 @@ def generate_report(
     dry_run: bool = True,
     approved_tdlib_public_username_resolve: bool = False,
     approved_registry_resolve_mutation: bool = False,
+    diagnose_single_resolve_rpc: bool = False,
     limit: int | None = None,
     tdlib_auth_max_updates: int = DEFAULT_TDLIB_AUTH_MAX_UPDATES,
     tdlib_receive_timeout_sec: float = DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC,
@@ -1703,6 +2057,7 @@ def generate_report(
         dry_run=effective_dry_run,
         approved_tdlib_public_username_resolve=approved_tdlib_public_username_resolve,
         approved_registry_resolve_mutation=approved_registry_resolve_mutation,
+        diagnose_single_resolve_rpc=diagnose_single_resolve_rpc,
     )
 
     try:
@@ -1729,6 +2084,7 @@ def generate_report(
         approved_tdlib_public_username_resolve
         and approved_registry_resolve_mutation
         and not effective_dry_run
+        and not diagnose_single_resolve_rpc
     )
 
     try:
@@ -1785,6 +2141,17 @@ def generate_report(
             )
             return ScriptResult(exit_code=1, report=report)
 
+        if diagnose_single_resolve_rpc and not approved_tdlib_public_username_resolve:
+            _set_status(report, "blocked_approval_required", "approval.tdlib_resolve_required")
+            report["operator_next_action"] = (
+                "Single public username RPC diagnostic requires explicit TDLib public "
+                "username resolve approval, but still performs no registry mutation."
+            )
+            report["single_resolve_rpc_operator_next_action"] = report[
+                "operator_next_action"
+            ]
+            return ScriptResult(exit_code=1, report=report)
+
         if effective_dry_run:
             _set_status(report, "dry_run_public_username_resolve_plan_ready")
             report["operator_next_action"] = (
@@ -1795,7 +2162,10 @@ def generate_report(
             )
             return ScriptResult(exit_code=0, report=report)
 
-        rows = _load_target_rows(connection, limit=limit)
+        row_limit = 1 if diagnose_single_resolve_rpc else limit
+        if diagnose_single_resolve_rpc and limit is not None:
+            row_limit = min(limit, 1)
+        rows = _load_target_rows(connection, limit=row_limit)
         if not rows:
             _set_status(
                 report,
@@ -1803,6 +2173,9 @@ def generate_report(
                 "registry.no_valid_public_username_rows_selected",
             )
             return ScriptResult(exit_code=1, report=report)
+        if diagnose_single_resolve_rpc:
+            report["single_resolve_rpc_target_selected"] = True
+            report["single_resolve_rpc_target_index_bucket"] = _bucket_count(1)
 
         try:
             if public_username_resolver_factory is None:
@@ -1832,6 +2205,19 @@ def generate_report(
             )
             _merge_resolver_side_effects(report, resolver)
             return ScriptResult(exit_code=1, report=report)
+
+        if diagnose_single_resolve_rpc:
+            diagnostic = asyncio.run(
+                _diagnose_single_resolve_rpc(
+                    row=rows[0],
+                    resolver=resolver,
+                    report=report,
+                )
+            )
+            _apply_single_resolve_rpc_diagnostic(report, diagnostic)
+            _merge_resolver_side_effects(report, resolver)
+            _set_status(report, _single_resolve_rpc_contract_status(diagnostic))
+            return ScriptResult(exit_code=0, report=report)
 
         try:
             resolve_counters = asyncio.run(
@@ -1919,6 +2305,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         dry_run=args.dry_run,
         approved_tdlib_public_username_resolve=args.approved_tdlib_public_username_resolve,
         approved_registry_resolve_mutation=args.approved_registry_resolve_mutation,
+        diagnose_single_resolve_rpc=args.diagnose_single_resolve_rpc,
         limit=args.limit,
         tdlib_auth_max_updates=args.tdlib_auth_max_updates,
         tdlib_receive_timeout_sec=args.tdlib_receive_timeout_sec,
