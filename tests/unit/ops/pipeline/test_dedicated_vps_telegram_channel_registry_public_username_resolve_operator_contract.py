@@ -101,6 +101,22 @@ SINGLE_RESOLVE_RPC_DIAGNOSTIC_FIELD_NAMES = (
     "single_resolve_rpc_timed_out",
     "single_resolve_rpc_operator_next_action",
 )
+POST_READY_DRAIN_FIELD_NAMES = (
+    "tdlib_post_ready_drain_attempted",
+    "tdlib_post_ready_drain_max_updates",
+    "tdlib_post_ready_drain_timeout_sec",
+    "tdlib_post_ready_drain_receive_attempt_count_bucket",
+    "tdlib_post_ready_drain_observation_count_bucket",
+    "tdlib_post_ready_drain_inbound_object_types_seen",
+    "tdlib_post_ready_drain_function_response_types_seen",
+    "tdlib_post_ready_drain_update_types_seen",
+    "tdlib_post_ready_drain_authorization_states_seen",
+    "tdlib_post_ready_drain_final_authorization_state",
+    "tdlib_post_ready_drain_response_without_extra_count_bucket",
+    "tdlib_post_ready_drain_response_wrong_extra_count_bucket",
+    "tdlib_post_ready_drain_budget_exhausted",
+    "tdlib_post_ready_drain_authorization_lost",
+)
 
 
 class FakeResult:
@@ -244,12 +260,17 @@ class FakeResolver:
         responses: dict[str, Any],
         *,
         fail_initialize: Exception | None = None,
+        drain_summary: Any | None = None,
+        fail_drain: Exception | None = None,
     ) -> None:
         self.responses = responses
         self.fail_initialize = fail_initialize
+        self.drain_summary = drain_summary
+        self.fail_drain = fail_drain
         self.initialized = False
         self.closed = False
         self.calls: list[str] = []
+        self.drain_calls = 0
         self.auth_code_called = False
         self.auth_password_called = False
         self.join_called = False
@@ -260,6 +281,16 @@ class FakeResolver:
         if self.fail_initialize is not None:
             raise self.fail_initialize
         self.initialized = True
+
+    async def drain_post_ready_updates(self) -> Any:
+        self.drain_calls += 1
+        if self.fail_drain is not None:
+            raise self.fail_drain
+        if self.drain_summary is not None:
+            return self.drain_summary
+        summary = _module().TDLibPostReadyDrainSummary()
+        summary.mark_attempted()
+        return summary
 
     async def resolve_public_username(self, username: str) -> Any:
         self.calls.append(username)
@@ -290,20 +321,32 @@ class FakeTDLibTransport:
         self.closed = False
         self.sent_requests: list[dict[str, Any]] = []
         self.receive_timeouts: list[float] = []
+        self.events: list[str] = []
 
     async def initialize(self) -> None:
         self.initialized = True
 
     async def send(self, request: dict[str, Any]) -> None:
+        self.events.append(f"send:{request.get('@type', '')}")
         self.sent_requests.append(request)
 
     async def receive(self, timeout: float) -> dict[str, Any] | None:
         self.receive_timeouts.append(timeout)
         if not self.payloads:
+            self.events.append("receive:none")
             return None
         payload = self.payloads.pop(0)
         if callable(payload):
-            payload = payload(self)
+            try:
+                payload = payload(self)
+            except AssertionError as exc:
+                if "was not sent" in str(exc):
+                    self.payloads.insert(0, payload)
+                    self.events.append("receive:none")
+                    return None
+                raise
+        payload_type = payload.get("@type", "") if isinstance(payload, dict) else "none"
+        self.events.append(f"receive:{payload_type}")
         return payload
 
     async def close(self) -> None:
@@ -431,6 +474,8 @@ def _run_report_with_tdlib_transport(
     tdlib_auth_max_updates: int | None = None,
     tdlib_receive_timeout_sec: float | None = None,
     tdlib_overall_timeout_sec: float | None = None,
+    tdlib_post_ready_drain_max_updates: int | None = None,
+    tdlib_post_ready_drain_timeout_sec: float | None = None,
     diagnose_single_resolve_rpc: bool = False,
 ) -> tuple[dict[str, Any], FakeDatabaseConnection, Any]:
     module = _module()
@@ -451,6 +496,16 @@ def _run_report_with_tdlib_transport(
         if tdlib_overall_timeout_sec is None
         else tdlib_overall_timeout_sec
     )
+    post_ready_drain_max_updates = (
+        module.DEFAULT_TDLIB_POST_READY_DRAIN_MAX_UPDATES
+        if tdlib_post_ready_drain_max_updates is None
+        else tdlib_post_ready_drain_max_updates
+    )
+    post_ready_drain_timeout_sec = (
+        module.DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC
+        if tdlib_post_ready_drain_timeout_sec is None
+        else tdlib_post_ready_drain_timeout_sec
+    )
 
     def resolver_factory(values: dict[str, str]) -> Any:
         resolver = module.TDLibPublicUsernameResolver(
@@ -459,6 +514,8 @@ def _run_report_with_tdlib_transport(
             auth_max_updates=auth_max_updates,
             receive_timeout_sec=receive_timeout_sec,
             overall_timeout_sec=overall_timeout_sec,
+            post_ready_drain_max_updates=post_ready_drain_max_updates,
+            post_ready_drain_timeout_sec=post_ready_drain_timeout_sec,
         )
         resolver_holder["resolver"] = resolver
         return resolver
@@ -472,6 +529,8 @@ def _run_report_with_tdlib_transport(
         tdlib_auth_max_updates=auth_max_updates,
         tdlib_receive_timeout_sec=receive_timeout_sec,
         tdlib_overall_timeout_sec=overall_timeout_sec,
+        tdlib_post_ready_drain_max_updates=post_ready_drain_max_updates,
+        tdlib_post_ready_drain_timeout_sec=post_ready_drain_timeout_sec,
         runtime_env_reader=lambda _path: _runtime_env_for_tdlib_transport(tmp_path),
         database_connection_factory=lambda _database_url: fake_db,
         public_username_resolver_factory=resolver_factory,
@@ -570,6 +629,11 @@ def _assert_single_resolve_rpc_diagnostic_fields_present(report: dict[str, Any])
         assert field_name in report, field_name
 
 
+def _assert_post_ready_drain_fields_present(report: dict[str, Any]) -> None:
+    for field_name in POST_READY_DRAIN_FIELD_NAMES:
+        assert field_name in report, field_name
+
+
 def _render(report: dict[str, Any]) -> str:
     return _module().render_json(report)
 
@@ -615,6 +679,10 @@ def test_cli_tdlib_readiness_budget_options_are_passed_to_report_generation(
             "0.25",
             "--tdlib-overall-timeout-sec",
             "9.5",
+            "--tdlib-post-ready-drain-max-updates",
+            "11",
+            "--tdlib-post-ready-drain-timeout-sec",
+            "0.05",
         ]
     )
     stdout = capsys.readouterr().out
@@ -624,6 +692,8 @@ def test_cli_tdlib_readiness_budget_options_are_passed_to_report_generation(
     assert captured_kwargs["tdlib_auth_max_updates"] == 7
     assert captured_kwargs["tdlib_receive_timeout_sec"] == 0.25
     assert captured_kwargs["tdlib_overall_timeout_sec"] == 9.5
+    assert captured_kwargs["tdlib_post_ready_drain_max_updates"] == 11
+    assert captured_kwargs["tdlib_post_ready_drain_timeout_sec"] == 0.05
 
 
 def test_cli_help_includes_single_resolve_rpc_diagnostic_flag() -> None:
@@ -641,6 +711,24 @@ def test_cli_help_includes_single_resolve_rpc_diagnostic_flag() -> None:
 
     assert result.returncode == 0
     assert "--diagnose-single-resolve-rpc" in result.stdout
+
+
+def test_cli_help_includes_post_ready_drain_options() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--help",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0
+    assert "--tdlib-post-ready-drain-max-updates" in result.stdout
+    assert "--tdlib-post-ready-drain-timeout-sec" in result.stdout
 
 
 def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutation() -> None:
@@ -665,6 +753,7 @@ def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutat
     assert report["side_effects"]["database_mutation_performed"] is False
     assert report["side_effects"]["telegram_channel_registry_updated"] is False
     _assert_ready_probe_fields_present(report)
+    _assert_post_ready_drain_fields_present(report)
     _assert_resolve_classification_fields_present(report)
     _assert_single_resolve_rpc_diagnostic_fields_present(report)
     assert report["tdlib_ready_probe_attempted"] is False
@@ -690,6 +779,10 @@ def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutat
     assert report["tdlib_ready_helper_reused"] is False
     assert report["tdlib_ready_helper_status"] == "not_attempted"
     assert report["tdlib_ready_helper_manual_intervention_required"] is False
+    assert report["tdlib_post_ready_drain_attempted"] is False
+    assert report["tdlib_post_ready_drain_receive_attempt_count_bucket"] == "zero"
+    assert report["tdlib_post_ready_drain_observation_count_bucket"] == "zero"
+    assert report["tdlib_post_ready_drain_authorization_lost"] is False
     assert report["single_resolve_rpc_diagnostic_enabled"] is False
     assert report["single_resolve_rpc_target_selected"] is False
     assert report["single_resolve_rpc_request_sent"] is False
@@ -759,6 +852,7 @@ def test_approved_tdlib_resolve_without_mutation_calls_fake_resolver_only() -> N
 
     assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
     assert resolver.initialized is True
+    assert resolver.drain_calls == 1
     assert resolver.closed is True
     assert resolver.calls == [RAW_PUBLIC_USERNAME]
     assert report["tdlib_resolve_attempted"] is True
@@ -773,6 +867,7 @@ def test_approved_tdlib_resolve_without_mutation_calls_fake_resolver_only() -> N
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
     assert report["side_effects"]["database_mutation_performed"] is False
     assert report["side_effects"]["telegram_channel_registry_updated"] is False
+    assert report["tdlib_post_ready_drain_attempted"] is True
 
 
 def test_tdlib_ready_update_allows_public_username_resolve_without_mutation(
@@ -1666,6 +1761,7 @@ def test_public_username_resolve_wrong_extra_is_counted_without_resolving(
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
+            None,
             {
                 "@type": "chat",
                 "@extra": "wrong-public-username-extra",
@@ -1704,6 +1800,7 @@ def test_public_username_resolve_without_extra_is_counted_without_resolving(
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
+            None,
             {
                 "@type": "chat",
                 "id": RAW_CHAT_ID,
@@ -1736,6 +1833,7 @@ def test_public_username_resolve_authorization_lost_is_classified_without_mutati
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
+            None,
             _auth_update("authorizationStateClosing"),
         ]
     )
@@ -1888,6 +1986,172 @@ def test_public_username_resolve_success_classification_keeps_no_mutation_path(
     _assert_sensitive_values_absent(rendered, tmp_path)
 
 
+def test_post_ready_drain_consumes_update_noise_before_single_rpc_search(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {
+                "@type": "updateOption",
+                "name": RAW_TDLIB_PAYLOAD_VALUE,
+                "value": {"@type": "optionValueString", "value": RAW_PUBLIC_USERNAME},
+            },
+            None,
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        diagnose_single_resolve_rpc=True,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert transport.events.index("receive:updateOption") < transport.events.index(
+        "send:searchPublicChat"
+    )
+    assert report["tdlib_post_ready_drain_attempted"] is True
+    assert report["tdlib_post_ready_drain_observation_count_bucket"] == "one"
+    assert report["tdlib_post_ready_drain_update_types_seen"] == ["updateOption"]
+    assert report["tdlib_post_ready_drain_authorization_lost"] is False
+    assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
+    assert report["single_resolve_rpc_result_class"] == "resolved"
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_post_ready_drain_stale_ok_does_not_count_as_single_rpc_response(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {"@type": "ok", "@extra": "stale-public-username-extra"},
+            None,
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        diagnose_single_resolve_rpc=True,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert report["tdlib_post_ready_drain_function_response_types_seen"] == ["ok"]
+    assert report["tdlib_post_ready_drain_response_wrong_extra_count_bucket"] == "one"
+    assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
+    assert report["single_resolve_rpc_response_wrong_extra_count_bucket"] == "zero"
+    assert report["single_resolve_rpc_response_extra_matched"] is True
+    assert report["single_resolve_rpc_result_class"] == "resolved"
+    assert db.update_attempts == 0
+    assert "stale-public-username-extra" not in rendered
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_post_ready_drain_budget_exhaustion_with_stable_ready_allows_search(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {"@type": "updateOption", "name": "version"},
+            {"@type": "updateChatLastMessage", "chat_id": RAW_CHAT_ID},
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        tdlib_post_ready_drain_max_updates=2,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
+    assert report["tdlib_post_ready_drain_budget_exhausted"] is True
+    assert report["tdlib_post_ready_drain_authorization_lost"] is False
+    assert report["tdlib_post_ready_drain_update_types_seen"] == [
+        "updateOption",
+        "updateChatLastMessage",
+    ]
+    assert report["resolve_function_response_types_seen"] == ["chat"]
+    assert _sent_request_types(transport) == ["searchPublicChat"]
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_post_ready_drain_authorization_lost_blocks_search_and_mutation(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _auth_update("authorizationStateClosing"),
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=True,
+    )
+
+    assert report["contract_status"] == "blocked_tdlib_post_ready_drain_authorization_lost"
+    assert "tdlib.post_ready_drain_authorization_lost" in report["checks_failed"]
+    assert report["tdlib_post_ready_drain_attempted"] is True
+    assert report["tdlib_post_ready_drain_authorization_lost"] is True
+    assert report["tdlib_post_ready_drain_authorization_states_seen"] == [
+        "authorizationStateClosing"
+    ]
+    assert report["tdlib_resolve_attempted"] is False
+    assert _sent_request_types(transport) == []
+    assert db.update_attempts == 0
+    assert db.transaction.rolled_back is True
+    assert db.transaction.committed is False
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
+
+
+def test_normal_no_mutation_resolve_uses_drain_before_first_search(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {"@type": "updateConnectionState"},
+            None,
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
+    assert transport.events.index("receive:updateConnectionState") < transport.events.index(
+        "send:searchPublicChat"
+    )
+    assert report["tdlib_post_ready_drain_update_types_seen"] == [
+        "updateConnectionState"
+    ]
+    assert report["resolve_function_response_types_seen"] == ["chat"]
+    assert db.update_attempts == 0
+
+
 def test_single_resolve_rpc_diagnostic_sends_one_search_after_readiness(
     tmp_path: Path,
 ) -> None:
@@ -2000,6 +2264,7 @@ def test_single_resolve_rpc_diagnostic_wrong_extra_chat_is_bucketed_without_matc
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
+            None,
             {
                 "@type": "chat",
                 "@extra": "wrong-public-username-extra",
@@ -2039,6 +2304,7 @@ def test_single_resolve_rpc_diagnostic_response_without_extra_is_bucketed_withou
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
+            None,
             {
                 "@type": "chat",
                 "id": RAW_CHAT_ID,
@@ -2072,6 +2338,7 @@ def test_single_resolve_rpc_diagnostic_authorization_lost_reports_no_mutation(
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
+            None,
             _auth_update("authorizationStateClosing"),
         ]
     )
@@ -2373,6 +2640,7 @@ def test_all_side_effect_fields_are_present_and_correct_across_modes() -> None:
     for report in (dry_report, resolve_report, mutation_report):
         assert set(report["side_effects"]) == set(module.SIDE_EFFECT_FLAG_NAMES)
         _assert_ready_probe_fields_present(report)
+        _assert_post_ready_drain_fields_present(report)
         _assert_resolve_classification_fields_present(report)
         _assert_single_resolve_rpc_diagnostic_fields_present(report)
 
@@ -2457,8 +2725,10 @@ def test_tdlib_not_ready_fails_closed_without_db_mutation() -> None:
 
     assert report["contract_status"] == "blocked_tdlib_not_ready"
     assert resolver.calls == []
+    assert resolver.drain_calls == 0
     assert db.update_attempts == 0
     _assert_ready_probe_fields_present(report)
+    _assert_post_ready_drain_fields_present(report)
     assert report["side_effects"]["tdlib_initialized"] is True
     assert report["side_effects"]["tdlib_auth_attempted"] is False
     assert report["side_effects"]["database_mutation_performed"] is False

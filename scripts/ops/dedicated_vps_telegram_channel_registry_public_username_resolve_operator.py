@@ -22,6 +22,8 @@ DEFAULT_TDLIB_AUTH_MAX_UPDATES = 200
 DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC = 240.0
 DEFAULT_TDLIB_RPC_TIMEOUT_SEC = 15.0
 DEFAULT_TDLIB_RPC_MAX_UPDATES = 120
+DEFAULT_TDLIB_POST_READY_DRAIN_MAX_UPDATES = 200
+DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC = 0.0
 TDLIB_READY_STATE = "authorizationStateReady"
 TDLIB_BOOTSTRAP_AUTH_STATES = frozenset(
     {
@@ -193,6 +195,8 @@ class DatabaseConnection(Protocol):
 
 class PublicUsernameResolver(Protocol):
     async def initialize(self) -> None: ...
+
+    async def drain_post_ready_updates(self) -> "TDLibPostReadyDrainSummary": ...
 
     async def resolve_public_username(self, username: str) -> "PublicUsernameResolveResult": ...
 
@@ -553,6 +557,89 @@ class TDLibReadyProbeSummary:
         }
 
 
+@dataclass(slots=True)
+class TDLibPostReadyDrainSummary:
+    attempted: bool = False
+    max_updates: int = DEFAULT_TDLIB_POST_READY_DRAIN_MAX_UPDATES
+    timeout_sec: float = DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC
+    receive_attempt_count: int = 0
+    observation_count: int = 0
+    inbound_object_types_seen: list[str] = field(default_factory=list)
+    function_response_types_seen: list[str] = field(default_factory=list)
+    update_types_seen: list[str] = field(default_factory=list)
+    authorization_states_seen: list[str] = field(default_factory=list)
+    final_authorization_state: str | None = None
+    response_without_extra_count: int = 0
+    response_wrong_extra_count: int = 0
+    budget_exhausted: bool = False
+    authorization_lost: bool = False
+
+    def mark_attempted(self) -> None:
+        self.attempted = True
+        if self.final_authorization_state is None:
+            self.final_authorization_state = TDLIB_READY_STATE
+
+    def record_payload(self, payload: Mapping[str, Any]) -> None:
+        self.observation_count += 1
+        payload_type = _safe_tdlib_object_type(payload.get("@type"))
+        if payload_type is not None:
+            _append_unique(self.inbound_object_types_seen, payload_type)
+            if payload_type.startswith("update"):
+                _append_unique(self.update_types_seen, payload_type)
+
+        state_type = _authorization_state_type_from_payload(payload)
+        if state_type is not None:
+            safe_state_type = _safe_tdlib_object_type(state_type)
+            if safe_state_type == state_type:
+                _append_unique(self.authorization_states_seen, state_type)
+                self.final_authorization_state = state_type
+            if state_type != TDLIB_READY_STATE:
+                self.authorization_lost = True
+
+        response_type = _function_response_type_from_payload(payload)
+        if response_type is None:
+            return
+        _append_unique(self.function_response_types_seen, response_type)
+        if isinstance(payload.get("@extra"), str):
+            self.response_wrong_extra_count += 1
+        else:
+            self.response_without_extra_count += 1
+
+    def as_report_fields(self) -> dict[str, Any]:
+        return {
+            "tdlib_post_ready_drain_attempted": self.attempted,
+            "tdlib_post_ready_drain_max_updates": self.max_updates,
+            "tdlib_post_ready_drain_timeout_sec": self.timeout_sec,
+            "tdlib_post_ready_drain_receive_attempt_count_bucket": _bucket_count(
+                self.receive_attempt_count
+            ),
+            "tdlib_post_ready_drain_observation_count_bucket": _bucket_count(
+                self.observation_count
+            ),
+            "tdlib_post_ready_drain_inbound_object_types_seen": list(
+                self.inbound_object_types_seen
+            ),
+            "tdlib_post_ready_drain_function_response_types_seen": list(
+                self.function_response_types_seen
+            ),
+            "tdlib_post_ready_drain_update_types_seen": list(self.update_types_seen),
+            "tdlib_post_ready_drain_authorization_states_seen": list(
+                self.authorization_states_seen
+            ),
+            "tdlib_post_ready_drain_final_authorization_state": (
+                self.final_authorization_state
+            ),
+            "tdlib_post_ready_drain_response_without_extra_count_bucket": _bucket_count(
+                self.response_without_extra_count
+            ),
+            "tdlib_post_ready_drain_response_wrong_extra_count_bucket": _bucket_count(
+                self.response_wrong_extra_count
+            ),
+            "tdlib_post_ready_drain_budget_exhausted": self.budget_exhausted,
+            "tdlib_post_ready_drain_authorization_lost": self.authorization_lost,
+        }
+
+
 class TDLibTransportUnavailable(RuntimeError):
     pass
 
@@ -603,6 +690,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--tdlib-overall-timeout-sec",
         type=_non_negative_float_named("tdlib-overall-timeout-sec"),
         default=DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC,
+    )
+    parser.add_argument(
+        "--tdlib-post-ready-drain-max-updates",
+        type=_positive_int_named("tdlib-post-ready-drain-max-updates"),
+        default=DEFAULT_TDLIB_POST_READY_DRAIN_MAX_UPDATES,
+    )
+    parser.add_argument(
+        "--tdlib-post-ready-drain-timeout-sec",
+        type=_non_negative_float_named("tdlib-post-ready-drain-timeout-sec"),
+        default=DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC,
     )
     return parser
 
@@ -676,6 +773,10 @@ def _empty_ready_helper_report_fields() -> dict[str, Any]:
         "tdlib_ready_helper_status": "not_attempted",
         "tdlib_ready_helper_manual_intervention_required": False,
     }
+
+
+def _empty_post_ready_drain_report_fields() -> dict[str, Any]:
+    return TDLibPostReadyDrainSummary().as_report_fields()
 
 
 def _empty_resolve_classification_report_fields() -> dict[str, Any]:
@@ -904,6 +1005,7 @@ def _base_report(
     }
     report.update(_empty_ready_probe_report_fields())
     report.update(_empty_ready_helper_report_fields())
+    report.update(_empty_post_ready_drain_report_fields())
     report.update(_empty_resolve_classification_report_fields())
     report.update(
         _empty_single_resolve_rpc_diagnostic_report_fields(
@@ -1316,6 +1418,8 @@ class TDLibPublicUsernameResolver:
         auth_max_updates: int = DEFAULT_TDLIB_AUTH_MAX_UPDATES,
         receive_timeout_sec: float = DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC,
         overall_timeout_sec: float = DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC,
+        post_ready_drain_max_updates: int = DEFAULT_TDLIB_POST_READY_DRAIN_MAX_UPDATES,
+        post_ready_drain_timeout_sec: float = DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC,
     ) -> None:
         from src.services.collector_telegram.auth_entrypoint import TDLibAuthOnlyRunner
         from src.services.collector_telegram.auth_fsm import (
@@ -1357,6 +1461,10 @@ class TDLibPublicUsernameResolver:
             login_code_entry_is_interactive=lambda: False,
         )
         self._overall_timeout_sec = overall_timeout_sec
+        self._post_ready_drain_summary = TDLibPostReadyDrainSummary(
+            max_updates=post_ready_drain_max_updates,
+            timeout_sec=post_ready_drain_timeout_sec,
+        )
         self._ready_helper_reused = False
         self._ready_helper_status = "not_attempted"
         self._ready_helper_manual_intervention_required = False
@@ -1377,6 +1485,10 @@ class TDLibPublicUsernameResolver:
             }
         )
         return fields
+
+    @property
+    def tdlib_post_ready_drain_summary(self) -> Mapping[str, Any]:
+        return self._post_ready_drain_summary.as_report_fields()
 
     async def initialize(self) -> None:
         try:
@@ -1418,6 +1530,26 @@ class TDLibPublicUsernameResolver:
         except Exception:
             return _resolve_failure_result("transport_error")
         return await self._receive_response(extra)
+
+    async def drain_post_ready_updates(self) -> TDLibPostReadyDrainSummary:
+        self._post_ready_drain_summary.mark_attempted()
+        for _ in range(self._post_ready_drain_summary.max_updates):
+            self._post_ready_drain_summary.receive_attempt_count += 1
+            try:
+                payload = await self._receive(self._post_ready_drain_summary.timeout_sec)
+            except Exception as exc:
+                self._ready_probe_summary.mark_transport_error(exc)
+                raise TDLibTransportUnavailable("TDLib transport unavailable") from exc
+            if payload is None:
+                break
+            if not isinstance(payload, Mapping):
+                continue
+            self._post_ready_drain_summary.record_payload(payload)
+            if self._post_ready_drain_summary.authorization_lost:
+                raise TDLibNotReady("TDLib authorization changed during post-ready drain")
+        else:
+            self._post_ready_drain_summary.budget_exhausted = True
+        return self._post_ready_drain_summary
 
     async def diagnose_single_resolve_rpc(
         self,
@@ -1656,12 +1788,16 @@ def _default_resolver_factory(
     auth_max_updates: int,
     receive_timeout_sec: float,
     overall_timeout_sec: float,
+    post_ready_drain_max_updates: int,
+    post_ready_drain_timeout_sec: float,
 ) -> PublicUsernameResolver:
     return TDLibPublicUsernameResolver(
         runtime_env,
         auth_max_updates=auth_max_updates,
         receive_timeout_sec=receive_timeout_sec,
         overall_timeout_sec=overall_timeout_sec,
+        post_ready_drain_max_updates=post_ready_drain_max_updates,
+        post_ready_drain_timeout_sec=post_ready_drain_timeout_sec,
     )
 
 
@@ -1801,6 +1937,33 @@ def _merge_resolver_side_effects(
         }:
             if key in ready_probe_summary:
                 report[key] = ready_probe_summary[key]
+    post_ready_drain_summary = getattr(resolver, "tdlib_post_ready_drain_summary", None)
+    if isinstance(post_ready_drain_summary, Mapping):
+        for key in _empty_post_ready_drain_report_fields():
+            if key in post_ready_drain_summary:
+                report[key] = post_ready_drain_summary[key]
+
+
+def _post_ready_drain_authorization_lost_next_action() -> str:
+    return (
+        "TDLib authorization changed away from ready during the post-ready "
+        "receive-only drain. No searchPublicChat request was sent and no registry "
+        "mutation was committed; restore a ready TDLib session before retrying."
+    )
+
+
+async def _drain_post_ready_updates(
+    *,
+    resolver: PublicUsernameResolver,
+    report: dict[str, Any],
+) -> TDLibPostReadyDrainSummary:
+    summary = await resolver.drain_post_ready_updates()
+    if not isinstance(summary, TDLibPostReadyDrainSummary):
+        summary = TDLibPostReadyDrainSummary()
+    report.update(summary.as_report_fields())
+    if summary.receive_attempt_count > 0:
+        report["side_effects"]["tdlib_receive_called"] = True
+    return summary
 
 
 def _apply_single_resolve_rpc_diagnostic(
@@ -2048,6 +2211,12 @@ def generate_report(
     tdlib_auth_max_updates: int = DEFAULT_TDLIB_AUTH_MAX_UPDATES,
     tdlib_receive_timeout_sec: float = DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC,
     tdlib_overall_timeout_sec: float = DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC,
+    tdlib_post_ready_drain_max_updates: int = (
+        DEFAULT_TDLIB_POST_READY_DRAIN_MAX_UPDATES
+    ),
+    tdlib_post_ready_drain_timeout_sec: float = (
+        DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC
+    ),
     runtime_env_reader: RuntimeEnvReader | None = None,
     database_connection_factory: DatabaseConnectionFactory | None = None,
     public_username_resolver_factory: PublicUsernameResolverFactory | None = None,
@@ -2184,6 +2353,8 @@ def generate_report(
                     auth_max_updates=tdlib_auth_max_updates,
                     receive_timeout_sec=tdlib_receive_timeout_sec,
                     overall_timeout_sec=tdlib_overall_timeout_sec,
+                    post_ready_drain_max_updates=tdlib_post_ready_drain_max_updates,
+                    post_ready_drain_timeout_sec=tdlib_post_ready_drain_timeout_sec,
                 )
             else:
                 resolver = public_username_resolver_factory(values)
@@ -2202,6 +2373,44 @@ def generate_report(
                 report,
                 "blocked_tdlib_transport_unavailable",
                 "tdlib.transport_unavailable",
+            )
+            _merge_resolver_side_effects(report, resolver)
+            return ScriptResult(exit_code=1, report=report)
+
+        try:
+            drain_summary = asyncio.run(
+                _drain_post_ready_updates(
+                    resolver=resolver,
+                    report=report,
+                )
+            )
+            _merge_resolver_side_effects(report, resolver)
+            if drain_summary.authorization_lost:
+                _set_status(
+                    report,
+                    "blocked_tdlib_post_ready_drain_authorization_lost",
+                    "tdlib.post_ready_drain_authorization_lost",
+                )
+                report["operator_next_action"] = (
+                    _post_ready_drain_authorization_lost_next_action()
+                )
+                return ScriptResult(exit_code=1, report=report)
+        except TDLibNotReady:
+            _set_status(
+                report,
+                "blocked_tdlib_post_ready_drain_authorization_lost",
+                "tdlib.post_ready_drain_authorization_lost",
+            )
+            _merge_resolver_side_effects(report, resolver)
+            report["operator_next_action"] = (
+                _post_ready_drain_authorization_lost_next_action()
+            )
+            return ScriptResult(exit_code=1, report=report)
+        except Exception:
+            _set_status(
+                report,
+                "blocked_tdlib_transport_unavailable",
+                "tdlib.post_ready_drain_transport_unavailable",
             )
             _merge_resolver_side_effects(report, resolver)
             return ScriptResult(exit_code=1, report=report)
@@ -2310,6 +2519,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         tdlib_auth_max_updates=args.tdlib_auth_max_updates,
         tdlib_receive_timeout_sec=args.tdlib_receive_timeout_sec,
         tdlib_overall_timeout_sec=args.tdlib_overall_timeout_sec,
+        tdlib_post_ready_drain_max_updates=args.tdlib_post_ready_drain_max_updates,
+        tdlib_post_ready_drain_timeout_sec=args.tdlib_post_ready_drain_timeout_sec,
     )
     sys.stdout.write(render_json(result.report))
     sys.stdout.write("\n")
