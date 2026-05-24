@@ -56,6 +56,26 @@ RuntimeEnvReader = Callable[[str | Path], Mapping[str, str]]
 CollectorConfigFactory = Callable[[Mapping[str, str]], Any]
 TdjsonAvailabilityChecker = Callable[[Mapping[str, str]], Mapping[str, Any] | bool]
 TransportFactory = Callable[[Mapping[str, str]], Any]
+SetParametersPayloadBuilder = Callable[[Any], Mapping[str, Any]]
+
+SET_PARAMETERS_REQUIRED_FIELDS = (
+    "api_id",
+    "api_hash",
+    "database_directory",
+    "files_directory",
+    "database_encryption_key",
+    "use_test_dc",
+    "use_file_database",
+    "use_chat_info_database",
+    "use_message_database",
+    "use_secret_chats",
+    "system_language_code",
+    "device_model",
+    "system_version",
+    "application_version",
+)
+SET_PARAMETERS_PATH_FIELDS = frozenset({"database_directory", "files_directory"})
+UNMATCHED_FUNCTION_RESPONSE_TYPES = frozenset({"ok", "error"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +154,25 @@ def _base_report() -> dict[str, Any]:
         "request_count_bucket": "zero",
         "receive_attempt_count_bucket": "zero",
         "observation_count_bucket": "zero",
+        "transport_send_call_count_bucket": "zero",
+        "transport_receive_call_count_bucket": "zero",
+        "sent_request_shape_summaries": [],
+        "set_parameters_transport_envelope_seen": False,
+        "set_parameters_transport_extra_present": False,
+        "set_parameters_transport_required_fields_present": {
+            field: False for field in SET_PARAMETERS_REQUIRED_FIELDS
+        },
+        "set_parameters_transport_required_fields_missing": list(
+            SET_PARAMETERS_REQUIRED_FIELDS
+        ),
+        "set_parameters_transport_field_type_categories": {
+            field: "absent" for field in SET_PARAMETERS_REQUIRED_FIELDS
+        },
+        "unmatched_response_types_seen": [],
+        "unmatched_response_extra_present_count_bucket": "zero",
+        "unmatched_response_without_extra_count_bucket": "zero",
+        "response_correlation_strategy": "tdlib_extra_exact_match",
+        "response_correlation_gap_detected": False,
         "update_types_seen": [],
         "authorization_states_seen": [],
         "final_authorization_state": None,
@@ -182,6 +221,45 @@ def _bucket_count(count: int | None) -> str:
 def _append_unique(values: list[str], value: str) -> None:
     if value not in values:
         values.append(value)
+
+
+def _type_category(value: Any, *, field: str | None = None) -> str:
+    if value is None:
+        return "absent"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, str):
+        if field in SET_PARAMETERS_PATH_FIELDS:
+            return "path" if value.strip() else "empty_string"
+        return "non_empty_string" if value.strip() else "empty_string"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    return "other"
+
+
+def _request_shape_summary(request: Mapping[str, Any]) -> dict[str, Any]:
+    fields_present = sorted(str(field) for field in request)
+    return {
+        "request_type": _safe_tdlib_type(request.get("@type")),
+        "extra_present": isinstance(request.get("@extra"), str),
+        "fields_present": fields_present,
+        "field_type_categories": {
+            field: _type_category(request.get(field), field=field)
+            for field in fields_present
+        },
+    }
+
+
+def _response_type_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
+    raw_extra = payload.get("@extra")
+    return {
+        "response_type": _safe_tdlib_type(payload.get("@type")),
+        "extra_state": "present" if isinstance(raw_extra, str) else "absent",
+    }
 
 
 def _safe_tdlib_type(value: Any) -> str | None:
@@ -325,6 +403,122 @@ def _set_count_buckets(
     report["observation_count_bucket"] = _bucket_count(observation_count)
 
 
+class TransportBoundaryRecorder:
+    """Records sanitized TDLib transport-boundary evidence for this diagnostic."""
+
+    def __init__(self) -> None:
+        self.send_call_count = 0
+        self.receive_call_count = 0
+        self.unmatched_response_extra_present_count = 0
+        self.unmatched_response_without_extra_count = 0
+        self.sent_request_shape_summaries: list[dict[str, Any]] = []
+        self.inbound_payload_type_summaries: list[dict[str, Any]] = []
+        self.unmatched_response_types_seen: list[str] = []
+
+    def record_send(self, request: Mapping[str, Any]) -> None:
+        self.send_call_count += 1
+        summary = _request_shape_summary(request)
+        self.sent_request_shape_summaries.append(summary)
+
+    def record_receive_call(self) -> None:
+        self.receive_call_count += 1
+
+    def record_inbound_payload(self, payload: Any) -> None:
+        if not isinstance(payload, Mapping):
+            return
+        self.inbound_payload_type_summaries.append(_response_type_summary(payload))
+
+    def record_unmatched_response(self, payload: Mapping[str, Any]) -> None:
+        payload_type = _safe_tdlib_type(payload.get("@type"))
+        if payload_type not in UNMATCHED_FUNCTION_RESPONSE_TYPES:
+            return
+
+        _append_unique(self.unmatched_response_types_seen, payload_type)
+        if isinstance(payload.get("@extra"), str):
+            self.unmatched_response_extra_present_count += 1
+        else:
+            self.unmatched_response_without_extra_count += 1
+
+    def apply_to_report(self, report: dict[str, Any]) -> None:
+        report["transport_send_call_count_bucket"] = _bucket_count(
+            self.send_call_count
+        )
+        report["transport_receive_call_count_bucket"] = _bucket_count(
+            self.receive_call_count
+        )
+        report["sent_request_shape_summaries"] = self.sent_request_shape_summaries
+        report["unmatched_response_types_seen"] = self.unmatched_response_types_seen
+        report["unmatched_response_extra_present_count_bucket"] = _bucket_count(
+            self.unmatched_response_extra_present_count
+        )
+        report["unmatched_response_without_extra_count_bucket"] = _bucket_count(
+            self.unmatched_response_without_extra_count
+        )
+
+        for summary in self.sent_request_shape_summaries:
+            if summary.get("request_type") != "setTdlibParameters":
+                continue
+
+            report["set_parameters_transport_envelope_seen"] = True
+            extra_present = bool(summary.get("extra_present"))
+            report["set_parameters_transport_extra_present"] = extra_present
+
+            fields_present = set(summary.get("fields_present") or [])
+            required_present = {
+                field: field in fields_present
+                for field in SET_PARAMETERS_REQUIRED_FIELDS
+            }
+            report["set_parameters_transport_required_fields_present"] = (
+                required_present
+            )
+            report["set_parameters_transport_required_fields_missing"] = [
+                field
+                for field in SET_PARAMETERS_REQUIRED_FIELDS
+                if not required_present[field]
+            ]
+
+            categories = summary.get("field_type_categories")
+            if isinstance(categories, Mapping):
+                report["set_parameters_transport_field_type_categories"] = {
+                    field: str(categories.get(field, "absent"))
+                    for field in SET_PARAMETERS_REQUIRED_FIELDS
+                }
+
+        report["response_correlation_gap_detected"] = bool(
+            report["set_parameters_request_sent"]
+            and not report["set_parameters_response_seen"]
+            and (
+                not report["set_parameters_transport_extra_present"]
+                or self.unmatched_response_extra_present_count > 0
+                or self.unmatched_response_without_extra_count > 0
+            )
+        )
+
+
+class ObservingTDLibTransport:
+    """Diagnostic-only wrapper that records sanitized TDLib boundary evidence."""
+
+    def __init__(self, transport: Any, recorder: TransportBoundaryRecorder) -> None:
+        self._transport = transport
+        self._recorder = recorder
+
+    async def initialize(self) -> None:
+        await self._transport.initialize()
+
+    async def send(self, request: dict[str, Any]) -> None:
+        self._recorder.record_send(request)
+        await self._transport.send(request)
+
+    async def receive(self, timeout: float) -> dict[str, Any] | None:
+        self._recorder.record_receive_call()
+        payload = await self._transport.receive(timeout)
+        self._recorder.record_inbound_payload(payload)
+        return payload
+
+    async def close(self) -> None:
+        await self._transport.close()
+
+
 def _make_extra(sequence: int, request_type: str) -> str:
     return f"{SCRIPT_NAME}:{sequence}:{request_type}"
 
@@ -335,6 +529,7 @@ def _apply_observation(
     *,
     set_parameters_extra: str | None,
     set_parameters_request_sent: bool,
+    transport_recorder: TransportBoundaryRecorder,
 ) -> tuple[bool, bool]:
     payload_type = _safe_tdlib_type(payload.get("@type"))
     if payload_type is not None and payload_type.startswith("update"):
@@ -357,6 +552,9 @@ def _apply_observation(
             report["set_parameters_error_class"] = "tdlib_error"
             stop_after_observation = True
 
+    if set_parameters_request_sent and not matched_set_parameters_response:
+        transport_recorder.record_unmatched_response(payload)
+
     state_type = _authorization_state_type_from_payload(payload)
     if state_type is not None:
         _append_unique(report["authorization_states_seen"], state_type)
@@ -375,6 +573,7 @@ async def _run_runtime_probe(
     values: Mapping[str, str],
     config: Any,
     transport_factory: TransportFactory | None,
+    set_parameters_payload_builder: SetParametersPayloadBuilder | None,
     max_observations: int,
     receive_timeout_sec: float,
     overall_timeout_sec: float,
@@ -386,7 +585,11 @@ async def _run_runtime_probe(
         build_set_tdlib_parameters_payload,
     )
 
-    transport = (transport_factory or _build_default_transport)(values)
+    transport_recorder = TransportBoundaryRecorder()
+    transport = ObservingTDLibTransport(
+        (transport_factory or _build_default_transport)(values),
+        transport_recorder,
+    )
     client = TDLibClient(config, transport=transport)
 
     request_count = 0
@@ -450,13 +653,17 @@ async def _run_runtime_probe(
                 payload,
                 set_parameters_extra=set_parameters_extra,
                 set_parameters_request_sent=report["set_parameters_request_sent"],
+                transport_recorder=transport_recorder,
             )
 
             if (
                 report["final_authorization_state"] == "authorizationStateWaitTdlibParameters"
                 and not report["set_parameters_request_sent"]
             ):
-                set_request = build_set_tdlib_parameters_payload(config)
+                if set_parameters_payload_builder is None:
+                    set_request = build_set_tdlib_parameters_payload(config)
+                else:
+                    set_request = dict(set_parameters_payload_builder(config))
                 sent_payload = await send_request(set_request)
                 set_parameters_extra = sent_payload.get("@extra")
                 report["set_parameters_request_sent"] = True
@@ -474,6 +681,7 @@ async def _run_runtime_probe(
             receive_attempt_count=receive_attempt_count,
             observation_count=observation_count,
         )
+        transport_recorder.apply_to_report(report)
         try:
             await client.close()
             report["tdlib_closed"] = True
@@ -544,6 +752,7 @@ def generate_report(
     collector_config_factory: CollectorConfigFactory | None = None,
     tdjson_availability_checker: TdjsonAvailabilityChecker | None = None,
     transport_factory: TransportFactory | None = None,
+    set_parameters_payload_builder: SetParametersPayloadBuilder | None = None,
 ) -> ScriptResult:
     resolved_repo_root = (
         Path(repo_root).resolve() if repo_root is not None else default_repo_root()
@@ -615,6 +824,7 @@ def generate_report(
             values=values,
             config=config,
             transport_factory=transport_factory,
+            set_parameters_payload_builder=set_parameters_payload_builder,
             max_observations=max_observations,
             receive_timeout_sec=receive_timeout_sec,
             overall_timeout_sec=overall_timeout_sec,

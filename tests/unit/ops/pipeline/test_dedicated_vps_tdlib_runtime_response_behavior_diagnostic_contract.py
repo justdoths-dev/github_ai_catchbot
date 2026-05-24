@@ -24,6 +24,8 @@ FAKE_TDLIB_KEY = "unit-tdlib-db-encryption-key"
 FAKE_2FA_PASSWORD = "unit two factor password"
 
 FORBIDDEN_REQUEST_TYPES = {
+    "checkDatabaseEncryptionKey",
+    "setAuthenticationPhoneNumber",
     "searchPublicChat",
     "joinChat",
     "joinChatByInviteLink",
@@ -142,6 +144,7 @@ def _run_report(
     transport: FakeTDLibTransport | None = None,
     approved: bool = True,
     max_observations: int = 6,
+    set_parameters_payload_builder: Any | None = None,
 ) -> tuple[dict[str, Any], FakeTDLibTransport | None]:
     fake_transport = transport
     transport_called = False
@@ -163,6 +166,7 @@ def _run_report(
         runtime_env_reader=lambda _path: _runtime_env(tmp_path),
         tdjson_availability_checker=lambda _values: True,
         transport_factory=transport_factory,
+        set_parameters_payload_builder=set_parameters_payload_builder,
     )
     if approved:
         assert transport_called is True
@@ -229,6 +233,11 @@ def test_dry_run_requires_approval_without_tdlib_side_effects(tmp_path: Path) ->
     assert report["tdlib_receive_called"] is False
     assert report["request_types_sent"] == []
     assert report["observation_count_bucket"] == "zero"
+    assert report["transport_send_call_count_bucket"] == "zero"
+    assert report["transport_receive_call_count_bucket"] == "zero"
+    assert report["sent_request_shape_summaries"] == []
+    assert report["response_correlation_strategy"] == "tdlib_extra_exact_match"
+    assert report["response_correlation_gap_detected"] is False
     _assert_non_tdlib_side_effects_false(report)
     _assert_sensitive_values_absent(rendered, tmp_path)
 
@@ -260,14 +269,94 @@ def test_approved_probe_correlates_set_parameters_ok(tmp_path: Path) -> None:
         "getAuthorizationState",
         "setTdlibParameters",
     ]
+    assert report["transport_send_call_count_bucket"] == "two_to_five"
+    assert report["transport_receive_call_count_bucket"] == "six_to_ten"
+    assert [
+        summary["request_type"]
+        for summary in report["sent_request_shape_summaries"]
+    ] == [
+        "getAuthorizationState",
+        "setTdlibParameters",
+    ]
+    assert report["set_parameters_transport_envelope_seen"] is True
+    assert report["set_parameters_transport_extra_present"] is True
     assert report["set_parameters_request_sent"] is True
     assert report["set_parameters_request_extra_present"] is True
+    assert report["set_parameters_transport_required_fields_missing"] == []
+    assert all(
+        report["set_parameters_transport_required_fields_present"].values()
+    )
+    assert report["set_parameters_transport_field_type_categories"][
+        "api_id"
+    ] == "int"
+    assert report["set_parameters_transport_field_type_categories"][
+        "api_hash"
+    ] == "non_empty_string"
+    assert report["set_parameters_transport_field_type_categories"][
+        "database_directory"
+    ] == "path"
+    assert report["set_parameters_transport_field_type_categories"][
+        "use_message_database"
+    ] == "bool"
     assert report["set_parameters_response_seen"] is True
     assert report["set_parameters_response_type"] == "ok"
     assert report["set_parameters_response_extra_matched"] is True
     assert report["set_parameters_error_code"] is None
     assert report["set_parameters_error_class"] is None
     assert report["timed_out_waiting_for_set_parameters_response"] is False
+    assert report["unmatched_response_types_seen"] == []
+    assert report["unmatched_response_extra_present_count_bucket"] == "zero"
+    assert report["unmatched_response_without_extra_count_bucket"] == "zero"
+    assert report["response_correlation_gap_detected"] is False
+    _assert_non_tdlib_side_effects_false(report)
+
+
+def test_set_parameters_transport_summary_reports_missing_required_field_without_values(
+    tmp_path: Path,
+) -> None:
+    def missing_api_hash_builder(_config: Any) -> dict[str, Any]:
+        return {
+            "@type": "setTdlibParameters",
+            "use_test_dc": False,
+            "database_directory": f"{tmp_path}/secret-db-path",
+            "files_directory": f"{tmp_path}/secret-files-path",
+            "use_file_database": True,
+            "use_chat_info_database": True,
+            "use_message_database": True,
+            "use_secret_chats": False,
+            "api_id": 123456,
+            "system_language_code": "en",
+            "device_model": "catchbot-vps",
+            "system_version": "linux",
+            "application_version": "0.1.0",
+            "database_encryption_key": FAKE_TDLIB_KEY,
+        }
+
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateWaitTdlibParameters"),
+            _response_for_last_request("setTdlibParameters", {"@type": "ok"}),
+        ]
+    )
+
+    report, _used_transport = _run_report(
+        tmp_path=tmp_path,
+        transport=transport,
+        set_parameters_payload_builder=missing_api_hash_builder,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "tdlib_runtime_response_diagnostic_completed"
+    assert report["set_parameters_transport_envelope_seen"] is True
+    assert report["set_parameters_transport_required_fields_present"][
+        "api_hash"
+    ] is False
+    assert "api_hash" in report["set_parameters_transport_required_fields_missing"]
+    assert report["set_parameters_transport_field_type_categories"][
+        "api_hash"
+    ] == "absent"
+    assert "api_hash" not in transport.sent_requests[1]
+    _assert_sensitive_values_absent(rendered, tmp_path)
     _assert_non_tdlib_side_effects_false(report)
 
 
@@ -331,10 +420,75 @@ def test_approved_probe_times_out_after_set_parameters_without_correlated_respon
     assert report["timed_out_waiting_for_set_parameters_response"] is True
     assert report["final_authorization_state"] == "authorizationStateWaitTdlibParameters"
     assert report["receive_attempt_count_bucket"] == "two_to_five"
+    assert report["transport_send_call_count_bucket"] == "two_to_five"
+    assert report["transport_receive_call_count_bucket"] == "two_to_five"
+    assert report["set_parameters_transport_envelope_seen"] is True
+    assert report["set_parameters_transport_extra_present"] is True
+    assert report["set_parameters_transport_required_fields_missing"] == []
+    assert report["unmatched_response_types_seen"] == []
+    assert report["unmatched_response_extra_present_count_bucket"] == "zero"
+    assert report["unmatched_response_without_extra_count_bucket"] == "zero"
+    assert report["response_correlation_gap_detected"] is False
     assert _sent_request_types(transport) == [
         "getAuthorizationState",
         "setTdlibParameters",
     ]
+    _assert_non_tdlib_side_effects_false(report)
+
+
+def test_unmatched_response_with_different_extra_is_reported_without_matching(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateWaitTdlibParameters"),
+            {"@type": "ok", "@extra": "different-extra"},
+            None,
+        ]
+    )
+
+    report, _used_transport = _run_report(
+        tmp_path=tmp_path,
+        transport=transport,
+        max_observations=3,
+    )
+
+    assert report["contract_status"] == "blocked_set_parameters_response_timeout"
+    assert report["set_parameters_response_seen"] is False
+    assert report["set_parameters_response_extra_matched"] is False
+    assert report["unmatched_response_types_seen"] == ["ok"]
+    assert report["unmatched_response_extra_present_count_bucket"] == "one"
+    assert report["unmatched_response_without_extra_count_bucket"] == "zero"
+    assert report["response_correlation_gap_detected"] is True
+    _assert_non_tdlib_side_effects_false(report)
+
+
+def test_unmatched_response_without_extra_is_bucketed(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateWaitTdlibParameters"),
+            {"@type": "error", "code": 400, "message": FAKE_API_HASH},
+            None,
+        ]
+    )
+
+    report, _used_transport = _run_report(
+        tmp_path=tmp_path,
+        transport=transport,
+        max_observations=3,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "blocked_set_parameters_response_timeout"
+    assert report["set_parameters_response_seen"] is False
+    assert report["set_parameters_response_extra_matched"] is False
+    assert report["unmatched_response_types_seen"] == ["error"]
+    assert report["unmatched_response_extra_present_count_bucket"] == "zero"
+    assert report["unmatched_response_without_extra_count_bucket"] == "one"
+    assert report["response_correlation_gap_detected"] is True
+    _assert_sensitive_values_absent(rendered, tmp_path)
     _assert_non_tdlib_side_effects_false(report)
 
 
@@ -402,4 +556,3 @@ def test_transport_receive_failure_reports_class_only(tmp_path: Path) -> None:
     assert "tdlib.receive_failed" in report["checks_failed"]
     _assert_sensitive_values_absent(rendered, tmp_path)
     _assert_non_tdlib_side_effects_false(report)
-
