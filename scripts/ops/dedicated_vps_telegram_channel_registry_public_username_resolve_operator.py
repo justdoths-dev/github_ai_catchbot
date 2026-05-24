@@ -23,6 +23,9 @@ DEFAULT_TDLIB_AUTH_MAX_UPDATES = 200
 DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC = 240.0
 DEFAULT_TDLIB_RPC_TIMEOUT_SEC = 15.0
 DEFAULT_TDLIB_RPC_MAX_UPDATES = 120
+DEFAULT_TDLIB_SINGLE_RPC_MAX_UPDATES = DEFAULT_TDLIB_RPC_MAX_UPDATES
+DEFAULT_TDLIB_SINGLE_RPC_RECEIVE_TIMEOUT_SEC = DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC
+DEFAULT_TDLIB_SINGLE_RPC_MAX_DURATION_SEC = 60.0
 DEFAULT_TDLIB_POST_READY_DRAIN_MAX_UPDATES = 200
 DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC = 0.0
 DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_EMPTY_RECEIVES = 3
@@ -251,18 +254,32 @@ class PublicUsernameResolveResult:
 
 
 @dataclass(frozen=True, slots=True)
+class TDLibSingleResolveRpcWaitConfig:
+    max_updates: int = DEFAULT_TDLIB_SINGLE_RPC_MAX_UPDATES
+    receive_timeout_sec: float = DEFAULT_TDLIB_SINGLE_RPC_RECEIVE_TIMEOUT_SEC
+    max_duration_sec: float = DEFAULT_TDLIB_SINGLE_RPC_MAX_DURATION_SEC
+
+
+@dataclass(frozen=True, slots=True)
 class SingleResolveRpcDiagnosticResult:
     enabled: bool = False
     target_selected: bool = False
     target_index_bucket: str = "zero"
     request_sent: bool = False
     request_extra_present: bool = False
+    max_updates: int = DEFAULT_TDLIB_SINGLE_RPC_MAX_UPDATES
+    receive_timeout_sec: float = DEFAULT_TDLIB_SINGLE_RPC_RECEIVE_TIMEOUT_SEC
+    max_duration_sec: float = DEFAULT_TDLIB_SINGLE_RPC_MAX_DURATION_SEC
     send_error_class: str | None = None
     receive_attempt_count: int = 0
     observation_count: int = 0
+    empty_receive_count: int = 0
     inbound_object_types_seen: tuple[str, ...] = ()
     function_response_types_seen: tuple[str, ...] = ()
     update_types_seen: tuple[str, ...] = ()
+    update_budget_exhausted: bool = False
+    duration_exhausted: bool = False
+    update_pressure_observed: bool = False
     authorization_states_seen: tuple[str, ...] = ()
     final_authorization_state: str | None = None
     response_extra_matched: bool = False
@@ -280,12 +297,18 @@ class SingleResolveRpcDiagnosticResult:
             "single_resolve_rpc_target_index_bucket": self.target_index_bucket,
             "single_resolve_rpc_request_sent": self.request_sent,
             "single_resolve_rpc_request_extra_present": self.request_extra_present,
+            "single_resolve_rpc_max_updates": self.max_updates,
+            "single_resolve_rpc_receive_timeout_sec": self.receive_timeout_sec,
+            "single_resolve_rpc_max_duration_sec": self.max_duration_sec,
             "single_resolve_rpc_send_error_class": self.send_error_class,
             "single_resolve_rpc_receive_attempt_count_bucket": _bucket_count(
                 self.receive_attempt_count
             ),
             "single_resolve_rpc_observation_count_bucket": _bucket_count(
                 self.observation_count
+            ),
+            "single_resolve_rpc_empty_receive_count_bucket": _bucket_count(
+                self.empty_receive_count
             ),
             "single_resolve_rpc_inbound_object_types_seen": list(
                 self.inbound_object_types_seen
@@ -294,6 +317,13 @@ class SingleResolveRpcDiagnosticResult:
                 self.function_response_types_seen
             ),
             "single_resolve_rpc_update_types_seen": list(self.update_types_seen),
+            "single_resolve_rpc_update_budget_exhausted": (
+                self.update_budget_exhausted
+            ),
+            "single_resolve_rpc_duration_exhausted": self.duration_exhausted,
+            "single_resolve_rpc_update_pressure_observed": (
+                self.update_pressure_observed
+            ),
             "single_resolve_rpc_authorization_states_seen": list(
                 self.authorization_states_seen
             ),
@@ -886,6 +916,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--tdlib-overall-timeout-sec",
         type=_non_negative_float_named("tdlib-overall-timeout-sec"),
         default=DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC,
+    )
+    parser.add_argument(
+        "--tdlib-single-rpc-max-updates",
+        type=_positive_int_named("tdlib-single-rpc-max-updates"),
+        default=DEFAULT_TDLIB_SINGLE_RPC_MAX_UPDATES,
+    )
+    parser.add_argument(
+        "--tdlib-single-rpc-receive-timeout-sec",
+        type=_non_negative_float_named("tdlib-single-rpc-receive-timeout-sec"),
+        default=DEFAULT_TDLIB_SINGLE_RPC_RECEIVE_TIMEOUT_SEC,
+    )
+    parser.add_argument(
+        "--tdlib-single-rpc-max-duration-sec",
+        type=_non_negative_float_named("tdlib-single-rpc-max-duration-sec"),
+        default=DEFAULT_TDLIB_SINGLE_RPC_MAX_DURATION_SEC,
     )
     parser.add_argument(
         "--tdlib-post-ready-drain-max-updates",
@@ -1665,6 +1710,13 @@ class TDLibPublicUsernameResolver:
         post_ready_drain_quiet_timeout_sec: float = (
             DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC
         ),
+        single_rpc_max_updates: int = DEFAULT_TDLIB_SINGLE_RPC_MAX_UPDATES,
+        single_rpc_receive_timeout_sec: float = (
+            DEFAULT_TDLIB_SINGLE_RPC_RECEIVE_TIMEOUT_SEC
+        ),
+        single_rpc_max_duration_sec: float = (
+            DEFAULT_TDLIB_SINGLE_RPC_MAX_DURATION_SEC
+        ),
         sync_settle_max_updates: int = DEFAULT_TDLIB_SYNC_SETTLE_MAX_UPDATES,
         sync_settle_receive_timeout_sec: float = (
             DEFAULT_TDLIB_SYNC_SETTLE_RECEIVE_TIMEOUT_SEC
@@ -1722,6 +1774,11 @@ class TDLibPublicUsernameResolver:
             timeout_sec=post_ready_drain_timeout_sec,
             quiet_empty_receive_target=post_ready_drain_quiet_empty_receives,
             quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
+        )
+        self._single_rpc_wait_config = TDLibSingleResolveRpcWaitConfig(
+            max_updates=single_rpc_max_updates,
+            receive_timeout_sec=single_rpc_receive_timeout_sec,
+            max_duration_sec=single_rpc_max_duration_sec,
         )
         self._sync_settle_summary = TDLibSyncSettleDiagnosticSummary(
             enabled=False,
@@ -1844,6 +1901,11 @@ class TDLibPublicUsernameResolver:
             return SingleResolveRpcDiagnosticResult(
                 enabled=True,
                 request_extra_present=request_extra_present,
+                max_updates=self._single_rpc_wait_config.max_updates,
+                receive_timeout_sec=(
+                    self._single_rpc_wait_config.receive_timeout_sec
+                ),
+                max_duration_sec=self._single_rpc_wait_config.max_duration_sec,
                 send_error_class=_safe_exception_class(exc),
                 result_class="transport_error",
                 operator_next_action=_single_resolve_rpc_next_action(
@@ -1979,8 +2041,10 @@ class TDLibPublicUsernameResolver:
         self,
         extra: str,
     ) -> SingleResolveRpcDiagnosticResult:
+        wait_config = self._single_rpc_wait_config
         receive_attempt_count = 0
         observation_count = 0
+        empty_receive_count = 0
         response_without_extra_count = 0
         response_wrong_extra_count = 0
         inbound_object_types_seen: list[str] = []
@@ -1993,15 +2057,31 @@ class TDLibPublicUsernameResolver:
         result_class = "response_timeout"
         response_extra_matched = False
         timed_out = True
+        update_budget_exhausted = False
+        duration_exhausted = False
+        update_pressure_observed = False
 
-        for _ in range(DEFAULT_TDLIB_RPC_MAX_UPDATES):
+        started_at = self._monotonic_clock()
+        for _ in range(wait_config.max_updates):
+            elapsed_sec = self._monotonic_clock() - started_at
+            remaining_duration_sec = wait_config.max_duration_sec - elapsed_sec
+            if remaining_duration_sec <= 0:
+                duration_exhausted = True
+                break
             receive_attempt_count += 1
+            receive_timeout_sec = min(
+                wait_config.receive_timeout_sec,
+                max(remaining_duration_sec, 0.0),
+            )
             try:
-                payload = await self._receive(DEFAULT_TDLIB_RPC_TIMEOUT_SEC)
+                payload = await self._receive(receive_timeout_sec)
             except Exception:
                 result_class = "transport_error"
                 timed_out = False
                 break
+            if payload is None:
+                empty_receive_count += 1
+                continue
             if not isinstance(payload, Mapping):
                 continue
 
@@ -2011,6 +2091,7 @@ class TDLibPublicUsernameResolver:
                 _append_unique(inbound_object_types_seen, payload_type)
                 if payload_type.startswith("update"):
                     _append_unique(update_types_seen, payload_type)
+                    update_pressure_observed = True
             if payload_type == "error":
                 _append_unique_safe_error_code(tdlib_error_codes_seen, payload.get("code"))
 
@@ -2057,16 +2138,25 @@ class TDLibPublicUsernameResolver:
                 response_wrong_extra_count += 1
             else:
                 response_without_extra_count += 1
+        else:
+            update_budget_exhausted = True
 
         return SingleResolveRpcDiagnosticResult(
             enabled=True,
             request_sent=True,
             request_extra_present=True,
+            max_updates=wait_config.max_updates,
+            receive_timeout_sec=wait_config.receive_timeout_sec,
+            max_duration_sec=wait_config.max_duration_sec,
             receive_attempt_count=receive_attempt_count,
             observation_count=observation_count,
+            empty_receive_count=empty_receive_count,
             inbound_object_types_seen=tuple(inbound_object_types_seen),
             function_response_types_seen=tuple(function_response_types_seen),
             update_types_seen=tuple(update_types_seen),
+            update_budget_exhausted=update_budget_exhausted,
+            duration_exhausted=duration_exhausted,
+            update_pressure_observed=update_pressure_observed,
             authorization_states_seen=tuple(authorization_states_seen),
             final_authorization_state=final_authorization_state,
             response_extra_matched=response_extra_matched,
@@ -2105,6 +2195,9 @@ def _default_resolver_factory(
     post_ready_drain_timeout_sec: float,
     post_ready_drain_quiet_empty_receives: int,
     post_ready_drain_quiet_timeout_sec: float,
+    single_rpc_max_updates: int,
+    single_rpc_receive_timeout_sec: float,
+    single_rpc_max_duration_sec: float,
     sync_settle_max_updates: int,
     sync_settle_receive_timeout_sec: float,
     sync_settle_quiet_empty_receives: int,
@@ -2119,6 +2212,9 @@ def _default_resolver_factory(
         post_ready_drain_timeout_sec=post_ready_drain_timeout_sec,
         post_ready_drain_quiet_empty_receives=post_ready_drain_quiet_empty_receives,
         post_ready_drain_quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
+        single_rpc_max_updates=single_rpc_max_updates,
+        single_rpc_receive_timeout_sec=single_rpc_receive_timeout_sec,
+        single_rpc_max_duration_sec=single_rpc_max_duration_sec,
         sync_settle_max_updates=sync_settle_max_updates,
         sync_settle_receive_timeout_sec=sync_settle_receive_timeout_sec,
         sync_settle_quiet_empty_receives=sync_settle_quiet_empty_receives,
@@ -2593,6 +2689,13 @@ def generate_report(
     tdlib_post_ready_drain_quiet_timeout_sec: float = (
         DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC
     ),
+    tdlib_single_rpc_max_updates: int = DEFAULT_TDLIB_SINGLE_RPC_MAX_UPDATES,
+    tdlib_single_rpc_receive_timeout_sec: float = (
+        DEFAULT_TDLIB_SINGLE_RPC_RECEIVE_TIMEOUT_SEC
+    ),
+    tdlib_single_rpc_max_duration_sec: float = (
+        DEFAULT_TDLIB_SINGLE_RPC_MAX_DURATION_SEC
+    ),
     tdlib_sync_settle_max_updates: int = DEFAULT_TDLIB_SYNC_SETTLE_MAX_UPDATES,
     tdlib_sync_settle_receive_timeout_sec: float = (
         DEFAULT_TDLIB_SYNC_SETTLE_RECEIVE_TIMEOUT_SEC
@@ -2768,6 +2871,13 @@ def generate_report(
                     post_ready_drain_quiet_timeout_sec=(
                         tdlib_post_ready_drain_quiet_timeout_sec
                     ),
+                    single_rpc_max_updates=tdlib_single_rpc_max_updates,
+                    single_rpc_receive_timeout_sec=(
+                        tdlib_single_rpc_receive_timeout_sec
+                    ),
+                    single_rpc_max_duration_sec=(
+                        tdlib_single_rpc_max_duration_sec
+                    ),
                     sync_settle_max_updates=tdlib_sync_settle_max_updates,
                     sync_settle_receive_timeout_sec=(
                         tdlib_sync_settle_receive_timeout_sec
@@ -2838,6 +2948,19 @@ def generate_report(
                 report=report,
             )
 
+        if diagnose_single_resolve_rpc:
+            diagnostic = asyncio.run(
+                _diagnose_single_resolve_rpc(
+                    row=rows[0],
+                    resolver=resolver,
+                    report=report,
+                )
+            )
+            _apply_single_resolve_rpc_diagnostic(report, diagnostic)
+            _merge_resolver_side_effects(report, resolver)
+            _set_status(report, _single_resolve_rpc_contract_status(diagnostic))
+            return ScriptResult(exit_code=0, report=report)
+
         try:
             drain_summary = asyncio.run(
                 _drain_post_ready_updates(
@@ -2875,19 +2998,6 @@ def generate_report(
             )
             _merge_resolver_side_effects(report, resolver)
             return ScriptResult(exit_code=1, report=report)
-
-        if diagnose_single_resolve_rpc:
-            diagnostic = asyncio.run(
-                _diagnose_single_resolve_rpc(
-                    row=rows[0],
-                    resolver=resolver,
-                    report=report,
-                )
-            )
-            _apply_single_resolve_rpc_diagnostic(report, diagnostic)
-            _merge_resolver_side_effects(report, resolver)
-            _set_status(report, _single_resolve_rpc_contract_status(diagnostic))
-            return ScriptResult(exit_code=0, report=report)
 
         try:
             resolve_counters = asyncio.run(
@@ -2991,6 +3101,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         tdlib_post_ready_drain_quiet_timeout_sec=(
             args.tdlib_post_ready_drain_quiet_timeout_sec
         ),
+        tdlib_single_rpc_max_updates=args.tdlib_single_rpc_max_updates,
+        tdlib_single_rpc_receive_timeout_sec=(
+            args.tdlib_single_rpc_receive_timeout_sec
+        ),
+        tdlib_single_rpc_max_duration_sec=args.tdlib_single_rpc_max_duration_sec,
         tdlib_sync_settle_max_updates=args.tdlib_sync_settle_max_updates,
         tdlib_sync_settle_receive_timeout_sec=(
             args.tdlib_sync_settle_receive_timeout_sec

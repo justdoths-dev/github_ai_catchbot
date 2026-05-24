@@ -85,12 +85,19 @@ SINGLE_RESOLVE_RPC_DIAGNOSTIC_FIELD_NAMES = (
     "single_resolve_rpc_target_index_bucket",
     "single_resolve_rpc_request_sent",
     "single_resolve_rpc_request_extra_present",
+    "single_resolve_rpc_max_updates",
+    "single_resolve_rpc_receive_timeout_sec",
+    "single_resolve_rpc_max_duration_sec",
     "single_resolve_rpc_send_error_class",
     "single_resolve_rpc_receive_attempt_count_bucket",
     "single_resolve_rpc_observation_count_bucket",
+    "single_resolve_rpc_empty_receive_count_bucket",
     "single_resolve_rpc_inbound_object_types_seen",
     "single_resolve_rpc_function_response_types_seen",
     "single_resolve_rpc_update_types_seen",
+    "single_resolve_rpc_update_budget_exhausted",
+    "single_resolve_rpc_duration_exhausted",
+    "single_resolve_rpc_update_pressure_observed",
     "single_resolve_rpc_authorization_states_seen",
     "single_resolve_rpc_final_authorization_state",
     "single_resolve_rpc_response_extra_matched",
@@ -526,6 +533,9 @@ def _run_report_with_tdlib_transport(
     tdlib_post_ready_drain_timeout_sec: float | None = None,
     tdlib_post_ready_drain_quiet_empty_receives: int | None = None,
     tdlib_post_ready_drain_quiet_timeout_sec: float | None = None,
+    tdlib_single_rpc_max_updates: int | None = None,
+    tdlib_single_rpc_receive_timeout_sec: float | None = None,
+    tdlib_single_rpc_max_duration_sec: float | None = None,
     diagnose_single_resolve_rpc: bool = False,
     diagnose_tdlib_post_ready_sync_settle: bool = False,
     tdlib_sync_settle_max_updates: int | None = None,
@@ -572,6 +582,21 @@ def _run_report_with_tdlib_transport(
         if tdlib_post_ready_drain_quiet_timeout_sec is None
         else tdlib_post_ready_drain_quiet_timeout_sec
     )
+    single_rpc_max_updates = (
+        module.DEFAULT_TDLIB_SINGLE_RPC_MAX_UPDATES
+        if tdlib_single_rpc_max_updates is None
+        else tdlib_single_rpc_max_updates
+    )
+    single_rpc_receive_timeout_sec = (
+        module.DEFAULT_TDLIB_SINGLE_RPC_RECEIVE_TIMEOUT_SEC
+        if tdlib_single_rpc_receive_timeout_sec is None
+        else tdlib_single_rpc_receive_timeout_sec
+    )
+    single_rpc_max_duration_sec = (
+        module.DEFAULT_TDLIB_SINGLE_RPC_MAX_DURATION_SEC
+        if tdlib_single_rpc_max_duration_sec is None
+        else tdlib_single_rpc_max_duration_sec
+    )
     sync_settle_max_updates = (
         module.DEFAULT_TDLIB_SYNC_SETTLE_MAX_UPDATES
         if tdlib_sync_settle_max_updates is None
@@ -606,6 +631,9 @@ def _run_report_with_tdlib_transport(
                 post_ready_drain_quiet_empty_receives
             ),
             post_ready_drain_quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
+            single_rpc_max_updates=single_rpc_max_updates,
+            single_rpc_receive_timeout_sec=single_rpc_receive_timeout_sec,
+            single_rpc_max_duration_sec=single_rpc_max_duration_sec,
             sync_settle_max_updates=sync_settle_max_updates,
             sync_settle_receive_timeout_sec=sync_settle_receive_timeout_sec,
             sync_settle_quiet_empty_receives=sync_settle_quiet_empty_receives,
@@ -633,6 +661,9 @@ def _run_report_with_tdlib_transport(
             post_ready_drain_quiet_empty_receives
         ),
         tdlib_post_ready_drain_quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
+        tdlib_single_rpc_max_updates=single_rpc_max_updates,
+        tdlib_single_rpc_receive_timeout_sec=single_rpc_receive_timeout_sec,
+        tdlib_single_rpc_max_duration_sec=single_rpc_max_duration_sec,
         tdlib_sync_settle_max_updates=sync_settle_max_updates,
         tdlib_sync_settle_receive_timeout_sec=sync_settle_receive_timeout_sec,
         tdlib_sync_settle_quiet_empty_receives=sync_settle_quiet_empty_receives,
@@ -790,6 +821,12 @@ def test_cli_tdlib_readiness_budget_options_are_passed_to_report_generation(
             "0.25",
             "--tdlib-overall-timeout-sec",
             "9.5",
+            "--tdlib-single-rpc-max-updates",
+            "19",
+            "--tdlib-single-rpc-receive-timeout-sec",
+            "0.45",
+            "--tdlib-single-rpc-max-duration-sec",
+            "23.5",
             "--tdlib-post-ready-drain-max-updates",
             "11",
             "--tdlib-post-ready-drain-timeout-sec",
@@ -816,6 +853,9 @@ def test_cli_tdlib_readiness_budget_options_are_passed_to_report_generation(
     assert captured_kwargs["tdlib_auth_max_updates"] == 7
     assert captured_kwargs["tdlib_receive_timeout_sec"] == 0.25
     assert captured_kwargs["tdlib_overall_timeout_sec"] == 9.5
+    assert captured_kwargs["tdlib_single_rpc_max_updates"] == 19
+    assert captured_kwargs["tdlib_single_rpc_receive_timeout_sec"] == 0.45
+    assert captured_kwargs["tdlib_single_rpc_max_duration_sec"] == 23.5
     assert captured_kwargs["tdlib_post_ready_drain_max_updates"] == 11
     assert captured_kwargs["tdlib_post_ready_drain_timeout_sec"] == 0.05
     assert captured_kwargs["tdlib_post_ready_drain_quiet_empty_receives"] == 4
@@ -825,6 +865,59 @@ def test_cli_tdlib_readiness_budget_options_are_passed_to_report_generation(
     assert captured_kwargs["tdlib_sync_settle_receive_timeout_sec"] == 0.35
     assert captured_kwargs["tdlib_sync_settle_quiet_empty_receives"] == 5
     assert captured_kwargs["tdlib_sync_settle_max_duration_sec"] == 17.5
+
+
+def test_generate_report_passes_single_rpc_wait_options_to_default_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    captured_kwargs: dict[str, Any] = {}
+
+    def fake_default_resolver_factory(
+        _values: dict[str, str],
+        **kwargs: Any,
+    ) -> FakeResolver:
+        captured_kwargs.update(kwargs)
+        return FakeResolver(
+            {
+                RAW_PUBLIC_USERNAME: module.SingleResolveRpcDiagnosticResult(
+                    enabled=True,
+                    request_sent=True,
+                    request_extra_present=True,
+                    max_updates=kwargs["single_rpc_max_updates"],
+                    receive_timeout_sec=kwargs["single_rpc_receive_timeout_sec"],
+                    max_duration_sec=kwargs["single_rpc_max_duration_sec"],
+                    receive_attempt_count=1,
+                    observation_count=1,
+                    function_response_types_seen=("chat",),
+                    response_extra_matched=True,
+                    result_class="resolved",
+                )
+            }
+        )
+
+    monkeypatch.setattr(module, "_default_resolver_factory", fake_default_resolver_factory)
+    db = FakeDatabaseConnection([_registry_row("registry-1")])
+
+    result = module.generate_report(
+        runtime_env_path="/safe/unit/runtime.env",
+        dry_run=False,
+        approved_tdlib_public_username_resolve=True,
+        diagnose_single_resolve_rpc=True,
+        tdlib_single_rpc_max_updates=31,
+        tdlib_single_rpc_receive_timeout_sec=0.75,
+        tdlib_single_rpc_max_duration_sec=12.5,
+        runtime_env_reader=_runtime_env,
+        database_connection_factory=lambda _database_url: db,
+    )
+
+    assert result.report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert captured_kwargs["single_rpc_max_updates"] == 31
+    assert captured_kwargs["single_rpc_receive_timeout_sec"] == 0.75
+    assert captured_kwargs["single_rpc_max_duration_sec"] == 12.5
+    assert result.report["single_resolve_rpc_max_updates"] == 31
+    assert result.report["single_resolve_rpc_receive_timeout_sec"] == 0.75
+    assert result.report["single_resolve_rpc_max_duration_sec"] == 12.5
 
 
 def test_cli_help_includes_single_resolve_rpc_diagnostic_flag() -> None:
@@ -842,6 +935,24 @@ def test_cli_help_includes_single_resolve_rpc_diagnostic_flag() -> None:
 
     assert result.returncode == 0
     assert "--diagnose-single-resolve-rpc" in result.stdout
+
+
+def test_cli_help_includes_single_resolve_rpc_wait_options() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--help",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "--tdlib-single-rpc-max-updates" in result.stdout
+    assert "--tdlib-single-rpc-receive-timeout-sec" in result.stdout
+    assert "--tdlib-single-rpc-max-duration-sec" in result.stdout
 
 
 def test_cli_help_includes_post_ready_drain_options() -> None:
@@ -2428,7 +2539,108 @@ def test_public_username_resolve_success_classification_keeps_no_mutation_path(
     _assert_sensitive_values_absent(rendered, tmp_path)
 
 
-def test_post_ready_drain_consumes_update_noise_before_single_rpc_search(
+def test_single_rpc_diagnostic_observes_match_after_update_backlog_without_quiet_drain(
+    tmp_path: Path,
+) -> None:
+    update_backlog = [
+        {
+            "@type": "updateOption",
+            "name": RAW_TDLIB_PAYLOAD_VALUE,
+            "value": {"@type": "optionValueString", "value": RAW_PUBLIC_USERNAME},
+        }
+        for _ in range(25)
+    ]
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            *update_backlog,
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        diagnose_single_resolve_rpc=True,
+        tdlib_single_rpc_max_updates=40,
+        tdlib_single_rpc_receive_timeout_sec=0.5,
+        tdlib_single_rpc_max_duration_sec=15.0,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert transport.events.index("send:searchPublicChat") < transport.events.index(
+        "receive:updateOption"
+    )
+    assert report["tdlib_post_ready_drain_attempted"] is False
+    assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
+    assert report["tdlib_post_ready_drain_budget_exhausted"] is False
+    assert report["single_resolve_rpc_max_updates"] == 40
+    assert report["single_resolve_rpc_receive_timeout_sec"] == 0.5
+    assert report["single_resolve_rpc_max_duration_sec"] == 15.0
+    assert report["single_resolve_rpc_receive_attempt_count_bucket"] == (
+        "twenty_one_to_fifty"
+    )
+    assert report["single_resolve_rpc_observation_count_bucket"] == (
+        "twenty_one_to_fifty"
+    )
+    assert report["single_resolve_rpc_empty_receive_count_bucket"] == "zero"
+    assert report["single_resolve_rpc_update_pressure_observed"] is True
+    assert report["single_resolve_rpc_update_budget_exhausted"] is False
+    assert report["single_resolve_rpc_duration_exhausted"] is False
+    assert report["single_resolve_rpc_update_types_seen"] == ["updateOption"]
+    assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
+    assert report["single_resolve_rpc_result_class"] == "resolved"
+    assert report["single_resolve_rpc_response_extra_matched"] is True
+    assert report["single_resolve_rpc_response_wrong_extra_count_bucket"] == "zero"
+    assert all(
+        timeout == 0.5
+        for timeout in transport.receive_timeouts[1:]
+    )
+    assert report["tdlib_resolve_attempted"] is True
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_single_rpc_diagnostic_sends_search_before_stale_function_response(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {"@type": "ok", "@extra": "stale-public-username-extra"},
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        diagnose_single_resolve_rpc=True,
+        tdlib_single_rpc_max_updates=3,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert transport.events.index("send:searchPublicChat") < transport.events.index(
+        "receive:ok"
+    )
+    assert report["tdlib_post_ready_drain_attempted"] is False
+    assert report["single_resolve_rpc_function_response_types_seen"] == ["ok", "chat"]
+    assert report["single_resolve_rpc_response_wrong_extra_count_bucket"] == "one"
+    assert report["single_resolve_rpc_response_extra_matched"] is True
+    assert report["single_resolve_rpc_result_class"] == "resolved"
+    assert db.update_attempts == 0
+    assert "stale-public-username-extra" not in rendered
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_post_ready_drain_consumes_update_noise_before_normal_search(
     tmp_path: Path,
 ) -> None:
     transport = FakeTDLibTransport(
@@ -2448,11 +2660,10 @@ def test_post_ready_drain_consumes_update_noise_before_single_rpc_search(
         tmp_path=tmp_path,
         transport=transport,
         approved_mutation=False,
-        diagnose_single_resolve_rpc=True,
     )
     rendered = _render(report)
 
-    assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
     assert transport.events.index("receive:updateOption") < transport.events.index(
         "send:searchPublicChat"
     )
@@ -2467,8 +2678,7 @@ def test_post_ready_drain_consumes_update_noise_before_single_rpc_search(
     assert report["tdlib_post_ready_drain_budget_exhausted"] is False
     assert report["tdlib_post_ready_drain_update_types_seen"] == ["updateOption"]
     assert report["tdlib_post_ready_drain_authorization_lost"] is False
-    assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
-    assert report["single_resolve_rpc_result_class"] == "resolved"
+    assert report["resolve_function_response_types_seen"] == ["chat"]
     assert db.update_attempts == 0
     _assert_sensitive_values_absent(rendered, tmp_path)
 
@@ -2544,7 +2754,7 @@ def test_post_ready_drain_non_empty_update_resets_quiet_streak(
     assert db.update_attempts == 0
 
 
-def test_post_ready_drain_stale_ok_does_not_count_as_single_rpc_response(
+def test_post_ready_drain_stale_ok_does_not_count_as_normal_resolve_response(
     tmp_path: Path,
 ) -> None:
     transport = FakeTDLibTransport(
@@ -2560,25 +2770,23 @@ def test_post_ready_drain_stale_ok_does_not_count_as_single_rpc_response(
         tmp_path=tmp_path,
         transport=transport,
         approved_mutation=False,
-        diagnose_single_resolve_rpc=True,
     )
     rendered = _render(report)
 
-    assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
     assert report["tdlib_post_ready_drain_quiet_window_reached"] is True
     assert report["tdlib_post_ready_drain_empty_receive_count_bucket"] == "two_to_five"
     assert report["tdlib_post_ready_drain_function_response_types_seen"] == ["ok"]
     assert report["tdlib_post_ready_drain_response_wrong_extra_count_bucket"] == "one"
-    assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
-    assert report["single_resolve_rpc_response_wrong_extra_count_bucket"] == "zero"
-    assert report["single_resolve_rpc_response_extra_matched"] is True
-    assert report["single_resolve_rpc_result_class"] == "resolved"
+    assert report["resolve_function_response_types_seen"] == ["chat"]
+    assert report["resolve_response_wrong_extra_count_bucket"] == "zero"
+    assert report["resolve_response_extra_matched_count_bucket"] == "one"
     assert db.update_attempts == 0
     assert "stale-public-username-extra" not in rendered
     _assert_sensitive_values_absent(rendered, tmp_path)
 
 
-def test_post_ready_drain_stale_function_response_resets_quiet_streak(
+def test_post_ready_drain_stale_function_response_resets_quiet_streak_before_normal_resolve(
     tmp_path: Path,
 ) -> None:
     transport = FakeTDLibTransport(
@@ -2595,19 +2803,18 @@ def test_post_ready_drain_stale_function_response_resets_quiet_streak(
         tmp_path=tmp_path,
         transport=transport,
         approved_mutation=False,
-        diagnose_single_resolve_rpc=True,
         tdlib_post_ready_drain_max_updates=3,
         tdlib_post_ready_drain_quiet_empty_receives=2,
     )
     rendered = _render(report)
 
-    assert report["contract_status"] == "single_resolve_rpc_diagnostic_completed"
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
     assert report["tdlib_post_ready_drain_quiet_empty_receive_streak_bucket"] == "one"
     assert report["tdlib_post_ready_drain_quiet_window_reached"] is False
     assert report["tdlib_post_ready_drain_budget_exhausted"] is True
     assert report["tdlib_post_ready_drain_function_response_types_seen"] == ["ok"]
-    assert report["single_resolve_rpc_function_response_types_seen"] == ["chat"]
-    assert report["single_resolve_rpc_response_wrong_extra_count_bucket"] == "zero"
+    assert report["resolve_function_response_types_seen"] == ["chat"]
+    assert report["resolve_response_wrong_extra_count_bucket"] == "zero"
     assert "stale-public-username-extra" not in rendered
     assert db.update_attempts == 0
     _assert_sensitive_values_absent(rendered, tmp_path)
@@ -2783,11 +2990,7 @@ def test_single_resolve_rpc_diagnostic_forces_no_mutation_even_when_requested(
 
 def test_single_resolve_rpc_diagnostic_timeout_reports_no_function_response(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _module()
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
@@ -2801,26 +3004,66 @@ def test_single_resolve_rpc_diagnostic_timeout_reports_no_function_response(
         transport=transport,
         approved_mutation=True,
         diagnose_single_resolve_rpc=True,
+        tdlib_single_rpc_max_updates=2,
+        tdlib_single_rpc_receive_timeout_sec=0,
+        tdlib_single_rpc_max_duration_sec=60.0,
     )
 
     assert report["contract_status"] == "single_resolve_rpc_diagnostic_response_timeout"
     assert report["single_resolve_rpc_timed_out"] is True
     assert report["single_resolve_rpc_result_class"] == "response_timeout"
+    assert report["single_resolve_rpc_update_budget_exhausted"] is True
+    assert report["single_resolve_rpc_duration_exhausted"] is False
     assert report["single_resolve_rpc_function_response_types_seen"] == []
     assert report["single_resolve_rpc_response_extra_matched"] is False
     assert report["single_resolve_rpc_receive_attempt_count_bucket"] == "two_to_five"
     assert report["single_resolve_rpc_observation_count_bucket"] == "zero"
+    assert report["single_resolve_rpc_empty_receive_count_bucket"] == "two_to_five"
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert db.update_attempts == 0
+
+
+def test_single_resolve_rpc_diagnostic_reports_duration_exhausted_first(
+    tmp_path: Path,
+) -> None:
+    clock_values = iter([0.0, 0.0, 2.0])
+
+    def monotonic_clock() -> float:
+        return next(clock_values, 2.0)
+
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            None,
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+        diagnose_single_resolve_rpc=True,
+        tdlib_single_rpc_max_updates=50,
+        tdlib_single_rpc_receive_timeout_sec=1.0,
+        tdlib_single_rpc_max_duration_sec=1.0,
+        monotonic_clock=monotonic_clock,
+    )
+
+    assert report["contract_status"] == "single_resolve_rpc_diagnostic_response_timeout"
+    assert report["single_resolve_rpc_timed_out"] is True
+    assert report["single_resolve_rpc_update_budget_exhausted"] is False
+    assert report["single_resolve_rpc_duration_exhausted"] is True
+    assert report["single_resolve_rpc_receive_attempt_count_bucket"] == "one"
+    assert report["single_resolve_rpc_empty_receive_count_bucket"] == "one"
+    assert report["single_resolve_rpc_response_extra_matched"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
     assert db.update_attempts == 0
 
 
 def test_single_resolve_rpc_diagnostic_wrong_extra_chat_is_bucketed_without_match(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _module()
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
@@ -2842,11 +3085,15 @@ def test_single_resolve_rpc_diagnostic_wrong_extra_chat_is_bucketed_without_matc
         transport=transport,
         approved_mutation=False,
         diagnose_single_resolve_rpc=True,
+        tdlib_single_rpc_max_updates=4,
+        tdlib_single_rpc_receive_timeout_sec=0,
     )
     rendered = _render(report)
 
     assert report["contract_status"] == "single_resolve_rpc_diagnostic_response_timeout"
     assert report["single_resolve_rpc_result_class"] == "response_timeout"
+    assert report["single_resolve_rpc_update_budget_exhausted"] is True
+    assert report["single_resolve_rpc_duration_exhausted"] is False
     assert report["single_resolve_rpc_response_extra_matched"] is False
     assert report["single_resolve_rpc_response_wrong_extra_count_bucket"] == "one"
     assert report["single_resolve_rpc_response_without_extra_count_bucket"] == "zero"
@@ -2858,11 +3105,7 @@ def test_single_resolve_rpc_diagnostic_wrong_extra_chat_is_bucketed_without_matc
 
 def test_single_resolve_rpc_diagnostic_response_without_extra_is_bucketed_without_match(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    module = _module()
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
-    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
     transport = FakeTDLibTransport(
         [
             _auth_update("authorizationStateReady"),
@@ -2883,11 +3126,15 @@ def test_single_resolve_rpc_diagnostic_response_without_extra_is_bucketed_withou
         transport=transport,
         approved_mutation=False,
         diagnose_single_resolve_rpc=True,
+        tdlib_single_rpc_max_updates=4,
+        tdlib_single_rpc_receive_timeout_sec=0,
     )
     rendered = _render(report)
 
     assert report["contract_status"] == "single_resolve_rpc_diagnostic_response_timeout"
     assert report["single_resolve_rpc_result_class"] == "response_timeout"
+    assert report["single_resolve_rpc_update_budget_exhausted"] is True
+    assert report["single_resolve_rpc_duration_exhausted"] is False
     assert report["single_resolve_rpc_response_extra_matched"] is False
     assert report["single_resolve_rpc_response_without_extra_count_bucket"] == "one"
     assert report["single_resolve_rpc_response_wrong_extra_count_bucket"] == "zero"
