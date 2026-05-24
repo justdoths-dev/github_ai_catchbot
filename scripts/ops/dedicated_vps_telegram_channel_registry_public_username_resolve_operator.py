@@ -6,6 +6,7 @@ import json
 import math
 import re
 import sys
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -26,6 +27,10 @@ DEFAULT_TDLIB_POST_READY_DRAIN_MAX_UPDATES = 200
 DEFAULT_TDLIB_POST_READY_DRAIN_TIMEOUT_SEC = 0.0
 DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_EMPTY_RECEIVES = 3
 DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC = 0.25
+DEFAULT_TDLIB_SYNC_SETTLE_MAX_UPDATES = 5000
+DEFAULT_TDLIB_SYNC_SETTLE_RECEIVE_TIMEOUT_SEC = 1.0
+DEFAULT_TDLIB_SYNC_SETTLE_QUIET_EMPTY_RECEIVES = 3
+DEFAULT_TDLIB_SYNC_SETTLE_MAX_DURATION_SEC = 300.0
 TDLIB_READY_STATE = "authorizationStateReady"
 TDLIB_BOOTSTRAP_AUTH_STATES = frozenset(
     {
@@ -206,6 +211,8 @@ class PublicUsernameResolver(Protocol):
         self,
         username: str,
     ) -> "SingleResolveRpcDiagnosticResult": ...
+
+    async def diagnose_post_ready_sync_settle(self) -> "TDLibSyncSettleDiagnosticSummary": ...
 
     async def close(self) -> None: ...
 
@@ -669,6 +676,165 @@ class TDLibPostReadyDrainSummary:
         }
 
 
+@dataclass(slots=True)
+class TDLibSyncSettleDiagnosticSummary:
+    enabled: bool = False
+    attempted: bool = False
+    max_updates: int = DEFAULT_TDLIB_SYNC_SETTLE_MAX_UPDATES
+    receive_timeout_sec: float = DEFAULT_TDLIB_SYNC_SETTLE_RECEIVE_TIMEOUT_SEC
+    quiet_empty_receive_target: int = (
+        DEFAULT_TDLIB_SYNC_SETTLE_QUIET_EMPTY_RECEIVES
+    )
+    max_duration_sec: float = DEFAULT_TDLIB_SYNC_SETTLE_MAX_DURATION_SEC
+    receive_attempt_count: int = 0
+    observation_count: int = 0
+    empty_receive_count: int = 0
+    quiet_empty_receive_streak: int = 0
+    inbound_object_types_seen: list[str] = field(default_factory=list)
+    update_types_seen: list[str] = field(default_factory=list)
+    function_response_types_seen: list[str] = field(default_factory=list)
+    authorization_states_seen: list[str] = field(default_factory=list)
+    final_authorization_state: str | None = None
+    response_without_extra_count: int = 0
+    response_wrong_extra_count: int = 0
+    quiet_window_reached: bool = False
+    update_budget_exhausted: bool = False
+    duration_exhausted: bool = False
+    authorization_lost: bool = False
+    search_sent: bool = False
+    operator_next_action: str = (
+        "TDLib post-ready sync-settle diagnostic was not requested."
+    )
+
+    def mark_attempted(self) -> None:
+        self.enabled = True
+        self.attempted = True
+        if self.final_authorization_state is None:
+            self.final_authorization_state = TDLIB_READY_STATE
+
+    def record_payload(self, payload: Mapping[str, Any]) -> None:
+        self.observation_count += 1
+        self.quiet_empty_receive_streak = 0
+        payload_type = _safe_tdlib_object_type(payload.get("@type"))
+        if payload_type is not None:
+            _append_unique(self.inbound_object_types_seen, payload_type)
+            if payload_type.startswith("update"):
+                _append_unique(self.update_types_seen, payload_type)
+
+        state_type = _authorization_state_type_from_payload(payload)
+        if state_type is not None:
+            safe_state_type = _safe_tdlib_object_type(state_type)
+            if safe_state_type == state_type:
+                _append_unique(self.authorization_states_seen, state_type)
+                self.final_authorization_state = state_type
+            if state_type != TDLIB_READY_STATE:
+                self.authorization_lost = True
+
+        response_type = _function_response_type_from_payload(payload)
+        if response_type is None:
+            return
+        _append_unique(self.function_response_types_seen, response_type)
+        if isinstance(payload.get("@extra"), str):
+            self.response_wrong_extra_count += 1
+        else:
+            self.response_without_extra_count += 1
+
+    def record_empty_receive(self) -> None:
+        self.empty_receive_count += 1
+        self.quiet_empty_receive_streak += 1
+        if self.quiet_empty_receive_streak >= self.quiet_empty_receive_target:
+            self.quiet_window_reached = True
+
+    def mark_update_budget_exhausted(self) -> None:
+        self.update_budget_exhausted = True
+
+    def mark_duration_exhausted(self) -> None:
+        self.duration_exhausted = True
+
+    def apply_next_action(self) -> None:
+        if self.authorization_lost:
+            self.operator_next_action = (
+                "TDLib authorization changed away from ready during the no-search "
+                "sync-settle diagnostic. No searchPublicChat request was sent and "
+                "no registry mutation was committed; restore a ready TDLib session "
+                "before any resolve run."
+            )
+        elif self.quiet_window_reached:
+            self.operator_next_action = (
+                "The no-search TDLib sync-settle diagnostic reached the configured "
+                "quiet empty receive target. Treat this only as bounded idle "
+                "evidence for the observed window."
+            )
+        elif self.duration_exhausted:
+            self.operator_next_action = (
+                "The no-search TDLib sync-settle diagnostic exhausted max duration "
+                "before reaching a quiet window. Do not treat TDLib as idle; review "
+                "the sanitized object-type buckets before the next bounded action."
+            )
+        elif self.update_budget_exhausted:
+            self.operator_next_action = (
+                "The no-search TDLib sync-settle diagnostic exhausted its receive "
+                "budget before reaching a quiet window. This is not solved by "
+                "sending searchPublicChat; review the sanitized backlog summary."
+            )
+        else:
+            self.operator_next_action = (
+                "The no-search TDLib sync-settle diagnostic completed. Review only "
+                "the sanitized settle fields before any separate resolve action."
+            )
+
+    def as_report_fields(self) -> dict[str, Any]:
+        return {
+            "tdlib_sync_settle_diagnostic_enabled": self.enabled,
+            "tdlib_sync_settle_attempted": self.attempted,
+            "tdlib_sync_settle_max_updates": self.max_updates,
+            "tdlib_sync_settle_receive_timeout_sec": self.receive_timeout_sec,
+            "tdlib_sync_settle_quiet_empty_receive_target": (
+                self.quiet_empty_receive_target
+            ),
+            "tdlib_sync_settle_max_duration_sec": self.max_duration_sec,
+            "tdlib_sync_settle_receive_attempt_count_bucket": _bucket_count(
+                self.receive_attempt_count
+            ),
+            "tdlib_sync_settle_observation_count_bucket": _bucket_count(
+                self.observation_count
+            ),
+            "tdlib_sync_settle_empty_receive_count_bucket": _bucket_count(
+                self.empty_receive_count
+            ),
+            "tdlib_sync_settle_quiet_empty_receive_streak_bucket": _bucket_count(
+                self.quiet_empty_receive_streak
+            ),
+            "tdlib_sync_settle_inbound_object_types_seen": list(
+                self.inbound_object_types_seen
+            ),
+            "tdlib_sync_settle_update_types_seen": list(self.update_types_seen),
+            "tdlib_sync_settle_function_response_types_seen": list(
+                self.function_response_types_seen
+            ),
+            "tdlib_sync_settle_authorization_states_seen": list(
+                self.authorization_states_seen
+            ),
+            "tdlib_sync_settle_final_authorization_state": (
+                self.final_authorization_state
+            ),
+            "tdlib_sync_settle_response_without_extra_count_bucket": _bucket_count(
+                self.response_without_extra_count
+            ),
+            "tdlib_sync_settle_response_wrong_extra_count_bucket": _bucket_count(
+                self.response_wrong_extra_count
+            ),
+            "tdlib_sync_settle_quiet_window_reached": self.quiet_window_reached,
+            "tdlib_sync_settle_update_budget_exhausted": (
+                self.update_budget_exhausted
+            ),
+            "tdlib_sync_settle_duration_exhausted": self.duration_exhausted,
+            "tdlib_sync_settle_authorization_lost": self.authorization_lost,
+            "tdlib_sync_settle_search_sent": self.search_sent,
+            "tdlib_sync_settle_operator_next_action": self.operator_next_action,
+        }
+
+
 class TDLibTransportUnavailable(RuntimeError):
     pass
 
@@ -704,6 +870,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--approved-tdlib-public-username-resolve", action="store_true")
     parser.add_argument("--approved-registry-resolve-mutation", action="store_true")
     parser.add_argument("--diagnose-single-resolve-rpc", action="store_true")
+    parser.add_argument("--diagnose-tdlib-post-ready-sync-settle", action="store_true")
     parser.add_argument("--limit", type=_positive_int, default=None)
     parser.add_argument(
         "--tdlib-auth-max-updates",
@@ -739,6 +906,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--tdlib-post-ready-drain-quiet-timeout-sec",
         type=_non_negative_float_named("tdlib-post-ready-drain-quiet-timeout-sec"),
         default=DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC,
+    )
+    parser.add_argument(
+        "--tdlib-sync-settle-max-updates",
+        type=_positive_int_named("tdlib-sync-settle-max-updates"),
+        default=DEFAULT_TDLIB_SYNC_SETTLE_MAX_UPDATES,
+    )
+    parser.add_argument(
+        "--tdlib-sync-settle-receive-timeout-sec",
+        type=_non_negative_float_named("tdlib-sync-settle-receive-timeout-sec"),
+        default=DEFAULT_TDLIB_SYNC_SETTLE_RECEIVE_TIMEOUT_SEC,
+    )
+    parser.add_argument(
+        "--tdlib-sync-settle-quiet-empty-receives",
+        type=_positive_int_named("tdlib-sync-settle-quiet-empty-receives"),
+        default=DEFAULT_TDLIB_SYNC_SETTLE_QUIET_EMPTY_RECEIVES,
+    )
+    parser.add_argument(
+        "--tdlib-sync-settle-max-duration-sec",
+        type=_non_negative_float_named("tdlib-sync-settle-max-duration-sec"),
+        default=DEFAULT_TDLIB_SYNC_SETTLE_MAX_DURATION_SEC,
     )
     return parser
 
@@ -816,6 +1003,13 @@ def _empty_ready_helper_report_fields() -> dict[str, Any]:
 
 def _empty_post_ready_drain_report_fields() -> dict[str, Any]:
     return TDLibPostReadyDrainSummary().as_report_fields()
+
+
+def _empty_sync_settle_diagnostic_report_fields(
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    return TDLibSyncSettleDiagnosticSummary(enabled=enabled).as_report_fields()
 
 
 def _empty_resolve_classification_report_fields() -> dict[str, Any]:
@@ -1015,6 +1209,7 @@ def _base_report(
     approved_tdlib_public_username_resolve: bool,
     approved_registry_resolve_mutation: bool,
     diagnose_single_resolve_rpc: bool,
+    diagnose_tdlib_post_ready_sync_settle: bool,
 ) -> dict[str, Any]:
     report = {
         "schema_version": SCHEMA_VERSION,
@@ -1045,6 +1240,11 @@ def _base_report(
     report.update(_empty_ready_probe_report_fields())
     report.update(_empty_ready_helper_report_fields())
     report.update(_empty_post_ready_drain_report_fields())
+    report.update(
+        _empty_sync_settle_diagnostic_report_fields(
+            enabled=diagnose_tdlib_post_ready_sync_settle
+        )
+    )
     report.update(_empty_resolve_classification_report_fields())
     report.update(
         _empty_single_resolve_rpc_diagnostic_report_fields(
@@ -1465,6 +1665,17 @@ class TDLibPublicUsernameResolver:
         post_ready_drain_quiet_timeout_sec: float = (
             DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC
         ),
+        sync_settle_max_updates: int = DEFAULT_TDLIB_SYNC_SETTLE_MAX_UPDATES,
+        sync_settle_receive_timeout_sec: float = (
+            DEFAULT_TDLIB_SYNC_SETTLE_RECEIVE_TIMEOUT_SEC
+        ),
+        sync_settle_quiet_empty_receives: int = (
+            DEFAULT_TDLIB_SYNC_SETTLE_QUIET_EMPTY_RECEIVES
+        ),
+        sync_settle_max_duration_sec: float = (
+            DEFAULT_TDLIB_SYNC_SETTLE_MAX_DURATION_SEC
+        ),
+        monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         from src.services.collector_telegram.auth_entrypoint import TDLibAuthOnlyRunner
         from src.services.collector_telegram.auth_fsm import (
@@ -1512,6 +1723,14 @@ class TDLibPublicUsernameResolver:
             quiet_empty_receive_target=post_ready_drain_quiet_empty_receives,
             quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
         )
+        self._sync_settle_summary = TDLibSyncSettleDiagnosticSummary(
+            enabled=False,
+            max_updates=sync_settle_max_updates,
+            receive_timeout_sec=sync_settle_receive_timeout_sec,
+            quiet_empty_receive_target=sync_settle_quiet_empty_receives,
+            max_duration_sec=sync_settle_max_duration_sec,
+        )
+        self._monotonic_clock = monotonic_clock or time.monotonic
         self._ready_helper_reused = False
         self._ready_helper_status = "not_attempted"
         self._ready_helper_manual_intervention_required = False
@@ -1536,6 +1755,10 @@ class TDLibPublicUsernameResolver:
     @property
     def tdlib_post_ready_drain_summary(self) -> Mapping[str, Any]:
         return self._post_ready_drain_summary.as_report_fields()
+
+    @property
+    def tdlib_sync_settle_diagnostic_summary(self) -> Mapping[str, Any]:
+        return self._sync_settle_summary.as_report_fields()
 
     async def initialize(self) -> None:
         try:
@@ -1630,6 +1853,40 @@ class TDLibPublicUsernameResolver:
                 ),
             )
         return await self._receive_single_resolve_rpc_diagnostic(extra)
+
+    async def diagnose_post_ready_sync_settle(self) -> TDLibSyncSettleDiagnosticSummary:
+        self._sync_settle_summary.mark_attempted()
+        started_at = self._monotonic_clock()
+        for _ in range(self._sync_settle_summary.max_updates):
+            if (
+                self._monotonic_clock() - started_at
+                >= self._sync_settle_summary.max_duration_sec
+            ):
+                self._sync_settle_summary.mark_duration_exhausted()
+                break
+            self._sync_settle_summary.receive_attempt_count += 1
+            try:
+                payload = await self._receive(
+                    self._sync_settle_summary.receive_timeout_sec
+                )
+            except Exception as exc:
+                self._ready_probe_summary.mark_transport_error(exc)
+                raise TDLibTransportUnavailable("TDLib transport unavailable") from exc
+            if payload is None:
+                self._sync_settle_summary.record_empty_receive()
+                if self._sync_settle_summary.quiet_window_reached:
+                    break
+                continue
+            if not isinstance(payload, Mapping):
+                self._sync_settle_summary.quiet_empty_receive_streak = 0
+                continue
+            self._sync_settle_summary.record_payload(payload)
+            if self._sync_settle_summary.authorization_lost:
+                break
+        else:
+            self._sync_settle_summary.mark_update_budget_exhausted()
+        self._sync_settle_summary.apply_next_action()
+        return self._sync_settle_summary
 
     def _apply_ready_helper_result(self, auth_result: Any) -> None:
         self._ready_helper_reused = True
@@ -1848,6 +2105,10 @@ def _default_resolver_factory(
     post_ready_drain_timeout_sec: float,
     post_ready_drain_quiet_empty_receives: int,
     post_ready_drain_quiet_timeout_sec: float,
+    sync_settle_max_updates: int,
+    sync_settle_receive_timeout_sec: float,
+    sync_settle_quiet_empty_receives: int,
+    sync_settle_max_duration_sec: float,
 ) -> PublicUsernameResolver:
     return TDLibPublicUsernameResolver(
         runtime_env,
@@ -1858,6 +2119,10 @@ def _default_resolver_factory(
         post_ready_drain_timeout_sec=post_ready_drain_timeout_sec,
         post_ready_drain_quiet_empty_receives=post_ready_drain_quiet_empty_receives,
         post_ready_drain_quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
+        sync_settle_max_updates=sync_settle_max_updates,
+        sync_settle_receive_timeout_sec=sync_settle_receive_timeout_sec,
+        sync_settle_quiet_empty_receives=sync_settle_quiet_empty_receives,
+        sync_settle_max_duration_sec=sync_settle_max_duration_sec,
     )
 
 
@@ -2002,6 +2267,15 @@ def _merge_resolver_side_effects(
         for key in _empty_post_ready_drain_report_fields():
             if key in post_ready_drain_summary:
                 report[key] = post_ready_drain_summary[key]
+    sync_settle_summary = getattr(
+        resolver,
+        "tdlib_sync_settle_diagnostic_summary",
+        None,
+    )
+    if isinstance(sync_settle_summary, Mapping):
+        for key in _empty_sync_settle_diagnostic_report_fields(enabled=False):
+            if key in sync_settle_summary:
+                report[key] = sync_settle_summary[key]
 
 
 def _post_ready_drain_authorization_lost_next_action() -> str:
@@ -2010,6 +2284,41 @@ def _post_ready_drain_authorization_lost_next_action() -> str:
         "receive-only drain. No searchPublicChat request was sent and no registry "
         "mutation was committed; restore a ready TDLib session before retrying."
     )
+
+
+def _sync_settle_contract_status(summary: TDLibSyncSettleDiagnosticSummary) -> str:
+    if summary.authorization_lost:
+        return "tdlib_sync_settle_diagnostic_authorization_lost"
+    if summary.duration_exhausted:
+        return "tdlib_sync_settle_diagnostic_duration_exhausted"
+    if summary.update_budget_exhausted:
+        return "tdlib_sync_settle_diagnostic_update_budget_exhausted"
+    if summary.quiet_window_reached:
+        return "tdlib_sync_settle_diagnostic_quiet_window_reached"
+    return "tdlib_sync_settle_diagnostic_completed"
+
+
+async def _diagnose_post_ready_sync_settle(
+    *,
+    resolver: PublicUsernameResolver,
+    report: dict[str, Any],
+) -> TDLibSyncSettleDiagnosticSummary:
+    summary = await resolver.diagnose_post_ready_sync_settle()
+    if not isinstance(summary, TDLibSyncSettleDiagnosticSummary):
+        summary = TDLibSyncSettleDiagnosticSummary(enabled=True, attempted=True)
+        summary.operator_next_action = (
+            "The no-search TDLib sync-settle diagnostic returned an unexpected "
+            "summary shape. Keep registry mutation disabled and inspect code-level "
+            "diagnostic wiring only."
+        )
+    summary.enabled = True
+    summary.search_sent = False
+    summary.apply_next_action()
+    report.update(summary.as_report_fields())
+    if summary.receive_attempt_count > 0:
+        report["side_effects"]["tdlib_receive_called"] = True
+    report["operator_next_action"] = summary.operator_next_action
+    return summary
 
 
 async def _drain_post_ready_updates(
@@ -2267,6 +2576,7 @@ def generate_report(
     approved_tdlib_public_username_resolve: bool = False,
     approved_registry_resolve_mutation: bool = False,
     diagnose_single_resolve_rpc: bool = False,
+    diagnose_tdlib_post_ready_sync_settle: bool = False,
     limit: int | None = None,
     tdlib_auth_max_updates: int = DEFAULT_TDLIB_AUTH_MAX_UPDATES,
     tdlib_receive_timeout_sec: float = DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC,
@@ -2283,6 +2593,16 @@ def generate_report(
     tdlib_post_ready_drain_quiet_timeout_sec: float = (
         DEFAULT_TDLIB_POST_READY_DRAIN_QUIET_TIMEOUT_SEC
     ),
+    tdlib_sync_settle_max_updates: int = DEFAULT_TDLIB_SYNC_SETTLE_MAX_UPDATES,
+    tdlib_sync_settle_receive_timeout_sec: float = (
+        DEFAULT_TDLIB_SYNC_SETTLE_RECEIVE_TIMEOUT_SEC
+    ),
+    tdlib_sync_settle_quiet_empty_receives: int = (
+        DEFAULT_TDLIB_SYNC_SETTLE_QUIET_EMPTY_RECEIVES
+    ),
+    tdlib_sync_settle_max_duration_sec: float = (
+        DEFAULT_TDLIB_SYNC_SETTLE_MAX_DURATION_SEC
+    ),
     runtime_env_reader: RuntimeEnvReader | None = None,
     database_connection_factory: DatabaseConnectionFactory | None = None,
     public_username_resolver_factory: PublicUsernameResolverFactory | None = None,
@@ -2293,6 +2613,9 @@ def generate_report(
         approved_tdlib_public_username_resolve=approved_tdlib_public_username_resolve,
         approved_registry_resolve_mutation=approved_registry_resolve_mutation,
         diagnose_single_resolve_rpc=diagnose_single_resolve_rpc,
+        diagnose_tdlib_post_ready_sync_settle=(
+            diagnose_tdlib_post_ready_sync_settle
+        ),
     )
 
     try:
@@ -2320,6 +2643,7 @@ def generate_report(
         and approved_registry_resolve_mutation
         and not effective_dry_run
         and not diagnose_single_resolve_rpc
+        and not diagnose_tdlib_post_ready_sync_settle
     )
 
     try:
@@ -2356,7 +2680,7 @@ def generate_report(
         target_count = _count_target_rows(connection)
         report["target_rows_checked"] = True
         report["target_row_count_bucket"] = _bucket_count(target_count)
-        if target_count == 0:
+        if target_count == 0 and not diagnose_tdlib_post_ready_sync_settle:
             _set_status(
                 report,
                 "blocked_no_unresolved_public_username_rows",
@@ -2374,6 +2698,21 @@ def generate_report(
                 "Registry resolve mutation requires both explicit TDLib public "
                 "username resolve approval and explicit registry mutation approval."
             )
+            return ScriptResult(exit_code=1, report=report)
+
+        if (
+            diagnose_tdlib_post_ready_sync_settle
+            and not approved_tdlib_public_username_resolve
+        ):
+            _set_status(report, "blocked_approval_required", "approval.tdlib_resolve_required")
+            report["operator_next_action"] = (
+                "TDLib post-ready sync-settle diagnostic requires explicit TDLib "
+                "public username resolve approval, but still sends no searchPublicChat "
+                "request and performs no registry mutation."
+            )
+            report["tdlib_sync_settle_operator_next_action"] = report[
+                "operator_next_action"
+            ]
             return ScriptResult(exit_code=1, report=report)
 
         if diagnose_single_resolve_rpc and not approved_tdlib_public_username_resolve:
@@ -2397,20 +2736,22 @@ def generate_report(
             )
             return ScriptResult(exit_code=0, report=report)
 
-        row_limit = 1 if diagnose_single_resolve_rpc else limit
-        if diagnose_single_resolve_rpc and limit is not None:
-            row_limit = min(limit, 1)
-        rows = _load_target_rows(connection, limit=row_limit)
-        if not rows:
-            _set_status(
-                report,
-                "blocked_no_unresolved_public_username_rows",
-                "registry.no_valid_public_username_rows_selected",
-            )
-            return ScriptResult(exit_code=1, report=report)
-        if diagnose_single_resolve_rpc:
-            report["single_resolve_rpc_target_selected"] = True
-            report["single_resolve_rpc_target_index_bucket"] = _bucket_count(1)
+        rows: tuple[TargetRow, ...] = ()
+        if not diagnose_tdlib_post_ready_sync_settle:
+            row_limit = 1 if diagnose_single_resolve_rpc else limit
+            if diagnose_single_resolve_rpc and limit is not None:
+                row_limit = min(limit, 1)
+            rows = _load_target_rows(connection, limit=row_limit)
+            if not rows:
+                _set_status(
+                    report,
+                    "blocked_no_unresolved_public_username_rows",
+                    "registry.no_valid_public_username_rows_selected",
+                )
+                return ScriptResult(exit_code=1, report=report)
+            if diagnose_single_resolve_rpc:
+                report["single_resolve_rpc_target_selected"] = True
+                report["single_resolve_rpc_target_index_bucket"] = _bucket_count(1)
 
         try:
             if public_username_resolver_factory is None:
@@ -2426,6 +2767,16 @@ def generate_report(
                     ),
                     post_ready_drain_quiet_timeout_sec=(
                         tdlib_post_ready_drain_quiet_timeout_sec
+                    ),
+                    sync_settle_max_updates=tdlib_sync_settle_max_updates,
+                    sync_settle_receive_timeout_sec=(
+                        tdlib_sync_settle_receive_timeout_sec
+                    ),
+                    sync_settle_quiet_empty_receives=(
+                        tdlib_sync_settle_quiet_empty_receives
+                    ),
+                    sync_settle_max_duration_sec=(
+                        tdlib_sync_settle_max_duration_sec
                     ),
                 )
             else:
@@ -2448,6 +2799,44 @@ def generate_report(
             )
             _merge_resolver_side_effects(report, resolver)
             return ScriptResult(exit_code=1, report=report)
+
+        if diagnose_tdlib_post_ready_sync_settle:
+            try:
+                sync_settle_summary = asyncio.run(
+                    _diagnose_post_ready_sync_settle(
+                        resolver=resolver,
+                        report=report,
+                    )
+                )
+                _merge_resolver_side_effects(report, resolver)
+            except TDLibTransportUnavailable:
+                _set_status(
+                    report,
+                    "blocked_tdlib_transport_unavailable",
+                    "tdlib.sync_settle_transport_unavailable",
+                )
+                _merge_resolver_side_effects(report, resolver)
+                return ScriptResult(exit_code=1, report=report)
+            except Exception:
+                _set_status(
+                    report,
+                    "blocked_unexpected_error",
+                    "tdlib.sync_settle_unexpected_error",
+                )
+                _merge_resolver_side_effects(report, resolver)
+                return ScriptResult(exit_code=1, report=report)
+            status = _sync_settle_contract_status(sync_settle_summary)
+            _set_status(
+                report,
+                status,
+                "tdlib.sync_settle_authorization_lost"
+                if sync_settle_summary.authorization_lost
+                else None,
+            )
+            return ScriptResult(
+                exit_code=1 if sync_settle_summary.authorization_lost else 0,
+                report=report,
+            )
 
         try:
             drain_summary = asyncio.run(
@@ -2587,6 +2976,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         approved_tdlib_public_username_resolve=args.approved_tdlib_public_username_resolve,
         approved_registry_resolve_mutation=args.approved_registry_resolve_mutation,
         diagnose_single_resolve_rpc=args.diagnose_single_resolve_rpc,
+        diagnose_tdlib_post_ready_sync_settle=(
+            args.diagnose_tdlib_post_ready_sync_settle
+        ),
         limit=args.limit,
         tdlib_auth_max_updates=args.tdlib_auth_max_updates,
         tdlib_receive_timeout_sec=args.tdlib_receive_timeout_sec,
@@ -2599,6 +2991,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         tdlib_post_ready_drain_quiet_timeout_sec=(
             args.tdlib_post_ready_drain_quiet_timeout_sec
         ),
+        tdlib_sync_settle_max_updates=args.tdlib_sync_settle_max_updates,
+        tdlib_sync_settle_receive_timeout_sec=(
+            args.tdlib_sync_settle_receive_timeout_sec
+        ),
+        tdlib_sync_settle_quiet_empty_receives=(
+            args.tdlib_sync_settle_quiet_empty_receives
+        ),
+        tdlib_sync_settle_max_duration_sec=args.tdlib_sync_settle_max_duration_sec,
     )
     sys.stdout.write(render_json(result.report))
     sys.stdout.write("\n")

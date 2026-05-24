@@ -122,6 +122,31 @@ POST_READY_DRAIN_FIELD_NAMES = (
     "tdlib_post_ready_drain_authorization_lost",
     "tdlib_post_ready_drain_quiet_window_reached",
 )
+SYNC_SETTLE_DIAGNOSTIC_FIELD_NAMES = (
+    "tdlib_sync_settle_diagnostic_enabled",
+    "tdlib_sync_settle_attempted",
+    "tdlib_sync_settle_max_updates",
+    "tdlib_sync_settle_receive_timeout_sec",
+    "tdlib_sync_settle_quiet_empty_receive_target",
+    "tdlib_sync_settle_max_duration_sec",
+    "tdlib_sync_settle_receive_attempt_count_bucket",
+    "tdlib_sync_settle_observation_count_bucket",
+    "tdlib_sync_settle_empty_receive_count_bucket",
+    "tdlib_sync_settle_quiet_empty_receive_streak_bucket",
+    "tdlib_sync_settle_inbound_object_types_seen",
+    "tdlib_sync_settle_update_types_seen",
+    "tdlib_sync_settle_function_response_types_seen",
+    "tdlib_sync_settle_authorization_states_seen",
+    "tdlib_sync_settle_final_authorization_state",
+    "tdlib_sync_settle_response_without_extra_count_bucket",
+    "tdlib_sync_settle_response_wrong_extra_count_bucket",
+    "tdlib_sync_settle_quiet_window_reached",
+    "tdlib_sync_settle_update_budget_exhausted",
+    "tdlib_sync_settle_duration_exhausted",
+    "tdlib_sync_settle_authorization_lost",
+    "tdlib_sync_settle_search_sent",
+    "tdlib_sync_settle_operator_next_action",
+)
 
 
 class FakeResult:
@@ -311,6 +336,20 @@ class FakeResolver:
             raise response
         return response
 
+    async def diagnose_post_ready_sync_settle(self) -> Any:
+        response = self.responses.get("sync_settle")
+        if isinstance(response, Exception):
+            raise response
+        if response is not None:
+            return response
+        summary = _module().TDLibSyncSettleDiagnosticSummary(enabled=True)
+        summary.mark_attempted()
+        summary.record_empty_receive()
+        summary.record_empty_receive()
+        summary.record_empty_receive()
+        summary.apply_next_action()
+        return summary
+
     async def close(self) -> None:
         self.closed = True
 
@@ -450,6 +489,7 @@ def _run_report(
     runtime_env_reader=_runtime_env,
     limit: int | None = None,
     diagnose_single_resolve_rpc: bool = False,
+    diagnose_tdlib_post_ready_sync_settle: bool = False,
 ) -> tuple[dict[str, Any], FakeDatabaseConnection, FakeResolver | None]:
     module = _module()
     fake_db = db or FakeDatabaseConnection([_registry_row("registry-1")])
@@ -460,6 +500,9 @@ def _run_report(
         approved_tdlib_public_username_resolve=approved_tdlib,
         approved_registry_resolve_mutation=approved_mutation,
         diagnose_single_resolve_rpc=diagnose_single_resolve_rpc,
+        diagnose_tdlib_post_ready_sync_settle=(
+            diagnose_tdlib_post_ready_sync_settle
+        ),
         limit=limit,
         runtime_env_reader=runtime_env_reader,
         database_connection_factory=lambda _database_url: fake_db,
@@ -484,6 +527,12 @@ def _run_report_with_tdlib_transport(
     tdlib_post_ready_drain_quiet_empty_receives: int | None = None,
     tdlib_post_ready_drain_quiet_timeout_sec: float | None = None,
     diagnose_single_resolve_rpc: bool = False,
+    diagnose_tdlib_post_ready_sync_settle: bool = False,
+    tdlib_sync_settle_max_updates: int | None = None,
+    tdlib_sync_settle_receive_timeout_sec: float | None = None,
+    tdlib_sync_settle_quiet_empty_receives: int | None = None,
+    tdlib_sync_settle_max_duration_sec: float | None = None,
+    monotonic_clock: Any | None = None,
 ) -> tuple[dict[str, Any], FakeDatabaseConnection, Any]:
     module = _module()
     fake_db = db or FakeDatabaseConnection([_registry_row("registry-1")])
@@ -523,6 +572,26 @@ def _run_report_with_tdlib_transport(
         if tdlib_post_ready_drain_quiet_timeout_sec is None
         else tdlib_post_ready_drain_quiet_timeout_sec
     )
+    sync_settle_max_updates = (
+        module.DEFAULT_TDLIB_SYNC_SETTLE_MAX_UPDATES
+        if tdlib_sync_settle_max_updates is None
+        else tdlib_sync_settle_max_updates
+    )
+    sync_settle_receive_timeout_sec = (
+        module.DEFAULT_TDLIB_SYNC_SETTLE_RECEIVE_TIMEOUT_SEC
+        if tdlib_sync_settle_receive_timeout_sec is None
+        else tdlib_sync_settle_receive_timeout_sec
+    )
+    sync_settle_quiet_empty_receives = (
+        module.DEFAULT_TDLIB_SYNC_SETTLE_QUIET_EMPTY_RECEIVES
+        if tdlib_sync_settle_quiet_empty_receives is None
+        else tdlib_sync_settle_quiet_empty_receives
+    )
+    sync_settle_max_duration_sec = (
+        module.DEFAULT_TDLIB_SYNC_SETTLE_MAX_DURATION_SEC
+        if tdlib_sync_settle_max_duration_sec is None
+        else tdlib_sync_settle_max_duration_sec
+    )
 
     def resolver_factory(values: dict[str, str]) -> Any:
         resolver = module.TDLibPublicUsernameResolver(
@@ -537,6 +606,11 @@ def _run_report_with_tdlib_transport(
                 post_ready_drain_quiet_empty_receives
             ),
             post_ready_drain_quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
+            sync_settle_max_updates=sync_settle_max_updates,
+            sync_settle_receive_timeout_sec=sync_settle_receive_timeout_sec,
+            sync_settle_quiet_empty_receives=sync_settle_quiet_empty_receives,
+            sync_settle_max_duration_sec=sync_settle_max_duration_sec,
+            monotonic_clock=monotonic_clock,
         )
         resolver_holder["resolver"] = resolver
         return resolver
@@ -547,6 +621,9 @@ def _run_report_with_tdlib_transport(
         approved_tdlib_public_username_resolve=True,
         approved_registry_resolve_mutation=approved_mutation,
         diagnose_single_resolve_rpc=diagnose_single_resolve_rpc,
+        diagnose_tdlib_post_ready_sync_settle=(
+            diagnose_tdlib_post_ready_sync_settle
+        ),
         tdlib_auth_max_updates=auth_max_updates,
         tdlib_receive_timeout_sec=receive_timeout_sec,
         tdlib_overall_timeout_sec=overall_timeout_sec,
@@ -556,6 +633,10 @@ def _run_report_with_tdlib_transport(
             post_ready_drain_quiet_empty_receives
         ),
         tdlib_post_ready_drain_quiet_timeout_sec=post_ready_drain_quiet_timeout_sec,
+        tdlib_sync_settle_max_updates=sync_settle_max_updates,
+        tdlib_sync_settle_receive_timeout_sec=sync_settle_receive_timeout_sec,
+        tdlib_sync_settle_quiet_empty_receives=sync_settle_quiet_empty_receives,
+        tdlib_sync_settle_max_duration_sec=sync_settle_max_duration_sec,
         runtime_env_reader=lambda _path: _runtime_env_for_tdlib_transport(tmp_path),
         database_connection_factory=lambda _database_url: fake_db,
         public_username_resolver_factory=resolver_factory,
@@ -659,6 +740,11 @@ def _assert_post_ready_drain_fields_present(report: dict[str, Any]) -> None:
         assert field_name in report, field_name
 
 
+def _assert_sync_settle_diagnostic_fields_present(report: dict[str, Any]) -> None:
+    for field_name in SYNC_SETTLE_DIAGNOSTIC_FIELD_NAMES:
+        assert field_name in report, field_name
+
+
 def _render(report: dict[str, Any]) -> str:
     return _module().render_json(report)
 
@@ -712,6 +798,15 @@ def test_cli_tdlib_readiness_budget_options_are_passed_to_report_generation(
             "4",
             "--tdlib-post-ready-drain-quiet-timeout-sec",
             "0.15",
+            "--diagnose-tdlib-post-ready-sync-settle",
+            "--tdlib-sync-settle-max-updates",
+            "13",
+            "--tdlib-sync-settle-receive-timeout-sec",
+            "0.35",
+            "--tdlib-sync-settle-quiet-empty-receives",
+            "5",
+            "--tdlib-sync-settle-max-duration-sec",
+            "17.5",
         ]
     )
     stdout = capsys.readouterr().out
@@ -725,6 +820,11 @@ def test_cli_tdlib_readiness_budget_options_are_passed_to_report_generation(
     assert captured_kwargs["tdlib_post_ready_drain_timeout_sec"] == 0.05
     assert captured_kwargs["tdlib_post_ready_drain_quiet_empty_receives"] == 4
     assert captured_kwargs["tdlib_post_ready_drain_quiet_timeout_sec"] == 0.15
+    assert captured_kwargs["diagnose_tdlib_post_ready_sync_settle"] is True
+    assert captured_kwargs["tdlib_sync_settle_max_updates"] == 13
+    assert captured_kwargs["tdlib_sync_settle_receive_timeout_sec"] == 0.35
+    assert captured_kwargs["tdlib_sync_settle_quiet_empty_receives"] == 5
+    assert captured_kwargs["tdlib_sync_settle_max_duration_sec"] == 17.5
 
 
 def test_cli_help_includes_single_resolve_rpc_diagnostic_flag() -> None:
@@ -764,6 +864,27 @@ def test_cli_help_includes_post_ready_drain_options() -> None:
     assert "--tdlib-post-ready-drain-quiet-timeout-sec" in result.stdout
 
 
+def test_cli_help_includes_sync_settle_diagnostic_options() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--help",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+    assert result.returncode == 0
+    assert "--diagnose-tdlib-post-ready-sync-settle" in result.stdout
+    assert "--tdlib-sync-settle-max-updates" in result.stdout
+    assert "--tdlib-sync-settle-receive-timeout-sec" in result.stdout
+    assert "--tdlib-sync-settle-quiet-empty-receives" in result.stdout
+    assert "--tdlib-sync-settle-max-duration-sec" in result.stdout
+
+
 def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutation() -> None:
     report, db, resolver = _run_report()
 
@@ -785,8 +906,23 @@ def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutat
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
     assert report["side_effects"]["telegram_channel_registry_updated"] is False
+    for key in (
+        "redis_mutation_performed",
+        "tdlib_join_called",
+        "tdlib_history_fetch_called",
+        "live_collector_started",
+        "collector_runtime_started",
+        "source_messages_written",
+        "source_message_versions_written",
+        "event_outbox_written",
+        "outbox_relay_started",
+        "router_normalizer_started",
+        "notifier_transport_enabled",
+    ):
+        assert report["side_effects"][key] is False, key
     _assert_ready_probe_fields_present(report)
     _assert_post_ready_drain_fields_present(report)
+    _assert_sync_settle_diagnostic_fields_present(report)
     _assert_resolve_classification_fields_present(report)
     _assert_single_resolve_rpc_diagnostic_fields_present(report)
     assert report["tdlib_ready_probe_attempted"] is False
@@ -816,6 +952,9 @@ def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutat
     assert report["tdlib_post_ready_drain_receive_attempt_count_bucket"] == "zero"
     assert report["tdlib_post_ready_drain_observation_count_bucket"] == "zero"
     assert report["tdlib_post_ready_drain_authorization_lost"] is False
+    assert report["tdlib_sync_settle_diagnostic_enabled"] is False
+    assert report["tdlib_sync_settle_attempted"] is False
+    assert report["tdlib_sync_settle_search_sent"] is False
     assert report["single_resolve_rpc_diagnostic_enabled"] is False
     assert report["single_resolve_rpc_target_selected"] is False
     assert report["single_resolve_rpc_request_sent"] is False
@@ -872,6 +1011,270 @@ def test_single_resolve_rpc_diagnostic_requires_tdlib_approval_without_mutation(
     assert db.update_attempts == 0
     assert report["side_effects"]["telegram_api_called"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
+
+
+def test_sync_settle_diagnostic_requires_tdlib_approval_without_mutation() -> None:
+    resolver = FakeResolver({})
+    report, db, resolver = _run_report(
+        resolver=resolver,
+        dry_run=False,
+        approved_tdlib=False,
+        approved_mutation=False,
+        diagnose_tdlib_post_ready_sync_settle=True,
+    )
+
+    assert report["contract_status"] == "blocked_approval_required"
+    assert "approval.tdlib_resolve_required" in report["checks_failed"]
+    assert report["tdlib_sync_settle_diagnostic_enabled"] is True
+    assert report["tdlib_sync_settle_attempted"] is False
+    assert report["tdlib_sync_settle_search_sent"] is False
+    assert resolver.calls == []
+    assert resolver.diagnostic_calls == []
+    assert db.update_attempts == 0
+    assert report["side_effects"]["telegram_api_called"] is False
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+
+
+def test_sync_settle_diagnostic_does_not_require_target_row(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport([_auth_update("authorizationStateReady"), None])
+    db = FakeDatabaseConnection([])
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        db=db,
+        diagnose_tdlib_post_ready_sync_settle=True,
+        tdlib_sync_settle_quiet_empty_receives=1,
+    )
+
+    assert report["contract_status"] == "tdlib_sync_settle_diagnostic_quiet_window_reached"
+    assert report["target_row_count_bucket"] == "zero"
+    assert report["tdlib_sync_settle_attempted"] is True
+    assert report["tdlib_sync_settle_quiet_window_reached"] is True
+    assert _sent_request_types(transport) == []
+    assert db.update_attempts == 0
+
+
+def test_sync_settle_diagnostic_does_not_send_search_or_mutate_when_approved(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            None,
+            None,
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=True,
+        diagnose_tdlib_post_ready_sync_settle=True,
+        tdlib_sync_settle_receive_timeout_sec=0.2,
+        tdlib_sync_settle_quiet_empty_receives=2,
+    )
+
+    assert report["contract_status"] == "tdlib_sync_settle_diagnostic_quiet_window_reached"
+    assert report["approved_registry_resolve_mutation"] is True
+    assert report["tdlib_sync_settle_diagnostic_enabled"] is True
+    assert report["tdlib_sync_settle_attempted"] is True
+    assert report["tdlib_sync_settle_quiet_empty_receive_target"] == 2
+    assert report["tdlib_sync_settle_receive_timeout_sec"] == 0.2
+    assert report["tdlib_sync_settle_receive_attempt_count_bucket"] == "two_to_five"
+    assert report["tdlib_sync_settle_empty_receive_count_bucket"] == "two_to_five"
+    assert report["tdlib_sync_settle_quiet_empty_receive_streak_bucket"] == "two_to_five"
+    assert report["tdlib_sync_settle_quiet_window_reached"] is True
+    assert report["tdlib_sync_settle_search_sent"] is False
+    assert report["tdlib_resolve_attempted"] is False
+    assert report["registry_resolve_mutation_performed"] is False
+    assert _sent_request_types(transport) == []
+    assert db.update_attempts == 0
+    assert db.transaction.rolled_back is True
+    assert db.transaction.committed is False
+    assert any(
+        statement == _normalize(_module().SET_TRANSACTION_READ_ONLY_QUERY)
+        for statement in db.statements
+    )
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert report["side_effects"]["telegram_channel_registry_updated"] is False
+
+
+def test_sync_settle_diagnostic_non_empty_update_resets_quiet_streak(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            None,
+            {"@type": "updateConnectionState"},
+            None,
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        diagnose_tdlib_post_ready_sync_settle=True,
+        tdlib_sync_settle_max_updates=3,
+        tdlib_sync_settle_quiet_empty_receives=2,
+    )
+
+    assert report["contract_status"] == "tdlib_sync_settle_diagnostic_update_budget_exhausted"
+    assert report["tdlib_sync_settle_quiet_window_reached"] is False
+    assert report["tdlib_sync_settle_update_budget_exhausted"] is True
+    assert report["tdlib_sync_settle_empty_receive_count_bucket"] == "two_to_five"
+    assert report["tdlib_sync_settle_quiet_empty_receive_streak_bucket"] == "one"
+    assert report["tdlib_sync_settle_update_types_seen"] == ["updateConnectionState"]
+    assert _sent_request_types(transport) == []
+    assert db.update_attempts == 0
+
+
+def test_sync_settle_diagnostic_stale_ok_is_reported_without_search_response(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {"@type": "ok", "@extra": "stale-public-username-extra"},
+            None,
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        diagnose_tdlib_post_ready_sync_settle=True,
+        tdlib_sync_settle_max_updates=2,
+        tdlib_sync_settle_quiet_empty_receives=2,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "tdlib_sync_settle_diagnostic_update_budget_exhausted"
+    assert report["tdlib_sync_settle_function_response_types_seen"] == ["ok"]
+    assert report["tdlib_sync_settle_response_wrong_extra_count_bucket"] == "one"
+    assert report["tdlib_sync_settle_search_sent"] is False
+    assert report["single_resolve_rpc_response_extra_matched"] is False
+    assert report["single_resolve_rpc_function_response_types_seen"] == []
+    assert report["tdlib_resolve_attempted"] is False
+    assert "stale-public-username-extra" not in rendered
+    assert _sent_request_types(transport) == []
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_sync_settle_diagnostic_max_update_exhaustion_is_reported(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {"@type": "updateOption", "name": RAW_TDLIB_PAYLOAD_VALUE},
+            {"@type": "updateSupergroup", "supergroup": {"id": RAW_CHAT_ID}},
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        diagnose_tdlib_post_ready_sync_settle=True,
+        tdlib_sync_settle_max_updates=2,
+        tdlib_sync_settle_quiet_empty_receives=3,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "tdlib_sync_settle_diagnostic_update_budget_exhausted"
+    assert report["tdlib_sync_settle_update_budget_exhausted"] is True
+    assert report["tdlib_sync_settle_quiet_window_reached"] is False
+    assert report["tdlib_sync_settle_observation_count_bucket"] == "two_to_five"
+    assert report["tdlib_sync_settle_update_types_seen"] == [
+        "updateOption",
+        "updateSupergroup",
+    ]
+    assert str(RAW_CHAT_ID) not in rendered
+    assert RAW_TDLIB_PAYLOAD_VALUE not in rendered
+    assert _sent_request_types(transport) == []
+    assert db.update_attempts == 0
+
+
+def test_sync_settle_diagnostic_max_duration_exhaustion_is_reported(
+    tmp_path: Path,
+) -> None:
+    ticks = iter([0.0, 0.0, 301.0])
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {"@type": "updateOption", "name": "version"},
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        diagnose_tdlib_post_ready_sync_settle=True,
+        tdlib_sync_settle_max_updates=5,
+        tdlib_sync_settle_max_duration_sec=300.0,
+        monotonic_clock=lambda: next(ticks, 301.0),
+    )
+
+    assert report["contract_status"] == "tdlib_sync_settle_diagnostic_duration_exhausted"
+    assert report["tdlib_sync_settle_duration_exhausted"] is True
+    assert report["tdlib_sync_settle_update_budget_exhausted"] is False
+    assert report["tdlib_sync_settle_quiet_window_reached"] is False
+    assert report["tdlib_sync_settle_receive_attempt_count_bucket"] == "one"
+    assert report["tdlib_sync_settle_observation_count_bucket"] == "one"
+    assert _sent_request_types(transport) == []
+    assert db.update_attempts == 0
+
+
+def test_sync_settle_diagnostic_authorization_lost_blocks_search_and_mutation(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _auth_update("authorizationStateClosing"),
+        ]
+    )
+
+    result = _module().generate_report(
+        runtime_env_path="/safe/unit/runtime.env",
+        dry_run=False,
+        approved_tdlib_public_username_resolve=True,
+        approved_registry_resolve_mutation=True,
+        diagnose_tdlib_post_ready_sync_settle=True,
+        runtime_env_reader=lambda _path: _runtime_env_for_tdlib_transport(tmp_path),
+        database_connection_factory=lambda _database_url: FakeDatabaseConnection(
+            [_registry_row("registry-1")]
+        ),
+        public_username_resolver_factory=lambda values: _module().TDLibPublicUsernameResolver(
+            values,
+            transport=transport,
+            sync_settle_max_updates=2,
+        ),
+    )
+    report = result.report
+
+    assert result.exit_code == 1
+    assert report["contract_status"] == "tdlib_sync_settle_diagnostic_authorization_lost"
+    assert "tdlib.sync_settle_authorization_lost" in report["checks_failed"]
+    assert report["tdlib_sync_settle_authorization_lost"] is True
+    assert report["tdlib_sync_settle_authorization_states_seen"] == [
+        "authorizationStateClosing"
+    ]
+    assert report["tdlib_sync_settle_final_authorization_state"] == (
+        "authorizationStateClosing"
+    )
+    assert report["tdlib_sync_settle_search_sent"] is False
+    assert report["tdlib_resolve_attempted"] is False
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert _sent_request_types(transport) == []
 
 
 def test_approved_tdlib_resolve_without_mutation_calls_fake_resolver_only() -> None:
@@ -2804,6 +3207,7 @@ def test_all_side_effect_fields_are_present_and_correct_across_modes() -> None:
         assert set(report["side_effects"]) == set(module.SIDE_EFFECT_FLAG_NAMES)
         _assert_ready_probe_fields_present(report)
         _assert_post_ready_drain_fields_present(report)
+        _assert_sync_settle_diagnostic_fields_present(report)
         _assert_resolve_classification_fields_present(report)
         _assert_single_resolve_rpc_diagnostic_fields_present(report)
 
