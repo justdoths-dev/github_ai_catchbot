@@ -8,7 +8,7 @@ import re
 import sys
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -161,6 +161,26 @@ SUSPICIOUS_VALUE_FRAGMENTS = (
 ALLOWED_CHAT_TYPE_SUMMARIES = frozenset({"channel", "supergroup", "basic_group", "group"})
 NOT_FOUND_ERROR_MARKERS = ("CHAT_NOT_FOUND", "USERNAME_NOT_OCCUPIED", "USERNAME_INVALID")
 ACCESS_DENIED_ERROR_MARKERS = ("FORBIDDEN", "CHANNEL_PRIVATE", "USER_BANNED_IN_CHANNEL")
+RESOLVE_FAILURE_CLASSES = frozenset(
+    {
+        "not_found",
+        "access_denied",
+        "unsupported_chat_type",
+        "response_timeout",
+        "transport_error",
+        "tdlib_error",
+        "response_shape_error",
+        "authorization_lost",
+        "unknown_error",
+    }
+)
+RESOLVE_UNRESOLVED_STATUSES = frozenset(
+    {
+        "not_found",
+        "access_denied",
+        "unsupported_chat_type",
+    }
+)
 
 
 class DatabaseConnection(Protocol):
@@ -204,6 +224,87 @@ class PublicUsernameResolveResult:
     username_snapshot: str | None = None
     title_snapshot: str | None = None
     chat_type: str | None = None
+    failure_class: str | None = None
+    tdlib_error_code: int | str | None = None
+    function_response_types_seen: tuple[str, ...] = ()
+    response_extra_matched: bool = False
+    response_without_extra_count: int = 0
+    response_wrong_extra_count: int = 0
+
+
+@dataclass(slots=True)
+class ResolveReportCounters:
+    attempt_count: int = 0
+    resolved_count: int = 0
+    unresolved_count: int = 0
+    failed_count: int = 0
+    updated_count: int = 0
+    skipped_count: int = 0
+    not_found_count: int = 0
+    access_denied_count: int = 0
+    unsupported_chat_type_count: int = 0
+    response_timeout_count: int = 0
+    transport_error_count: int = 0
+    tdlib_error_count: int = 0
+    response_shape_error_count: int = 0
+    authorization_lost_count: int = 0
+    unknown_error_count: int = 0
+    response_extra_matched_count: int = 0
+    response_without_extra_count: int = 0
+    response_wrong_extra_count: int = 0
+    authorization_lost_seen: bool = False
+    failure_classes_seen: list[str] = field(default_factory=list)
+    tdlib_error_codes_seen: list[int | str] = field(default_factory=list)
+    function_response_types_seen: list[str] = field(default_factory=list)
+
+    def record(self, result: PublicUsernameResolveResult) -> PublicUsernameResolveResult:
+        result = _canonical_resolve_result(result)
+        self.attempt_count += 1
+        self.response_without_extra_count += max(result.response_without_extra_count, 0)
+        self.response_wrong_extra_count += max(result.response_wrong_extra_count, 0)
+        if result.response_extra_matched:
+            self.response_extra_matched_count += 1
+        for response_type in result.function_response_types_seen:
+            if _safe_tdlib_object_type(response_type) == response_type:
+                _append_unique(self.function_response_types_seen, response_type)
+        if (
+            result.tdlib_error_code is not None
+            and result.tdlib_error_code not in self.tdlib_error_codes_seen
+        ):
+            self.tdlib_error_codes_seen.append(result.tdlib_error_code)
+
+        status = result.status
+        if status == "resolved":
+            self.resolved_count += 1
+            return result
+
+        failure_class = _safe_resolve_failure_class(result.failure_class or status)
+        _append_unique(self.failure_classes_seen, failure_class)
+        if status in RESOLVE_UNRESOLVED_STATUSES:
+            self.unresolved_count += 1
+        else:
+            self.failed_count += 1
+
+        if failure_class == "not_found":
+            self.not_found_count += 1
+        elif failure_class == "access_denied":
+            self.access_denied_count += 1
+        elif failure_class == "unsupported_chat_type":
+            self.unsupported_chat_type_count += 1
+        elif failure_class == "response_timeout":
+            self.response_timeout_count += 1
+        elif failure_class == "transport_error":
+            self.transport_error_count += 1
+        elif failure_class == "tdlib_error":
+            self.tdlib_error_count += 1
+        elif failure_class == "response_shape_error":
+            self.response_shape_error_count += 1
+        elif failure_class == "authorization_lost":
+            self.authorization_lost_count += 1
+            self.authorization_lost_seen = True
+        else:
+            self.unknown_error_count += 1
+        return result
 
 
 @dataclass(slots=True)
@@ -505,6 +606,28 @@ def _empty_ready_helper_report_fields() -> dict[str, Any]:
     }
 
 
+def _empty_resolve_classification_report_fields() -> dict[str, Any]:
+    return {
+        "resolve_attempt_count_bucket": "zero",
+        "resolve_resolved_count_bucket": "zero",
+        "resolve_not_found_count_bucket": "zero",
+        "resolve_access_denied_count_bucket": "zero",
+        "resolve_unsupported_chat_type_count_bucket": "zero",
+        "resolve_response_timeout_count_bucket": "zero",
+        "resolve_transport_error_count_bucket": "zero",
+        "resolve_tdlib_error_count_bucket": "zero",
+        "resolve_response_shape_error_count_bucket": "zero",
+        "resolve_authorization_lost_count_bucket": "zero",
+        "resolve_unknown_error_count_bucket": "zero",
+        "resolve_failure_classes_seen": [],
+        "resolve_tdlib_error_codes_seen": [],
+        "resolve_function_response_types_seen": [],
+        "resolve_response_extra_matched_count_bucket": "zero",
+        "resolve_response_without_extra_count_bucket": "zero",
+        "resolve_response_wrong_extra_count_bucket": "zero",
+    }
+
+
 def _append_unique(values: list[str], value: str) -> None:
     if value not in values:
         values.append(value)
@@ -529,6 +652,79 @@ def _safe_tdlib_object_type(value: Any) -> str | None:
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,79}", value):
         return value
     return "unrecognized"
+
+
+def _safe_resolve_failure_class(value: Any) -> str:
+    if isinstance(value, str) and value in RESOLVE_FAILURE_CLASSES:
+        return value
+    return "unknown_error"
+
+
+def _safe_resolve_status(value: Any) -> str:
+    if value == "resolved":
+        return "resolved"
+    if isinstance(value, str) and value in RESOLVE_FAILURE_CLASSES:
+        return value
+    return "unknown_error"
+
+
+def _canonical_resolve_result(
+    result: PublicUsernameResolveResult,
+) -> PublicUsernameResolveResult:
+    status = _safe_resolve_status(result.status)
+    failure_class = result.failure_class
+    if status == "resolved" and result.chat_id is None:
+        status = "response_shape_error"
+        failure_class = "response_shape_error"
+    elif status != "resolved":
+        failure_class = _safe_resolve_failure_class(failure_class or status)
+    if status == result.status and failure_class == result.failure_class:
+        return result
+    return replace(result, status=status, failure_class=failure_class)
+
+
+def _resolve_failure_result(
+    failure_class: str,
+    *,
+    tdlib_error_code: int | str | None = None,
+    function_response_types_seen: Sequence[str] = (),
+    response_extra_matched: bool = False,
+    response_without_extra_count: int = 0,
+    response_wrong_extra_count: int = 0,
+) -> PublicUsernameResolveResult:
+    safe_failure_class = _safe_resolve_failure_class(failure_class)
+    safe_response_types = tuple(
+        response_type
+        for response_type in function_response_types_seen
+        if _safe_tdlib_object_type(response_type) == response_type
+    )
+    return PublicUsernameResolveResult(
+        status=safe_failure_class,
+        failure_class=safe_failure_class,
+        tdlib_error_code=_safe_error_code(tdlib_error_code),
+        function_response_types_seen=safe_response_types,
+        response_extra_matched=response_extra_matched,
+        response_without_extra_count=max(response_without_extra_count, 0),
+        response_wrong_extra_count=max(response_wrong_extra_count, 0),
+    )
+
+
+def _function_response_type_from_payload(payload: Mapping[str, Any]) -> str | None:
+    payload_type = _safe_tdlib_object_type(payload.get("@type"))
+    if payload_type is None:
+        return None
+    if payload_type.startswith("update") or payload_type.startswith("authorizationState"):
+        return None
+    return payload_type
+
+
+def _append_function_response_type(
+    values: list[str],
+    payload: Mapping[str, Any],
+) -> None:
+    response_type = _function_response_type_from_payload(payload)
+    if response_type is not None:
+        _append_unique(values, response_type)
 
 
 def _authorization_state_type_from_payload(payload: Mapping[str, Any]) -> str | None:
@@ -577,6 +773,7 @@ def _base_report(
     }
     report.update(_empty_ready_probe_report_fields())
     report.update(_empty_ready_helper_report_fields())
+    report.update(_empty_resolve_classification_report_fields())
     return report
 
 
@@ -1082,10 +1279,9 @@ class TDLibPublicUsernameResolver:
         request = {**request, "@extra": extra}
         try:
             await self._send(request)
-            response = await self._receive_response(extra)
-        except Exception as exc:
-            raise TDLibTransportUnavailable("TDLib public username resolve failed") from exc
-        return _resolve_result_from_tdlib_payload(response)
+        except Exception:
+            return _resolve_failure_result("transport_error")
+        return await self._receive_response(extra)
 
     def _apply_ready_helper_result(self, auth_result: Any) -> None:
         self._ready_helper_reused = True
@@ -1124,19 +1320,55 @@ class TDLibPublicUsernameResolver:
             and getattr(auth_result, "telegram_connected", False) is True
         )
 
-    async def _receive_response(self, extra: str) -> dict[str, Any]:
+    async def _receive_response(self, extra: str) -> PublicUsernameResolveResult:
+        response_without_extra_count = 0
+        response_wrong_extra_count = 0
+        function_response_types_seen: list[str] = []
         for _ in range(DEFAULT_TDLIB_RPC_MAX_UPDATES):
-            payload = await self._receive(DEFAULT_TDLIB_RPC_TIMEOUT_SEC)
+            try:
+                payload = await self._receive(DEFAULT_TDLIB_RPC_TIMEOUT_SEC)
+            except Exception:
+                return _resolve_failure_result(
+                    "transport_error",
+                    function_response_types_seen=function_response_types_seen,
+                    response_without_extra_count=response_without_extra_count,
+                    response_wrong_extra_count=response_wrong_extra_count,
+                )
             if not isinstance(payload, dict):
                 continue
             if payload.get("@extra") == extra:
-                return payload
+                _append_function_response_type(function_response_types_seen, payload)
+                return _resolve_result_from_tdlib_payload(
+                    payload,
+                    response_extra_matched=True,
+                    response_without_extra_count=response_without_extra_count,
+                    response_wrong_extra_count=response_wrong_extra_count,
+                    function_response_types_seen=function_response_types_seen,
+                )
             if payload.get("@type") == "updateAuthorizationState":
                 state = payload.get("authorization_state")
                 state_type = state.get("@type") if isinstance(state, dict) else None
                 if state_type != TDLIB_READY_STATE:
-                    raise TDLibNotReady("TDLib authorization left ready state")
-        raise TDLibTransportUnavailable("TDLib public username resolve timed out")
+                    return _resolve_failure_result(
+                        "authorization_lost",
+                        function_response_types_seen=function_response_types_seen,
+                        response_without_extra_count=response_without_extra_count,
+                        response_wrong_extra_count=response_wrong_extra_count,
+                    )
+            response_type = _function_response_type_from_payload(payload)
+            if response_type is None:
+                continue
+            _append_unique(function_response_types_seen, response_type)
+            if isinstance(payload.get("@extra"), str):
+                response_wrong_extra_count += 1
+            else:
+                response_without_extra_count += 1
+        return _resolve_failure_result(
+            "response_timeout",
+            function_response_types_seen=function_response_types_seen,
+            response_without_extra_count=response_without_extra_count,
+            response_wrong_extra_count=response_wrong_extra_count,
+        )
 
     async def _send(self, request: Mapping[str, Any]) -> None:
         self.tdlib_send_called = True
@@ -1166,27 +1398,80 @@ def _default_resolver_factory(
     )
 
 
-def _resolve_result_from_tdlib_payload(payload: Mapping[str, Any]) -> PublicUsernameResolveResult:
+def _resolve_result_from_tdlib_payload(
+    payload: Mapping[str, Any],
+    *,
+    response_extra_matched: bool = False,
+    response_without_extra_count: int = 0,
+    response_wrong_extra_count: int = 0,
+    function_response_types_seen: Sequence[str] = (),
+) -> PublicUsernameResolveResult:
+    response_types = tuple(
+        response_type
+        for response_type in function_response_types_seen
+        if _safe_tdlib_object_type(response_type) == response_type
+    )
     if payload.get("@type") == "error":
-        message = str(payload.get("message", "")).upper()
-        if any(marker in message for marker in NOT_FOUND_ERROR_MARKERS):
-            return PublicUsernameResolveResult(status="not_found")
-        if any(marker in message for marker in ACCESS_DENIED_ERROR_MARKERS):
-            return PublicUsernameResolveResult(status="access_denied")
-        return PublicUsernameResolveResult(status="failed")
+        error_code = _safe_error_code(payload.get("code"))
+        marker_text = f"{payload.get('code', '')} {payload.get('message', '')}".upper()
+        if any(marker in marker_text for marker in NOT_FOUND_ERROR_MARKERS):
+            return PublicUsernameResolveResult(
+                status="not_found",
+                failure_class="not_found",
+                tdlib_error_code=error_code,
+                function_response_types_seen=response_types,
+                response_extra_matched=response_extra_matched,
+                response_without_extra_count=response_without_extra_count,
+                response_wrong_extra_count=response_wrong_extra_count,
+            )
+        if any(marker in marker_text for marker in ACCESS_DENIED_ERROR_MARKERS):
+            return PublicUsernameResolveResult(
+                status="access_denied",
+                failure_class="access_denied",
+                tdlib_error_code=error_code,
+                function_response_types_seen=response_types,
+                response_extra_matched=response_extra_matched,
+                response_without_extra_count=response_without_extra_count,
+                response_wrong_extra_count=response_wrong_extra_count,
+            )
+        return _resolve_failure_result(
+            "tdlib_error",
+            tdlib_error_code=error_code,
+            function_response_types_seen=response_types,
+            response_extra_matched=response_extra_matched,
+            response_without_extra_count=response_without_extra_count,
+            response_wrong_extra_count=response_wrong_extra_count,
+        )
 
     chat_id = _safe_int(payload.get("id"))
     if chat_id is None:
-        return PublicUsernameResolveResult(status="failed")
+        return _resolve_failure_result(
+            "response_shape_error",
+            function_response_types_seen=response_types,
+            response_extra_matched=response_extra_matched,
+            response_without_extra_count=response_without_extra_count,
+            response_wrong_extra_count=response_wrong_extra_count,
+        )
     chat_type = _extract_chat_type_summary(payload)
     if chat_type not in ALLOWED_CHAT_TYPE_SUMMARIES:
-        return PublicUsernameResolveResult(status="unsupported_chat_type")
+        return PublicUsernameResolveResult(
+            status="unsupported_chat_type",
+            failure_class="unsupported_chat_type",
+            function_response_types_seen=response_types,
+            response_extra_matched=response_extra_matched,
+            response_without_extra_count=response_without_extra_count,
+            response_wrong_extra_count=response_wrong_extra_count,
+        )
     return PublicUsernameResolveResult(
         status="resolved",
         chat_id=chat_id,
         username_snapshot=_extract_username_snapshot(payload),
         title_snapshot=_extract_title_snapshot(payload),
         chat_type=chat_type,
+        function_response_types_seen=response_types,
+        response_extra_matched=response_extra_matched,
+        response_without_extra_count=response_without_extra_count,
+        response_wrong_extra_count=response_wrong_extra_count,
     )
 
 
@@ -1258,12 +1543,8 @@ async def _resolve_rows(
     report: dict[str, Any],
     connection: DatabaseConnection,
     approved_registry_resolve_mutation: bool,
-) -> tuple[int, int, int, int, int]:
-    resolved_count = 0
-    unresolved_count = 0
-    failed_count = 0
-    updated_count = 0
-    skipped_count = 0
+) -> ResolveReportCounters:
+    counters = ResolveReportCounters()
 
     for row in rows:
         report["tdlib_resolve_attempted"] = True
@@ -1274,20 +1555,27 @@ async def _resolve_rows(
             resolved = await resolver.resolve_public_username(row.normalized_username)
             report["side_effects"]["tdlib_receive_called"] = True
         except TDLibNotReady:
-            raise
+            resolved = _resolve_failure_result("authorization_lost")
+        except TDLibTransportUnavailable:
+            resolved = _resolve_failure_result("transport_error")
         except Exception:
-            failed_count += 1
-            skipped_count += 1
-            continue
+            resolved = _resolve_failure_result("unknown_error")
+
+        if not isinstance(resolved, PublicUsernameResolveResult):
+            resolved = _resolve_failure_result("response_shape_error")
+        resolved = counters.record(resolved)
+        if resolved.status == "authorization_lost":
+            counters.skipped_count += counters.updated_count
+            counters.updated_count = 0
+            counters.skipped_count += 1
+            break
 
         if resolved.status != "resolved" or resolved.chat_id is None:
-            unresolved_count += 1
-            skipped_count += 1
+            counters.skipped_count += 1
             continue
 
-        resolved_count += 1
         if not approved_registry_resolve_mutation:
-            skipped_count += 1
+            counters.skipped_count += 1
             continue
 
         if _update_resolved_row(
@@ -1296,27 +1584,64 @@ async def _resolve_rows(
             resolved=resolved,
             resolved_at=datetime.now(timezone.utc),
         ):
-            updated_count += 1
+            counters.updated_count += 1
         else:
-            skipped_count += 1
+            counters.skipped_count += 1
 
-    return resolved_count, unresolved_count, failed_count, updated_count, skipped_count
+    return counters
 
 
 def _apply_count_buckets(
     report: dict[str, Any],
     *,
-    resolved_count: int,
-    unresolved_count: int,
-    failed_count: int,
-    updated_count: int,
-    skipped_count: int,
+    counters: ResolveReportCounters,
 ) -> None:
-    report["resolved_count_bucket"] = _bucket_count(resolved_count)
-    report["unresolved_count_bucket"] = _bucket_count(unresolved_count)
-    report["failed_resolve_count_bucket"] = _bucket_count(failed_count)
-    report["updated_row_count_bucket"] = _bucket_count(updated_count)
-    report["skipped_row_count_bucket"] = _bucket_count(skipped_count)
+    report["resolved_count_bucket"] = _bucket_count(counters.resolved_count)
+    report["unresolved_count_bucket"] = _bucket_count(counters.unresolved_count)
+    report["failed_resolve_count_bucket"] = _bucket_count(counters.failed_count)
+    report["updated_row_count_bucket"] = _bucket_count(counters.updated_count)
+    report["skipped_row_count_bucket"] = _bucket_count(counters.skipped_count)
+    report["resolve_attempt_count_bucket"] = _bucket_count(counters.attempt_count)
+    report["resolve_resolved_count_bucket"] = _bucket_count(counters.resolved_count)
+    report["resolve_not_found_count_bucket"] = _bucket_count(counters.not_found_count)
+    report["resolve_access_denied_count_bucket"] = _bucket_count(
+        counters.access_denied_count
+    )
+    report["resolve_unsupported_chat_type_count_bucket"] = _bucket_count(
+        counters.unsupported_chat_type_count
+    )
+    report["resolve_response_timeout_count_bucket"] = _bucket_count(
+        counters.response_timeout_count
+    )
+    report["resolve_transport_error_count_bucket"] = _bucket_count(
+        counters.transport_error_count
+    )
+    report["resolve_tdlib_error_count_bucket"] = _bucket_count(
+        counters.tdlib_error_count
+    )
+    report["resolve_response_shape_error_count_bucket"] = _bucket_count(
+        counters.response_shape_error_count
+    )
+    report["resolve_authorization_lost_count_bucket"] = _bucket_count(
+        counters.authorization_lost_count
+    )
+    report["resolve_unknown_error_count_bucket"] = _bucket_count(
+        counters.unknown_error_count
+    )
+    report["resolve_failure_classes_seen"] = list(counters.failure_classes_seen)
+    report["resolve_tdlib_error_codes_seen"] = list(counters.tdlib_error_codes_seen)
+    report["resolve_function_response_types_seen"] = list(
+        counters.function_response_types_seen
+    )
+    report["resolve_response_extra_matched_count_bucket"] = _bucket_count(
+        counters.response_extra_matched_count
+    )
+    report["resolve_response_without_extra_count_bucket"] = _bucket_count(
+        counters.response_without_extra_count
+    )
+    report["resolve_response_wrong_extra_count_bucket"] = _bucket_count(
+        counters.response_wrong_extra_count
+    )
 
 
 def _final_success_status(
@@ -1509,13 +1834,7 @@ def generate_report(
             return ScriptResult(exit_code=1, report=report)
 
         try:
-            (
-                resolved_count,
-                unresolved_count,
-                failed_count,
-                updated_count,
-                skipped_count,
-            ) = asyncio.run(
+            resolve_counters = asyncio.run(
                 _resolve_rows(
                     rows=rows,
                     resolver=resolver,
@@ -1533,26 +1852,32 @@ def generate_report(
 
         _apply_count_buckets(
             report,
-            resolved_count=resolved_count,
-            unresolved_count=unresolved_count,
-            failed_count=failed_count,
-            updated_count=updated_count,
-            skipped_count=skipped_count,
+            counters=resolve_counters,
         )
-        report["registry_resolve_mutation_performed"] = updated_count > 0
-        report["side_effects"]["database_mutation_performed"] = updated_count > 0
-        report["side_effects"]["telegram_channel_registry_updated"] = updated_count > 0
+        report["registry_resolve_mutation_performed"] = resolve_counters.updated_count > 0
+        report["side_effects"]["database_mutation_performed"] = (
+            resolve_counters.updated_count > 0
+        )
+        report["side_effects"]["telegram_channel_registry_updated"] = (
+            resolve_counters.updated_count > 0
+        )
 
         status = _final_success_status(
             approved_registry_resolve_mutation=approved_registry_resolve_mutation,
-            resolved_count=resolved_count,
-            unresolved_count=unresolved_count,
-            failed_count=failed_count,
-            updated_count=updated_count,
-            skipped_count=skipped_count,
+            resolved_count=resolve_counters.resolved_count,
+            unresolved_count=resolve_counters.unresolved_count,
+            failed_count=resolve_counters.failed_count,
+            updated_count=resolve_counters.updated_count,
+            skipped_count=resolve_counters.skipped_count,
         )
         _set_status(report, status)
-        if approved_registry_resolve_mutation:
+        if resolve_counters.authorization_lost_seen:
+            report["operator_next_action"] = (
+                "TDLib authorization was lost during public username resolve. "
+                "No registry mutation was committed; restore a ready TDLib session "
+                "before any separately approved registry mutation run."
+            )
+        elif approved_registry_resolve_mutation:
             report["operator_next_action"] = (
                 "Resolved registry metadata was applied only where the guarded "
                 "public_username/unresolved/chat_id-null UPDATE matched. Do not "
@@ -1564,7 +1889,7 @@ def generate_report(
                 "Review coarse buckets before separately approving registry mutation."
             )
 
-        if updated_count > 0:
+        if resolve_counters.updated_count > 0:
             _commit_transaction(transaction)
             transaction_committed = True
         return ScriptResult(exit_code=0, report=report)

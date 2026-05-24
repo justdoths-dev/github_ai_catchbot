@@ -22,8 +22,10 @@ FAKE_DATABASE_URL = (
     "postgresql+psycopg://github_ai_catchbot_app:"
     "unit-db-password-for-public-username-resolve@127.0.0.1:5432/github_ai_catchbot"
 )
+FAKE_REDIS_URL = "redis://:unit-redis-secret-public-username-resolve@127.0.0.1:6379/0"
 FAKE_DATABASE_PASSWORD = "unit-db-password-for-public-username-resolve"
 FAKE_TELEGRAM_SECRET = "unit-telegram-api-hash-public-username-resolve"
+RAW_TDLIB_PAYLOAD_VALUE = "unit-raw-tdlib-payload-value-public-username-resolve"
 RAW_PUBLIC_USERNAME = "PrivateAlphaChannel"
 RAW_PUBLIC_USERNAME_TWO = "PrivateBetaChannel"
 RAW_PUBLIC_USERNAME_THREE = "PrivateGammaChannel"
@@ -57,6 +59,25 @@ READY_PROBE_FIELD_NAMES = (
     "tdlib_ready_helper_reused",
     "tdlib_ready_helper_status",
     "tdlib_ready_helper_manual_intervention_required",
+)
+RESOLVE_CLASSIFICATION_FIELD_NAMES = (
+    "resolve_attempt_count_bucket",
+    "resolve_resolved_count_bucket",
+    "resolve_not_found_count_bucket",
+    "resolve_access_denied_count_bucket",
+    "resolve_unsupported_chat_type_count_bucket",
+    "resolve_response_timeout_count_bucket",
+    "resolve_transport_error_count_bucket",
+    "resolve_tdlib_error_count_bucket",
+    "resolve_response_shape_error_count_bucket",
+    "resolve_authorization_lost_count_bucket",
+    "resolve_unknown_error_count_bucket",
+    "resolve_failure_classes_seen",
+    "resolve_tdlib_error_codes_seen",
+    "resolve_function_response_types_seen",
+    "resolve_response_extra_matched_count_bucket",
+    "resolve_response_without_extra_count_bucket",
+    "resolve_response_wrong_extra_count_bucket",
 )
 
 
@@ -274,6 +295,7 @@ def _normalize(statement: str) -> str:
 def _runtime_env(_path: str | Path) -> dict[str, str]:
     return {
         "DATABASE_URL": FAKE_DATABASE_URL,
+        "REDIS_URL": FAKE_REDIS_URL,
         "TELEGRAM_API_HASH": FAKE_TELEGRAM_SECRET,
         "TELEGRAM_API_ID": "12345",
         "TELEGRAM_PHONE_NUMBER": "+10000000000",
@@ -457,12 +479,55 @@ def _public_chat_response() -> TransportPayloadFactory:
     )
 
 
+def _public_chat_error_response(
+    *,
+    code: int | str = 400,
+    message: str,
+) -> TransportPayloadFactory:
+    return _response_for_last_request(
+        "searchPublicChat",
+        {
+            "@type": "error",
+            "code": code,
+            "message": message,
+        },
+    )
+
+
+def _public_chat_private_response() -> TransportPayloadFactory:
+    return _response_for_last_request(
+        "searchPublicChat",
+        {
+            "@type": "chat",
+            "id": RAW_CHAT_ID,
+            "title": RAW_TDLIB_PAYLOAD_VALUE,
+            "type": {"@type": "chatTypePrivate"},
+        },
+    )
+
+
+def _public_chat_malformed_response() -> TransportPayloadFactory:
+    return _response_for_last_request(
+        "searchPublicChat",
+        {
+            "@type": "chat",
+            "title": RAW_TDLIB_PAYLOAD_VALUE,
+            "type": {"@type": "chatTypeSupergroup", "is_channel": True},
+        },
+    )
+
+
 def _sent_request_types(transport: FakeTDLibTransport) -> list[str]:
     return [request.get("@type", "") for request in transport.sent_requests]
 
 
 def _assert_ready_probe_fields_present(report: dict[str, Any]) -> None:
     for field_name in READY_PROBE_FIELD_NAMES:
+        assert field_name in report, field_name
+
+
+def _assert_resolve_classification_fields_present(report: dict[str, Any]) -> None:
+    for field_name in RESOLVE_CLASSIFICATION_FIELD_NAMES:
         assert field_name in report, field_name
 
 
@@ -474,8 +539,10 @@ def _assert_sensitive_values_absent(rendered: str, tmp_path: Path | None = None)
     assert RAW_PUBLIC_USERNAME not in rendered
     assert str(RAW_CHAT_ID) not in rendered
     assert FAKE_DATABASE_URL not in rendered
+    assert FAKE_REDIS_URL not in rendered
     assert FAKE_DATABASE_PASSWORD not in rendered
     assert FAKE_TELEGRAM_SECRET not in rendered
+    assert RAW_TDLIB_PAYLOAD_VALUE not in rendered
     assert "fake-tdlib-key" not in rendered
     assert "ZmFrZS10ZGxpYi1rZXk=" not in rendered
     if tmp_path is not None:
@@ -542,6 +609,7 @@ def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutat
     assert report["side_effects"]["database_mutation_performed"] is False
     assert report["side_effects"]["telegram_channel_registry_updated"] is False
     _assert_ready_probe_fields_present(report)
+    _assert_resolve_classification_fields_present(report)
     assert report["tdlib_ready_probe_attempted"] is False
     assert report["tdlib_ready_probe_status"] == "not_attempted"
     assert report["tdlib_ready_probe_observation_count_bucket"] == "zero"
@@ -1381,6 +1449,363 @@ def test_tdlib_readiness_error_reports_only_redacted_error_fields(
     assert FAKE_TELEGRAM_SECRET not in rendered
 
 
+def test_public_username_resolve_not_found_error_is_classified_without_unknown_failure(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _public_chat_error_response(
+                message=f"USERNAME_NOT_OCCUPIED {RAW_PUBLIC_USERNAME} {RAW_CHAT_ID}"
+            ),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert report["resolve_attempt_count_bucket"] == "one"
+    assert report["resolve_not_found_count_bucket"] == "one"
+    assert report["resolve_unknown_error_count_bucket"] == "zero"
+    assert report["failed_resolve_count_bucket"] == "zero"
+    assert report["unresolved_count_bucket"] == "one"
+    assert report["resolve_failure_classes_seen"] == ["not_found"]
+    assert report["resolve_tdlib_error_codes_seen"] == [400]
+    assert report["resolve_function_response_types_seen"] == ["error"]
+    assert report["resolve_response_extra_matched_count_bucket"] == "one"
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_public_username_resolve_private_error_is_classified_access_denied(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _public_chat_error_response(
+                message=f"CHANNEL_PRIVATE {RAW_PUBLIC_USERNAME} {RAW_TDLIB_PAYLOAD_VALUE}"
+            ),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert report["resolve_access_denied_count_bucket"] == "one"
+    assert report["resolve_unknown_error_count_bucket"] == "zero"
+    assert report["failed_resolve_count_bucket"] == "zero"
+    assert report["unresolved_count_bucket"] == "one"
+    assert report["resolve_failure_classes_seen"] == ["access_denied"]
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_public_username_resolve_unknown_tdlib_error_reports_sanitized_code_only(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _public_chat_error_response(
+                code="SAFE_UNKNOWN_CODE",
+                message=(
+                    f"{RAW_PUBLIC_USERNAME} {RAW_CHAT_ID} "
+                    f"{FAKE_TELEGRAM_SECRET} {RAW_TDLIB_PAYLOAD_VALUE}"
+                ),
+            ),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert report["resolve_tdlib_error_count_bucket"] == "one"
+    assert report["resolve_unknown_error_count_bucket"] == "zero"
+    assert report["failed_resolve_count_bucket"] == "one"
+    assert report["resolve_failure_classes_seen"] == ["tdlib_error"]
+    assert report["resolve_tdlib_error_codes_seen"] == ["SAFE_UNKNOWN_CODE"]
+    assert "SAFE_UNKNOWN_CODE" in rendered
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_public_username_resolve_timeout_is_classified_without_matching_response(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            None,
+            None,
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert report["resolve_response_timeout_count_bucket"] == "one"
+    assert report["failed_resolve_count_bucket"] == "one"
+    assert report["resolve_failure_classes_seen"] == ["response_timeout"]
+    assert report["resolve_response_extra_matched_count_bucket"] == "zero"
+    assert db.update_attempts == 0
+
+
+def test_public_username_resolve_wrong_extra_is_counted_without_resolving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {
+                "@type": "chat",
+                "@extra": "wrong-public-username-extra",
+                "id": RAW_CHAT_ID,
+                "title": RAW_TDLIB_PAYLOAD_VALUE,
+                "type": {"@type": "chatTypeSupergroup", "is_channel": True},
+            },
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert report["resolve_response_timeout_count_bucket"] == "one"
+    assert report["resolve_response_wrong_extra_count_bucket"] == "one"
+    assert report["resolve_response_extra_matched_count_bucket"] == "zero"
+    assert report["resolve_function_response_types_seen"] == ["chat"]
+    assert report["resolved_count_bucket"] == "zero"
+    assert db.update_attempts == 0
+    assert "wrong-public-username-extra" not in rendered
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_public_username_resolve_without_extra_is_counted_without_resolving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_MAX_UPDATES", 2)
+    monkeypatch.setattr(module, "DEFAULT_TDLIB_RPC_TIMEOUT_SEC", 0)
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            {
+                "@type": "chat",
+                "id": RAW_CHAT_ID,
+                "title": RAW_TDLIB_PAYLOAD_VALUE,
+                "type": {"@type": "chatTypeSupergroup", "is_channel": True},
+            },
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert report["resolve_response_timeout_count_bucket"] == "one"
+    assert report["resolve_response_without_extra_count_bucket"] == "one"
+    assert report["resolve_response_extra_matched_count_bucket"] == "zero"
+    assert report["resolve_function_response_types_seen"] == ["chat"]
+    assert report["resolved_count_bucket"] == "zero"
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_public_username_resolve_authorization_lost_is_classified_without_mutation(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _auth_update("authorizationStateClosing"),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=True,
+    )
+
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert report["resolve_authorization_lost_count_bucket"] == "one"
+    assert report["resolve_failure_classes_seen"] == ["authorization_lost"]
+    assert report["failed_resolve_count_bucket"] == "one"
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert db.update_attempts == 0
+    assert db.transaction.rolled_back is True
+
+
+def test_authorization_lost_after_prior_update_rolls_back_and_reports_no_mutation() -> None:
+    module = _module()
+    db = FakeDatabaseConnection(
+        [
+            _registry_row("registry-1", RAW_PUBLIC_USERNAME),
+            _registry_row("registry-2", RAW_PUBLIC_USERNAME_TWO),
+        ]
+    )
+    resolver = FakeResolver(
+        {
+            RAW_PUBLIC_USERNAME: _resolved(),
+            RAW_PUBLIC_USERNAME_TWO: module.TDLibNotReady("authorization lost"),
+        }
+    )
+
+    report, db, resolver = _run_report(
+        db=db,
+        resolver=resolver,
+        dry_run=False,
+        approved_tdlib=True,
+        approved_mutation=True,
+    )
+
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert resolver.calls == [RAW_PUBLIC_USERNAME, RAW_PUBLIC_USERNAME_TWO]
+    assert db.update_attempts == 1
+    assert db.transaction.rolled_back is True
+    assert db.transaction.committed is False
+    assert report["resolve_authorization_lost_count_bucket"] == "one"
+    assert "authorization_lost" in report["resolve_failure_classes_seen"]
+    assert report["updated_row_count_bucket"] == "zero"
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert report["side_effects"]["telegram_channel_registry_updated"] is False
+    assert "authorization was lost" in report["operator_next_action"]
+    assert "No registry mutation was committed" in report["operator_next_action"]
+    for key in (
+        "redis_mutation_performed",
+        "tdlib_join_called",
+        "tdlib_history_fetch_called",
+        "live_collector_started",
+        "collector_runtime_started",
+        "source_messages_written",
+        "source_message_versions_written",
+        "event_outbox_written",
+    ):
+        assert report["side_effects"][key] is False, key
+
+
+def test_public_username_resolve_unsupported_chat_type_is_classified(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _public_chat_private_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert report["resolve_unsupported_chat_type_count_bucket"] == "one"
+    assert report["unresolved_count_bucket"] == "one"
+    assert report["failed_resolve_count_bucket"] == "zero"
+    assert report["resolve_failure_classes_seen"] == ["unsupported_chat_type"]
+    assert report["resolve_function_response_types_seen"] == ["chat"]
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_public_username_resolve_malformed_chat_is_response_shape_error(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _public_chat_malformed_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "public_username_resolve_partial"
+    assert report["resolve_response_shape_error_count_bucket"] == "one"
+    assert report["failed_resolve_count_bucket"] == "one"
+    assert report["resolve_failure_classes_seen"] == ["response_shape_error"]
+    assert report["resolve_function_response_types_seen"] == ["chat"]
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
+def test_public_username_resolve_success_classification_keeps_no_mutation_path(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
+    assert report["resolved_count_bucket"] == "one"
+    assert report["resolve_attempt_count_bucket"] == "one"
+    assert report["resolve_resolved_count_bucket"] == "one"
+    assert report["resolve_failure_classes_seen"] == []
+    assert report["resolve_function_response_types_seen"] == ["chat"]
+    assert report["resolve_response_extra_matched_count_bucket"] == "one"
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(rendered, tmp_path)
+
+
 def test_approved_tdlib_resolve_with_mutation_updates_only_successful_rows() -> None:
     db = FakeDatabaseConnection(
         [
@@ -1550,8 +1975,10 @@ def test_chat_id_and_raw_username_remain_unprinted_in_output() -> None:
     assert str(RAW_CHAT_ID) not in rendered
     assert RAW_PUBLIC_USERNAME not in rendered
     assert FAKE_DATABASE_URL not in rendered
+    assert FAKE_REDIS_URL not in rendered
     assert FAKE_DATABASE_PASSWORD not in rendered
     assert FAKE_TELEGRAM_SECRET not in rendered
+    assert RAW_TDLIB_PAYLOAD_VALUE not in rendered
 
 
 def test_tdlib_auth_code_password_join_and_history_paths_are_not_called() -> None:
@@ -1618,6 +2045,7 @@ def test_all_side_effect_fields_are_present_and_correct_across_modes() -> None:
     for report in (dry_report, resolve_report, mutation_report):
         assert set(report["side_effects"]) == set(module.SIDE_EFFECT_FLAG_NAMES)
         _assert_ready_probe_fields_present(report)
+        _assert_resolve_classification_fields_present(report)
 
     for value in dry_report["side_effects"].values():
         assert value is False
