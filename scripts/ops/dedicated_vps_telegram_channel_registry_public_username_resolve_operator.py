@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import re
 import sys
 import uuid
@@ -17,7 +18,8 @@ SCHEMA_VERSION = "1.0"
 SCRIPT_NAME = "dedicated_vps_telegram_channel_registry_public_username_resolve_operator"
 DEFAULT_RUNTIME_ENV_PATH = "/etc/github-ai-catchbot/runtime.env"
 DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC = 1.0
-DEFAULT_TDLIB_AUTH_MAX_UPDATES = 80
+DEFAULT_TDLIB_AUTH_MAX_UPDATES = 200
+DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC = 240.0
 DEFAULT_TDLIB_RPC_TIMEOUT_SEC = 15.0
 DEFAULT_TDLIB_RPC_MAX_UPDATES = 120
 TDLIB_READY_STATE = "authorizationStateReady"
@@ -215,6 +217,9 @@ class TDLibReadyProbeSummary:
     final_authorization_state: str | None = None
     error_class: str | None = None
     error_code: int | str | None = None
+    auth_max_updates: int = DEFAULT_TDLIB_AUTH_MAX_UPDATES
+    receive_timeout_sec: float = DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC
+    overall_timeout_sec: float = DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC
     manual_intervention_required: bool = False
     parameter_bootstrap_attempted: bool = False
     encryption_key_check_attempted: bool = False
@@ -228,6 +233,17 @@ class TDLibReadyProbeSummary:
     encryption_key_response_type: str | None = None
     encryption_key_error_code: int | str | None = None
     encryption_key_error_class: str | None = None
+
+    def configure_budget(
+        self,
+        *,
+        auth_max_updates: int,
+        receive_timeout_sec: float,
+        overall_timeout_sec: float,
+    ) -> None:
+        self.auth_max_updates = auth_max_updates
+        self.receive_timeout_sec = receive_timeout_sec
+        self.overall_timeout_sec = overall_timeout_sec
 
     def mark_attempted(self) -> None:
         self.attempted = True
@@ -326,6 +342,9 @@ class TDLibReadyProbeSummary:
             "tdlib_ready_probe_final_authorization_state": self.final_authorization_state,
             "tdlib_ready_probe_error_class": self.error_class,
             "tdlib_ready_probe_error_code": self.error_code,
+            "tdlib_ready_probe_auth_max_updates": self.auth_max_updates,
+            "tdlib_ready_probe_receive_timeout_sec": self.receive_timeout_sec,
+            "tdlib_ready_probe_overall_timeout_sec": self.overall_timeout_sec,
             "tdlib_ready_probe_manual_intervention_required": (
                 self.manual_intervention_required
             ),
@@ -397,17 +416,59 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--approved-tdlib-public-username-resolve", action="store_true")
     parser.add_argument("--approved-registry-resolve-mutation", action="store_true")
     parser.add_argument("--limit", type=_positive_int, default=None)
+    parser.add_argument(
+        "--tdlib-auth-max-updates",
+        type=_positive_int_named("tdlib-auth-max-updates"),
+        default=DEFAULT_TDLIB_AUTH_MAX_UPDATES,
+    )
+    parser.add_argument(
+        "--tdlib-receive-timeout-sec",
+        type=_non_negative_float_named("tdlib-receive-timeout-sec"),
+        default=DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC,
+    )
+    parser.add_argument(
+        "--tdlib-overall-timeout-sec",
+        type=_non_negative_float_named("tdlib-overall-timeout-sec"),
+        default=DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC,
+    )
     return parser
 
 
 def _positive_int(raw: str) -> int:
+    return _parse_positive_int(raw, field_name="limit")
+
+
+def _positive_int_named(field_name: str) -> Callable[[str], int]:
+    return lambda raw: _parse_positive_int(raw, field_name=field_name)
+
+
+def _parse_positive_int(raw: str, *, field_name: str) -> int:
     try:
         value = int(raw)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("limit must be a positive integer") from exc
+        raise argparse.ArgumentTypeError(
+            f"{field_name} must be a positive integer"
+        ) from exc
     if value <= 0:
-        raise argparse.ArgumentTypeError("limit must be a positive integer")
+        raise argparse.ArgumentTypeError(f"{field_name} must be a positive integer")
     return value
+
+
+def _non_negative_float_named(field_name: str) -> Callable[[str], float]:
+    def parse(raw: str) -> float:
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"{field_name} must be a finite non-negative number"
+            ) from exc
+        if not math.isfinite(value) or value < 0:
+            raise argparse.ArgumentTypeError(
+                f"{field_name} must be a finite non-negative number"
+            )
+        return value
+
+    return parse
 
 
 def _bucket_count(count: int | None) -> str:
@@ -919,6 +980,9 @@ class TDLibPublicUsernameResolver:
         runtime_env: Mapping[str, str],
         *,
         transport: Any | None = None,
+        auth_max_updates: int = DEFAULT_TDLIB_AUTH_MAX_UPDATES,
+        receive_timeout_sec: float = DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC,
+        overall_timeout_sec: float = DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC,
     ) -> None:
         from src.services.collector_telegram.auth_entrypoint import TDLibAuthOnlyRunner
         from src.services.collector_telegram.auth_fsm import (
@@ -937,6 +1001,11 @@ class TDLibPublicUsernameResolver:
             self._transport.assert_available()
         self._client = TDLibClient(self._config, transport=self._transport)
         self._ready_probe_summary = TDLibReadyProbeSummary()
+        self._ready_probe_summary.configure_budget(
+            auth_max_updates=auth_max_updates,
+            receive_timeout_sec=receive_timeout_sec,
+            overall_timeout_sec=overall_timeout_sec,
+        )
         self._ready_probe_client = _ReadySessionProbeClient(
             self._client,
             self._ready_probe_summary,
@@ -948,12 +1017,13 @@ class TDLibPublicUsernameResolver:
                 AuthorizationFSM(self._config),
                 AuthTransitionResult,
             ),
-            receive_timeout_sec=DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC,
-            max_authorization_updates=DEFAULT_TDLIB_AUTH_MAX_UPDATES,
+            receive_timeout_sec=receive_timeout_sec,
+            max_authorization_updates=auth_max_updates,
             approved_tdlib_auth_code_entry=False,
             login_code_prompt=_blocked_login_code_prompt,
             login_code_entry_is_interactive=lambda: False,
         )
+        self._overall_timeout_sec = overall_timeout_sec
         self._ready_helper_reused = False
         self._ready_helper_status = "not_attempted"
         self._ready_helper_manual_intervention_required = False
@@ -978,12 +1048,22 @@ class TDLibPublicUsernameResolver:
     async def initialize(self) -> None:
         try:
             self._config.ensure_runtime_dirs()
-            auth_result = await self._ready_helper_runner.run_once()
+            auth_result = await asyncio.wait_for(
+                self._ready_helper_runner.run_once(),
+                timeout=self._overall_timeout_sec,
+            )
             self.tdlib_send_called = self._ready_probe_client.send_called
             self.tdlib_receive_called = self._ready_probe_client.receive_called
             self._apply_ready_helper_result(auth_result)
             if not self._ready_helper_result_is_ready(auth_result):
                 raise TDLibNotReady("TDLib ready session helper did not report ready")
+        except TimeoutError as exc:
+            self.tdlib_send_called = self._ready_probe_client.send_called
+            self.tdlib_receive_called = self._ready_probe_client.receive_called
+            self._ready_helper_reused = True
+            self._ready_helper_status = "degraded"
+            self._ready_probe_summary.mark_timed_out()
+            raise TDLibNotReady("TDLib ready session helper timed out") from exc
         except TDLibNotReady:
             raise
         except Exception as exc:
@@ -1071,8 +1151,19 @@ class TDLibPublicUsernameResolver:
         return f"{SCRIPT_NAME}.{label}.{self._request_sequence}"
 
 
-def _default_resolver_factory(runtime_env: Mapping[str, str]) -> PublicUsernameResolver:
-    return TDLibPublicUsernameResolver(runtime_env)
+def _default_resolver_factory(
+    runtime_env: Mapping[str, str],
+    *,
+    auth_max_updates: int,
+    receive_timeout_sec: float,
+    overall_timeout_sec: float,
+) -> PublicUsernameResolver:
+    return TDLibPublicUsernameResolver(
+        runtime_env,
+        auth_max_updates=auth_max_updates,
+        receive_timeout_sec=receive_timeout_sec,
+        overall_timeout_sec=overall_timeout_sec,
+    )
 
 
 def _resolve_result_from_tdlib_payload(payload: Mapping[str, Any]) -> PublicUsernameResolveResult:
@@ -1247,6 +1338,27 @@ def _final_success_status(
     return "public_username_resolve_completed_no_mutation"
 
 
+def _tdlib_not_ready_next_action(report: Mapping[str, Any]) -> str:
+    if (
+        report.get("tdlib_ready_probe_status") == "timed_out"
+        and report.get("runtime_env_read") is True
+        and report.get("database_connected") is True
+        and report.get("target_rows_checked") is True
+    ):
+        return (
+            "TDLib readiness probe timed out before authorizationStateReady. "
+            "Review tdlib_ready_probe_* budget and transition fields, then rerun "
+            "with a larger --tdlib-auth-max-updates or --tdlib-overall-timeout-sec "
+            "if updateOption noise consumed the configured budget; do not change "
+            "TDLib parameter shape based on this timeout alone."
+        )
+    return (
+        "TDLib readiness did not reach authorizationStateReady. Review the "
+        "tdlib_ready_probe_* fields and only continue with public username resolve "
+        "after the existing session is ready."
+    )
+
+
 def generate_report(
     *,
     runtime_env_path: str | Path = DEFAULT_RUNTIME_ENV_PATH,
@@ -1254,6 +1366,9 @@ def generate_report(
     approved_tdlib_public_username_resolve: bool = False,
     approved_registry_resolve_mutation: bool = False,
     limit: int | None = None,
+    tdlib_auth_max_updates: int = DEFAULT_TDLIB_AUTH_MAX_UPDATES,
+    tdlib_receive_timeout_sec: float = DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC,
+    tdlib_overall_timeout_sec: float = DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC,
     runtime_env_reader: RuntimeEnvReader | None = None,
     database_connection_factory: DatabaseConnectionFactory | None = None,
     public_username_resolver_factory: PublicUsernameResolverFactory | None = None,
@@ -1365,8 +1480,15 @@ def generate_report(
             return ScriptResult(exit_code=1, report=report)
 
         try:
-            resolver_factory = public_username_resolver_factory or _default_resolver_factory
-            resolver = resolver_factory(values)
+            if public_username_resolver_factory is None:
+                resolver = _default_resolver_factory(
+                    values,
+                    auth_max_updates=tdlib_auth_max_updates,
+                    receive_timeout_sec=tdlib_receive_timeout_sec,
+                    overall_timeout_sec=tdlib_overall_timeout_sec,
+                )
+            else:
+                resolver = public_username_resolver_factory(values)
             awaitable = resolver.initialize()
             asyncio.run(awaitable)
             report["side_effects"]["tdlib_initialized"] = True
@@ -1375,6 +1497,7 @@ def generate_report(
             _set_status(report, "blocked_tdlib_not_ready", "tdlib.not_ready")
             report["side_effects"]["tdlib_initialized"] = True
             _merge_resolver_side_effects(report, resolver)
+            report["operator_next_action"] = _tdlib_not_ready_next_action(report)
             return ScriptResult(exit_code=1, report=report)
         except Exception:
             _set_status(
@@ -1404,6 +1527,7 @@ def generate_report(
         except TDLibNotReady:
             _set_status(report, "blocked_tdlib_not_ready", "tdlib.not_ready")
             _merge_resolver_side_effects(report, resolver)
+            report["operator_next_action"] = _tdlib_not_ready_next_action(report)
             return ScriptResult(exit_code=1, report=report)
         _merge_resolver_side_effects(report, resolver)
 
@@ -1471,6 +1595,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         approved_tdlib_public_username_resolve=args.approved_tdlib_public_username_resolve,
         approved_registry_resolve_mutation=args.approved_registry_resolve_mutation,
         limit=args.limit,
+        tdlib_auth_max_updates=args.tdlib_auth_max_updates,
+        tdlib_receive_timeout_sec=args.tdlib_receive_timeout_sec,
+        tdlib_overall_timeout_sec=args.tdlib_overall_timeout_sec,
     )
     sys.stdout.write(render_json(result.report))
     sys.stdout.write("\n")

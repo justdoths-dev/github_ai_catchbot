@@ -38,6 +38,9 @@ READY_PROBE_FIELD_NAMES = (
     "tdlib_ready_probe_final_authorization_state",
     "tdlib_ready_probe_error_class",
     "tdlib_ready_probe_error_code",
+    "tdlib_ready_probe_auth_max_updates",
+    "tdlib_ready_probe_receive_timeout_sec",
+    "tdlib_ready_probe_overall_timeout_sec",
     "tdlib_ready_probe_manual_intervention_required",
     "tdlib_ready_probe_parameter_bootstrap_attempted",
     "tdlib_ready_probe_encryption_key_check_attempted",
@@ -371,13 +374,37 @@ def _run_report_with_tdlib_transport(
     transport: FakeTDLibTransport,
     db: FakeDatabaseConnection | None = None,
     approved_mutation: bool = False,
+    tdlib_auth_max_updates: int | None = None,
+    tdlib_receive_timeout_sec: float | None = None,
+    tdlib_overall_timeout_sec: float | None = None,
 ) -> tuple[dict[str, Any], FakeDatabaseConnection, Any]:
     module = _module()
     fake_db = db or FakeDatabaseConnection([_registry_row("registry-1")])
     resolver_holder: dict[str, Any] = {}
+    auth_max_updates = (
+        module.DEFAULT_TDLIB_AUTH_MAX_UPDATES
+        if tdlib_auth_max_updates is None
+        else tdlib_auth_max_updates
+    )
+    receive_timeout_sec = (
+        module.DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC
+        if tdlib_receive_timeout_sec is None
+        else tdlib_receive_timeout_sec
+    )
+    overall_timeout_sec = (
+        module.DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC
+        if tdlib_overall_timeout_sec is None
+        else tdlib_overall_timeout_sec
+    )
 
     def resolver_factory(values: dict[str, str]) -> Any:
-        resolver = module.TDLibPublicUsernameResolver(values, transport=transport)
+        resolver = module.TDLibPublicUsernameResolver(
+            values,
+            transport=transport,
+            auth_max_updates=auth_max_updates,
+            receive_timeout_sec=receive_timeout_sec,
+            overall_timeout_sec=overall_timeout_sec,
+        )
         resolver_holder["resolver"] = resolver
         return resolver
 
@@ -386,6 +413,9 @@ def _run_report_with_tdlib_transport(
         dry_run=False,
         approved_tdlib_public_username_resolve=True,
         approved_registry_resolve_mutation=approved_mutation,
+        tdlib_auth_max_updates=auth_max_updates,
+        tdlib_receive_timeout_sec=receive_timeout_sec,
+        tdlib_overall_timeout_sec=overall_timeout_sec,
         runtime_env_reader=lambda _path: _runtime_env_for_tdlib_transport(tmp_path),
         database_connection_factory=lambda _database_url: fake_db,
         public_username_resolver_factory=resolver_factory,
@@ -450,6 +480,44 @@ def _assert_sensitive_values_absent(rendered: str, tmp_path: Path | None = None)
     assert "ZmFrZS10ZGxpYi1rZXk=" not in rendered
     if tmp_path is not None:
         assert str(tmp_path) not in rendered
+
+
+def test_cli_tdlib_readiness_budget_options_are_passed_to_report_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _module()
+    captured_kwargs: dict[str, Any] = {}
+
+    def fake_generate_report(**kwargs: Any) -> Any:
+        captured_kwargs.update(kwargs)
+        return module.ScriptResult(
+            exit_code=0,
+            report={"contract_status": "captured"},
+        )
+
+    monkeypatch.setattr(module, "generate_report", fake_generate_report)
+
+    exit_code = module.main(
+        [
+            "--runtime-env-path",
+            "/safe/unit/runtime.env",
+            "--approved-tdlib-public-username-resolve",
+            "--tdlib-auth-max-updates",
+            "7",
+            "--tdlib-receive-timeout-sec",
+            "0.25",
+            "--tdlib-overall-timeout-sec",
+            "9.5",
+        ]
+    )
+    stdout = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert json.loads(stdout) == {"contract_status": "captured"}
+    assert captured_kwargs["tdlib_auth_max_updates"] == 7
+    assert captured_kwargs["tdlib_receive_timeout_sec"] == 0.25
+    assert captured_kwargs["tdlib_overall_timeout_sec"] == 9.5
 
 
 def test_dry_run_reads_unresolved_public_username_targets_without_tdlib_or_mutation() -> None:
@@ -660,6 +728,7 @@ def test_tdlib_ready_after_set_parameters_without_function_response_allows_resol
         tmp_path=tmp_path,
         transport=transport,
         approved_mutation=False,
+        tdlib_auth_max_updates=6,
     )
 
     assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
@@ -673,6 +742,13 @@ def test_tdlib_ready_after_set_parameters_without_function_response_allows_resol
     assert db.update_attempts == 0
     assert db.transaction.rolled_back is True
     assert report["tdlib_ready_probe_status"] == "ready"
+    assert report["tdlib_ready_probe_auth_max_updates"] == 6
+    assert report["tdlib_ready_probe_receive_timeout_sec"] == (
+        _module().DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC
+    )
+    assert report["tdlib_ready_probe_overall_timeout_sec"] == (
+        _module().DEFAULT_TDLIB_OVERALL_TIMEOUT_SEC
+    )
     assert report["tdlib_ready_probe_request_types_sent"] == ["setTdlibParameters"]
     assert report["tdlib_ready_probe_update_types_seen"] == [
         "updateOption",
@@ -694,6 +770,82 @@ def test_tdlib_ready_after_set_parameters_without_function_response_allows_resol
     assert report["side_effects"]["tdlib_history_fetch_called"] is False
     assert report["side_effects"]["live_collector_started"] is False
     assert report["side_effects"]["database_mutation_performed"] is False
+    assert report["side_effects"]["source_messages_written"] is False
+    assert report["side_effects"]["source_message_versions_written"] is False
+    assert report["side_effects"]["event_outbox_written"] is False
+
+
+def test_tdlib_readiness_probe_short_budget_wait_parameters_noise_fails_closed(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            {
+                "@type": "updateOption",
+                "name": "version",
+                "value": {"@type": "optionValueString"},
+            },
+            _auth_update("authorizationStateWaitTdlibParameters"),
+            {
+                "@type": "updateOption",
+                "name": "connection_state",
+                "value": {"@type": "optionValueEmpty"},
+            },
+            _auth_update("authorizationStateReady"),
+            _public_chat_response(),
+        ]
+    )
+
+    report, db, _resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=True,
+        tdlib_auth_max_updates=3,
+    )
+
+    sent_types = _sent_request_types(transport)
+    assert report["contract_status"] == "blocked_tdlib_not_ready"
+    assert "tdlib.not_ready" in report["checks_failed"]
+    assert sent_types == ["setTdlibParameters"]
+    assert "searchPublicChat" not in sent_types
+    assert "joinChat" not in sent_types
+    assert "getChatHistory" not in sent_types
+    assert db.update_attempts == 0
+    assert db.transaction.rolled_back is True
+    assert report["runtime_env_read"] is True
+    assert report["database_connected"] is True
+    assert report["target_rows_checked"] is True
+    assert report["tdlib_ready_probe_status"] == "timed_out"
+    assert report["tdlib_ready_probe_auth_max_updates"] == 3
+    assert report["tdlib_ready_probe_request_types_sent"] == ["setTdlibParameters"]
+    assert report["tdlib_ready_probe_update_types_seen"] == [
+        "updateOption",
+        "updateAuthorizationState",
+    ]
+    assert report["tdlib_ready_probe_authorization_states_seen"] == [
+        "authorizationStateWaitTdlibParameters",
+    ]
+    assert (
+        report["tdlib_ready_probe_final_authorization_state"]
+        == "authorizationStateWaitTdlibParameters"
+    )
+    assert (
+        report["tdlib_ready_probe_timed_out_after_state"]
+        == "authorizationStateWaitTdlibParameters"
+    )
+    assert report["tdlib_resolve_attempted"] is False
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is False
+    assert report["side_effects"]["tdlib_join_called"] is False
+    assert report["side_effects"]["tdlib_history_fetch_called"] is False
+    assert report["side_effects"]["live_collector_started"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert report["side_effects"]["telegram_channel_registry_updated"] is False
+    assert report["side_effects"]["source_messages_written"] is False
+    assert report["side_effects"]["source_message_versions_written"] is False
+    assert report["side_effects"]["event_outbox_written"] is False
+    assert "TDLib readiness probe timed out" in report["operator_next_action"]
+    assert "runtime env or DB access" not in report["operator_next_action"]
+    assert "Fix runtime env" not in report["operator_next_action"]
 
 
 def test_tdlib_bootstrap_readiness_requests_are_summarized_without_values(
