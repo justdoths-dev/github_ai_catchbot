@@ -197,6 +197,7 @@ def _runner(
     tmp_path: Path,
     payloads: list[dict[str, Any] | None],
     *,
+    message_bearing_probe_mode: bool = False,
     monotonic: Any | None = None,
 ) -> tuple[
     BoundedCollectorSmokeRunner,
@@ -222,6 +223,7 @@ def _runner(
         tdlib_client=client,
         singleton_guard=guard,
         dispatcher_factory=dispatcher_factory,
+        message_bearing_probe_mode=message_bearing_probe_mode,
         monotonic=monotonic or (lambda: 0.0),
     )
     return runner, client, guard, dispatchers, contexts
@@ -387,6 +389,91 @@ class BoundedSmokeRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.raw_only_writes_observed)
         self.assertTrue(result.message_ingest_not_proven)
 
+    async def test_ordinary_write_capable_mode_still_dispatches_control_updates(
+        self,
+    ) -> None:
+        runner, _client, _guard, dispatchers, _contexts = _runner(
+            self._tmp(),
+            [_control_update("updateOption"), None],
+        )
+
+        result = await runner.run(runtime_env={}, bounds=Bounds())
+
+        self.assertEqual(result.control_updates_observed, 1)
+        self.assertEqual(result.control_updates_skipped_not_written, 0)
+        self.assertEqual(result.telegram_raw_updates_written, 1)
+        self.assertEqual(
+            [payload["@type"] for payload in dispatchers[0].dispatched],
+            ["updateOption"],
+        )
+
+    async def test_message_bearing_probe_mode_skips_control_and_reconcile_writes(
+        self,
+    ) -> None:
+        runner, _client, _guard, dispatchers, _contexts = _runner(
+            self._tmp(),
+            [
+                _control_update("updateOption"),
+                _control_update("updateTrustedMiniAppBots"),
+                _reconcile_update(),
+                None,
+            ],
+            message_bearing_probe_mode=True,
+        )
+
+        result = await runner.run(runtime_env={}, bounds=Bounds())
+
+        self.assertEqual(result.updates_observed, 3)
+        self.assertEqual(result.control_updates_observed, 2)
+        self.assertEqual(result.reconcile_signal_updates_observed, 1)
+        self.assertEqual(result.control_updates_skipped_not_written, 3)
+        self.assertEqual(result.message_bearing_updates_dispatched, 0)
+        self.assertEqual(result.telegram_raw_updates_written, 0)
+        self.assertEqual(dispatchers[0].dispatched, [])
+
+    async def test_message_bearing_probe_mode_dispatches_message_and_counts_writes(
+        self,
+    ) -> None:
+        runner, _client, _guard, dispatchers, _contexts = _runner(
+            self._tmp(),
+            [_control_update("updateOption"), _new_message(7), None],
+            message_bearing_probe_mode=True,
+        )
+
+        result = await runner.run(runtime_env={}, bounds=Bounds())
+
+        self.assertEqual(result.updates_observed, 2)
+        self.assertEqual(result.control_updates_skipped_not_written, 1)
+        self.assertEqual(result.message_bearing_updates_observed, 1)
+        self.assertEqual(result.message_bearing_updates_dispatched, 1)
+        self.assertEqual(result.telegram_raw_updates_written, 1)
+        self.assertEqual(result.source_messages_written, 1)
+        self.assertEqual(result.source_message_versions_written, 1)
+        self.assertEqual(result.event_outbox_written, 1)
+        self.assertTrue(result.canonical_ingest_writes_observed)
+        self.assertEqual(
+            [payload["@type"] for payload in dispatchers[0].dispatched],
+            ["updateNewMessage"],
+        )
+
+    async def test_message_bearing_probe_mode_control_only_reports_no_message_proof(
+        self,
+    ) -> None:
+        runner, _client, _guard, _dispatchers, _contexts = _runner(
+            self._tmp(),
+            [_control_update("updateOption"), None],
+            message_bearing_probe_mode=True,
+        )
+
+        result = await runner.run(runtime_env={}, bounds=Bounds())
+
+        self.assertEqual(result.message_bearing_updates_observed, 0)
+        self.assertEqual(result.message_bearing_updates_dispatched, 0)
+        self.assertEqual(result.control_updates_skipped_not_written, 1)
+        self.assertEqual(result.telegram_raw_updates_written, 0)
+        self.assertFalse(result.canonical_ingest_writes_observed)
+        self.assertTrue(result.message_ingest_not_proven)
+
     async def test_update_type_sanitizer_drops_unsafe_update_identifiers(
         self,
     ) -> None:
@@ -407,6 +494,7 @@ class BoundedSmokeRunnerTests(unittest.IsolatedAsyncioTestCase):
                         },
                         None,
                     ],
+                    message_bearing_probe_mode=True,
                 )
 
                 result = await runner.run(runtime_env={}, bounds=Bounds())

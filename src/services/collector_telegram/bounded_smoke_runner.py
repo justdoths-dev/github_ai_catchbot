@@ -157,8 +157,10 @@ class CollectorSmokeWriteCounter:
 class CollectorSmokeUpdateTypeCounter:
     update_types_seen: dict[str, int] = field(default_factory=dict)
     message_bearing_updates_observed: int = 0
+    message_bearing_updates_dispatched: int = 0
     control_updates_observed: int = 0
     reconcile_signal_updates_observed: int = 0
+    control_updates_skipped_not_written: int = 0
 
     def observe(self, update_type: str) -> None:
         self.update_types_seen[update_type] = self.update_types_seen.get(update_type, 0) + 1
@@ -182,8 +184,10 @@ class BoundedCollectorSmokeResult:
     updates_observed: int = 0
     update_types_seen: tuple[tuple[str, int], ...] = ()
     message_bearing_updates_observed: int = 0
+    message_bearing_updates_dispatched: int = 0
     control_updates_observed: int = 0
     reconcile_signal_updates_observed: int = 0
+    control_updates_skipped_not_written: int = 0
     telegram_raw_updates_written: int = 0
     source_messages_written: int = 0
     source_message_versions_written: int = 0
@@ -362,6 +366,7 @@ class BoundedCollectorSmokeRunner:
         singleton_guard: SingletonGuardProtocol,
         dispatcher_factory: DispatcherFactory,
         receive_timeout_sec: float = DEFAULT_RECEIVE_TIMEOUT_SEC,
+        message_bearing_probe_mode: bool = False,
         monotonic: MonotonicClock = time.monotonic,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -370,6 +375,7 @@ class BoundedCollectorSmokeRunner:
         self._singleton_guard = singleton_guard
         self._dispatcher_factory = dispatcher_factory
         self._receive_timeout_sec = receive_timeout_sec
+        self._message_bearing_probe_mode = message_bearing_probe_mode
         self._monotonic = monotonic
         self._logger = logger or logging.getLogger(__name__)
 
@@ -437,12 +443,21 @@ class BoundedCollectorSmokeRunner:
 
                     updates_observed += 1
                     update_type_counter.observe(update_type)
+                    if (
+                        self._message_bearing_probe_mode
+                        and update_type not in MESSAGE_BEARING_UPDATE_TYPES
+                    ):
+                        update_type_counter.control_updates_skipped_not_written += 1
+                        continue
+
                     estimated_writes = _estimate_reported_writes(payload)
                     if counter.total + estimated_writes > bounds.max_db_writes:
                         db_write_cap_exhausted = True
                         break
 
                     await dispatcher.dispatch(payload)
+                    if update_type in MESSAGE_BEARING_UPDATE_TYPES:
+                        update_type_counter.message_bearing_updates_dispatched += 1
 
                     if updates_observed >= bounds.max_updates:
                         update_cap_exhausted = True
@@ -558,6 +573,8 @@ class BoundedCollectorSmokeRunner:
 
 def build_default_bounded_collector_smoke_runner(
     runtime_env: Mapping[str, str],
+    *,
+    message_bearing_probe_mode: bool = False,
 ) -> BoundedCollectorSmokeRunner:
     config = CollectorTelegramConfig.from_env(runtime_env)
     logger = logging.getLogger(__name__)
@@ -583,6 +600,7 @@ def build_default_bounded_collector_smoke_runner(
         tdlib_client=tdlib_client,
         singleton_guard=CollectorSingletonGuard(lock_path=config.singleton_lock_path),
         dispatcher_factory=dispatcher_factory,
+        message_bearing_probe_mode=message_bearing_probe_mode,
         logger=logger,
     )
 
@@ -672,9 +690,15 @@ def _build_result(
         message_bearing_updates_observed=(
             update_type_counter.message_bearing_updates_observed
         ),
+        message_bearing_updates_dispatched=(
+            update_type_counter.message_bearing_updates_dispatched
+        ),
         control_updates_observed=update_type_counter.control_updates_observed,
         reconcile_signal_updates_observed=(
             update_type_counter.reconcile_signal_updates_observed
+        ),
+        control_updates_skipped_not_written=(
+            update_type_counter.control_updates_skipped_not_written
         ),
         telegram_raw_updates_written=counter.telegram_raw_updates_written,
         source_messages_written=counter.source_messages_written,

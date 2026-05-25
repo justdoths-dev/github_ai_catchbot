@@ -218,8 +218,10 @@ class CollectorSmokeResult:
     updates_observed: int = 0
     update_types_seen: tuple[tuple[str, int], ...] = ()
     message_bearing_updates_observed: int = 0
+    message_bearing_updates_dispatched: int = 0
     control_updates_observed: int = 0
     reconcile_signal_updates_observed: int = 0
+    control_updates_skipped_not_written: int = 0
     telegram_raw_updates_written: int = 0
     source_messages_written: int = 0
     source_message_versions_written: int = 0
@@ -281,6 +283,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Authorize collector-owned ingest table writes during bounded smoke. "
             "This is valid only together with startup smoke approval."
+        ),
+    )
+    parser.add_argument(
+        "--approved-message-bearing-probe-mode",
+        action="store_true",
+        help=(
+            "Authorize diagnostic-only message-bearing probe mode for the "
+            "write-capable bounded startup smoke. Control/state/reconcile "
+            "updates are counted but skipped before dispatcher/raw-update writes."
         ),
     )
     parser.add_argument(
@@ -368,6 +379,7 @@ def _base_report(
     approved_tdlib_readiness_probe: bool,
     approved_live_collector_startup_smoke: bool,
     approved_collector_ingest_db_write: bool,
+    approved_message_bearing_probe_mode: bool,
     collector_smoke_max_duration_sec: int | None,
     collector_smoke_max_updates: int | None,
     collector_smoke_max_db_writes: int | None,
@@ -406,6 +418,10 @@ def _base_report(
             approved_live_collector_startup_smoke
         ),
         "collector_ingest_db_write_approved": approved_collector_ingest_db_write,
+        "collector_message_bearing_probe_mode_approved": (
+            approved_message_bearing_probe_mode
+        ),
+        "collector_message_bearing_probe_mode": False,
         "collector_smoke_attempted": False,
         "collector_smoke_status": "not_attempted",
         "collector_smoke_failure_class": None,
@@ -419,8 +435,10 @@ def _base_report(
         "collector_smoke_update_types_seen": {},
         "collector_smoke_message_bearing_updates_observed": False,
         "collector_smoke_message_bearing_updates_observed_bucket": "zero",
+        "collector_smoke_message_bearing_updates_dispatched_bucket": "zero",
         "collector_smoke_control_updates_observed_bucket": "zero",
         "collector_smoke_reconcile_signal_updates_observed_bucket": "zero",
+        "collector_smoke_control_updates_skipped_not_written_bucket": "zero",
         "collector_smoke_raw_updates_written_bucket": "zero",
         "collector_smoke_source_messages_written_bucket": "zero",
         "collector_smoke_source_message_versions_written_bucket": "zero",
@@ -1068,12 +1086,18 @@ def _merge_smoke_result(report: dict[str, Any], result: CollectorSmokeResult) ->
     message_bearing_updates_observed = _safe_non_negative_int(
         getattr(result, "message_bearing_updates_observed", 0)
     ) or _class_count_from_types(update_type_counts, "message_bearing")
+    message_bearing_updates_dispatched = _safe_non_negative_int(
+        getattr(result, "message_bearing_updates_dispatched", 0)
+    )
     control_updates_observed = _safe_non_negative_int(
         getattr(result, "control_updates_observed", 0)
     ) or _class_count_from_types(update_type_counts, "control_or_state")
     reconcile_signal_updates_observed = _safe_non_negative_int(
         getattr(result, "reconcile_signal_updates_observed", 0)
     ) or _class_count_from_types(update_type_counts, "reconcile_signal")
+    control_updates_skipped_not_written = _safe_non_negative_int(
+        getattr(result, "control_updates_skipped_not_written", 0)
+    )
 
     write_counts = {
         "telegram_raw_updates_written": _safe_non_negative_int(
@@ -1133,11 +1157,17 @@ def _merge_smoke_result(report: dict[str, Any], result: CollectorSmokeResult) ->
     report["collector_smoke_message_bearing_updates_observed_bucket"] = (
         _bucket_count(message_bearing_updates_observed)
     )
+    report["collector_smoke_message_bearing_updates_dispatched_bucket"] = (
+        _bucket_count(message_bearing_updates_dispatched)
+    )
     report["collector_smoke_control_updates_observed_bucket"] = _bucket_count(
         control_updates_observed
     )
     report["collector_smoke_reconcile_signal_updates_observed_bucket"] = (
         _bucket_count(reconcile_signal_updates_observed)
+    )
+    report["collector_smoke_control_updates_skipped_not_written_bucket"] = (
+        _bucket_count(control_updates_skipped_not_written)
     )
     report["collector_smoke_raw_updates_written_bucket"] = _bucket_count(
         write_counts["telegram_raw_updates_written"]
@@ -1233,12 +1263,17 @@ async def _run_smoke_runner(
 
 def _default_collector_smoke_runner_factory(
     runtime_env: Mapping[str, str],
+    *,
+    message_bearing_probe_mode: bool = False,
 ) -> CollectorSmokeRunner:
     from src.services.collector_telegram.bounded_smoke_runner import (  # noqa: PLC0415
         build_default_bounded_collector_smoke_runner,
     )
 
-    return build_default_bounded_collector_smoke_runner(runtime_env)
+    return build_default_bounded_collector_smoke_runner(
+        runtime_env,
+        message_bearing_probe_mode=message_bearing_probe_mode,
+    )
 
 
 def generate_report(
@@ -1247,6 +1282,7 @@ def generate_report(
     approved_tdlib_readiness_probe: bool = False,
     approved_live_collector_startup_smoke: bool = False,
     approved_collector_ingest_db_write: bool = False,
+    approved_message_bearing_probe_mode: bool = False,
     joined_row_limit: int = DEFAULT_JOINED_ROW_LIMIT,
     collector_smoke_max_duration_sec: int | None = None,
     collector_smoke_max_updates: int | None = None,
@@ -1264,6 +1300,7 @@ def generate_report(
         approved_tdlib_readiness_probe=approved_tdlib_readiness_probe,
         approved_live_collector_startup_smoke=approved_live_collector_startup_smoke,
         approved_collector_ingest_db_write=approved_collector_ingest_db_write,
+        approved_message_bearing_probe_mode=approved_message_bearing_probe_mode,
         collector_smoke_max_duration_sec=collector_smoke_max_duration_sec,
         collector_smoke_max_updates=collector_smoke_max_updates,
         collector_smoke_max_db_writes=collector_smoke_max_db_writes,
@@ -1349,11 +1386,30 @@ def generate_report(
             )
             return ScriptResult(exit_code=1, report=report)
 
+        if approved_message_bearing_probe_mode and not (
+            approved_tdlib_readiness_probe
+            and approved_live_collector_startup_smoke
+            and approved_collector_ingest_db_write
+        ):
+            _set_status(
+                report,
+                "blocked_approval_required",
+                "approval.message_bearing_probe_mode_requires_full_smoke_approvals",
+            )
+            report["operator_next_action"] = (
+                "Message-bearing probe mode is diagnostic-only and requires "
+                "TDLib readiness, bounded live startup smoke, ingest DB-write "
+                "approval, and valid smoke caps."
+            )
+            return ScriptResult(exit_code=1, report=report)
+
         bounds: CollectorSmokeBounds | None = None
         if approved_live_collector_startup_smoke:
             bounds = _validate_smoke_bounds(report)
             if bounds is None:
                 return ScriptResult(exit_code=1, report=report)
+            if approved_message_bearing_probe_mode:
+                report["collector_message_bearing_probe_mode"] = True
 
         probe_failure = _run_tdlib_readiness_probe(
             report=report,
@@ -1403,7 +1459,20 @@ def generate_report(
                     collector_smoke_runner_factory
                     or _default_collector_smoke_runner_factory
                 )
-                runner = factory(values)
+                if collector_smoke_runner_factory is None:
+                    try:
+                        runner = _default_collector_smoke_runner_factory(
+                            values,
+                            message_bearing_probe_mode=(
+                                approved_message_bearing_probe_mode
+                            ),
+                        )
+                    except TypeError:
+                        if approved_message_bearing_probe_mode:
+                            raise
+                        runner = _default_collector_smoke_runner_factory(values)
+                else:
+                    runner = factory(values)
             except Exception:
                 _set_status(
                     report,
@@ -1489,7 +1558,39 @@ def generate_report(
                 )
                 return ScriptResult(exit_code=1, report=report)
 
-            if smoke_result.updates_observed <= 0:
+            if approved_message_bearing_probe_mode:
+                if smoke_result.updates_observed <= 0 or not report[
+                    "collector_smoke_message_bearing_updates_observed"
+                ]:
+                    _set_status(
+                        report,
+                        "joined_channel_collector_bounded_startup_message_bearing_probe_no_message_updates_observed",
+                    )
+                    report["operator_next_action"] = (
+                        "Diagnostic message-bearing probe completed without "
+                        "sanitized message-bearing updates. Control/state/reconcile "
+                        "updates were counted and skipped before raw update writes."
+                    )
+                elif report["collector_smoke_canonical_ingest_writes_observed"]:
+                    _set_status(
+                        report,
+                        "joined_channel_collector_bounded_startup_message_bearing_probe_message_ingest_writes_observed",
+                    )
+                    report["operator_next_action"] = (
+                        "Diagnostic message-bearing probe observed message-bearing "
+                        "updates and canonical source/version/outbox writes under caps."
+                    )
+                else:
+                    _set_status(
+                        report,
+                        "joined_channel_collector_bounded_startup_message_bearing_probe_message_updates_observed_no_canonical_writes",
+                    )
+                    report["operator_next_action"] = (
+                        "Diagnostic message-bearing probe observed or dispatched "
+                        "message-bearing updates, but canonical source/version/outbox "
+                        "writes stayed at zero."
+                    )
+            elif smoke_result.updates_observed <= 0:
                 _set_status(
                     report,
                     "joined_channel_collector_bounded_startup_no_updates_observed",
@@ -1567,6 +1668,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.approved_live_collector_startup_smoke
         ),
         approved_collector_ingest_db_write=args.approved_collector_ingest_db_write,
+        approved_message_bearing_probe_mode=args.approved_message_bearing_probe_mode,
         joined_row_limit=args.joined_row_limit,
         collector_smoke_max_duration_sec=args.collector_smoke_max_duration_sec,
         collector_smoke_max_updates=args.collector_smoke_max_updates,

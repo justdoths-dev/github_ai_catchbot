@@ -294,6 +294,7 @@ def _run_report(
     approved_tdlib: bool = False,
     approved_startup: bool = False,
     approved_db_write: bool = False,
+    approved_probe_mode: bool = False,
     smoke_bounds: tuple[int | None, int | None, int | None] | None = None,
     probe: FakeTDLibReadinessProbe | None = None,
     smoke_runner: FakeCollectorSmokeRunner | None = None,
@@ -312,6 +313,7 @@ def _run_report(
         approved_tdlib_readiness_probe=approved_tdlib,
         approved_live_collector_startup_smoke=approved_startup,
         approved_collector_ingest_db_write=approved_db_write,
+        approved_message_bearing_probe_mode=approved_probe_mode,
         joined_row_limit=10,
         collector_smoke_max_duration_sec=duration,
         collector_smoke_max_updates=updates,
@@ -337,15 +339,19 @@ def _canonical_write_smoke_result(
     updates_observed: int = 1,
     update_types_seen: tuple[tuple[str, int], ...] = (),
     message_bearing_updates_observed: int = 0,
+    message_bearing_updates_dispatched: int = 0,
     control_updates_observed: int = 0,
     reconcile_signal_updates_observed: int = 0,
+    control_updates_skipped_not_written: int = 0,
 ) -> Any:
     return module.CollectorSmokeResult(
         updates_observed=updates_observed,
         update_types_seen=update_types_seen,
         message_bearing_updates_observed=message_bearing_updates_observed,
+        message_bearing_updates_dispatched=message_bearing_updates_dispatched,
         control_updates_observed=control_updates_observed,
         reconcile_signal_updates_observed=reconcile_signal_updates_observed,
+        control_updates_skipped_not_written=control_updates_skipped_not_written,
         telegram_raw_updates_written=1,
         source_messages_written=1,
         source_message_versions_written=1,
@@ -697,6 +703,25 @@ def test_db_write_approval_without_startup_approval_blocks(tmp_path: Path) -> No
     assert "approval.live_collector_startup_smoke_required" in report["checks_failed"]
     assert report["collector_smoke_attempted"] is False
     assert report["database_mutation_performed"] is False
+
+
+def test_message_bearing_probe_flag_without_required_approvals_blocks(
+    tmp_path: Path,
+) -> None:
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_probe_mode=True,
+        smoke_bounds=(30, 10, 10),
+    )
+
+    assert report["contract_status"] == "blocked_approval_required"
+    assert (
+        "approval.message_bearing_probe_mode_requires_full_smoke_approvals"
+        in report["checks_failed"]
+    )
+    assert report["collector_message_bearing_probe_mode_approved"] is True
+    assert report["collector_message_bearing_probe_mode"] is False
+    assert report["collector_smoke_attempted"] is False
 
 
 def test_startup_smoke_without_db_write_approval_reports_no_write_readiness(
@@ -1054,6 +1079,162 @@ def test_control_only_raw_writes_do_not_prove_message_ingest(tmp_path: Path) -> 
     assert report["collector_smoke_source_messages_written_bucket"] == "zero"
     assert report["collector_smoke_canonical_ingest_writes_observed"] is False
     assert report["collector_smoke_raw_only_writes_observed"] is True
+    assert report["collector_smoke_message_ingest_not_proven"] is True
+
+
+def test_message_bearing_probe_control_only_reports_no_message_updates_observed(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    runner = FakeCollectorSmokeRunner(
+        module.CollectorSmokeResult(
+            updates_observed=3,
+            update_types_seen=(
+                ("updateOption", 2),
+                ("updateTrustedMiniAppBots", 1),
+            ),
+            control_updates_observed=3,
+            control_updates_skipped_not_written=3,
+            side_effects={
+                "live_collector_started": True,
+                "collector_runtime_started": True,
+                "tdlib_initialized": True,
+                "tdlib_receive_called": True,
+                "telegram_api_called": True,
+            },
+        )
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        approved_probe_mode=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    assert report["contract_status"] == (
+        "joined_channel_collector_bounded_startup_message_bearing_probe_no_message_updates_observed"
+    )
+    assert report["collector_message_bearing_probe_mode"] is True
+    assert report["collector_smoke_update_types_seen"] == {
+        "updateOption": "two_to_five",
+        "updateTrustedMiniAppBots": "one",
+    }
+    assert report["collector_smoke_control_updates_observed_bucket"] == "two_to_five"
+    assert (
+        report["collector_smoke_control_updates_skipped_not_written_bucket"]
+        == "two_to_five"
+    )
+    assert report["collector_smoke_raw_updates_written_bucket"] == "zero"
+    assert report["collector_smoke_canonical_ingest_writes_observed"] is False
+    assert report["collector_smoke_message_ingest_not_proven"] is True
+
+
+def test_message_bearing_probe_with_message_and_canonical_writes_reports_probe_success(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    runner = FakeCollectorSmokeRunner(
+        module.CollectorSmokeResult(
+            updates_observed=2,
+            update_types_seen=(("updateOption", 1), ("updateNewMessage", 1)),
+            message_bearing_updates_observed=1,
+            message_bearing_updates_dispatched=1,
+            control_updates_observed=1,
+            control_updates_skipped_not_written=1,
+            telegram_raw_updates_written=1,
+            source_messages_written=1,
+            source_message_versions_written=1,
+            event_outbox_written=1,
+            written_tables=(
+                "telegram_raw_updates",
+                "source_messages",
+                "source_message_versions",
+                "event_outbox",
+            ),
+            side_effects={
+                "live_collector_started": True,
+                "collector_runtime_started": True,
+                "tdlib_initialized": True,
+                "tdlib_receive_called": True,
+                "telegram_api_called": True,
+            },
+        )
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        approved_probe_mode=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    assert report["contract_status"] == (
+        "joined_channel_collector_bounded_startup_message_bearing_probe_message_ingest_writes_observed"
+    )
+    assert (
+        report["collector_smoke_message_bearing_updates_dispatched_bucket"] == "one"
+    )
+    assert report["collector_smoke_raw_updates_written_bucket"] == "one"
+    assert report["collector_smoke_source_messages_written_bucket"] == "one"
+    assert report["collector_smoke_canonical_ingest_writes_observed"] is True
+    assert report["collector_smoke_message_ingest_not_proven"] is False
+
+
+def test_message_bearing_probe_with_message_and_zero_canonical_writes_reports_gap(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    runner = FakeCollectorSmokeRunner(
+        module.CollectorSmokeResult(
+            updates_observed=1,
+            update_types_seen=(("updateNewMessage", 1),),
+            message_bearing_updates_observed=1,
+            message_bearing_updates_dispatched=1,
+            telegram_raw_updates_written=1,
+            written_tables=("telegram_raw_updates",),
+            side_effects={
+                "live_collector_started": True,
+                "collector_runtime_started": True,
+                "tdlib_initialized": True,
+                "tdlib_receive_called": True,
+                "telegram_api_called": True,
+            },
+        )
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        approved_probe_mode=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    assert report["contract_status"] == (
+        "joined_channel_collector_bounded_startup_message_bearing_probe_message_updates_observed_no_canonical_writes"
+    )
+    assert report["collector_smoke_message_bearing_updates_observed"] is True
+    assert (
+        report["collector_smoke_message_bearing_updates_dispatched_bucket"] == "one"
+    )
+    assert report["collector_smoke_raw_updates_written_bucket"] == "one"
+    assert report["collector_smoke_source_messages_written_bucket"] == "zero"
+    assert report["collector_smoke_canonical_ingest_writes_observed"] is False
     assert report["collector_smoke_message_ingest_not_proven"] is True
 
 
@@ -1558,6 +1739,7 @@ def test_help_outputs_gate_and_smoke_options_without_runtime_actions() -> None:
     assert "--approved-tdlib-readiness-probe" in result.stdout
     assert "--approved-live-collector-startup-smoke" in result.stdout
     assert "--approved-collector-ingest-db-write" in result.stdout
+    assert "--approved-message-bearing-probe-mode" in result.stdout
     assert "--collector-smoke-max-duration-sec" in result.stdout
     assert "--collector-smoke-max-updates" in result.stdout
     assert "--collector-smoke-max-db-writes" in result.stdout
