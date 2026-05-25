@@ -213,7 +213,15 @@ class FakeCollectorSmokeRunner:
         self.started = True
         self.runtime_env_seen = runtime_env
         self.bounds_seen = bounds
+        if isinstance(self.result, Exception):
+            raise self.result
         return self.result
+
+
+class FakePartialSmokeFailure(RuntimeError):
+    def __init__(self, result: Any) -> None:
+        super().__init__("partial smoke failure")
+        self.result = result
 
 
 def _module():
@@ -346,6 +354,33 @@ def test_default_dry_run_confirms_joined_rows_and_readiness_without_side_effects
     assert db.transaction.rolled_back is True
     assert probe is None
     assert runner is None
+
+
+def test_default_dry_run_does_not_construct_default_smoke_runner(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module = _module()
+    constructed = False
+
+    def forbidden_default_factory(_values: Any) -> Any:
+        nonlocal constructed
+        constructed = True
+        raise AssertionError("default smoke runner must not be constructed")
+
+    monkeypatch.setattr(
+        module,
+        "_default_collector_smoke_runner_factory",
+        forbidden_default_factory,
+    )
+
+    report, _db, _probe, _runner = _run_report(tmp_path)
+
+    assert report["contract_status"] == (
+        "joined_channel_collector_bounded_startup_ingest_gate_ready"
+    )
+    assert constructed is False
+    assert report["collector_smoke_attempted"] is False
 
 
 def test_no_joined_rows_blocks_without_side_effects(tmp_path: Path) -> None:
@@ -488,6 +523,38 @@ def test_approved_tdlib_readiness_probe_reports_ready_from_fake_helper(
     assert probe.closed is True
 
 
+def test_tdlib_readiness_only_does_not_construct_default_smoke_runner(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module = _module()
+    constructed = False
+
+    def forbidden_default_factory(_values: Any) -> Any:
+        nonlocal constructed
+        constructed = True
+        raise AssertionError("default smoke runner must not be constructed")
+
+    monkeypatch.setattr(
+        module,
+        "_default_collector_smoke_runner_factory",
+        forbidden_default_factory,
+    )
+    probe = FakeTDLibReadinessProbe()
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        probe=probe,
+        approved_tdlib=True,
+    )
+
+    assert report["contract_status"] == (
+        "joined_channel_collector_bounded_startup_tdlib_ready"
+    )
+    assert constructed is False
+    assert report["collector_smoke_attempted"] is False
+
+
 def test_manual_login_code_password_states_fail_closed_without_auth_submission(
     tmp_path: Path,
 ) -> None:
@@ -539,6 +606,39 @@ def test_startup_smoke_approval_without_valid_bounds_blocks(tmp_path: Path) -> N
     assert report["live_collector_started"] is False
 
 
+def test_invalid_bounds_block_before_default_runner_construction(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module = _module()
+    constructed = False
+
+    def forbidden_default_factory(_values: Any) -> Any:
+        nonlocal constructed
+        constructed = True
+        raise AssertionError("default smoke runner must not be constructed")
+
+    monkeypatch.setattr(
+        module,
+        "_default_collector_smoke_runner_factory",
+        forbidden_default_factory,
+    )
+    probe = FakeTDLibReadinessProbe()
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(121, 10, 10),
+        probe=probe,
+    )
+
+    assert report["contract_status"] == "blocked_invalid_smoke_bounds"
+    assert constructed is False
+    assert report["collector_smoke_attempted"] is False
+
+
 def test_db_write_approval_without_startup_approval_blocks(tmp_path: Path) -> None:
     report, _db, _probe, _runner = _run_report(
         tmp_path,
@@ -572,6 +672,37 @@ def test_startup_smoke_without_db_write_approval_reports_no_write_readiness(
     assert report["database_mutation_performed"] is False
     assert runner is not None
     assert runner.started is False
+
+
+def test_full_approval_without_tdlib_readiness_approval_blocks_before_runner(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module = _module()
+    constructed = False
+
+    def forbidden_default_factory(_values: Any) -> Any:
+        nonlocal constructed
+        constructed = True
+        raise AssertionError("default smoke runner must not be constructed")
+
+    monkeypatch.setattr(
+        module,
+        "_default_collector_smoke_runner_factory",
+        forbidden_default_factory,
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+    )
+
+    assert report["contract_status"] == "blocked_approval_required"
+    assert "approval.tdlib_readiness_probe_required" in report["checks_failed"]
+    assert constructed is False
+    assert report["collector_smoke_attempted"] is False
 
 
 def test_fully_approved_fake_smoke_with_no_updates_reports_distinct_status(
@@ -615,6 +746,54 @@ def test_fully_approved_fake_smoke_with_no_updates_reports_distinct_status(
     assert runner is not None
     assert runner.started is True
     assert runner.bounds_seen.max_duration_sec == 30
+
+
+def test_fully_approved_default_runner_factory_is_used_after_approvals(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    runner = FakeCollectorSmokeRunner(
+        module.CollectorSmokeResult(
+            updates_observed=0,
+            side_effects={
+                "live_collector_started": True,
+                "collector_runtime_started": True,
+                "tdlib_initialized": True,
+                "tdlib_receive_called": True,
+                "telegram_api_called": True,
+            },
+        )
+    )
+    constructed = False
+
+    def default_factory(_values: Any) -> FakeCollectorSmokeRunner:
+        nonlocal constructed
+        constructed = True
+        return runner
+
+    monkeypatch.setattr(
+        module,
+        "_default_collector_smoke_runner_factory",
+        default_factory,
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+    )
+
+    assert callable(module._default_collector_smoke_runner_factory)
+    assert constructed is True
+    assert runner.started is True
+    assert report["contract_status"] == (
+        "joined_channel_collector_bounded_startup_no_updates_observed"
+    )
 
 
 def test_fully_approved_fake_smoke_with_writes_reports_collector_owned_buckets(
@@ -674,7 +853,171 @@ def test_fully_approved_fake_smoke_with_writes_reports_collector_owned_buckets(
     assert report["event_outbox_written"] is True
 
 
-def test_forbidden_write_or_side_effect_from_fake_smoke_blocks(tmp_path: Path) -> None:
+def test_gate_merges_partial_smoke_write_failure_and_blocks(tmp_path: Path) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    partial_result = module.CollectorSmokeResult(
+        status="failed",
+        failure_class="RuntimeError",
+        updates_observed=1,
+        telegram_raw_updates_written=1,
+        written_tables=("telegram_raw_updates",),
+        side_effects={
+            "live_collector_started": True,
+            "collector_runtime_started": True,
+            "tdlib_initialized": True,
+            "tdlib_receive_called": True,
+            "telegram_api_called": True,
+            "telegram_raw_updates_written": True,
+            "database_mutation_performed": True,
+        },
+    )
+    runner = FakeCollectorSmokeRunner(FakePartialSmokeFailure(partial_result))
+
+    report, _db, _probe, runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    assert report["contract_status"] == "blocked_collector_smoke_runner_failed"
+    assert "collector_smoke.runner_failed" in report["checks_failed"]
+    assert report["collector_smoke_status"] == "failed"
+    assert report["collector_smoke_failure_class"] == "RuntimeError"
+    assert report["collector_smoke_updates_observed_bucket"] == "one"
+    assert report["collector_smoke_raw_updates_written_bucket"] == "one"
+    assert report["telegram_raw_updates_written"] is True
+    assert report["database_mutation_performed"] is True
+    assert report["live_collector_started"] is True
+    assert report["tdlib_initialized"] is True
+    assert runner is not None
+    assert runner.started is True
+
+
+def test_gate_merges_partial_smoke_receive_failure_tdlib_side_effects(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    partial_result = module.CollectorSmokeResult(
+        status="failed",
+        failure_class="RuntimeError",
+        updates_observed=0,
+        side_effects={
+            "live_collector_started": True,
+            "collector_runtime_started": True,
+            "tdlib_initialized": True,
+            "tdlib_receive_called": True,
+            "telegram_api_called": True,
+        },
+    )
+    runner = FakeCollectorSmokeRunner(FakePartialSmokeFailure(partial_result))
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    assert report["contract_status"] == "blocked_collector_smoke_runner_failed"
+    assert report["collector_smoke_status"] == "failed"
+    assert report["collector_smoke_failure_class"] == "RuntimeError"
+    assert report["tdlib_initialized"] is True
+    assert report["tdlib_receive_called"] is True
+    assert report["telegram_api_called"] is True
+    assert report["database_mutation_performed"] is False
+
+
+def test_gate_blocks_manual_auth_partial_smoke_without_success_status(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    partial_result = module.CollectorSmokeResult(
+        status="blocked",
+        failure_class="manual_authorization_required",
+        updates_observed=0,
+        side_effects={
+            "live_collector_started": True,
+            "collector_runtime_started": True,
+            "tdlib_initialized": True,
+            "tdlib_receive_called": True,
+            "telegram_api_called": True,
+        },
+    )
+    runner = FakeCollectorSmokeRunner(FakePartialSmokeFailure(partial_result))
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    assert report["contract_status"] == (
+        "blocked_collector_smoke_manual_authorization_required"
+    )
+    assert report["collector_smoke_status"] == "blocked"
+    assert report["collector_smoke_failure_class"] == "manual_authorization_required"
+    assert report["collector_smoke_no_updates_observed"] is True
+    assert report["tdlib_auth_attempted"] is False
+    assert report["tdlib_phone_number_submitted"] is False
+    assert report["tdlib_code_submitted"] is False
+    assert report["tdlib_password_submitted"] is False
+
+
+def test_default_runner_factory_tdjson_path_failure_leaks_no_raw_path(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    module = _module()
+    tdjson_path = "/safe/missing/libtdjson.so"
+    values = _runtime_env(tmp_path)
+    values["TDJSON_LIBRARY_PATH"] = tdjson_path
+    captured_paths: list[str | None] = []
+
+    def unavailable_default_factory(runtime_env: Any) -> Any:
+        captured_paths.append(runtime_env.get("TDJSON_LIBRARY_PATH"))
+        raise RuntimeError(f"tdjson missing at {tdjson_path}")
+
+    monkeypatch.setattr(
+        module,
+        "_default_collector_smoke_runner_factory",
+        unavailable_default_factory,
+    )
+    probe = FakeTDLibReadinessProbe()
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        runtime_env_reader=lambda _path: values,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+    )
+    rendered = module.render_json(report)
+
+    assert captured_paths == [tdjson_path]
+    assert report["contract_status"] == "blocked_collector_smoke_runner_unavailable"
+    assert report["collector_smoke_attempted"] is False
+    assert tdjson_path not in rendered
+    assert "TDJSON_LIBRARY_PATH" not in rendered
+    assert str(tmp_path) not in rendered
+
+
+def test_forbidden_write_table_from_fake_smoke_blocks(tmp_path: Path) -> None:
     module = _module()
     probe = FakeTDLibReadinessProbe()
     runner = FakeCollectorSmokeRunner(
@@ -685,7 +1028,36 @@ def test_forbidden_write_or_side_effect_from_fake_smoke_blocks(tmp_path: Path) -
             side_effects={
                 "live_collector_started": True,
                 "collector_runtime_started": True,
+            },
+        )
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    assert report["contract_status"] == "blocked_forbidden_side_effect_detected"
+    assert report["telegram_raw_updates_written"] is True
+    assert report["history_fetch_attempted"] is False
+
+
+def test_forbidden_tdlib_action_flags_from_fake_smoke_block(tmp_path: Path) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    runner = FakeCollectorSmokeRunner(
+        module.CollectorSmokeResult(
+            updates_observed=1,
+            side_effects={
+                "live_collector_started": True,
+                "collector_runtime_started": True,
                 "tdlib_history_fetch_called": True,
+                "tdlib_send_message_called": True,
             },
         )
     )
@@ -702,6 +1074,7 @@ def test_forbidden_write_or_side_effect_from_fake_smoke_blocks(tmp_path: Path) -
 
     assert report["contract_status"] == "blocked_forbidden_side_effect_detected"
     assert report["side_effects"]["tdlib_history_fetch_called"] is True
+    assert report["side_effects"]["tdlib_send_message_called"] is True
     assert report["history_fetch_attempted"] is True
 
 
@@ -747,6 +1120,7 @@ def test_forbidden_runtime_and_infra_side_effects_remain_false(tmp_path: Path) -
     assert side_effects["tdlib_history_fetch_called"] is False
     assert side_effects["tdlib_public_username_resolve_called"] is False
     assert side_effects["tdlib_search_public_chat_called"] is False
+    assert side_effects["tdlib_send_message_called"] is False
     assert side_effects["redis_mutation_performed"] is False
     assert side_effects["notifier_transport_enabled"] is False
     assert side_effects["outbox_relay_started"] is False

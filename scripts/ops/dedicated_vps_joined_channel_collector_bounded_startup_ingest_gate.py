@@ -85,6 +85,7 @@ SIDE_EFFECT_FLAG_NAMES = (
     "tdlib_history_fetch_called",
     "tdlib_public_username_resolve_called",
     "tdlib_search_public_chat_called",
+    "tdlib_send_message_called",
     "live_collector_started",
     "collector_runtime_started",
     "notifier_transport_enabled",
@@ -119,6 +120,7 @@ TDLIB_FORBIDDEN_REQUEST_FLAGS = {
     "joinChatByInviteLink": "tdlib_join_called",
     "getChatHistory": "tdlib_history_fetch_called",
     "searchPublicChat": "tdlib_public_username_resolve_called",
+    "sendMessage": "tdlib_send_message_called",
 }
 
 SMOKE_ALLOWED_SIDE_EFFECTS = frozenset(
@@ -200,6 +202,8 @@ class CollectorSmokeBounds:
 
 @dataclass(frozen=True, slots=True)
 class CollectorSmokeResult:
+    status: str = "completed"
+    failure_class: str | None = None
     updates_observed: int = 0
     telegram_raw_updates_written: int = 0
     source_messages_written: int = 0
@@ -385,6 +389,8 @@ def _base_report(
         ),
         "collector_ingest_db_write_approved": approved_collector_ingest_db_write,
         "collector_smoke_attempted": False,
+        "collector_smoke_status": "not_attempted",
+        "collector_smoke_failure_class": None,
         "collector_smoke_max_duration_sec": collector_smoke_max_duration_sec,
         "collector_smoke_max_updates": collector_smoke_max_updates,
         "collector_smoke_max_db_writes": collector_smoke_max_db_writes,
@@ -738,6 +744,10 @@ def _safe_text(value: Any, *, default: str | None = None) -> str | None:
     return default
 
 
+def _safe_smoke_status(value: Any) -> str:
+    return _safe_text(value, default="unknown") or "unknown"
+
+
 def _safe_text_list(value: Any) -> list[str]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         return []
@@ -834,6 +844,7 @@ def _tdlib_probe_forbidden_side_effect_detected(report: Mapping[str, Any]) -> bo
             "tdlib_history_fetch_called",
             "tdlib_public_username_resolve_called",
             "tdlib_search_public_chat_called",
+            "tdlib_send_message_called",
         )
     )
 
@@ -972,6 +983,13 @@ def _merge_smoke_result(report: dict[str, Any], result: CollectorSmokeResult) ->
     if any(count > 0 for count in write_counts.values()):
         side_effects["database_mutation_performed"] = True
 
+    report["collector_smoke_status"] = _safe_smoke_status(
+        getattr(result, "status", "completed")
+    )
+    report["collector_smoke_failure_class"] = _safe_text(
+        getattr(result, "failure_class", None),
+        default=None,
+    )
     report["collector_smoke_duration_exhausted"] = result.duration_exhausted
     report["collector_smoke_update_cap_exhausted"] = result.update_cap_exhausted
     report["collector_smoke_db_write_cap_exhausted"] = result.db_write_cap_exhausted
@@ -991,6 +1009,38 @@ def _merge_smoke_result(report: dict[str, Any], result: CollectorSmokeResult) ->
         max(result.event_outbox_written, 0)
     )
     report["collector_smoke_no_updates_observed"] = result.updates_observed <= 0
+
+
+def _smoke_result_is_failure(result: CollectorSmokeResult) -> bool:
+    return getattr(result, "status", "completed") != "completed" or bool(
+        getattr(result, "failure_class", None)
+    )
+
+
+def _blocked_smoke_status(result: CollectorSmokeResult) -> str:
+    if getattr(result, "failure_class", None) == "manual_authorization_required":
+        return "blocked_collector_smoke_manual_authorization_required"
+    return "blocked_collector_smoke_runner_failed"
+
+
+def _partial_smoke_result_from_exception(exc: Exception) -> CollectorSmokeResult | None:
+    result = getattr(exc, "result", None)
+    return result if _looks_like_smoke_result(result) else None
+
+
+def _looks_like_smoke_result(value: Any) -> bool:
+    return all(
+        hasattr(value, field_name)
+        for field_name in (
+            "updates_observed",
+            "telegram_raw_updates_written",
+            "source_messages_written",
+            "source_message_versions_written",
+            "event_outbox_written",
+            "written_tables",
+            "side_effects",
+        )
+    )
 
 
 def _smoke_forbidden_side_effect_detected(
@@ -1023,6 +1073,16 @@ async def _run_smoke_runner(
     bounds: CollectorSmokeBounds,
 ) -> CollectorSmokeResult:
     return await runner.run(runtime_env=runtime_env, bounds=bounds)
+
+
+def _default_collector_smoke_runner_factory(
+    runtime_env: Mapping[str, str],
+) -> CollectorSmokeRunner:
+    from src.services.collector_telegram.bounded_smoke_runner import (  # noqa: PLC0415
+        build_default_bounded_collector_smoke_runner,
+    )
+
+    return build_default_bounded_collector_smoke_runner(runtime_env)
 
 
 def generate_report(
@@ -1181,22 +1241,23 @@ def generate_report(
             return ScriptResult(exit_code=0, report=report)
 
         if approved_live_collector_startup_smoke and approved_collector_ingest_db_write:
-            if collector_smoke_runner_factory is None:
+            assert bounds is not None
+            try:
+                factory = (
+                    collector_smoke_runner_factory
+                    or _default_collector_smoke_runner_factory
+                )
+                runner = factory(values)
+            except Exception:
                 _set_status(
                     report,
                     "blocked_collector_smoke_runner_unavailable",
                     "collector_smoke.runner_unavailable",
                 )
-                report["operator_next_action"] = (
-                    "The gate is ready, but this implementation intentionally has "
-                    "no default live collector smoke runner. Add a reviewed bounded "
-                    "runner before VPS execution."
-                )
                 return ScriptResult(exit_code=1, report=report)
-            assert bounds is not None
+
             report["collector_smoke_attempted"] = True
             try:
-                runner = collector_smoke_runner_factory(values)
                 smoke_result = asyncio.run(
                     _run_smoke_runner(
                         runner,
@@ -1204,15 +1265,50 @@ def generate_report(
                         bounds=bounds,
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                partial_result = _partial_smoke_result_from_exception(exc)
+                if partial_result is not None:
+                    _merge_smoke_result(report, partial_result)
+                    if _smoke_forbidden_side_effect_detected(
+                        report,
+                        partial_result,
+                        bounds,
+                    ):
+                        _set_status(
+                            report,
+                            "blocked_forbidden_side_effect_detected",
+                            "collector_smoke.forbidden_side_effect",
+                        )
+                    else:
+                        _set_status(
+                            report,
+                            _blocked_smoke_status(partial_result),
+                            "collector_smoke.runner_failed",
+                        )
+                    report["operator_next_action"] = (
+                        "The bounded smoke failed after partial startup. Review "
+                        "side-effect flags and write buckets before any retry."
+                    )
+                    return ScriptResult(exit_code=1, report=report)
                 _set_status(
                     report,
-                    "blocked_collector_smoke_runner_unavailable",
+                    "blocked_collector_smoke_runner_failed",
                     "collector_smoke.runner_failed",
                 )
                 return ScriptResult(exit_code=1, report=report)
 
             _merge_smoke_result(report, smoke_result)
+            if _smoke_result_is_failure(smoke_result):
+                _set_status(
+                    report,
+                    _blocked_smoke_status(smoke_result),
+                    "collector_smoke.runner_failed",
+                )
+                report["operator_next_action"] = (
+                    "The bounded smoke returned a fail-closed result. Review "
+                    "side-effect flags and write buckets before any retry."
+                )
+                return ScriptResult(exit_code=1, report=report)
             if _smoke_forbidden_side_effect_detected(report, smoke_result, bounds):
                 _set_status(
                     report,
