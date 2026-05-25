@@ -25,6 +25,17 @@ TDLIB_READY_STATE = "authorizationStateReady"
 MAX_COLLECTOR_SMOKE_DURATION_SEC = 120
 MAX_COLLECTOR_SMOKE_UPDATES = 100
 MAX_COLLECTOR_SMOKE_DB_WRITES = 100
+SAFE_TDLIB_UPDATE_TYPE_RE = re.compile(r"update[A-Z][A-Za-z0-9]{0,80}\Z")
+
+MESSAGE_BEARING_UPDATE_TYPES = frozenset(
+    {
+        "updateNewMessage",
+        "updateMessageContent",
+        "updateMessageEdited",
+        "updateDeleteMessages",
+    }
+)
+RECONCILE_SIGNAL_UPDATE_TYPES = frozenset({"updateChatLastMessage"})
 
 REQUIRED_TABLES = (
     "telegram_channel_registry",
@@ -205,10 +216,17 @@ class CollectorSmokeResult:
     status: str = "completed"
     failure_class: str | None = None
     updates_observed: int = 0
+    update_types_seen: tuple[tuple[str, int], ...] = ()
+    message_bearing_updates_observed: int = 0
+    control_updates_observed: int = 0
+    reconcile_signal_updates_observed: int = 0
     telegram_raw_updates_written: int = 0
     source_messages_written: int = 0
     source_message_versions_written: int = 0
     event_outbox_written: int = 0
+    canonical_ingest_writes_observed: bool = False
+    raw_only_writes_observed: bool = False
+    message_ingest_not_proven: bool = False
     duration_exhausted: bool = False
     update_cap_exhausted: bool = False
     db_write_cap_exhausted: bool = False
@@ -398,10 +416,18 @@ def _base_report(
         "collector_smoke_update_cap_exhausted": False,
         "collector_smoke_db_write_cap_exhausted": False,
         "collector_smoke_updates_observed_bucket": "unknown",
+        "collector_smoke_update_types_seen": {},
+        "collector_smoke_message_bearing_updates_observed": False,
+        "collector_smoke_message_bearing_updates_observed_bucket": "zero",
+        "collector_smoke_control_updates_observed_bucket": "zero",
+        "collector_smoke_reconcile_signal_updates_observed_bucket": "zero",
         "collector_smoke_raw_updates_written_bucket": "zero",
         "collector_smoke_source_messages_written_bucket": "zero",
         "collector_smoke_source_message_versions_written_bucket": "zero",
         "collector_smoke_event_outbox_written_bucket": "zero",
+        "collector_smoke_canonical_ingest_writes_observed": False,
+        "collector_smoke_raw_only_writes_observed": False,
+        "collector_smoke_message_ingest_not_proven": False,
         "collector_smoke_no_updates_observed": False,
         "live_collector_started": False,
         "collector_runtime_started": False,
@@ -748,6 +774,12 @@ def _safe_smoke_status(value: Any) -> str:
     return _safe_text(value, default="unknown") or "unknown"
 
 
+def _safe_update_type(value: Any) -> str | None:
+    if isinstance(value, str) and SAFE_TDLIB_UPDATE_TYPE_RE.fullmatch(value):
+        return value
+    return None
+
+
 def _safe_text_list(value: Any) -> list[str]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         return []
@@ -757,6 +789,65 @@ def _safe_text_list(value: Any) -> list[str]:
         if safe_item is not None and safe_item not in safe_values:
             safe_values.append(safe_item)
     return safe_values
+
+
+def _safe_non_negative_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _classify_update_type(update_type: str) -> str:
+    if update_type in MESSAGE_BEARING_UPDATE_TYPES:
+        return "message_bearing"
+    if update_type in RECONCILE_SIGNAL_UPDATE_TYPES:
+        return "reconcile_signal"
+    return "control_or_state"
+
+
+def _safe_update_type_counts(value: Any) -> dict[str, int]:
+    if isinstance(value, Mapping):
+        items = value.items()
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        items = []
+        for item in value:
+            if (
+                isinstance(item, Sequence)
+                and not isinstance(item, (str, bytes, bytearray))
+                and len(item) == 2
+            ):
+                items.append((item[0], item[1]))
+    else:
+        items = []
+
+    counts: dict[str, int] = {}
+    for update_type_value, count_value in items:
+        update_type = _safe_update_type(update_type_value)
+        if update_type is None:
+            continue
+        count = _safe_non_negative_int(count_value)
+        if count <= 0:
+            continue
+        counts[update_type] = counts.get(update_type, 0) + count
+    return dict(sorted(counts.items()))
+
+
+def _bucket_update_type_counts(counts: Mapping[str, int]) -> dict[str, str]:
+    return {update_type: _bucket_count(count) for update_type, count in counts.items()}
+
+
+def _class_count_from_types(
+    counts: Mapping[str, int],
+    update_class: str,
+) -> int:
+    return sum(
+        count
+        for update_type, count in counts.items()
+        if _classify_update_type(update_type) == update_class
+    )
 
 
 def _merge_tdlib_probe_fields(
@@ -971,17 +1062,54 @@ def _merge_smoke_result(report: dict[str, Any], result: CollectorSmokeResult) ->
         if flag in side_effects:
             side_effects[flag] = bool(value)
 
+    update_type_counts = _safe_update_type_counts(
+        getattr(result, "update_types_seen", ())
+    )
+    message_bearing_updates_observed = _safe_non_negative_int(
+        getattr(result, "message_bearing_updates_observed", 0)
+    ) or _class_count_from_types(update_type_counts, "message_bearing")
+    control_updates_observed = _safe_non_negative_int(
+        getattr(result, "control_updates_observed", 0)
+    ) or _class_count_from_types(update_type_counts, "control_or_state")
+    reconcile_signal_updates_observed = _safe_non_negative_int(
+        getattr(result, "reconcile_signal_updates_observed", 0)
+    ) or _class_count_from_types(update_type_counts, "reconcile_signal")
+
     write_counts = {
-        "telegram_raw_updates_written": result.telegram_raw_updates_written,
-        "source_messages_written": result.source_messages_written,
-        "source_message_versions_written": result.source_message_versions_written,
-        "event_outbox_written": result.event_outbox_written,
+        "telegram_raw_updates_written": _safe_non_negative_int(
+            result.telegram_raw_updates_written
+        ),
+        "source_messages_written": _safe_non_negative_int(
+            result.source_messages_written
+        ),
+        "source_message_versions_written": _safe_non_negative_int(
+            result.source_message_versions_written
+        ),
+        "event_outbox_written": _safe_non_negative_int(result.event_outbox_written),
     }
     for flag, count in write_counts.items():
         if count > 0:
             side_effects[flag] = True
     if any(count > 0 for count in write_counts.values()):
         side_effects["database_mutation_performed"] = True
+
+    canonical_ingest_writes_observed = any(
+        count > 0
+        for key, count in write_counts.items()
+        if key
+        in {
+            "source_messages_written",
+            "source_message_versions_written",
+            "event_outbox_written",
+        }
+    )
+    raw_only_writes_observed = (
+        write_counts["telegram_raw_updates_written"] > 0
+        and not canonical_ingest_writes_observed
+    )
+    message_ingest_proven = (
+        canonical_ingest_writes_observed and message_bearing_updates_observed > 0
+    )
 
     report["collector_smoke_status"] = _safe_smoke_status(
         getattr(result, "status", "completed")
@@ -994,21 +1122,43 @@ def _merge_smoke_result(report: dict[str, Any], result: CollectorSmokeResult) ->
     report["collector_smoke_update_cap_exhausted"] = result.update_cap_exhausted
     report["collector_smoke_db_write_cap_exhausted"] = result.db_write_cap_exhausted
     report["collector_smoke_updates_observed_bucket"] = _bucket_count(
-        max(result.updates_observed, 0)
+        _safe_non_negative_int(result.updates_observed)
+    )
+    report["collector_smoke_update_types_seen"] = _bucket_update_type_counts(
+        update_type_counts
+    )
+    report["collector_smoke_message_bearing_updates_observed"] = (
+        message_bearing_updates_observed > 0
+    )
+    report["collector_smoke_message_bearing_updates_observed_bucket"] = (
+        _bucket_count(message_bearing_updates_observed)
+    )
+    report["collector_smoke_control_updates_observed_bucket"] = _bucket_count(
+        control_updates_observed
+    )
+    report["collector_smoke_reconcile_signal_updates_observed_bucket"] = (
+        _bucket_count(reconcile_signal_updates_observed)
     )
     report["collector_smoke_raw_updates_written_bucket"] = _bucket_count(
-        max(result.telegram_raw_updates_written, 0)
+        write_counts["telegram_raw_updates_written"]
     )
     report["collector_smoke_source_messages_written_bucket"] = _bucket_count(
-        max(result.source_messages_written, 0)
+        write_counts["source_messages_written"]
     )
     report["collector_smoke_source_message_versions_written_bucket"] = _bucket_count(
-        max(result.source_message_versions_written, 0)
+        write_counts["source_message_versions_written"]
     )
     report["collector_smoke_event_outbox_written_bucket"] = _bucket_count(
-        max(result.event_outbox_written, 0)
+        write_counts["event_outbox_written"]
     )
-    report["collector_smoke_no_updates_observed"] = result.updates_observed <= 0
+    report["collector_smoke_canonical_ingest_writes_observed"] = (
+        canonical_ingest_writes_observed
+    )
+    report["collector_smoke_raw_only_writes_observed"] = raw_only_writes_observed
+    report["collector_smoke_message_ingest_not_proven"] = not message_ingest_proven
+    report["collector_smoke_no_updates_observed"] = (
+        _safe_non_negative_int(result.updates_observed) <= 0
+    )
 
 
 def _smoke_result_is_failure(result: CollectorSmokeResult) -> bool:
@@ -1021,6 +1171,12 @@ def _blocked_smoke_status(result: CollectorSmokeResult) -> str:
     if getattr(result, "failure_class", None) == "manual_authorization_required":
         return "blocked_collector_smoke_manual_authorization_required"
     return "blocked_collector_smoke_runner_failed"
+
+
+def _smoke_inconsistent_observation(report: Mapping[str, Any]) -> bool:
+    return bool(report.get("collector_smoke_canonical_ingest_writes_observed")) and not bool(
+        report.get("collector_smoke_message_bearing_updates_observed")
+    )
 
 
 def _partial_smoke_result_from_exception(exc: Exception) -> CollectorSmokeResult | None:
@@ -1320,6 +1476,18 @@ def generate_report(
                     "outside collector-owned ingest tables. Treat the run as blocked."
                 )
                 return ScriptResult(exit_code=1, report=report)
+            if _smoke_inconsistent_observation(report):
+                _set_status(
+                    report,
+                    "blocked_collector_smoke_inconsistent_observation",
+                    "collector_smoke.inconsistent_observation",
+                )
+                report["operator_next_action"] = (
+                    "The bounded smoke reported canonical source/version/outbox "
+                    "writes without any sanitized message-bearing update type. Treat "
+                    "the observation as inconsistent before any wider startup."
+                )
+                return ScriptResult(exit_code=1, report=report)
 
             if smoke_result.updates_observed <= 0:
                 _set_status(
@@ -1332,18 +1500,27 @@ def generate_report(
                     "flags before any wider startup."
                 )
             elif (
-                smoke_result.telegram_raw_updates_written
-                or smoke_result.source_messages_written
-                or smoke_result.source_message_versions_written
-                or smoke_result.event_outbox_written
+                report["collector_smoke_canonical_ingest_writes_observed"]
+                and report["collector_smoke_message_bearing_updates_observed"]
             ):
                 _set_status(
                     report,
-                    "joined_channel_collector_bounded_startup_writes_observed",
+                    "joined_channel_collector_bounded_startup_message_ingest_writes_observed",
                 )
                 report["operator_next_action"] = (
-                    "The bounded smoke observed collector-owned ingest writes only. "
-                    "Review coarse buckets before any wider collector startup."
+                    "The bounded smoke observed canonical source/version/outbox "
+                    "ingest writes under caps. Review sanitized update-type and "
+                    "write buckets before any wider collector startup."
+                )
+            elif report["collector_smoke_raw_only_writes_observed"]:
+                _set_status(
+                    report,
+                    "joined_channel_collector_bounded_startup_raw_update_writes_observed",
+                )
+                report["operator_next_action"] = (
+                    "The bounded smoke observed raw update journal writes under "
+                    "caps, but no canonical source/version/outbox ingest writes. "
+                    "Canonical message ingest is not proven by this run."
                 )
             else:
                 _set_status(

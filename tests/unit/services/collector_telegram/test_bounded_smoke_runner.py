@@ -18,6 +18,7 @@ from services.collector_telegram.bounded_smoke_runner import (
     BoundedSmokeRunnerConfigError,
     CollectorSmokeWriteCounter,
     build_default_bounded_collector_smoke_runner,
+    classify_tdlib_update_type,
 )
 from services.collector_telegram.config import CollectorTelegramConfig
 from services.collector_telegram.models import CollectorEnvironment, CollectorMode
@@ -118,6 +119,16 @@ class RawUpdateThenRaiseDispatcher(FakeDispatcher):
         raise RuntimeError("dispatcher failed after one collector-owned write")
 
 
+class MessageWriteThenRaiseDispatcher(FakeDispatcher):
+    async def dispatch(self, update: dict[str, Any]) -> None:
+        self.dispatched.append(update)
+        self.counter.count_table("telegram_raw_updates")
+        self.counter.count_table("source_messages")
+        self.counter.count_table("source_message_versions")
+        self.counter.count_table("event_outbox")
+        raise RuntimeError("dispatcher failed after canonical collector writes")
+
+
 class FakeDispatcherContext:
     def __init__(self, dispatcher: FakeDispatcher) -> None:
         self.dispatcher = dispatcher
@@ -174,6 +185,14 @@ def _new_message(message_id: int) -> dict[str, Any]:
     }
 
 
+def _control_update(update_type: str) -> dict[str, Any]:
+    return {"@type": update_type, "safe_value": "unit"}
+
+
+def _reconcile_update() -> dict[str, Any]:
+    return {"@type": "updateChatLastMessage", "last_message": None}
+
+
 def _runner(
     tmp_path: Path,
     payloads: list[dict[str, Any] | None],
@@ -209,13 +228,48 @@ def _runner(
 
 
 class BoundedSmokeRunnerTests(unittest.IsolatedAsyncioTestCase):
+    def test_update_type_classifier_groups_message_bearing_updates(self) -> None:
+        for update_type in (
+            "updateNewMessage",
+            "updateMessageContent",
+            "updateMessageEdited",
+            "updateDeleteMessages",
+        ):
+            self.assertEqual(
+                classify_tdlib_update_type(update_type),
+                "message_bearing",
+            )
+
+    def test_update_type_classifier_groups_control_and_reconcile_updates(self) -> None:
+        for update_type in (
+            "updateOption",
+            "updateDefaultReactionType",
+            "updateTrustedMiniAppBots",
+            "updateSomeFutureState",
+        ):
+            self.assertEqual(
+                classify_tdlib_update_type(update_type),
+                "control_or_state",
+            )
+        self.assertEqual(
+            classify_tdlib_update_type("updateChatLastMessage"),
+            "reconcile_signal",
+        )
+
     async def test_no_updates_reports_no_writes_and_releases_singleton(self) -> None:
         runner, client, guard, dispatchers, contexts = _runner(self._tmp(), [None])
 
         result = await runner.run(runtime_env={}, bounds=Bounds())
 
         self.assertEqual(result.updates_observed, 0)
+        self.assertEqual(result.update_types_seen, ())
+        self.assertEqual(result.message_bearing_updates_observed, 0)
+        self.assertEqual(result.control_updates_observed, 0)
+        self.assertEqual(result.reconcile_signal_updates_observed, 0)
         self.assertEqual(result.telegram_raw_updates_written, 0)
+        self.assertFalse(result.canonical_ingest_writes_observed)
+        self.assertFalse(result.raw_only_writes_observed)
+        self.assertTrue(result.message_ingest_not_proven)
         self.assertEqual(result.written_tables, ())
         self.assertTrue(result.side_effects["tdlib_initialized"])
         self.assertTrue(result.side_effects["tdlib_receive_called"])
@@ -243,6 +297,8 @@ class BoundedSmokeRunnerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result.updates_observed, 2)
+        self.assertEqual(result.update_types_seen, (("updateNewMessage", 2),))
+        self.assertEqual(result.message_bearing_updates_observed, 2)
         self.assertTrue(result.update_cap_exhausted)
         self.assertEqual(len(dispatchers[0].dispatched), 2)
 
@@ -263,6 +319,9 @@ class BoundedSmokeRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.source_messages_written, 1)
         self.assertEqual(result.source_message_versions_written, 1)
         self.assertEqual(result.event_outbox_written, 1)
+        self.assertTrue(result.canonical_ingest_writes_observed)
+        self.assertFalse(result.raw_only_writes_observed)
+        self.assertFalse(result.message_ingest_not_proven)
         self.assertEqual(len(dispatchers[0].dispatched), 1)
 
     async def test_duration_cap_can_stop_before_receive(self) -> None:
@@ -281,6 +340,93 @@ class BoundedSmokeRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.duration_exhausted)
         self.assertEqual(result.updates_observed, 0)
         self.assertEqual(client.receive_timeouts, [])
+
+    async def test_control_only_updates_report_raw_only_observation(self) -> None:
+        runner, _client, _guard, _dispatchers, _contexts = _runner(
+            self._tmp(),
+            [
+                _control_update("updateOption"),
+                _control_update("updateDefaultReactionType"),
+                _control_update("updateTrustedMiniAppBots"),
+                None,
+            ],
+        )
+
+        result = await runner.run(runtime_env={}, bounds=Bounds())
+
+        self.assertEqual(result.updates_observed, 3)
+        self.assertEqual(
+            result.update_types_seen,
+            (
+                ("updateDefaultReactionType", 1),
+                ("updateOption", 1),
+                ("updateTrustedMiniAppBots", 1),
+            ),
+        )
+        self.assertEqual(result.control_updates_observed, 3)
+        self.assertEqual(result.message_bearing_updates_observed, 0)
+        self.assertEqual(result.reconcile_signal_updates_observed, 0)
+        self.assertEqual(result.telegram_raw_updates_written, 3)
+        self.assertFalse(result.canonical_ingest_writes_observed)
+        self.assertTrue(result.raw_only_writes_observed)
+        self.assertTrue(result.message_ingest_not_proven)
+
+    async def test_reconcile_signal_does_not_prove_canonical_ingest(self) -> None:
+        runner, _client, _guard, _dispatchers, _contexts = _runner(
+            self._tmp(),
+            [_reconcile_update(), None],
+        )
+
+        result = await runner.run(runtime_env={}, bounds=Bounds())
+
+        self.assertEqual(result.updates_observed, 1)
+        self.assertEqual(result.update_types_seen, (("updateChatLastMessage", 1),))
+        self.assertEqual(result.reconcile_signal_updates_observed, 1)
+        self.assertEqual(result.telegram_raw_updates_written, 1)
+        self.assertFalse(result.canonical_ingest_writes_observed)
+        self.assertTrue(result.raw_only_writes_observed)
+        self.assertTrue(result.message_ingest_not_proven)
+
+    async def test_update_type_sanitizer_drops_unsafe_update_identifiers(
+        self,
+    ) -> None:
+        unsafe_update_types = (
+            "updateNewMessage:987654321",
+            "updateNewMessage-sensitive_username",
+            "updateNewMessage.suffix",
+            "updateNewMessage/anything",
+        )
+        for update_type in unsafe_update_types:
+            with self.subTest(update_type=update_type):
+                runner, _client, _guard, dispatchers, _contexts = _runner(
+                    self._tmp(),
+                    [
+                        {
+                            "@type": update_type,
+                            "message": {"chat_id": 987654321, "id": 123},
+                        },
+                        None,
+                    ],
+                )
+
+                result = await runner.run(runtime_env={}, bounds=Bounds())
+
+                self.assertEqual(result.updates_observed, 0)
+                self.assertEqual(result.update_types_seen, ())
+                self.assertEqual(result.telegram_raw_updates_written, 0)
+                self.assertEqual(dispatchers[0].dispatched, [])
+
+    async def test_update_type_sanitizer_accepts_tdlib_update_identifier(self) -> None:
+        runner, _client, _guard, dispatchers, _contexts = _runner(
+            self._tmp(),
+            [_new_message(123), None],
+        )
+
+        result = await runner.run(runtime_env={}, bounds=Bounds())
+
+        self.assertEqual(result.update_types_seen, (("updateNewMessage", 1),))
+        self.assertEqual(result.message_bearing_updates_observed, 1)
+        self.assertEqual(len(dispatchers[0].dispatched), 1)
 
     async def test_authorization_bootstrap_sends_only_allowed_requests(self) -> None:
         runner, client, _guard, dispatchers, _contexts = _runner(
@@ -401,7 +547,11 @@ class BoundedSmokeRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.failure_class, "RuntimeError")
         self.assertEqual(result.updates_observed, 1)
+        self.assertEqual(result.update_types_seen, (("updateNewMessage", 1),))
+        self.assertEqual(result.message_bearing_updates_observed, 1)
         self.assertEqual(result.telegram_raw_updates_written, 1)
+        self.assertTrue(result.raw_only_writes_observed)
+        self.assertTrue(result.message_ingest_not_proven)
         self.assertEqual(result.written_tables, ("telegram_raw_updates",))
         self.assertTrue(result.side_effects["database_mutation_performed"])
         self.assertTrue(result.side_effects["telegram_raw_updates_written"])
@@ -410,6 +560,64 @@ class BoundedSmokeRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.closed)
         self.assertEqual(guard.release_count, 1)
         self.assertTrue(contexts[0].exited)
+
+    async def test_partial_failure_after_control_update_preserves_summary(self) -> None:
+        tmp_path = self._tmp()
+        client = FakeTDLibClient([_control_update("updateOption")])
+        guard = FakeSingletonGuard()
+
+        def dispatcher_factory(counter: CollectorSmokeWriteCounter) -> FakeDispatcherContext:
+            return FakeDispatcherContext(RawUpdateThenRaiseDispatcher(counter))
+
+        runner = BoundedCollectorSmokeRunner(
+            config=_config(tmp_path),
+            tdlib_client=client,
+            singleton_guard=guard,
+            dispatcher_factory=dispatcher_factory,
+            monotonic=lambda: 0.0,
+        )
+
+        with self.assertRaises(BoundedCollectorSmokePartialFailure) as raised:
+            await runner.run(runtime_env={}, bounds=Bounds())
+
+        result = raised.exception.result
+        self.assertEqual(result.update_types_seen, (("updateOption", 1),))
+        self.assertEqual(result.control_updates_observed, 1)
+        self.assertEqual(result.message_bearing_updates_observed, 0)
+        self.assertEqual(result.telegram_raw_updates_written, 1)
+        self.assertFalse(result.canonical_ingest_writes_observed)
+        self.assertTrue(result.raw_only_writes_observed)
+        self.assertTrue(result.message_ingest_not_proven)
+
+    async def test_partial_failure_after_message_write_preserves_summary(self) -> None:
+        tmp_path = self._tmp()
+        client = FakeTDLibClient([_new_message(1)])
+        guard = FakeSingletonGuard()
+
+        def dispatcher_factory(counter: CollectorSmokeWriteCounter) -> FakeDispatcherContext:
+            return FakeDispatcherContext(MessageWriteThenRaiseDispatcher(counter))
+
+        runner = BoundedCollectorSmokeRunner(
+            config=_config(tmp_path),
+            tdlib_client=client,
+            singleton_guard=guard,
+            dispatcher_factory=dispatcher_factory,
+            monotonic=lambda: 0.0,
+        )
+
+        with self.assertRaises(BoundedCollectorSmokePartialFailure) as raised:
+            await runner.run(runtime_env={}, bounds=Bounds())
+
+        result = raised.exception.result
+        self.assertEqual(result.update_types_seen, (("updateNewMessage", 1),))
+        self.assertEqual(result.message_bearing_updates_observed, 1)
+        self.assertEqual(result.telegram_raw_updates_written, 1)
+        self.assertEqual(result.source_messages_written, 1)
+        self.assertEqual(result.source_message_versions_written, 1)
+        self.assertEqual(result.event_outbox_written, 1)
+        self.assertTrue(result.canonical_ingest_writes_observed)
+        self.assertFalse(result.raw_only_writes_observed)
+        self.assertFalse(result.message_ingest_not_proven)
 
     async def test_receive_failure_carries_tdlib_and_telegram_side_effects(self) -> None:
         client = FakeTDLibClient([], receive_error=RuntimeError("receive failed"))

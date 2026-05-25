@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -25,12 +26,30 @@ MAX_SMOKE_DURATION_SEC = 120
 MAX_SMOKE_UPDATES = 100
 MAX_SMOKE_DB_WRITES = 100
 DEFAULT_RECEIVE_TIMEOUT_SEC = 1.0
+SAFE_TDLIB_UPDATE_TYPE_RE = re.compile(r"update[A-Z][A-Za-z0-9]{0,80}\Z")
 
 COLLECTOR_OWNED_WRITE_TABLES = (
     "telegram_raw_updates",
     "source_messages",
     "source_message_versions",
     "event_outbox",
+)
+
+MESSAGE_BEARING_UPDATE_TYPES = frozenset(
+    {
+        "updateNewMessage",
+        "updateMessageContent",
+        "updateMessageEdited",
+        "updateDeleteMessages",
+    }
+)
+RECONCILE_SIGNAL_UPDATE_TYPES = frozenset({"updateChatLastMessage"})
+CONTROL_OR_STATE_UPDATE_TYPES = frozenset(
+    {
+        "updateOption",
+        "updateDefaultReactionType",
+        "updateTrustedMiniAppBots",
+    }
 )
 
 _FORBIDDEN_TDLIB_REQUEST_FLAGS = {
@@ -134,15 +153,44 @@ class CollectorSmokeWriteCounter:
         self.written_tables.add(table_name)
 
 
+@dataclass(slots=True)
+class CollectorSmokeUpdateTypeCounter:
+    update_types_seen: dict[str, int] = field(default_factory=dict)
+    message_bearing_updates_observed: int = 0
+    control_updates_observed: int = 0
+    reconcile_signal_updates_observed: int = 0
+
+    def observe(self, update_type: str) -> None:
+        self.update_types_seen[update_type] = self.update_types_seen.get(update_type, 0) + 1
+        update_class = classify_tdlib_update_type(update_type)
+        if update_class == "message_bearing":
+            self.message_bearing_updates_observed += 1
+        elif update_class == "reconcile_signal":
+            self.reconcile_signal_updates_observed += 1
+        else:
+            self.control_updates_observed += 1
+
+    @property
+    def safe_update_types_seen(self) -> tuple[tuple[str, int], ...]:
+        return tuple(sorted(self.update_types_seen.items()))
+
+
 @dataclass(frozen=True, slots=True)
 class BoundedCollectorSmokeResult:
     status: str = "completed"
     failure_class: str | None = None
     updates_observed: int = 0
+    update_types_seen: tuple[tuple[str, int], ...] = ()
+    message_bearing_updates_observed: int = 0
+    control_updates_observed: int = 0
+    reconcile_signal_updates_observed: int = 0
     telegram_raw_updates_written: int = 0
     source_messages_written: int = 0
     source_message_versions_written: int = 0
     event_outbox_written: int = 0
+    canonical_ingest_writes_observed: bool = False
+    raw_only_writes_observed: bool = False
+    message_ingest_not_proven: bool = False
     duration_exhausted: bool = False
     update_cap_exhausted: bool = False
     db_write_cap_exhausted: bool = False
@@ -337,6 +385,7 @@ class BoundedCollectorSmokeRunner:
         self._config.ensure_runtime_dirs()
 
         counter = CollectorSmokeWriteCounter()
+        update_type_counter = CollectorSmokeUpdateTypeCounter()
         side_effects = _runner_side_effects()
         updates_observed = 0
         duration_exhausted = False
@@ -382,11 +431,12 @@ class BoundedCollectorSmokeRunner:
                     if await self._handle_authorization_update(payload, side_effects):
                         continue
 
-                    update_type = _payload_type(payload)
-                    if update_type is None or not update_type.startswith("update"):
+                    update_type = _safe_tdlib_update_type(_payload_type(payload))
+                    if update_type is None:
                         continue
 
                     updates_observed += 1
+                    update_type_counter.observe(update_type)
                     estimated_writes = _estimate_reported_writes(payload)
                     if counter.total + estimated_writes > bounds.max_db_writes:
                         db_write_cap_exhausted = True
@@ -404,6 +454,7 @@ class BoundedCollectorSmokeRunner:
             raise BoundedCollectorSmokePartialFailure(
                 _build_result(
                     counter=counter,
+                    update_type_counter=update_type_counter,
                     side_effects=side_effects,
                     updates_observed=updates_observed,
                     duration_exhausted=duration_exhausted,
@@ -417,6 +468,7 @@ class BoundedCollectorSmokeRunner:
             raise BoundedCollectorSmokePartialFailure(
                 _build_result(
                     counter=counter,
+                    update_type_counter=update_type_counter,
                     side_effects=side_effects,
                     updates_observed=updates_observed,
                     duration_exhausted=duration_exhausted,
@@ -435,6 +487,7 @@ class BoundedCollectorSmokeRunner:
 
         return _build_result(
             counter=counter,
+            update_type_counter=update_type_counter,
             side_effects=side_effects,
             updates_observed=updates_observed,
             duration_exhausted=duration_exhausted,
@@ -580,6 +633,7 @@ def _runner_side_effects() -> dict[str, bool]:
 def _build_result(
     *,
     counter: CollectorSmokeWriteCounter,
+    update_type_counter: CollectorSmokeUpdateTypeCounter,
     side_effects: dict[str, bool],
     updates_observed: int,
     duration_exhausted: bool,
@@ -595,14 +649,40 @@ def _build_result(
         if side_effect_key in side_effects:
             side_effects[side_effect_key] = True
 
+    canonical_ingest_writes_observed = (
+        counter.source_messages_written > 0
+        or counter.source_message_versions_written > 0
+        or counter.event_outbox_written > 0
+    )
+    raw_only_writes_observed = (
+        counter.telegram_raw_updates_written > 0
+        and not canonical_ingest_writes_observed
+    )
+
+    message_ingest_proven = (
+        canonical_ingest_writes_observed
+        and update_type_counter.message_bearing_updates_observed > 0
+    )
+
     return BoundedCollectorSmokeResult(
         status=status,
         failure_class=failure_class,
         updates_observed=updates_observed,
+        update_types_seen=update_type_counter.safe_update_types_seen,
+        message_bearing_updates_observed=(
+            update_type_counter.message_bearing_updates_observed
+        ),
+        control_updates_observed=update_type_counter.control_updates_observed,
+        reconcile_signal_updates_observed=(
+            update_type_counter.reconcile_signal_updates_observed
+        ),
         telegram_raw_updates_written=counter.telegram_raw_updates_written,
         source_messages_written=counter.source_messages_written,
         source_message_versions_written=counter.source_message_versions_written,
         event_outbox_written=counter.event_outbox_written,
+        canonical_ingest_writes_observed=canonical_ingest_writes_observed,
+        raw_only_writes_observed=raw_only_writes_observed,
+        message_ingest_not_proven=not message_ingest_proven,
         duration_exhausted=duration_exhausted,
         update_cap_exhausted=update_cap_exhausted,
         db_write_cap_exhausted=db_write_cap_exhausted,
@@ -628,6 +708,20 @@ def _payload_type(payload: Mapping[str, Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _safe_tdlib_update_type(value: str | None) -> str | None:
+    if isinstance(value, str) and SAFE_TDLIB_UPDATE_TYPE_RE.fullmatch(value):
+        return value
+    return None
+
+
+def classify_tdlib_update_type(update_type: str) -> str:
+    if update_type in MESSAGE_BEARING_UPDATE_TYPES:
+        return "message_bearing"
+    if update_type in RECONCILE_SIGNAL_UPDATE_TYPES:
+        return "reconcile_signal"
+    return "control_or_state"
+
+
 def _unwrap_request_payload(request: Any) -> JsonDict:
     if isinstance(request, dict):
         return request
@@ -638,7 +732,7 @@ def _unwrap_request_payload(request: Any) -> JsonDict:
 
 
 def _estimate_reported_writes(update: Mapping[str, Any]) -> int:
-    update_type = _payload_type(update)
+    update_type = _safe_tdlib_update_type(_payload_type(update))
     if update_type == "updateNewMessage":
         return 4
     if update_type == "updateMessageContent":

@@ -331,6 +331,54 @@ def _run_report(
     return result.report, fake_db, probe, smoke_runner
 
 
+def _canonical_write_smoke_result(
+    module: Any,
+    *,
+    updates_observed: int = 1,
+    update_types_seen: tuple[tuple[str, int], ...] = (),
+    message_bearing_updates_observed: int = 0,
+    control_updates_observed: int = 0,
+    reconcile_signal_updates_observed: int = 0,
+) -> Any:
+    return module.CollectorSmokeResult(
+        updates_observed=updates_observed,
+        update_types_seen=update_types_seen,
+        message_bearing_updates_observed=message_bearing_updates_observed,
+        control_updates_observed=control_updates_observed,
+        reconcile_signal_updates_observed=reconcile_signal_updates_observed,
+        telegram_raw_updates_written=1,
+        source_messages_written=1,
+        source_message_versions_written=1,
+        event_outbox_written=1,
+        written_tables=(
+            "telegram_raw_updates",
+            "source_messages",
+            "source_message_versions",
+            "event_outbox",
+        ),
+        side_effects={
+            "live_collector_started": True,
+            "collector_runtime_started": True,
+            "tdlib_initialized": True,
+            "tdlib_receive_called": True,
+            "telegram_api_called": True,
+        },
+    )
+
+
+def _assert_inconsistent_observation_blocked(report: dict[str, Any]) -> None:
+    assert report["contract_status"] == (
+        "blocked_collector_smoke_inconsistent_observation"
+    )
+    assert "collector_smoke.inconsistent_observation" in report["checks_failed"]
+    assert report["contract_status"] != (
+        "joined_channel_collector_bounded_startup_message_ingest_writes_observed"
+    )
+    assert report["collector_smoke_canonical_ingest_writes_observed"] is True
+    assert report["collector_smoke_message_bearing_updates_observed"] is False
+    assert report["collector_smoke_message_ingest_not_proven"] is True
+
+
 def test_default_dry_run_confirms_joined_rows_and_readiness_without_side_effects(
     tmp_path: Path,
 ) -> None:
@@ -804,6 +852,8 @@ def test_fully_approved_fake_smoke_with_writes_reports_collector_owned_buckets(
     runner = FakeCollectorSmokeRunner(
         module.CollectorSmokeResult(
             updates_observed=3,
+            update_types_seen=(("updateNewMessage", 3),),
+            message_bearing_updates_observed=3,
             telegram_raw_updates_written=3,
             source_messages_written=2,
             source_message_versions_written=2,
@@ -836,9 +886,21 @@ def test_fully_approved_fake_smoke_with_writes_reports_collector_owned_buckets(
     )
 
     assert report["contract_status"] == (
-        "joined_channel_collector_bounded_startup_writes_observed"
+        "joined_channel_collector_bounded_startup_message_ingest_writes_observed"
     )
     assert report["collector_smoke_updates_observed_bucket"] == "two_to_five"
+    assert report["collector_smoke_update_types_seen"] == {
+        "updateNewMessage": "two_to_five"
+    }
+    assert report["collector_smoke_message_bearing_updates_observed"] is True
+    assert (
+        report["collector_smoke_message_bearing_updates_observed_bucket"]
+        == "two_to_five"
+    )
+    assert report["collector_smoke_control_updates_observed_bucket"] == "zero"
+    assert (
+        report["collector_smoke_reconcile_signal_updates_observed_bucket"] == "zero"
+    )
     assert report["collector_smoke_raw_updates_written_bucket"] == "two_to_five"
     assert report["collector_smoke_source_messages_written_bucket"] == "two_to_five"
     assert (
@@ -851,6 +913,258 @@ def test_fully_approved_fake_smoke_with_writes_reports_collector_owned_buckets(
     assert report["source_messages_written"] is True
     assert report["source_message_versions_written"] is True
     assert report["event_outbox_written"] is True
+    assert report["collector_smoke_canonical_ingest_writes_observed"] is True
+    assert report["collector_smoke_raw_only_writes_observed"] is False
+    assert report["collector_smoke_message_ingest_not_proven"] is False
+
+
+def test_control_update_with_canonical_writes_blocks_inconsistent_observation(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    runner = FakeCollectorSmokeRunner(
+        _canonical_write_smoke_result(
+            module,
+            update_types_seen=(("updateOption", 1),),
+            control_updates_observed=1,
+        )
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    _assert_inconsistent_observation_blocked(report)
+    assert report["collector_smoke_update_types_seen"] == {"updateOption": "one"}
+
+
+def test_reconcile_signal_with_canonical_writes_blocks_inconsistent_observation(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    runner = FakeCollectorSmokeRunner(
+        _canonical_write_smoke_result(
+            module,
+            update_types_seen=(("updateChatLastMessage", 1),),
+            reconcile_signal_updates_observed=1,
+        )
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    _assert_inconsistent_observation_blocked(report)
+    assert report["collector_smoke_update_types_seen"] == {
+        "updateChatLastMessage": "one"
+    }
+
+
+def test_canonical_writes_without_update_type_blocks_inconsistent_observation(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    runner = FakeCollectorSmokeRunner(
+        _canonical_write_smoke_result(
+            module,
+            updates_observed=1,
+            update_types_seen=(),
+        )
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    _assert_inconsistent_observation_blocked(report)
+    assert report["collector_smoke_update_types_seen"] == {}
+
+
+def test_control_only_raw_writes_do_not_prove_message_ingest(tmp_path: Path) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    runner = FakeCollectorSmokeRunner(
+        module.CollectorSmokeResult(
+            updates_observed=3,
+            update_types_seen=(
+                ("updateOption", 1),
+                ("updateDefaultReactionType", 1),
+                ("updateTrustedMiniAppBots", 1),
+            ),
+            control_updates_observed=3,
+            telegram_raw_updates_written=3,
+            written_tables=("telegram_raw_updates",),
+            side_effects={
+                "live_collector_started": True,
+                "collector_runtime_started": True,
+                "tdlib_initialized": True,
+                "tdlib_receive_called": True,
+                "telegram_api_called": True,
+            },
+        )
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    assert report["contract_status"] == (
+        "joined_channel_collector_bounded_startup_raw_update_writes_observed"
+    )
+    assert report["collector_smoke_update_types_seen"] == {
+        "updateDefaultReactionType": "one",
+        "updateOption": "one",
+        "updateTrustedMiniAppBots": "one",
+    }
+    assert (
+        report["collector_smoke_message_bearing_updates_observed_bucket"] == "zero"
+    )
+    assert report["collector_smoke_control_updates_observed_bucket"] == "two_to_five"
+    assert (
+        report["collector_smoke_reconcile_signal_updates_observed_bucket"] == "zero"
+    )
+    assert report["collector_smoke_raw_updates_written_bucket"] == "two_to_five"
+    assert report["collector_smoke_source_messages_written_bucket"] == "zero"
+    assert report["collector_smoke_canonical_ingest_writes_observed"] is False
+    assert report["collector_smoke_raw_only_writes_observed"] is True
+    assert report["collector_smoke_message_ingest_not_proven"] is True
+
+
+def test_reconcile_signal_raw_write_does_not_prove_message_ingest(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    runner = FakeCollectorSmokeRunner(
+        module.CollectorSmokeResult(
+            updates_observed=1,
+            update_types_seen=(("updateChatLastMessage", 1),),
+            reconcile_signal_updates_observed=1,
+            telegram_raw_updates_written=1,
+            written_tables=("telegram_raw_updates",),
+            side_effects={
+                "live_collector_started": True,
+                "collector_runtime_started": True,
+                "tdlib_initialized": True,
+                "tdlib_receive_called": True,
+                "telegram_api_called": True,
+            },
+        )
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    assert report["contract_status"] == (
+        "joined_channel_collector_bounded_startup_raw_update_writes_observed"
+    )
+    assert report["collector_smoke_update_types_seen"] == {
+        "updateChatLastMessage": "one"
+    }
+    assert (
+        report["collector_smoke_reconcile_signal_updates_observed_bucket"] == "one"
+    )
+    assert report["collector_smoke_message_ingest_not_proven"] is True
+
+
+def test_update_type_summary_drops_unsafe_update_identifiers_and_keeps_safe_one(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    unsafe_update_types = (
+        f"updateNewMessage:{RAW_CHAT_ID}",
+        f"updateNewMessage-{RAW_USERNAME}",
+        "updateNewMessage.suffix",
+        "updateNewMessage/anything",
+    )
+    runner = FakeCollectorSmokeRunner(
+        module.CollectorSmokeResult(
+            updates_observed=11,
+            update_types_seen=(
+                ("updateNewMessage", 1),
+                ("updateOption", 6),
+                ("updateDefaultReactionType", 1),
+                *((unsafe_update_type, 1) for unsafe_update_type in unsafe_update_types),
+            ),
+            telegram_raw_updates_written=11,
+            written_tables=("telegram_raw_updates",),
+            side_effects={
+                "live_collector_started": True,
+                "collector_runtime_started": True,
+                "tdlib_initialized": True,
+                "tdlib_receive_called": True,
+                "telegram_api_called": True,
+            },
+        )
+    )
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert report["collector_smoke_update_types_seen"] == {
+        "updateDefaultReactionType": "one",
+        "updateNewMessage": "one",
+        "updateOption": "six_to_ten",
+    }
+    assert report["collector_smoke_message_bearing_updates_observed"] is True
+    for unsafe_update_type in unsafe_update_types:
+        assert unsafe_update_type not in rendered
+    for forbidden in (
+        str(RAW_CHAT_ID),
+        RAW_SOURCE_VALUE,
+        RAW_USERNAME,
+        RAW_TITLE,
+        FAKE_DATABASE_URL,
+        FAKE_REDIS_URL,
+        RAW_TDLIB_PAYLOAD_VALUE,
+        RAW_EXTRA,
+        RAW_TEMP_PATH,
+        str(tmp_path),
+    ):
+        assert forbidden not in rendered
 
 
 def test_gate_merges_partial_smoke_write_failure_and_blocks(tmp_path: Path) -> None:
@@ -860,6 +1174,8 @@ def test_gate_merges_partial_smoke_write_failure_and_blocks(tmp_path: Path) -> N
         status="failed",
         failure_class="RuntimeError",
         updates_observed=1,
+        update_types_seen=(("updateOption", 1),),
+        control_updates_observed=1,
         telegram_raw_updates_written=1,
         written_tables=("telegram_raw_updates",),
         side_effects={
@@ -889,13 +1205,74 @@ def test_gate_merges_partial_smoke_write_failure_and_blocks(tmp_path: Path) -> N
     assert report["collector_smoke_status"] == "failed"
     assert report["collector_smoke_failure_class"] == "RuntimeError"
     assert report["collector_smoke_updates_observed_bucket"] == "one"
+    assert report["collector_smoke_update_types_seen"] == {"updateOption": "one"}
+    assert report["collector_smoke_control_updates_observed_bucket"] == "one"
     assert report["collector_smoke_raw_updates_written_bucket"] == "one"
+    assert report["collector_smoke_canonical_ingest_writes_observed"] is False
+    assert report["collector_smoke_raw_only_writes_observed"] is True
+    assert report["collector_smoke_message_ingest_not_proven"] is True
     assert report["telegram_raw_updates_written"] is True
     assert report["database_mutation_performed"] is True
     assert report["live_collector_started"] is True
     assert report["tdlib_initialized"] is True
     assert runner is not None
     assert runner.started is True
+
+
+def test_gate_merges_partial_message_bearing_write_summary(tmp_path: Path) -> None:
+    module = _module()
+    probe = FakeTDLibReadinessProbe()
+    partial_result = module.CollectorSmokeResult(
+        status="failed",
+        failure_class="RuntimeError",
+        updates_observed=1,
+        update_types_seen=(("updateNewMessage", 1),),
+        message_bearing_updates_observed=1,
+        telegram_raw_updates_written=1,
+        source_messages_written=1,
+        source_message_versions_written=1,
+        event_outbox_written=1,
+        written_tables=(
+            "telegram_raw_updates",
+            "source_messages",
+            "source_message_versions",
+            "event_outbox",
+        ),
+        side_effects={
+            "live_collector_started": True,
+            "collector_runtime_started": True,
+            "tdlib_initialized": True,
+            "tdlib_receive_called": True,
+            "telegram_api_called": True,
+            "telegram_raw_updates_written": True,
+            "source_messages_written": True,
+            "source_message_versions_written": True,
+            "event_outbox_written": True,
+            "database_mutation_performed": True,
+        },
+    )
+    runner = FakeCollectorSmokeRunner(FakePartialSmokeFailure(partial_result))
+
+    report, _db, _probe, _runner = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_startup=True,
+        approved_db_write=True,
+        smoke_bounds=(30, 10, 10),
+        probe=probe,
+        smoke_runner=runner,
+    )
+
+    assert report["contract_status"] == "blocked_collector_smoke_runner_failed"
+    assert report["collector_smoke_update_types_seen"] == {
+        "updateNewMessage": "one"
+    }
+    assert (
+        report["collector_smoke_message_bearing_updates_observed_bucket"] == "one"
+    )
+    assert report["collector_smoke_canonical_ingest_writes_observed"] is True
+    assert report["collector_smoke_raw_only_writes_observed"] is False
+    assert report["collector_smoke_message_ingest_not_proven"] is False
 
 
 def test_gate_merges_partial_smoke_receive_failure_tdlib_side_effects(
