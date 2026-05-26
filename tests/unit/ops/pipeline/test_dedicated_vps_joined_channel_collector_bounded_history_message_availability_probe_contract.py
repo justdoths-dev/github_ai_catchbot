@@ -578,4 +578,3 @@ def test_output_redaction_excludes_sensitive_runtime_and_tdlib_values(
     ]
     for raw_value in forbidden_values:
         assert raw_value not in rendered
-
