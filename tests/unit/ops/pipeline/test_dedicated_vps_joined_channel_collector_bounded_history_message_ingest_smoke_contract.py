@@ -206,6 +206,8 @@ class FakeRepositoryTransaction:
         self._snapshot: Any = None
 
     async def __aenter__(self) -> "FakeIngestRepository":
+        if self.repository.fail_transaction_enter is not None:
+            raise self.repository.fail_transaction_enter
         self._snapshot = self.repository.snapshot()
         self.repository.transactions.append(self)
         return self.repository
@@ -220,8 +222,22 @@ class FakeRepositoryTransaction:
 
 
 class FakeIngestRepository:
-    def __init__(self, *, fail_outbox: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_transaction_enter: Exception | None = None,
+        fail_get: Exception | None = None,
+        fail_upsert: Exception | None = None,
+        fail_append: Exception | None = None,
+        fail_outbox: bool = False,
+        fail_outbox_exception: Exception | None = None,
+    ) -> None:
+        self.fail_transaction_enter = fail_transaction_enter
+        self.fail_get = fail_get
+        self.fail_upsert = fail_upsert
+        self.fail_append = fail_append
         self.fail_outbox = fail_outbox
+        self.fail_outbox_exception = fail_outbox_exception
         self.messages: dict[tuple[int, int], dict[str, Any]] = {}
         self.versions: dict[str, list[dict[str, Any]]] = {}
         self.outbox: list[Any] = []
@@ -247,6 +263,8 @@ class FakeIngestRepository:
         chat_id: int,
         message_id: int,
     ) -> dict[str, Any] | None:
+        if self.fail_get is not None:
+            raise self.fail_get
         assert platform == "telegram"
         return self.messages.get((chat_id, message_id))
 
@@ -256,6 +274,8 @@ class FakeIngestRepository:
         *,
         platform: str = "telegram",
     ) -> dict[str, Any]:
+        if self.fail_upsert is not None:
+            raise self.fail_upsert
         assert platform == "telegram"
         key = (projection.chat_id, projection.message_id)
         row = self.messages.get(key)
@@ -286,6 +306,8 @@ class FakeIngestRepository:
         observed_at: Any = None,
         telegram_edit_date: Any = None,
     ) -> tuple[bool, dict[str, Any] | None]:
+        if self.fail_append is not None:
+            raise self.fail_append
         versions = self.versions.setdefault(source_message_id, [])
         previous_hash = versions[-1]["content_hash"] if versions else None
         if previous_hash == projection.content_hash:
@@ -305,6 +327,8 @@ class FakeIngestRepository:
         return True, row
 
     async def insert_outbox_event(self, event: Any) -> None:
+        if self.fail_outbox_exception is not None:
+            raise self.fail_outbox_exception
         if self.fail_outbox:
             raise RuntimeError("outbox insert failed")
         self.outbox.append(event)
@@ -479,6 +503,18 @@ def _run_report(
         ),
     )
     return result.report, fake_db, probe, fake_repository
+
+
+def _raw_exception_message() -> str:
+    return " ".join(
+        [
+            str(RAW_CHAT_ID),
+            str(RAW_MESSAGE_ID),
+            RAW_MESSAGE_TEXT,
+            FAKE_DATABASE_URL,
+            RAW_TEMP_PATH,
+        ]
+    )
 
 
 def test_default_no_write_mode_does_not_call_get_chat_history_or_mutate_db(
@@ -658,6 +694,22 @@ def test_fake_message_text_new_message_writes_source_version_outbox(
     assert report["history_ingest_created_events_bucket"] == "one"
     assert report["history_ingest_reconciled_events_bucket"] == "zero"
     assert report["history_ingest_content_type_buckets"] == {"messageText": "one"}
+    assert report["history_ingest_failure_stage"] == "none"
+    assert report["history_ingest_failure_class"] is None
+    assert report["history_ingest_projection_attempted"] is True
+    assert report["history_ingest_projection_succeeded"] is True
+    assert report["history_ingest_repository_transaction_attempted"] is True
+    assert report["history_ingest_repository_transaction_entered"] is True
+    assert report["history_ingest_get_existing_attempted"] is True
+    assert report["history_ingest_upsert_attempted"] is True
+    assert report["history_ingest_upsert_succeeded"] is True
+    assert report["history_ingest_version_append_attempted"] is True
+    assert report["history_ingest_version_append_succeeded"] is True
+    assert report["history_ingest_outbox_build_attempted"] is True
+    assert report["history_ingest_outbox_build_succeeded"] is True
+    assert report["history_ingest_outbox_insert_attempted"] is True
+    assert report["history_ingest_outbox_insert_succeeded"] is True
+    assert report["history_ingest_transaction_completed"] is True
     assert report["database_mutation_performed"] is True
     assert report["redis_mutation_performed"] is False
     assert report["telegram_raw_updates_written"] is False
@@ -703,6 +755,18 @@ def test_repeated_identical_fake_message_is_idempotent_noop(
     )
     assert second_report["history_ingest_messages_written_bucket"] == "zero"
     assert second_report["history_ingest_messages_noop_bucket"] == "one"
+    assert second_report["history_ingest_failure_stage"] == "none"
+    assert second_report["history_ingest_failure_class"] is None
+    assert second_report["history_ingest_projection_attempted"] is True
+    assert second_report["history_ingest_projection_succeeded"] is True
+    assert second_report["history_ingest_repository_transaction_entered"] is True
+    assert second_report["history_ingest_get_existing_attempted"] is True
+    assert second_report["history_ingest_upsert_attempted"] is False
+    assert second_report["history_ingest_version_append_attempted"] is True
+    assert second_report["history_ingest_version_append_succeeded"] is True
+    assert second_report["history_ingest_outbox_build_attempted"] is False
+    assert second_report["history_ingest_outbox_insert_attempted"] is False
+    assert second_report["history_ingest_transaction_completed"] is True
     assert second_report["database_mutation_performed"] is False
     assert len(repository.versions[source_id]) == 1
     assert len(repository.outbox) == 1
@@ -746,6 +810,159 @@ def test_changed_fake_message_appends_version_and_emits_reconciled_event(
     assert repository.outbox[-1].event_type == "source_message.reconciled.v1"
 
 
+def test_projection_builder_failure_reports_stage_and_sanitized_class(
+    tmp_path: Path,
+) -> None:
+    message = _text_message()
+    del message["id"]
+    probe = FakeHistoryProbe(results=[_history_result(message)])
+
+    report, _db, _probe, repository = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_history=True,
+        approved_db_write=True,
+        probe=probe,
+    )
+    rendered = _module().render_json(report)
+
+    assert report["contract_status"] == "blocked_history_message_ingest_failed"
+    assert "history_ingest.unexpected_failure" in report["checks_failed"]
+    assert report["history_ingest_failure_stage"] == "projection_build"
+    assert report["history_ingest_failure_class"] == "KeyError"
+    assert report["history_ingest_projection_attempted"] is True
+    assert report["history_ingest_projection_succeeded"] is False
+    assert report["history_ingest_repository_transaction_attempted"] is False
+    assert repository.messages == {}
+    assert str(RAW_CHAT_ID) not in rendered
+    assert str(RAW_MESSAGE_ID) not in rendered
+    assert RAW_MESSAGE_TEXT not in rendered
+
+
+def test_repository_transaction_enter_failure_reports_stage(tmp_path: Path) -> None:
+    repository = FakeIngestRepository(
+        fail_transaction_enter=RuntimeError(_raw_exception_message())
+    )
+    probe = FakeHistoryProbe(results=[_history_result(_text_message())])
+
+    report, _db, _probe, repository = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_history=True,
+        approved_db_write=True,
+        probe=probe,
+        repository=repository,
+    )
+
+    assert report["contract_status"] == "blocked_history_message_ingest_failed"
+    assert report["history_ingest_failure_stage"] == "repository_transaction_enter"
+    assert report["history_ingest_failure_class"] == "RuntimeError"
+    assert report["history_ingest_projection_succeeded"] is True
+    assert report["history_ingest_repository_transaction_attempted"] is True
+    assert report["history_ingest_repository_transaction_entered"] is False
+    assert repository.transactions == []
+
+
+def test_get_source_message_failure_reports_stage(tmp_path: Path) -> None:
+    repository = FakeIngestRepository(fail_get=LookupError(_raw_exception_message()))
+    probe = FakeHistoryProbe(results=[_history_result(_text_message())])
+
+    report, _db, _probe, repository = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_history=True,
+        approved_db_write=True,
+        probe=probe,
+        repository=repository,
+    )
+
+    assert report["contract_status"] == "blocked_history_message_ingest_failed"
+    assert report["history_ingest_failure_stage"] == "get_existing_source_message"
+    assert report["history_ingest_failure_class"] == "LookupError"
+    assert report["history_ingest_get_existing_attempted"] is True
+    assert repository.transactions[-1].rolled_back is True
+
+
+def test_upsert_source_message_failure_reports_stage(tmp_path: Path) -> None:
+    repository = FakeIngestRepository(fail_upsert=RuntimeError(_raw_exception_message()))
+    probe = FakeHistoryProbe(results=[_history_result(_text_message())])
+
+    report, _db, _probe, repository = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_history=True,
+        approved_db_write=True,
+        probe=probe,
+        repository=repository,
+    )
+
+    assert report["contract_status"] == "blocked_history_message_ingest_failed"
+    assert report["history_ingest_failure_stage"] == "upsert_source_message"
+    assert report["history_ingest_failure_class"] == "RuntimeError"
+    assert report["history_ingest_upsert_attempted"] is True
+    assert report["history_ingest_upsert_succeeded"] is False
+    assert repository.transactions[-1].rolled_back is True
+
+
+def test_append_source_message_version_failure_reports_stage(tmp_path: Path) -> None:
+    repository = FakeIngestRepository(fail_append=RuntimeError(_raw_exception_message()))
+    probe = FakeHistoryProbe(results=[_history_result(_text_message())])
+
+    report, _db, _probe, repository = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_history=True,
+        approved_db_write=True,
+        probe=probe,
+        repository=repository,
+    )
+
+    assert report["contract_status"] == "blocked_history_message_ingest_failed"
+    assert report["history_ingest_failure_stage"] == "append_source_message_version"
+    assert report["history_ingest_failure_class"] == "RuntimeError"
+    assert report["history_ingest_upsert_succeeded"] is True
+    assert report["history_ingest_version_append_attempted"] is True
+    assert report["history_ingest_version_append_succeeded"] is False
+    assert repository.transactions[-1].rolled_back is True
+    assert repository.messages == {}
+
+
+def test_outbox_build_failure_reports_created_stage(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    from src.services.collector_telegram import outbox as outbox_module
+
+    def fail_build_created(self: Any, **_kwargs: Any) -> Any:
+        raise ValueError(_raw_exception_message())
+
+    monkeypatch.setattr(
+        outbox_module.CollectorOutboxBuilder,
+        "build_created",
+        fail_build_created,
+    )
+    repository = FakeIngestRepository()
+    probe = FakeHistoryProbe(results=[_history_result(_text_message())])
+
+    report, _db, _probe, repository = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_history=True,
+        approved_db_write=True,
+        probe=probe,
+        repository=repository,
+    )
+
+    assert report["contract_status"] == "blocked_history_message_ingest_failed"
+    assert report["history_ingest_failure_stage"] == "outbox_build_created"
+    assert report["history_ingest_failure_class"] == "ValueError"
+    assert report["history_ingest_version_append_succeeded"] is True
+    assert report["history_ingest_outbox_build_attempted"] is True
+    assert report["history_ingest_outbox_build_succeeded"] is False
+    assert repository.transactions[-1].rolled_back is True
+    assert repository.messages == {}
+
+
 def test_outbox_insert_failure_rolls_back_source_and_version_writes(
     tmp_path: Path,
 ) -> None:
@@ -763,11 +980,46 @@ def test_outbox_insert_failure_rolls_back_source_and_version_writes(
 
     assert report["contract_status"] == "blocked_history_message_ingest_failed"
     assert "history_ingest.unexpected_failure" in report["checks_failed"]
+    assert report["history_ingest_failure_stage"] == "insert_outbox_event"
+    assert report["history_ingest_failure_class"] == "RuntimeError"
+    assert report["history_ingest_outbox_build_succeeded"] is True
+    assert report["history_ingest_outbox_insert_attempted"] is True
+    assert report["history_ingest_outbox_insert_succeeded"] is False
+    assert report["history_ingest_transaction_completed"] is False
     assert repository.transactions
     assert repository.transactions[-1].rolled_back is True
     assert repository.messages == {}
     assert repository.versions == {}
     assert repository.outbox == []
+
+
+def test_exception_messages_with_raw_values_are_not_rendered(tmp_path: Path) -> None:
+    repository = FakeIngestRepository(
+        fail_upsert=RuntimeError(_raw_exception_message())
+    )
+    probe = FakeHistoryProbe(results=[_history_result(_text_message())])
+
+    report, _db, _probe, _repository = _run_report(
+        tmp_path,
+        approved_tdlib=True,
+        approved_history=True,
+        approved_db_write=True,
+        probe=probe,
+        repository=repository,
+    )
+    rendered = _module().render_json(report)
+
+    assert report["history_ingest_failure_stage"] == "upsert_source_message"
+    assert report["history_ingest_failure_class"] == "RuntimeError"
+    assert "RuntimeError" in rendered
+    for raw_value in [
+        str(RAW_CHAT_ID),
+        str(RAW_MESSAGE_ID),
+        RAW_MESSAGE_TEXT,
+        FAKE_DATABASE_URL,
+        RAW_TEMP_PATH,
+    ]:
+        assert raw_value not in rendered
 
 
 def test_db_write_cap_stops_further_writes_and_reports_cap_exhaustion(

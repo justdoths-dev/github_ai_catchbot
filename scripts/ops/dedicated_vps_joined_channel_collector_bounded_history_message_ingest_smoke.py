@@ -46,6 +46,22 @@ LIMIT :limit
 """
 
 SAFE_TDLIB_OBJECT_TYPE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,80}\Z")
+SAFE_EXCEPTION_CLASS_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,80}\Z")
+HISTORY_INGEST_FAILURE_STAGES = frozenset(
+    {
+        "none",
+        "projection_build",
+        "repository_transaction_enter",
+        "get_existing_source_message",
+        "upsert_source_message",
+        "append_source_message_version",
+        "outbox_build_created",
+        "outbox_build_reconciled",
+        "insert_outbox_event",
+        "repository_transaction_exit",
+        "unknown",
+    }
+)
 ACCESS_DENIED_ERROR_MARKERS = (
     "FORBIDDEN",
     "CHANNEL_PRIVATE",
@@ -215,6 +231,35 @@ class HistoryMessageApplyResult:
         )
 
 
+@dataclass(slots=True)
+class HistoryIngestApplyDiagnostics:
+    failure_stage: str = "none"
+    failure_class: str | None = None
+    projection_attempted: bool = False
+    projection_succeeded: bool = False
+    repository_transaction_attempted: bool = False
+    repository_transaction_entered: bool = False
+    get_existing_attempted: bool = False
+    upsert_attempted: bool = False
+    upsert_succeeded: bool = False
+    version_append_attempted: bool = False
+    version_append_succeeded: bool = False
+    outbox_build_attempted: bool = False
+    outbox_build_succeeded: bool = False
+    outbox_insert_attempted: bool = False
+    outbox_insert_succeeded: bool = False
+    transaction_completed: bool = False
+    current_stage: str = "unknown"
+
+    def set_stage(self, stage: str) -> None:
+        self.current_stage = _safe_failure_stage(stage)
+
+    def capture_exception(self, exc: BaseException) -> None:
+        if self.failure_stage == "none":
+            self.failure_stage = _safe_failure_stage(self.current_stage)
+        self.failure_class = _safe_exception_class_name(exc)
+
+
 def _repo_root_for_imports() -> Path:
     return Path(__file__).resolve().parents[2]
 
@@ -368,6 +413,69 @@ def _side_effects() -> dict[str, bool]:
     return {flag: False for flag in SIDE_EFFECT_FLAG_NAMES}
 
 
+def _safe_failure_stage(value: Any) -> str:
+    if isinstance(value, str) and value in HISTORY_INGEST_FAILURE_STAGES:
+        return value
+    return "unknown"
+
+
+def _safe_exception_class_name(exc: BaseException) -> str:
+    class_name = exc.__class__.__name__
+    if SAFE_EXCEPTION_CLASS_RE.fullmatch(class_name):
+        return class_name
+    return "unknown"
+
+
+def _history_ingest_diagnostic_fields(
+    diagnostics: HistoryIngestApplyDiagnostics,
+) -> dict[str, Any]:
+    return {
+        "history_ingest_failure_stage": _safe_failure_stage(
+            diagnostics.failure_stage
+        ),
+        "history_ingest_failure_class": diagnostics.failure_class,
+        "history_ingest_projection_attempted": diagnostics.projection_attempted,
+        "history_ingest_projection_succeeded": diagnostics.projection_succeeded,
+        "history_ingest_repository_transaction_attempted": (
+            diagnostics.repository_transaction_attempted
+        ),
+        "history_ingest_repository_transaction_entered": (
+            diagnostics.repository_transaction_entered
+        ),
+        "history_ingest_get_existing_attempted": diagnostics.get_existing_attempted,
+        "history_ingest_upsert_attempted": diagnostics.upsert_attempted,
+        "history_ingest_upsert_succeeded": diagnostics.upsert_succeeded,
+        "history_ingest_version_append_attempted": (
+            diagnostics.version_append_attempted
+        ),
+        "history_ingest_version_append_succeeded": (
+            diagnostics.version_append_succeeded
+        ),
+        "history_ingest_outbox_build_attempted": diagnostics.outbox_build_attempted,
+        "history_ingest_outbox_build_succeeded": diagnostics.outbox_build_succeeded,
+        "history_ingest_outbox_insert_attempted": diagnostics.outbox_insert_attempted,
+        "history_ingest_outbox_insert_succeeded": diagnostics.outbox_insert_succeeded,
+        "history_ingest_transaction_completed": diagnostics.transaction_completed,
+    }
+
+
+def _merge_history_ingest_diagnostics(
+    report: dict[str, Any],
+    diagnostics: HistoryIngestApplyDiagnostics,
+) -> None:
+    report.update(_history_ingest_diagnostic_fields(diagnostics))
+
+
+def _record_unknown_history_ingest_failure(
+    report: dict[str, Any],
+    exc: BaseException,
+) -> None:
+    if report.get("history_ingest_failure_stage") == "none":
+        report["history_ingest_failure_stage"] = "unknown"
+    if report.get("history_ingest_failure_class") is None:
+        report["history_ingest_failure_class"] = _safe_exception_class_name(exc)
+
+
 def _base_report(
     *,
     approved_tdlib_readiness_probe: bool,
@@ -427,6 +535,22 @@ def _base_report(
         "history_ingest_db_write_cap_exhausted": False,
         "history_ingest_message_cap_exhausted": False,
         "history_ingest_content_type_buckets": {},
+        "history_ingest_failure_stage": "none",
+        "history_ingest_failure_class": None,
+        "history_ingest_projection_attempted": False,
+        "history_ingest_projection_succeeded": False,
+        "history_ingest_repository_transaction_attempted": False,
+        "history_ingest_repository_transaction_entered": False,
+        "history_ingest_get_existing_attempted": False,
+        "history_ingest_upsert_attempted": False,
+        "history_ingest_upsert_succeeded": False,
+        "history_ingest_version_append_attempted": False,
+        "history_ingest_version_append_succeeded": False,
+        "history_ingest_outbox_build_attempted": False,
+        "history_ingest_outbox_build_succeeded": False,
+        "history_ingest_outbox_insert_attempted": False,
+        "history_ingest_outbox_insert_succeeded": False,
+        "history_ingest_transaction_completed": False,
         "database_mutation_performed": False,
         "redis_mutation_performed": False,
         "telegram_channel_registry_updated": False,
@@ -991,74 +1115,141 @@ async def _apply_history_message(
     outbox_builder: Any,
     message: Mapping[str, Any],
     observed_at: datetime,
+    diagnostics: HistoryIngestApplyDiagnostics,
 ) -> HistoryMessageApplyResult:
-    projection = projection_builder.build_source_projection(dict(message))
-    async with repository.transaction():
-        existing = await repository.get_source_message(
-            platform="telegram",
-            chat_id=projection.chat_id,
-            message_id=projection.message_id,
-        )
-        if existing is None:
-            current_row = await repository.upsert_source_message(
-                projection,
+    try:
+        diagnostics.set_stage("projection_build")
+        diagnostics.projection_attempted = True
+        projection = projection_builder.build_source_projection(dict(message))
+        diagnostics.projection_succeeded = True
+
+        diagnostics.set_stage("repository_transaction_enter")
+        diagnostics.repository_transaction_attempted = True
+        transaction = repository.transaction()
+        apply_result: HistoryMessageApplyResult
+        async with transaction:
+            diagnostics.repository_transaction_entered = True
+            diagnostics.set_stage("get_existing_source_message")
+            diagnostics.get_existing_attempted = True
+            existing = await repository.get_source_message(
                 platform="telegram",
+                chat_id=projection.chat_id,
+                message_id=projection.message_id,
             )
-            source_message_id = str(_mapping_get(current_row, "source_message_id") or "")
-            changed, version_row = await repository.append_source_message_version_if_changed(
-                source_message_id=source_message_id,
-                projection=projection,
-                version_reason="new",
-                observed_at=observed_at,
-                telegram_edit_date=projection.edited_at,
+            if existing is None:
+                diagnostics.set_stage("upsert_source_message")
+                diagnostics.upsert_attempted = True
+                current_row = await repository.upsert_source_message(
+                    projection,
+                    platform="telegram",
+                )
+                diagnostics.upsert_succeeded = True
+                source_message_id = str(
+                    _mapping_get(current_row, "source_message_id") or ""
+                )
+                diagnostics.set_stage("append_source_message_version")
+                diagnostics.version_append_attempted = True
+                changed, version_row = (
+                    await repository.append_source_message_version_if_changed(
+                        source_message_id=source_message_id,
+                        projection=projection,
+                        version_reason="new",
+                        observed_at=observed_at,
+                        telegram_edit_date=projection.edited_at,
+                    )
+                )
+                diagnostics.version_append_succeeded = True
+                if not changed or version_row is None:
+                    apply_result = HistoryMessageApplyResult(
+                        message_written=False,
+                        noop=True,
+                    )
+                    diagnostics.set_stage("repository_transaction_exit")
+                    return apply_result
+                version_no = _safe_non_negative_int(
+                    _mapping_get(version_row, "version_no")
+                )
+                diagnostics.set_stage("outbox_build_created")
+                diagnostics.outbox_build_attempted = True
+                event = outbox_builder.build_created(
+                    source_message_id=source_message_id,
+                    current_version_no=version_no,
+                    logical_post_key=projection.logical_post_key,
+                    occurred_at=observed_at,
+                )
+                diagnostics.outbox_build_succeeded = True
+                diagnostics.set_stage("insert_outbox_event")
+                diagnostics.outbox_insert_attempted = True
+                await repository.insert_outbox_event(event)
+                diagnostics.outbox_insert_succeeded = True
+                apply_result = HistoryMessageApplyResult(
+                    message_written=True,
+                    noop=False,
+                    source_messages_written=1,
+                    source_message_versions_written=1,
+                    event_outbox_written=1,
+                    created_events=1,
+                )
+                diagnostics.set_stage("repository_transaction_exit")
+                return apply_result
+
+            source_message_id = str(_mapping_get(existing, "source_message_id") or "")
+            diagnostics.set_stage("append_source_message_version")
+            diagnostics.version_append_attempted = True
+            changed, version_row = (
+                await repository.append_source_message_version_if_changed(
+                    source_message_id=source_message_id,
+                    projection=projection,
+                    version_reason="reconcile",
+                    observed_at=observed_at,
+                    telegram_edit_date=projection.edited_at,
+                )
             )
+            diagnostics.version_append_succeeded = True
             if not changed or version_row is None:
-                return HistoryMessageApplyResult(message_written=False, noop=True)
+                apply_result = HistoryMessageApplyResult(
+                    message_written=False,
+                    noop=True,
+                )
+                diagnostics.set_stage("repository_transaction_exit")
+                return apply_result
             version_no = _safe_non_negative_int(_mapping_get(version_row, "version_no"))
-            event = outbox_builder.build_created(
+            diagnostics.set_stage("outbox_build_reconciled")
+            diagnostics.outbox_build_attempted = True
+            event = outbox_builder.build_reconciled(
                 source_message_id=source_message_id,
                 current_version_no=version_no,
                 logical_post_key=projection.logical_post_key,
                 occurred_at=observed_at,
+                reconcile_reason="bounded_history_ingest_smoke",
             )
+            diagnostics.outbox_build_succeeded = True
+            diagnostics.set_stage("insert_outbox_event")
+            diagnostics.outbox_insert_attempted = True
             await repository.insert_outbox_event(event)
-            return HistoryMessageApplyResult(
+            diagnostics.outbox_insert_succeeded = True
+            apply_result = HistoryMessageApplyResult(
                 message_written=True,
                 noop=False,
                 source_messages_written=1,
                 source_message_versions_written=1,
                 event_outbox_written=1,
-                created_events=1,
+                reconciled_events=1,
             )
-
-        source_message_id = str(_mapping_get(existing, "source_message_id") or "")
-        changed, version_row = await repository.append_source_message_version_if_changed(
-            source_message_id=source_message_id,
-            projection=projection,
-            version_reason="reconcile",
-            observed_at=observed_at,
-            telegram_edit_date=projection.edited_at,
-        )
-        if not changed or version_row is None:
-            return HistoryMessageApplyResult(message_written=False, noop=True)
-        version_no = _safe_non_negative_int(_mapping_get(version_row, "version_no"))
-        event = outbox_builder.build_reconciled(
-            source_message_id=source_message_id,
-            current_version_no=version_no,
-            logical_post_key=projection.logical_post_key,
-            occurred_at=observed_at,
-            reconcile_reason="bounded_history_ingest_smoke",
-        )
-        await repository.insert_outbox_event(event)
-        return HistoryMessageApplyResult(
-            message_written=True,
-            noop=False,
-            source_messages_written=1,
-            source_message_versions_written=1,
-            event_outbox_written=1,
-            reconciled_events=1,
-        )
-
+            diagnostics.set_stage("repository_transaction_exit")
+            return apply_result
+    except Exception as exc:
+        diagnostics.capture_exception(exc)
+        raise
+    finally:
+        if (
+            diagnostics.failure_stage == "none"
+            and diagnostics.repository_transaction_attempted
+            and diagnostics.repository_transaction_entered
+            and diagnostics.current_stage == "repository_transaction_exit"
+        ):
+            diagnostics.transaction_completed = True
+            diagnostics.set_stage("none")
 
 def _apply_write_counts(
     report: dict[str, Any],
@@ -1207,13 +1398,18 @@ async def _run_history_ingest(
                         stop = True
                         break
                     messages_considered += 1
-                    apply_result = await _apply_history_message(
-                        repository=repository,
-                        projection_builder=projection_builder,
-                        outbox_builder=outbox_builder,
-                        message=message,
-                        observed_at=observed_at,
-                    )
+                    diagnostics = HistoryIngestApplyDiagnostics()
+                    try:
+                        apply_result = await _apply_history_message(
+                            repository=repository,
+                            projection_builder=projection_builder,
+                            outbox_builder=outbox_builder,
+                            message=message,
+                            observed_at=observed_at,
+                            diagnostics=diagnostics,
+                        )
+                    finally:
+                        _merge_history_ingest_diagnostics(report, diagnostics)
                     _apply_write_counts(report, apply_result, counters)
                     if messages_considered >= max_messages:
                         report["history_ingest_message_cap_exhausted"] = True
@@ -1450,7 +1646,7 @@ def generate_report(
                     repository_context_factory=repository_context_factory,
                 )
             )
-        except Exception:
+        except Exception as exc:
             if _forbidden_side_effect_detected(report):
                 _set_status(
                     report,
@@ -1459,6 +1655,7 @@ def generate_report(
                 )
             else:
                 report["history_ingest_status"] = "failed"
+                _record_unknown_history_ingest_failure(report, exc)
                 _set_status(
                     report,
                     "blocked_history_message_ingest_failed",
@@ -1476,7 +1673,8 @@ def generate_report(
         if report["contract_status"].startswith("blocked_"):
             return ScriptResult(exit_code=1, report=report)
         return ScriptResult(exit_code=0, report=report)
-    except Exception:
+    except Exception as exc:
+        _record_unknown_history_ingest_failure(report, exc)
         _set_status(
             report,
             "blocked_history_message_ingest_failed",
