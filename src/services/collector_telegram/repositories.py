@@ -305,8 +305,8 @@ class CollectorRepository:
                     CAST(:source_message_id AS uuid),
                     :version_no,
                     :version_reason,
-                    :observed_at,
-                    :telegram_edit_date,
+                    CAST(:observed_at AS timestamptz),
+                    CAST(:telegram_edit_date AS timestamptz),
                     :text_surface,
                     CAST(:entities_json AS jsonb),
                     CAST(:raw_message_json AS jsonb),
@@ -336,9 +336,9 @@ class CollectorRepository:
                 SET
                     current_version_no = :current_version_no,
                     edited_at = CASE
-                        WHEN :edited_at IS NULL THEN edited_at
-                        WHEN edited_at IS NULL THEN :edited_at
-                        ELSE GREATEST(edited_at, :edited_at)
+                        WHEN CAST(:edited_at AS timestamptz) IS NULL THEN edited_at
+                        WHEN edited_at IS NULL THEN CAST(:edited_at AS timestamptz)
+                        ELSE GREATEST(edited_at, CAST(:edited_at AS timestamptz))
                     END,
                     deleted_at = NULL,
                     delete_kind = 'none',
