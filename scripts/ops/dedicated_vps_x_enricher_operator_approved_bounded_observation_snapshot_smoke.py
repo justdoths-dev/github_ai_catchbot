@@ -1485,8 +1485,14 @@ def _classify_x_api_response(response: XApiResponse) -> tuple[str, str, bool]:
         return "401_403", "access_denied", False
     if status == 400:
         return "400", "request_invalid", False
+    if status == 405:
+        return "405", "request_invalid", False
+    if status == 422:
+        return "422", "request_invalid", False
     if status == 404:
         return "404", "failed_permanent", False
+    if status == 451:
+        return "451", "failed_permanent", False
     if status == 429:
         return "429", "rate_limited", False
     if 400 <= status <= 499:

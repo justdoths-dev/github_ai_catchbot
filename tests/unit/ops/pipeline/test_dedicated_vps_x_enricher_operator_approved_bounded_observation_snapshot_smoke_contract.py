@@ -881,7 +881,16 @@ def _assert_x_api_classification_blocks_without_write_or_ack(
     assert redis.xack_calls == []
     assert result.report["raw_values_emitted"] is False
     assert f"x_api.{bucket}" in result.report["checks_failed"]
-    for value in (FAKE_RESPONSE_BODY, FAKE_X_TOKEN, FAKE_X_URL, FAKE_POST_ID):
+    for value in (
+        FAKE_RESPONSE_BODY,
+        FAKE_X_TOKEN,
+        FAKE_X_URL,
+        FAKE_POST_ID,
+        FAKE_DATABASE_URL,
+        FAKE_REDIS_URL,
+        FAKE_STREAM_ID,
+        FAKE_EXCEPTION_TEXT,
+    ):
         assert value not in rendered
 
 
@@ -909,13 +918,36 @@ def test_http_400_x_api_failure_is_request_invalid_and_sanitized() -> None:
     )
 
 
+def test_http_405_x_api_failure_is_request_invalid_and_sanitized() -> None:
+    _assert_x_api_classification_blocks_without_write_or_ack(
+        status_code=405,
+        bucket="405",
+        result_class="request_invalid",
+    )
+
+
+def test_http_422_x_api_failure_is_request_invalid_and_sanitized() -> None:
+    _assert_x_api_classification_blocks_without_write_or_ack(
+        status_code=422,
+        bucket="422",
+        result_class="request_invalid",
+    )
+
+
+def test_http_451_x_api_failure_is_permanent_and_sanitized() -> None:
+    _assert_x_api_classification_blocks_without_write_or_ack(
+        status_code=451,
+        bucket="451",
+        result_class="failed_permanent",
+    )
+
+
 def test_unexpected_4xx_x_api_failures_are_permanent_and_sanitized() -> None:
-    for status_code in (418, 422):
-        _assert_x_api_classification_blocks_without_write_or_ack(
-            status_code=status_code,
-            bucket="4xx_other",
-            result_class="failed_permanent",
-        )
+    _assert_x_api_classification_blocks_without_write_or_ack(
+        status_code=418,
+        bucket="4xx_other",
+        result_class="failed_permanent",
+    )
 
 
 def test_malformed_x_api_response_is_sanitized_and_not_acked() -> None:
