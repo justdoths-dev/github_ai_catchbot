@@ -71,6 +71,7 @@ PUBLIC_REPORT_LABEL_VALUES = {
     "partial_ready",
     "low_evidence",
     "access_denied",
+    "request_invalid",
     "rate_limited",
     "failed_transient",
     "failed_permanent",
@@ -1482,10 +1483,14 @@ def _classify_x_api_response(response: XApiResponse) -> tuple[str, str, bool]:
         return "2xx", "response_available", True
     if status in {401, 403}:
         return "401_403", "access_denied", False
+    if status == 400:
+        return "400", "request_invalid", False
     if status == 404:
         return "404", "failed_permanent", False
     if status == 429:
         return "429", "rate_limited", False
+    if 400 <= status <= 499:
+        return "4xx_other", "failed_permanent", False
     if 500 <= status <= 599:
         return "5xx", "failed_transient", False
     return "non_2xx", "failed_transient", False

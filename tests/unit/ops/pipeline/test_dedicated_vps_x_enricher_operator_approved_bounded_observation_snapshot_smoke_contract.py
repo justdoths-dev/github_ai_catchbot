@@ -846,6 +846,45 @@ def test_db_failure_rolls_back_and_does_not_ack() -> None:
     assert FAKE_EXCEPTION_TEXT not in json.dumps(result.report, sort_keys=True)
 
 
+def _assert_x_api_classification_blocks_without_write_or_ack(
+    *,
+    status_code: int,
+    bucket: str,
+    result_class: str,
+) -> None:
+    parts = _valid_parts()
+    x_client = FakeXClient(
+        _x_response(status_code=status_code, payload={"body": FAKE_RESPONSE_BODY})
+    )
+
+    result, session, redis, _fake_x = _run_report(
+        session=parts["session"],
+        redis=parts["redis"],
+        x_client=x_client,
+        approvals=_all_approvals(),
+    )
+    rendered = json.dumps(result.report, sort_keys=True)
+
+    assert result.exit_code == 1
+    assert result.report["contract_status"] == _module().STATUS_X_API_FAILED
+    assert result.report["x_api_call_attempted"] is True
+    assert result.report["external_network_attempted"] is True
+    assert result.report["targeted_stream_delivery_succeeded_bucket"] == "one"
+    assert result.report["delivered_target_match_bucket"] == "one"
+    assert result.report["x_api_status_bucket"] == bucket
+    assert result.report["x_api_result_class"] == result_class
+    assert result.report["database_write_attempted"] is False
+    assert result.report["redis_ack_attempted"] is False
+    assert session.writes == []
+    assert session.committed is False
+    assert session.rolled_back_count >= 2
+    assert redis.xack_calls == []
+    assert result.report["raw_values_emitted"] is False
+    assert f"x_api.{bucket}" in result.report["checks_failed"]
+    for value in (FAKE_RESPONSE_BODY, FAKE_X_TOKEN, FAKE_X_URL, FAKE_POST_ID):
+        assert value not in rendered
+
+
 def test_x_api_failure_classes_are_sanitized_and_do_not_write_or_ack() -> None:
     cases = [
         (401, "401_403", "access_denied"),
@@ -855,26 +894,28 @@ def test_x_api_failure_classes_are_sanitized_and_do_not_write_or_ack() -> None:
         (503, "5xx", "failed_transient"),
     ]
     for status_code, bucket, result_class in cases:
-        parts = _valid_parts()
-        x_client = FakeXClient(
-            _x_response(status_code=status_code, payload={"body": FAKE_RESPONSE_BODY})
+        _assert_x_api_classification_blocks_without_write_or_ack(
+            status_code=status_code,
+            bucket=bucket,
+            result_class=result_class,
         )
 
-        result, session, redis, _fake_x = _run_report(
-            session=parts["session"],
-            redis=parts["redis"],
-            x_client=x_client,
-            approvals=_all_approvals(),
-        )
 
-        assert result.exit_code == 1
-        assert result.report["contract_status"] == _module().STATUS_X_API_FAILED
-        assert result.report["x_api_status_bucket"] == bucket
-        assert result.report["x_api_result_class"] == result_class
-        assert session.writes == []
-        assert session.committed is False
-        assert redis.xack_calls == []
-        assert FAKE_RESPONSE_BODY not in json.dumps(result.report, sort_keys=True)
+def test_http_400_x_api_failure_is_request_invalid_and_sanitized() -> None:
+    _assert_x_api_classification_blocks_without_write_or_ack(
+        status_code=400,
+        bucket="400",
+        result_class="request_invalid",
+    )
+
+
+def test_unexpected_4xx_x_api_failures_are_permanent_and_sanitized() -> None:
+    for status_code in (418, 422):
+        _assert_x_api_classification_blocks_without_write_or_ack(
+            status_code=status_code,
+            bucket="4xx_other",
+            result_class="failed_permanent",
+        )
 
 
 def test_malformed_x_api_response_is_sanitized_and_not_acked() -> None:
