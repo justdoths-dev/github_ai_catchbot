@@ -1496,7 +1496,7 @@ def _classify_x_api_response(response: XApiResponse) -> tuple[str, str, bool]:
     if status == 429:
         return "429", "rate_limited", False
     if 400 <= status <= 499:
-        return "4xx_other", "failed_permanent", False
+        return str(status), "failed_permanent", False
     if 500 <= status <= 599:
         return "5xx", "failed_transient", False
     return "non_2xx", "failed_transient", False

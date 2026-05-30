@@ -942,10 +942,34 @@ def test_http_451_x_api_failure_is_permanent_and_sanitized() -> None:
     )
 
 
-def test_unexpected_4xx_x_api_failures_are_permanent_and_sanitized() -> None:
+def test_http_402_x_api_failure_uses_exact_status_bucket_and_is_sanitized() -> None:
+    _assert_x_api_classification_blocks_without_write_or_ack(
+        status_code=402,
+        bucket="402",
+        result_class="failed_permanent",
+    )
+
+
+def test_http_406_x_api_failure_uses_exact_status_bucket_and_is_sanitized() -> None:
+    _assert_x_api_classification_blocks_without_write_or_ack(
+        status_code=406,
+        bucket="406",
+        result_class="failed_permanent",
+    )
+
+
+def test_http_410_x_api_failure_uses_exact_status_bucket_and_is_sanitized() -> None:
+    _assert_x_api_classification_blocks_without_write_or_ack(
+        status_code=410,
+        bucket="410",
+        result_class="failed_permanent",
+    )
+
+
+def test_http_418_x_api_failure_uses_exact_status_bucket_and_is_sanitized() -> None:
     _assert_x_api_classification_blocks_without_write_or_ack(
         status_code=418,
-        bucket="4xx_other",
+        bucket="418",
         result_class="failed_permanent",
     )
 
