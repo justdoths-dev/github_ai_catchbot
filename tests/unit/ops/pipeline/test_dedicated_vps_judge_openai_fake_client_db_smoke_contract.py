@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -374,6 +377,34 @@ def _run_report(
 
 def test_script_exists() -> None:
     assert SCRIPT.exists()
+
+
+def test_file_path_execution_from_repo_root_bootstraps_src_imports_without_pythonpath(
+    tmp_path: Path,
+) -> None:
+    missing_runtime_env = tmp_path / "missing-runtime.env"
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--runtime-env-path", str(missing_runtime_env)],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+
+    combined_output = completed.stdout + completed.stderr
+    assert "ModuleNotFoundError" not in combined_output
+    assert "No module named 'src'" not in combined_output
+
+    report = json.loads(completed.stdout)
+    assert completed.returncode == 1
+    assert report["contract_status"] == _module().STATUS_NOT_READY
+    assert report["runtime_env_read"] is False
+    assert report["checks_failed"] == ["runtime_env.read"]
 
 
 def test_default_mode_is_read_only_and_performs_no_db_write() -> None:
