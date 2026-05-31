@@ -10,11 +10,14 @@ def test_prompt_library_renders_supported_profiles(profile: str) -> None:
     prompt = PromptLibrary().render(judge_profile=profile, prompt_version="judge_output_v1")
 
     assert profile in prompt
-    assert "CandidateEvidenceBundle" in prompt
-    assert "Do not browse" in prompt
-    assert "Do not compute the final verdict" in prompt
+    assert "Use only the provided CandidateEvidenceBundle context" in prompt
+    assert "Do not browse, search, fetch, call tools" in prompt
+    assert "Evaluate negative-first" in prompt
+    assert "Do not invent comparables" in prompt
+    assert "Do not decide final verdict or delivery_decision" in prompt
 
 
-def test_prompt_library_rejects_unknown_profile() -> None:
+@pytest.mark.parametrize("profile", ["idea_primary", "web_primary", "unknown_primary"])
+def test_prompt_library_rejects_unsupported_profiles(profile: str) -> None:
     with pytest.raises(UnsupportedJudgeProfileError):
-        PromptLibrary().render(judge_profile="web_primary", prompt_version="judge_output_v1")
+        PromptLibrary().render(judge_profile=profile, prompt_version="judge_output_v1")

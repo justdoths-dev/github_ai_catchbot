@@ -42,6 +42,20 @@ def test_response_mapper_extracts_refusal_text_from_output_blocks() -> None:
     assert result.refusal_detected is True
 
 
+def test_response_mapper_handles_invalid_json_as_missing_structured_payload() -> None:
+    response = {
+        "status": "completed",
+        "output_text": "{not-valid-json",
+    }
+
+    result = OpenAIResponseMapper().parse(response, started_monotonic=time.monotonic())
+
+    assert result.payload_json is None
+    assert result.refusal_text is None
+    assert result.has_structured_payload is False
+    assert result.finish_reason == "completed"
+
+
 def test_response_mapper_extracts_usage_fields_and_latency() -> None:
     started = time.monotonic() - 0.05
     response = {

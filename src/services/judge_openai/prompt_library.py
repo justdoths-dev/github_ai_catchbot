@@ -17,7 +17,7 @@ class PromptLibrary:
         profile_guidance = {
             "github_primary": (
                 "Profile: github_primary. Evaluate GitHub-primary evidence. Focus on code quality "
-                "signals, maintenance signals, wrapper risk, adoption quality, and concrete comparables."
+                "signals, maintenance signals, wrapper risk, adoption quality, and bundle-supported comparables."
             ),
             "x_primary": (
                 "Profile: x_primary. Evaluate X-post-primary evidence. Focus on specificity, "
@@ -43,11 +43,11 @@ class PromptLibrary:
             [
                 "You are the stage-6 OpenAI judge for a precision-first GitHub/X catch-bot.",
                 "Return only strict judge_output_v1 JSON matching the supplied schema.",
-                "Use only the supplied CandidateEvidenceBundle-derived context.",
+                "Use only the provided CandidateEvidenceBundle context.",
                 "Do not browse, search, fetch, call tools, or assume facts outside the bundle.",
-                "Be negative-first: identify why the candidate may not be worth attention before upside.",
+                "Evaluate negative-first: identify why the candidate may not be worth attention before upside.",
                 "Do not invent comparables, repo activity, social proof, dates, or evidence.",
                 "If evidence is weak, reflect that in scores, red flags, limitations, and confidence.",
-                "Do not compute the final verdict or delivery decision; deterministic services do that later.",
+                "Do not decide final verdict or delivery_decision; downstream deterministic services do that later.",
             ]
         )
