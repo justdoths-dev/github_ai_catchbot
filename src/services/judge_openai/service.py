@@ -72,8 +72,19 @@ class JudgeOpenAIService:
         return await self._repository.load_job_by_trigger_event_id(parsed_trigger_event_id)
 
     async def handle_job(self, job: JudgeCallJob) -> None:
+        if job.event_type != "judge.call.requested.v1" or self._job_missing_required_fields(job):
+            return
+
         judge_run = await self._repository.load_judge_run(job.judge_run_id)
         if judge_run is None or judge_run.status != "pending" or judge_run.bundle_id != job.bundle_id:
+            return
+
+        if self._run_missing_required_fields(judge_run):
+            await self._finish_without_output(
+                judge_run=judge_run,
+                status="failed_terminal",
+                finish_reason="prompt_missing",
+            )
             return
 
         if self._job_conflicts_with_run(job, judge_run):
@@ -115,18 +126,18 @@ class JudgeOpenAIService:
 
         try:
             outcome = await self._call_with_single_schema_retry(judge_run=judge_run, prepared=prepared)
-        except OpenAITransientError as exc:
+        except OpenAITransientError:
             await self._finish_without_output(
                 judge_run=judge_run,
                 status="failed_retryable",
-                finish_reason=str(exc) or type(exc).__name__,
+                finish_reason="openai_transport_retryable",
             )
             return
-        except OpenAIPermanentError as exc:
+        except OpenAIPermanentError:
             await self._finish_without_output(
                 judge_run=judge_run,
                 status="failed_terminal",
-                finish_reason=str(exc) or type(exc).__name__,
+                finish_reason="openai_permanent_error",
             )
             return
 
@@ -224,6 +235,31 @@ class JudgeOpenAIService:
             job.model != judge_run.model
             or job.reasoning_effort != judge_run.reasoning_effort
             or job.prompt_version != judge_run.prompt_version
+            or job.prompt_cache_key != judge_run.prompt_cache_key
+        )
+
+    @staticmethod
+    def _job_missing_required_fields(job: JudgeCallJob) -> bool:
+        return not all(
+            [
+                job.judge_run_id,
+                job.bundle_id,
+                job.model,
+                job.reasoning_effort,
+                job.prompt_version,
+                job.prompt_cache_key,
+            ]
+        )
+
+    @staticmethod
+    def _run_missing_required_fields(judge_run: JudgeRunRecord) -> bool:
+        return not all(
+            [
+                judge_run.model,
+                judge_run.reasoning_effort,
+                judge_run.prompt_version,
+                judge_run.prompt_cache_key,
+            ]
         )
 
     @staticmethod

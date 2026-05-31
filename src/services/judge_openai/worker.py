@@ -76,4 +76,7 @@ class JudgeOpenAIWorker:
                 },
             )
             return
-        await self._service.handle_trigger_event(trigger_event_id)
+        job = await self._service.rehydrate_job(trigger_event_id)
+        if job is None:
+            return
+        await self._service.handle_job(job)
