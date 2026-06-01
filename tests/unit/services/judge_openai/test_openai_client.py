@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from services.judge_openai.openai_client import OpenAIJudgeClient
+from services.judge_openai.openai_client import OpenAIJudgeClient, OpenAIRequestShapeError
+from services.judge_openai.request_shape import summarize_responses_request_shape
+from services.judge_openai.service import JudgeOpenAIService
 
 
 def test_openai_client_builds_responses_api_request_without_tools() -> None:
@@ -27,6 +29,34 @@ def test_openai_client_builds_responses_api_request_without_tools() -> None:
     assert request["prompt_cache_key"] == "judge:github:v1"
 
 
+def test_openai_client_current_judge_schema_passes_request_shape_diagnostic() -> None:
+    request = OpenAIJudgeClient.build_request(
+        model="gpt-5.4-mini",
+        reasoning_effort="low",
+        developer_prompt="developer",
+        user_context="user",
+        json_schema=JudgeOpenAIService.judge_output_schema(),
+        max_output_tokens=500,
+        prompt_cache_key="judge:github:v1",
+    )
+
+    summary = summarize_responses_request_shape(request)
+
+    assert summary["request_shape_valid_bucket"] == "one"
+    assert summary["request_shape_issue_count_bucket"] == "zero"
+    assert summary["request_shape_issue_buckets"] == []
+    assert summary["model_bucket"] == "locked_hot_path"
+    assert summary["reasoning_effort_bucket"] == "low"
+    assert summary["text_format_json_schema_bucket"] == "one"
+    assert summary["strict_schema_bucket"] == "one"
+    assert summary["tools_bucket"] == "zero"
+    assert summary["openai_call_attempted"] is False
+    assert summary["openai_key_file_read_bucket"] == "zero"
+    assert summary["database_write_attempted"] is False
+    assert summary["redis_write_attempted"] is False
+    assert summary["raw_values_emitted"] is False
+
+
 def test_openai_client_omits_missing_prompt_cache_key_for_legacy_events() -> None:
     request = OpenAIJudgeClient.build_request(
         model="gpt-5.4-mini",
@@ -39,6 +69,27 @@ def test_openai_client_omits_missing_prompt_cache_key_for_legacy_events() -> Non
     )
 
     assert "prompt_cache_key" not in request
+
+
+def test_request_shape_diagnostic_flags_unsupported_parameters_without_raw_text() -> None:
+    request = OpenAIJudgeClient.build_request(
+        model="gpt-5.4-mini",
+        reasoning_effort="low",
+        developer_prompt="private developer prompt should not be reported",
+        user_context="private user context should not be reported",
+        json_schema=JudgeOpenAIService.judge_output_schema(),
+        max_output_tokens=500,
+        prompt_cache_key="judge:github:v1",
+    )
+    request["temperature"] = 0
+
+    summary = summarize_responses_request_shape(request)
+    rendered = repr(summary)
+
+    assert summary["request_shape_valid_bucket"] == "zero"
+    assert summary["request_shape_issue_buckets"] == ["top_level.unsupported_parameter"]
+    assert "private developer prompt" not in rendered
+    assert "private user context" not in rendered
 
 
 @pytest.mark.asyncio
@@ -68,7 +119,7 @@ async def test_openai_client_can_use_injected_fake_without_sdk_import_or_network
         reasoning_effort="low",
         developer_prompt="developer",
         user_context="user",
-        json_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         max_output_tokens=None,
         prompt_cache_key=None,
     )
@@ -76,3 +127,46 @@ async def test_openai_client_can_use_injected_fake_without_sdk_import_or_network
     assert response == {"status": "completed", "output_text": "{}"}
     assert fake_client.responses.request is not None
     assert fake_client.responses.request["tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_openai_client_rejects_bad_schema_before_sdk_call() -> None:
+    class FakeResponses:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def create(self, **request):
+            self.calls += 1
+            return {"status": "completed", "output_text": "{}"}
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    fake_client = FakeClient()
+    client = OpenAIJudgeClient(
+        api_key="unused",
+        project=None,
+        timeout_sec=1,
+        client=fake_client,
+    )
+
+    with pytest.raises(OpenAIRequestShapeError) as exc_info:
+        await client.create_structured_response(
+            model="gpt-5.4-mini",
+            reasoning_effort="low",
+            developer_prompt="developer",
+            user_context="user",
+            json_schema={
+                "anyOf": [
+                    {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+                ]
+            },
+            max_output_tokens=None,
+            prompt_cache_key=None,
+        )
+
+    assert fake_client.responses.calls == 0
+    assert str(exc_info.value) == "invalid_request_shape"
+    assert "schema.root_not_object" in exc_info.value.issue_codes
+    assert "schema.root_anyof" in exc_info.value.issue_codes

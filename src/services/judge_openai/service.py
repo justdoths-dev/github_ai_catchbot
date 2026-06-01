@@ -9,7 +9,7 @@ from uuid import UUID
 from .config import JudgeOpenAIConfig
 from .context_builder import JudgeContextBuilder
 from .models import JudgeCallJob, JudgeRunRecord, OpenAIJudgeResult, OpenAIJudgeUsage
-from .openai_client import OpenAIPermanentError, OpenAITransientError
+from .openai_client import OpenAIPermanentError, OpenAIRequestShapeError, OpenAITransientError
 from .preflight import HeuristicSanitizingPreflight, NoopModelContextPreflight
 from .prompt_library import PromptLibrary, UnsupportedJudgeProfileError
 from .repositories import JudgeOpenAIRepository
@@ -126,6 +126,13 @@ class JudgeOpenAIService:
 
         try:
             outcome = await self._call_with_single_schema_retry(judge_run=judge_run, prepared=prepared)
+        except OpenAIRequestShapeError:
+            await self._finish_without_output(
+                judge_run=judge_run,
+                status="failed_terminal",
+                finish_reason="openai_request_shape_invalid",
+            )
+            return
         except OpenAITransientError:
             await self._finish_without_output(
                 judge_run=judge_run,

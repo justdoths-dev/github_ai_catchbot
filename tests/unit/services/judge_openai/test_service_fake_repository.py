@@ -10,7 +10,7 @@ import pytest
 
 from services.judge_openai.config import JudgeOpenAIConfig
 from services.judge_openai.models import BundleJudgeContext, JudgeCallJob, JudgeRunRecord, OpenAIJudgeUsage
-from services.judge_openai.openai_client import OpenAITransientError
+from services.judge_openai.openai_client import OpenAIRequestShapeError, OpenAITransientError
 from services.judge_openai.service import JudgeOpenAIService
 
 
@@ -428,6 +428,23 @@ async def test_fake_transport_failure_marks_retryable_and_emits_no_output_or_out
     assert len(client.calls) == 1
     assert repo.finished[-1]["status"] == "failed_retryable"
     assert repo.finished[-1]["finish_reason"] == "openai_transport_retryable"
+    assert repo.judge_outputs == []
+    assert repo.outbox == []
+
+
+@pytest.mark.asyncio
+async def test_request_shape_error_marks_precise_terminal_reason_without_output_or_outbox() -> None:
+    bundle = _bundle()
+    judge_run = _judge_run(bundle)
+    job = _job(judge_run)
+    repo = FakeRepository(job=job, judge_run=judge_run, bundle=bundle)
+    service, client = _subject(repo=repo, responses=[OpenAIRequestShapeError(("schema.root_anyof",))])
+
+    await service.handle_job(job)
+
+    assert len(client.calls) == 1
+    assert repo.finished[-1]["status"] == "failed_terminal"
+    assert repo.finished[-1]["finish_reason"] == "openai_request_shape_invalid"
     assert repo.judge_outputs == []
     assert repo.outbox == []
 

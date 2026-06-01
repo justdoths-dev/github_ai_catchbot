@@ -51,6 +51,7 @@ ALLOWED_FINISH_REASON_CODES = {
     "bundle_missing",
     "bundle_invalid",
     "unsupported_judge_profile",
+    "openai_request_shape_invalid",
     "openai_transport_retryable",
     "openai_permanent_error",
     "schema_invalid_after_retry",

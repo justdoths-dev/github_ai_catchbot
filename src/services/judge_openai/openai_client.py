@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .request_shape import validate_responses_request_shape
+
 
 class OpenAIClientConfigurationError(RuntimeError):
     pass
@@ -13,6 +15,12 @@ class OpenAITransientError(RuntimeError):
 
 class OpenAIPermanentError(RuntimeError):
     pass
+
+
+class OpenAIRequestShapeError(OpenAIPermanentError):
+    def __init__(self, issue_codes: tuple[str, ...]) -> None:
+        super().__init__("invalid_request_shape")
+        self.issue_codes = issue_codes
 
 
 class OpenAIJudgeClient:
@@ -50,6 +58,9 @@ class OpenAIJudgeClient:
             max_output_tokens=max_output_tokens,
             prompt_cache_key=prompt_cache_key,
         )
+        diagnostic = validate_responses_request_shape(request)
+        if not diagnostic.valid:
+            raise OpenAIRequestShapeError(diagnostic.issue_codes)
         try:
             return await self._client.responses.create(**request)
         except Exception as exc:
