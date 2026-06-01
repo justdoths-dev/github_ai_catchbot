@@ -41,6 +41,55 @@ ALLOWED_REDIS_THIN_FIELDS = {
     "not_before",
     "trigger_event_id",
 }
+ALLOWED_FINISH_REASON_CODES = {
+    "completed",
+    "incomplete",
+    "max_output_tokens",
+    "output_truncated",
+    "truncated",
+    "prompt_missing",
+    "bundle_missing",
+    "bundle_invalid",
+    "unsupported_judge_profile",
+    "openai_transport_retryable",
+    "openai_permanent_error",
+    "schema_invalid_after_retry",
+    "analysis_failed_truncation",
+    "model_refusal",
+    "validator_missing_skeptical_take",
+    "validator_missing_reason_codes",
+    "validator_schema_invalid",
+    "validator_missing_github_comparables",
+    "validator_inspect_now_evidence_too_low",
+    "validator_inspect_now_confidence_too_low",
+    "validator_inspect_now_hype_too_high",
+    "validator_passed",
+}
+SCHEMA_FAILURE_KEYWORDS = ("schema", "structured", "json_schema", "invalid_json")
+PRECONDITION_FAILURE_KEYWORDS = ("prompt", "bundle", "precondition", "missing", "unsupported")
+API_TRANSPORT_FAILURE_KEYWORDS = (
+    "openai",
+    "api",
+    "transport",
+    "timeout",
+    "network",
+    "rate_limit",
+    "rate-limit",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+)
+RESPONSE_MAPPING_FAILURE_KEYWORDS = (
+    "parse",
+    "parser",
+    "mapping",
+    "mapper",
+    "decode",
+    "response_map",
+    "response mapping",
+)
 
 STATUS_PASSED = "judge_openai_live_call_result_audit_passed"
 STATUS_NO_CANDIDATE = "blocked_judge_openai_live_call_result_audit_no_candidate"
@@ -66,6 +115,12 @@ WITH latest_outbox_per_run AS (
            jr.refusal_detected,
            jr.started_at,
            jr.finished_at,
+           jr.finish_reason,
+           jr.input_tokens,
+           jr.cached_input_tokens,
+           jr.output_tokens,
+           jr.reasoning_tokens,
+           jr.latency_ms,
            eo.event_id AS judge_call_requested_event_id,
            eo.status AS judge_call_requested_status,
            eo.fail_count AS judge_call_requested_fail_count,
@@ -90,6 +145,14 @@ SELECT judge_run_id,
        judge_run_status,
        schema_retry_count,
        refusal_detected,
+       started_at,
+       finished_at,
+       finish_reason,
+       input_tokens,
+       cached_input_tokens,
+       output_tokens,
+       reasoning_tokens,
+       latency_ms,
        judge_call_requested_event_id,
        judge_call_requested_status,
        judge_call_requested_fail_count,
@@ -226,6 +289,14 @@ class ReplayLiveSmokeCandidate:
     status: str
     schema_retry_count: int
     refusal_detected: bool
+    started_at: Any
+    finished_at: Any
+    finish_reason: str | None
+    input_tokens: Any
+    cached_input_tokens: Any
+    output_tokens: Any
+    reasoning_tokens: Any
+    latency_ms: Any
     judge_call_requested_event_id: UUID
     judge_call_requested_status: str
     judge_call_requested_fail_count: int
@@ -306,6 +377,15 @@ def _base_report() -> dict[str, Any]:
         "replay_judge_run_terminal_bucket": "zero",
         "replay_judge_run_retryable_bucket": "zero",
         "replay_judge_run_active_bucket": "zero",
+        "finish_reason_bucket": "zero",
+        "finish_reason_present_bucket": "zero",
+        "started_at_present_bucket": "zero",
+        "finished_at_present_bucket": "zero",
+        "latency_ms_present_bucket": "zero",
+        "input_tokens_present_bucket": "zero",
+        "output_tokens_present_bucket": "zero",
+        "reasoning_tokens_present_bucket": "zero",
+        "cached_input_tokens_present_bucket": "zero",
         "schema_retry_count_bucket": "zero",
         "refusal_detected_bucket": "zero",
         "judge_outputs_for_run_bucket": "zero",
@@ -351,6 +431,33 @@ def _bucket_count(count: int) -> str:
 
 def _bucket_bool(value: bool) -> str:
     return "one" if value else "zero"
+
+
+def _bucket_present(value: Any) -> str:
+    if value is None:
+        return "zero"
+    if isinstance(value, str) and not value.strip():
+        return "zero"
+    return "one"
+
+
+def _finish_reason_bucket(finish_reason: Any) -> str:
+    if finish_reason is None:
+        return "zero"
+    normalized = str(finish_reason).strip().lower()
+    if not normalized:
+        return "zero"
+    if normalized in ALLOWED_FINISH_REASON_CODES:
+        return normalized
+    if any(keyword in normalized for keyword in SCHEMA_FAILURE_KEYWORDS):
+        return "schema_failure"
+    if any(keyword in normalized for keyword in PRECONDITION_FAILURE_KEYWORDS):
+        return "precondition_failure"
+    if any(keyword in normalized for keyword in API_TRANSPORT_FAILURE_KEYWORDS):
+        return "api_or_transport_failure"
+    if any(keyword in normalized for keyword in RESPONSE_MAPPING_FAILURE_KEYWORDS):
+        return "response_mapping_failure"
+    return "other_sanitized"
 
 
 def parse_runtime_env_text(text: str) -> dict[str, str]:
@@ -606,6 +713,33 @@ def _report_contains_raw_values(report: Mapping[str, Any], raw_values: set[str])
         "failed_retryable",
         "published",
         "failed",
+        "completed",
+        "incomplete",
+        "max_output_tokens",
+        "output_truncated",
+        "truncated",
+        "prompt_missing",
+        "bundle_missing",
+        "bundle_invalid",
+        "unsupported_judge_profile",
+        "openai_transport_retryable",
+        "openai_permanent_error",
+        "schema_invalid_after_retry",
+        "analysis_failed_truncation",
+        "model_refusal",
+        "validator_missing_skeptical_take",
+        "validator_missing_reason_codes",
+        "validator_schema_invalid",
+        "validator_missing_github_comparables",
+        "validator_inspect_now_evidence_too_low",
+        "validator_inspect_now_confidence_too_low",
+        "validator_inspect_now_hype_too_high",
+        "validator_passed",
+        "schema_failure",
+        "precondition_failure",
+        "api_or_transport_failure",
+        "response_mapping_failure",
+        "other_sanitized",
         EXPECTED_STAGE_NAME,
         EXPECTED_AGGREGATE_TYPE,
         EXPECTED_QUEUE_NAME,
@@ -644,6 +778,16 @@ def _candidate_from_mapping(row: Mapping[str, Any]) -> ReplayLiveSmokeCandidate:
         status=str(row["judge_run_status"]),
         schema_retry_count=int(row.get("schema_retry_count", 0) or 0),
         refusal_detected=bool(row.get("refusal_detected", False)),
+        started_at=row.get("started_at"),
+        finished_at=row.get("finished_at"),
+        finish_reason=(
+            str(row["finish_reason"]) if row.get("finish_reason") is not None else None
+        ),
+        input_tokens=row.get("input_tokens"),
+        cached_input_tokens=row.get("cached_input_tokens"),
+        output_tokens=row.get("output_tokens"),
+        reasoning_tokens=row.get("reasoning_tokens"),
+        latency_ms=row.get("latency_ms"),
         judge_call_requested_event_id=_coerce_uuid(row["judge_call_requested_event_id"]),
         judge_call_requested_status=str(row.get("judge_call_requested_status", "")),
         judge_call_requested_fail_count=int(
@@ -709,6 +853,17 @@ def _apply_judge_run_status(report: dict[str, Any], candidate: ReplayLiveSmokeCa
         status in {"failed_retryable", "running"}
     )
     report["replay_judge_run_active_bucket"] = _bucket_bool(status in {"pending", "running"})
+    report["finish_reason_bucket"] = _finish_reason_bucket(candidate.finish_reason)
+    report["finish_reason_present_bucket"] = _bucket_present(candidate.finish_reason)
+    report["started_at_present_bucket"] = _bucket_present(candidate.started_at)
+    report["finished_at_present_bucket"] = _bucket_present(candidate.finished_at)
+    report["latency_ms_present_bucket"] = _bucket_present(candidate.latency_ms)
+    report["input_tokens_present_bucket"] = _bucket_present(candidate.input_tokens)
+    report["output_tokens_present_bucket"] = _bucket_present(candidate.output_tokens)
+    report["reasoning_tokens_present_bucket"] = _bucket_present(candidate.reasoning_tokens)
+    report["cached_input_tokens_present_bucket"] = _bucket_present(
+        candidate.cached_input_tokens
+    )
     report["schema_retry_count_bucket"] = _bucket_count(candidate.schema_retry_count)
     report["refusal_detected_bucket"] = _bucket_bool(candidate.refusal_detected)
 
@@ -949,6 +1104,7 @@ async def generate_report_async(
                 candidate.judge_run_id,
                 candidate.bundle_id,
                 candidate.judge_call_requested_event_id,
+                candidate.finish_reason,
             )
         )
         _apply_judge_run_status(report, candidate)

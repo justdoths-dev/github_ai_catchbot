@@ -249,6 +249,14 @@ def _candidate_row(
     status: str = "pending",
     schema_retry_count: int = 0,
     refusal_detected: bool = False,
+    finish_reason: str | None = None,
+    started_at: datetime | None = None,
+    finished_at: datetime | None = None,
+    input_tokens: int | None = None,
+    cached_input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    reasoning_tokens: int | None = None,
+    latency_ms: int | None = None,
     recency_at: datetime | None = None,
     created_at: datetime | None = None,
     outbox_status: str = "pending",
@@ -260,6 +268,14 @@ def _candidate_row(
         "judge_run_status": status,
         "schema_retry_count": schema_retry_count,
         "refusal_detected": refusal_detected,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "finish_reason": finish_reason,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "latency_ms": latency_ms,
         "judge_call_requested_event_id": event_id or uuid4(),
         "judge_call_requested_status": outbox_status,
         "judge_call_requested_fail_count": 0,
@@ -486,6 +502,99 @@ def test_schema_retry_and_refusal_buckets_are_sanitized_counts() -> None:
     assert result.report["schema_retry_count_bucket"] == "multiple"
     assert result.report["refusal_detected_bucket"] == "one"
     _assert_no_write_or_mutation_attempts(result, session, redis)
+
+
+def test_failed_terminal_candidate_reports_allowlisted_finish_reason_and_presence_buckets() -> None:
+    observed_at = datetime(2026, 6, 1, 2, 3, 4, tzinfo=timezone.utc)
+    result, session, redis = _run_report(
+        session=FakeSession(
+            candidate_rows=[
+                _candidate_row(
+                    status="failed_terminal",
+                    finish_reason="schema_invalid_after_retry",
+                    started_at=observed_at,
+                    finished_at=observed_at,
+                    input_tokens=987654,
+                    cached_input_tokens=876543,
+                    output_tokens=765432,
+                    reasoning_tokens=654321,
+                    latency_ms=543210,
+                )
+            ]
+        )
+    )
+
+    assert result.exit_code == 0
+    assert result.report["replay_judge_run_terminal_bucket"] == "one"
+    assert result.report["finish_reason_bucket"] == "schema_invalid_after_retry"
+    assert result.report["finish_reason_present_bucket"] == "one"
+    assert result.report["started_at_present_bucket"] == "one"
+    assert result.report["finished_at_present_bucket"] == "one"
+    assert result.report["input_tokens_present_bucket"] == "one"
+    assert result.report["cached_input_tokens_present_bucket"] == "one"
+    assert result.report["output_tokens_present_bucket"] == "one"
+    assert result.report["reasoning_tokens_present_bucket"] == "one"
+    assert result.report["latency_ms_present_bucket"] == "one"
+    rendered = _module().render_json(result.report)
+    for raw_number in ("987654", "876543", "765432", "654321", "543210"):
+        assert raw_number not in rendered
+    _assert_no_write_or_mutation_attempts(result, session, redis)
+
+
+def test_unknown_raw_looking_finish_reason_emits_other_bucket_without_raw_leak() -> None:
+    raw_finish_reason = "private durable terminal reason with raw source text"
+    result, session, redis = _run_report(
+        session=FakeSession(
+            candidate_rows=[
+                _candidate_row(status="failed_terminal", finish_reason=raw_finish_reason)
+            ]
+        ),
+        forbidden_raw_values=(raw_finish_reason,),
+    )
+
+    assert result.exit_code == 0
+    assert result.report["finish_reason_bucket"] == "other_sanitized"
+    assert result.report["finish_reason_present_bucket"] == "one"
+    assert result.report["raw_values_emitted"] is False
+    _assert_no_raw_values(result, raw_finish_reason)
+    _assert_no_write_or_mutation_attempts(result, session, redis)
+
+
+def test_null_finish_reason_emits_zero_bucket() -> None:
+    result, session, redis = _run_report(
+        session=FakeSession(
+            candidate_rows=[_candidate_row(status="failed_terminal", finish_reason=None)]
+        )
+    )
+
+    assert result.report["finish_reason_bucket"] == "zero"
+    assert result.report["finish_reason_present_bucket"] == "zero"
+    _assert_no_write_or_mutation_attempts(result, session, redis)
+
+
+def test_non_allowlisted_finish_reason_category_buckets_do_not_leak_raw_text() -> None:
+    examples = {
+        "schema parser failed around private field": "schema_failure",
+        "bundle precondition failed around private field": "precondition_failure",
+        "openai transport timeout around private field": "api_or_transport_failure",
+        "response mapper decode failed around private field": "response_mapping_failure",
+    }
+    for raw_finish_reason, expected_bucket in examples.items():
+        result, session, redis = _run_report(
+            session=FakeSession(
+                candidate_rows=[
+                    _candidate_row(
+                        status="failed_terminal",
+                        finish_reason=raw_finish_reason,
+                    )
+                ]
+            ),
+            forbidden_raw_values=(raw_finish_reason,),
+        )
+
+        assert result.report["finish_reason_bucket"] == expected_bucket
+        _assert_no_raw_values(result, raw_finish_reason)
+        _assert_no_write_or_mutation_attempts(result, session, redis)
 
 
 def test_judge_outputs_count_bucket() -> None:
