@@ -326,7 +326,12 @@ def _structured_response(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _fixtures(*, judge_run_status: str = "pending", include_bundle: bool = True) -> tuple[
+def _fixtures(
+    *,
+    judge_run_status: str = "pending",
+    include_bundle: bool = True,
+    replay: bool = False,
+) -> tuple[
     UUID,
     dict[str, dict[str, Any]],
     dict[str, dict[str, Any]],
@@ -338,13 +343,20 @@ def _fixtures(*, judge_run_status: str = "pending", include_bundle: bool = True)
     bundle_id = uuid4()
     candidate_group_id = uuid4()
     artifact_id = uuid4()
+    prompt_version = "judge_prompt_v1"
+    if replay:
+        prompt_version += "__replay_live_smoke_v1"
     payload = {
         "judge_run_id": str(judge_run_id),
         "bundle_id": str(bundle_id),
         "model": "gpt-5.4-mini",
         "reasoning_effort": "low",
-        "prompt_version": "judge_prompt_v1",
-        "prompt_cache_key": "judge:github_primary:judge_prompt_v1:judge_output_v1:policy_v1",
+        "prompt_version": prompt_version,
+        "prompt_cache_key": (
+            "judge:github_primary:"
+            + prompt_version
+            + ":judge_output_v1:policy_v1"
+        ),
         "prompt_context": FAKE_PROMPT_CONTEXT,
     }
     event_rows = {
@@ -636,22 +648,55 @@ def test_zero_redis_candidate_blocks(tmp_path: Path) -> None:
     assert result.report["contract_status"] == _module().STATUS_NO_CANDIDATE
     assert result.report["candidate_judge_message_found_bucket"] == "zero"
     assert live_client.calls == []
-    assert redis.xrevrange_calls == [("q.analysis.judge", 2)]
+    assert redis.xrevrange_calls == [("q.analysis.judge", _module().DEFAULT_SCAN_LIMIT)]
 
 
-def test_multiple_redis_candidates_block(tmp_path: Path) -> None:
-    _trigger_event_id, event_rows, judge_runs, bundles, redis_entry = _fixtures()
-    second = (
-        "1710000000001-0",
-        {**redis_entry[1], "trigger_event_id": str(uuid4()), "job_id": str(uuid4())},
+def test_stale_non_pending_candidate_is_ignored_when_fresh_pending_replay_candidate_exists(
+    tmp_path: Path,
+) -> None:
+    _stale_event_id, stale_events, stale_runs, stale_bundles, stale_entry = _fixtures(
+        judge_run_status="succeeded"
     )
-    session = FakeSession(event_rows=event_rows, judge_runs=judge_runs, bundles=bundles)
+    _fresh_event_id, fresh_events, fresh_runs, fresh_bundles, fresh_entry = _fixtures(
+        replay=True
+    )
+    session = FakeSession(
+        event_rows={**stale_events, **fresh_events},
+        judge_runs={**stale_runs, **fresh_runs},
+        bundles={**stale_bundles, **fresh_bundles},
+    )
+
+    result, session, redis, live_client, _forbidden = _run_report(
+        tmp_path,
+        session=session,
+        redis=FakeRedis(entries=[fresh_entry, stale_entry]),
+    )
+
+    assert result.exit_code == 0
+    assert result.report["contract_status"] == _module().STATUS_PREFLIGHT_PASSED
+    assert result.report["candidate_judge_message_found_bucket"] == "one"
+    assert result.report["judge_run_pending_bucket"] == "one"
+    assert live_client.calls == []
+    assert session.judge_outputs == []
+    assert redis.ack_calls == []
+
+
+def test_two_active_pending_eligible_redis_candidates_block_as_ambiguous(
+    tmp_path: Path,
+) -> None:
+    _first_event_id, first_events, first_runs, first_bundles, first_entry = _fixtures()
+    _second_event_id, second_events, second_runs, second_bundles, second_entry = _fixtures()
+    session = FakeSession(
+        event_rows={**first_events, **second_events},
+        judge_runs={**first_runs, **second_runs},
+        bundles={**first_bundles, **second_bundles},
+    )
     result, session, _redis, live_client, _forbidden = _run_report(
         tmp_path,
         approve_live_openai=True,
         approve_db_write=True,
         session=session,
-        redis=FakeRedis(entries=[redis_entry, second]),
+        redis=FakeRedis(entries=[first_entry, second_entry]),
     )
 
     assert result.exit_code == 1
@@ -692,7 +737,7 @@ def test_existing_ready_outbox_blocks_before_openai_call(tmp_path: Path) -> None
     assert session.ready_outbox == []
 
 
-def test_non_pending_judge_run_blocks(tmp_path: Path) -> None:
+def test_non_pending_judge_run_candidate_is_ignored(tmp_path: Path) -> None:
     result, session, _redis, live_client, _forbidden = _run_report(
         tmp_path,
         approve_live_openai=True,
@@ -701,7 +746,8 @@ def test_non_pending_judge_run_blocks(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 1
-    assert result.report["contract_status"] == _module().STATUS_NON_PENDING_RUN
+    assert result.report["contract_status"] == _module().STATUS_NO_CANDIDATE
+    assert result.report["candidate_judge_message_found_bucket"] == "zero"
     assert result.report["judge_run_pending_bucket"] == "zero"
     assert live_client.calls == []
     assert session.judge_outputs == []

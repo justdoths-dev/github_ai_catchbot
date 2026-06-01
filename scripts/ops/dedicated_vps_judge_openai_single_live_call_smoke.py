@@ -39,9 +39,21 @@ SCHEMA_VERSION = "1.0"
 SCRIPT_NAME = "dedicated_vps_judge_openai_single_live_call_smoke"
 REPORT_TYPE = "judge_openai_single_live_call_smoke_v1"
 DEFAULT_RUNTIME_ENV_PATH = "/etc/github-ai-catchbot/runtime.env"
+DEFAULT_SCAN_LIMIT = 100
+MAX_SCAN_LIMIT = 250
 EXPECTED_STREAM_NAME = "q.analysis.judge"
 EXPECTED_EVENT_TYPE = "judge.call.requested.v1"
 READY_EVENT_TYPE = "judge.output.ready.v1"
+ALLOWED_REDIS_THIN_FIELDS = {
+    "job_id",
+    "stage_name",
+    "root_object_type",
+    "root_object_id",
+    "idempotency_key",
+    "pipeline_run_id",
+    "not_before",
+    "trigger_event_id",
+}
 
 STATUS_PREFLIGHT_PASSED = "judge_openai_single_live_call_smoke_preflight_passed"
 STATUS_LIVE_CALL_PASSED = "judge_openai_single_live_call_smoke_approved_live_call_passed"
@@ -209,10 +221,32 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--runtime-env-path", default=DEFAULT_RUNTIME_ENV_PATH)
+    parser.add_argument(
+        "--scan-limit",
+        type=_bounded_positive_int_named("scan-limit", upper_bound=MAX_SCAN_LIMIT),
+        default=DEFAULT_SCAN_LIMIT,
+    )
     parser.add_argument("--approve-live-openai", action="store_true")
     parser.add_argument("--approve-db-write", action="store_true")
     parser.add_argument("--format", choices=("json",), default="json")
     return parser
+
+
+def _bounded_positive_int_named(field_name: str, *, upper_bound: int) -> Callable[[str], int]:
+    def parse(raw: str) -> int:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"{field_name} must be a positive integer"
+            ) from exc
+        if value <= 0 or value > upper_bound:
+            raise argparse.ArgumentTypeError(
+                f"{field_name} must be between 1 and {upper_bound}"
+            )
+        return value
+
+    return parse
 
 
 def _base_report() -> dict[str, Any]:
@@ -230,6 +264,7 @@ def _base_report() -> dict[str, Any]:
         "database_connected": False,
         "redis_connected": False,
         "q_analysis_judge_stream_exists": False,
+        "candidate_judge_message_scanned_bucket": "zero",
         "candidate_judge_message_found_bucket": "zero",
         "trigger_event_id_present": False,
         "event_outbox_rehydrated_bucket": "zero",
@@ -555,31 +590,113 @@ async def _count_query(
 async def _select_candidate_from_redis(
     *,
     report: dict[str, Any],
+    session: AsyncSessionLike,
+    repository: JudgeOpenAIRepository,
     redis_client: RedisClientLike,
     raw_values: set[str],
+    scan_limit: int,
 ) -> tuple[CandidateSelection | None, str | None]:
     exists_count = _safe_count(await _maybe_await(redis_client.exists(EXPECTED_STREAM_NAME)))
     report["q_analysis_judge_stream_exists"] = exists_count > 0
     if exists_count <= 0:
         return None, "redis.stream_missing"
 
-    entries = await _maybe_await(redis_client.xrevrange(EXPECTED_STREAM_NAME, count=2))
+    entries = await _maybe_await(redis_client.xrevrange(EXPECTED_STREAM_NAME, count=scan_limit))
     entry_count = len(entries or [])
-    report["candidate_judge_message_found_bucket"] = _bucket_count(entry_count)
+    report["candidate_judge_message_scanned_bucket"] = _bucket_count(entry_count)
     if entry_count <= 0:
+        report["candidate_judge_message_found_bucket"] = "zero"
         return None, "redis.candidate_missing"
-    if entry_count > 1:
-        raw_values.update(_collect_raw_strings(entries))
-        return None, "redis.candidate_ambiguous"
 
-    entry_id, raw_fields = entries[0]
+    eligible: list[CandidateSelection] = []
+    blocking: list[CandidateSelection] = []
+    for entry in entries:
+        selection, check = await _inspect_redis_candidate_entry(
+            entry=entry,
+            session=session,
+            repository=repository,
+            raw_values=raw_values,
+        )
+        if selection is None:
+            continue
+        if check is None:
+            eligible.append(selection)
+            continue
+        if check in {
+            "judge_outputs.existing",
+            "event_outbox.ready_existing",
+            "bundle.ready_for_judge",
+            "downstream.side_effect",
+        }:
+            blocking.append(selection)
+
+    report["candidate_judge_message_found_bucket"] = _bucket_count(len(eligible))
+    if len(eligible) > 1:
+        return None, "redis.candidate_ambiguous"
+    if len(eligible) == 1:
+        report["trigger_event_id_present"] = True
+        return eligible[0], None
+    if len(blocking) == 1:
+        report["candidate_judge_message_found_bucket"] = "one"
+        report["trigger_event_id_present"] = True
+        return blocking[0], None
+    return None, "redis.candidate_missing"
+
+
+async def _inspect_redis_candidate_entry(
+    *,
+    entry: Any,
+    session: AsyncSessionLike,
+    repository: JudgeOpenAIRepository,
+    raw_values: set[str],
+) -> tuple[CandidateSelection | None, str | None]:
+    if not isinstance(entry, (tuple, list)) or len(entry) < 2:
+        return None, "redis.entry_shape"
+    entry_id, raw_fields = entry[0], entry[1]
+    if not isinstance(raw_fields, Mapping):
+        return None, "redis.fields_shape"
     fields = _decode_stream_fields(raw_fields)
     raw_values.update(_collect_raw_strings(entry_id, fields))
+
+    if set(fields) != ALLOWED_REDIS_THIN_FIELDS:
+        return None, "redis.thin_fields"
+    if fields.get("stage_name") != "judge":
+        return None, "redis.stage_name"
+    if fields.get("root_object_type") != "judge_run":
+        return None, "redis.root_object_type"
+
+    job_id = _coerce_uuid(fields.get("job_id"))
     trigger_event_id = _coerce_uuid(fields.get("trigger_event_id"))
-    report["trigger_event_id_present"] = trigger_event_id is not None
-    if trigger_event_id is None:
-        return None, "redis.trigger_event_id"
-    return CandidateSelection(trigger_event_id=trigger_event_id, raw_fields=fields), None
+    root_object_id = _coerce_uuid(fields.get("root_object_id"))
+    if job_id is None or trigger_event_id is None or root_object_id is None:
+        return None, "redis.required_ids"
+    if job_id != trigger_event_id:
+        return None, "redis.job_id"
+
+    probe_report = _base_report()
+    event_row = await _load_event_row(
+        report=probe_report,
+        session=session,
+        trigger_event_id=trigger_event_id,
+        raw_values=raw_values,
+    )
+    if event_row is None or not probe_report["event_type_is_judge_call_requested"]:
+        return None, "event_outbox.event_type"
+
+    job, check = await _inspect_job_preconditions(
+        report=probe_report,
+        session=session,
+        repository=repository,
+        trigger_event_id=trigger_event_id,
+        raw_values=raw_values,
+    )
+    if job is not None and job.judge_run_id != root_object_id:
+        return None, "redis.root_object_id"
+
+    selection = CandidateSelection(trigger_event_id=trigger_event_id, raw_fields=fields)
+    if job is None:
+        return selection, check or "event_outbox.job"
+    return selection, None
 
 
 async def _load_event_row(
@@ -771,6 +888,7 @@ def _approved_execution_succeeded(report: Mapping[str, Any]) -> bool:
 async def generate_report_async(
     *,
     runtime_env_path: str | Path = DEFAULT_RUNTIME_ENV_PATH,
+    scan_limit: int = DEFAULT_SCAN_LIMIT,
     approve_live_openai: bool = False,
     approve_db_write: bool = False,
     runtime_env_reader: RuntimeEnvReader | None = None,
@@ -780,6 +898,10 @@ async def generate_report_async(
     forbidden_raw_values: Sequence[str] = (),
 ) -> ScriptResult:
     report = _base_report()
+    if scan_limit <= 0 or scan_limit > MAX_SCAN_LIMIT:
+        _set_status(report, STATUS_NOT_READY, "scan_limit.out_of_bounds")
+        return ScriptResult(exit_code=1, report=report)
+
     session: AsyncSessionLike | None = None
     redis_client: RedisClientLike | None = None
     committed = False
@@ -829,10 +951,14 @@ async def generate_report_async(
             _set_status(report, STATUS_NOT_READY, "redis.connection")
             return _finalize(report, raw_values, exit_code=1)
 
+        repository = JudgeOpenAIRepository(session)
         selection, selection_check = await _select_candidate_from_redis(
             report=report,
+            session=session,
+            repository=repository,
             redis_client=redis_client,
             raw_values=raw_values,
+            scan_limit=scan_limit,
         )
         if selection is None:
             status = _status_for_precondition_check(selection_check or "redis.candidate_missing")
@@ -849,7 +975,6 @@ async def generate_report_async(
             _set_status(report, STATUS_INVALID_CANDIDATE, "event_outbox.event_type")
             return _finalize(report, raw_values, exit_code=1)
 
-        repository = JudgeOpenAIRepository(session)
         job, job_check = await _inspect_job_preconditions(
             report=report,
             session=session,
@@ -918,6 +1043,7 @@ def _finalize(report: dict[str, Any], raw_values: set[str], *, exit_code: int) -
 def generate_report(
     *,
     runtime_env_path: str | Path = DEFAULT_RUNTIME_ENV_PATH,
+    scan_limit: int = DEFAULT_SCAN_LIMIT,
     approve_live_openai: bool = False,
     approve_db_write: bool = False,
     runtime_env_reader: RuntimeEnvReader | None = None,
@@ -929,6 +1055,7 @@ def generate_report(
     return asyncio.run(
         generate_report_async(
             runtime_env_path=runtime_env_path,
+            scan_limit=scan_limit,
             approve_live_openai=approve_live_openai,
             approve_db_write=approve_db_write,
             runtime_env_reader=runtime_env_reader,
@@ -949,6 +1076,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     result = generate_report(
         runtime_env_path=args.runtime_env_path,
+        scan_limit=args.scan_limit,
         approve_live_openai=args.approve_live_openai,
         approve_db_write=args.approve_db_write,
     )
