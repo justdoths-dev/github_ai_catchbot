@@ -36,6 +36,7 @@ ALLOWED_TOP_LEVEL_KEYS = frozenset(
         "prompt_cache_key",
     }
 )
+OPTIONAL_TOP_LEVEL_KEYS = frozenset({"max_output_tokens", "prompt_cache_key"})
 _FORMAT_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -65,24 +66,40 @@ def summarize_responses_request_shape(request: Mapping[str, Any]) -> dict[str, A
     reasoning = _as_mapping(request.get("reasoning"))
     input_items = request.get("input")
     tools = request.get("tools")
+    optional_null_fields = _optional_null_fields(request)
+    text_format_type = _text_format_type_bucket(text_format.get("type"))
+    max_output_tokens_present = "one" if "max_output_tokens" in request else "zero"
+    prompt_cache_key_present = "one" if "prompt_cache_key" in request else "zero"
+    tools_count = _bucket_count(len(tools) if isinstance(tools, list) else 0)
+    strict_bucket = "one" if text_format.get("strict") is True else "zero"
     return {
         "request_shape_valid_bucket": "one" if diagnostic.valid else "zero",
         "request_shape_issue_count_bucket": _bucket_count(len(diagnostic.issue_codes)),
         "request_shape_issue_buckets": list(diagnostic.issue_codes),
+        "top_level_request_key_presence_buckets": {
+            key: "one" if key in request else "zero"
+            for key in sorted(ALLOWED_TOP_LEVEL_KEYS)
+        },
+        "optional_null_field_count_bucket": _bucket_count(len(optional_null_fields)),
+        "optional_null_field_name_buckets": optional_null_fields,
         "model_bucket": _model_bucket(request.get("model")),
         "reasoning_effort_bucket": _reasoning_effort_bucket(reasoning.get("effort")),
         "input_message_count_bucket": _bucket_count(len(input_items) if isinstance(input_items, list) else 0),
+        "text_format_type_bucket": text_format_type,
         "text_format_json_schema_bucket": "one"
-        if text_format.get("type") == "json_schema"
+        if text_format_type == "json_schema"
         else "zero",
-        "strict_schema_bucket": "one" if text_format.get("strict") is True else "zero",
-        "tools_bucket": _bucket_count(len(tools) if isinstance(tools, list) else 0),
-        "max_output_tokens_present_bucket": "one"
-        if "max_output_tokens" in request
+        "json_schema_strict_bucket": strict_bucket,
+        "strict_schema_bucket": strict_bucket,
+        "tools_count_bucket": tools_count,
+        "tools_bucket": tools_count,
+        "max_output_tokens_presence_bucket": max_output_tokens_present,
+        "max_output_tokens_present_bucket": max_output_tokens_present,
+        "max_output_tokens_null_bucket": "one"
+        if request.get("max_output_tokens") is None and "max_output_tokens" in request
         else "zero",
-        "prompt_cache_key_present_bucket": "one"
-        if "prompt_cache_key" in request
-        else "zero",
+        "prompt_cache_key_presence_bucket": prompt_cache_key_present,
+        "prompt_cache_key_present_bucket": prompt_cache_key_present,
         "openai_call_attempted": False,
         "openai_key_file_read_bucket": "zero",
         "database_write_attempted": False,
@@ -166,11 +183,15 @@ def _validate_generation_controls(request: Mapping[str, Any], issues: list[str])
         issues.append("tools.non_empty_or_missing")
     if "max_output_tokens" in request:
         value = request.get("max_output_tokens")
-        if not isinstance(value, int) or value <= 0:
+        if value is None:
+            issues.append("max_output_tokens.null")
+        elif not isinstance(value, int) or value <= 0:
             issues.append("max_output_tokens.invalid")
     if "prompt_cache_key" in request:
         value = request.get("prompt_cache_key")
-        if not isinstance(value, str) or not value.strip():
+        if value is None:
+            issues.append("prompt_cache_key.null")
+        elif not isinstance(value, str) or not value.strip():
             issues.append("prompt_cache_key.invalid")
 
 
@@ -255,6 +276,22 @@ def _bucket_count(count: int) -> str:
     if count == 1:
         return "one"
     return "multiple"
+
+
+def _optional_null_fields(request: Mapping[str, Any]) -> list[str]:
+    return [
+        key
+        for key in sorted(OPTIONAL_TOP_LEVEL_KEYS)
+        if key in request and request.get(key) is None
+    ]
+
+
+def _text_format_type_bucket(value: Any) -> str:
+    if value == "json_schema":
+        return "json_schema"
+    if isinstance(value, str) and value:
+        return "other"
+    return "zero"
 
 
 def _model_bucket(value: Any) -> str:

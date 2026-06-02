@@ -91,6 +91,76 @@ ALLOWED_TARGET_FINISH_REASON_BUCKETS = frozenset(
 )
 SCHEMA_HINT_RE = re.compile(r"(json_schema|schema|response_format|structured)", re.IGNORECASE)
 MODEL_HINT_RE = re.compile(r"(model|deployment)", re.IGNORECASE)
+OPENAI_ERROR_CODE_BUCKET_PATTERNS = (
+    ("json_schema", re.compile(r"(json_schema|schema_invalid|schema)", re.IGNORECASE)),
+    ("response_format", re.compile(r"response_format", re.IGNORECASE)),
+    (
+        "unsupported_parameter",
+        re.compile(r"(unsupported|unknown|unrecognized).*(parameter|param)", re.IGNORECASE),
+    ),
+    ("unsupported_value", re.compile(r"(unsupported|invalid).*value", re.IGNORECASE)),
+    ("invalid_type", re.compile(r"invalid.*type", re.IGNORECASE)),
+    (
+        "missing_required_parameter",
+        re.compile(r"(missing|required).*(parameter|param)", re.IGNORECASE),
+    ),
+    ("context_length_exceeded", re.compile(r"context.*length", re.IGNORECASE)),
+    ("model_not_found", re.compile(r"model.*not.*found", re.IGNORECASE)),
+    ("model_access", re.compile(r"model.*(not.*available|access)", re.IGNORECASE)),
+    ("rate_limit", re.compile(r"rate.*limit", re.IGNORECASE)),
+    ("insufficient_quota", re.compile(r"insufficient.*quota", re.IGNORECASE)),
+    ("invalid_api_key", re.compile(r"invalid.*api.*key", re.IGNORECASE)),
+)
+OPENAI_ERROR_PARAM_BUCKET_PATTERNS = (
+    ("max_output_tokens", re.compile(r"max_output_tokens", re.IGNORECASE)),
+    ("prompt_cache_key", re.compile(r"prompt_cache_key", re.IGNORECASE)),
+    ("response_format", re.compile(r"response_format", re.IGNORECASE)),
+    ("text_format", re.compile(r"text.*format|format", re.IGNORECASE)),
+    ("json_schema", re.compile(r"json_schema|schema", re.IGNORECASE)),
+    ("input_context", re.compile(r"input|context|message|content", re.IGNORECASE)),
+    ("tools", re.compile(r"tools?", re.IGNORECASE)),
+    ("model", re.compile(r"model", re.IGNORECASE)),
+    ("reasoning", re.compile(r"reasoning", re.IGNORECASE)),
+)
+OPENAI_ERROR_MESSAGE_HINT_PATTERNS = (
+    ("optional_null", re.compile(r"\b(null|none|null value)\b", re.IGNORECASE)),
+    (
+        "unsupported_parameter",
+        re.compile(r"(unsupported|unknown|unrecognized).*(parameter|param)", re.IGNORECASE),
+    ),
+    ("unsupported_value", re.compile(r"(unsupported|invalid).*(value|type)", re.IGNORECASE)),
+    ("model_parameter", MODEL_HINT_RE),
+    ("response_format", re.compile(r"response_format|response format", re.IGNORECASE)),
+    ("text_format", re.compile(r"text\.format|text format", re.IGNORECASE)),
+    ("json_schema", SCHEMA_HINT_RE),
+    ("prompt_cache_key", re.compile(r"prompt_cache_key", re.IGNORECASE)),
+    ("max_output_tokens", re.compile(r"max_output_tokens|max output tokens", re.IGNORECASE)),
+    ("input_context", re.compile(r"\b(input|context|message|content)\b", re.IGNORECASE)),
+    ("tools", re.compile(r"\btools?\b", re.IGNORECASE)),
+    ("reasoning", re.compile(r"\breasoning\b", re.IGNORECASE)),
+)
+REQUEST_SHAPE_REPORT_KEYS = (
+    "request_shape_valid_bucket",
+    "request_shape_issue_count_bucket",
+    "request_shape_issue_buckets",
+    "top_level_request_key_presence_buckets",
+    "optional_null_field_count_bucket",
+    "optional_null_field_name_buckets",
+    "model_bucket",
+    "reasoning_effort_bucket",
+    "input_message_count_bucket",
+    "text_format_type_bucket",
+    "text_format_json_schema_bucket",
+    "json_schema_strict_bucket",
+    "strict_schema_bucket",
+    "tools_count_bucket",
+    "tools_bucket",
+    "max_output_tokens_presence_bucket",
+    "max_output_tokens_present_bucket",
+    "max_output_tokens_null_bucket",
+    "prompt_cache_key_presence_bucket",
+    "prompt_cache_key_present_bucket",
+)
 
 SET_TRANSACTION_READ_ONLY_QUERY = "SET TRANSACTION READ ONLY"
 SHOW_TRANSACTION_READ_ONLY_QUERY = "SHOW transaction_read_only"
@@ -997,6 +1067,7 @@ def _classify_openai_exception(exc: Exception) -> dict[str, Any]:
     status_int = status_code if isinstance(status_code, int) else None
     name = type(exc).__name__
     hint = _exception_hint(exc)
+    message_hint_buckets = _openai_error_message_hint_buckets(hint)
 
     result_bucket = "other_sanitized"
     error_type_bucket = "other"
@@ -1033,6 +1104,12 @@ def _classify_openai_exception(exc: Exception) -> dict[str, Any]:
         "live_result_class_bucket": result_bucket,
         "http_status_bucket": _http_status_bucket(status_int),
         "openai_error_type_bucket": error_type_bucket,
+        "openai_error_code_bucket": _openai_error_code_bucket(exc),
+        "openai_error_param_bucket": _openai_error_param_bucket(exc),
+        "openai_error_message_hint_count_bucket": _bucket_count(
+            len(message_hint_buckets)
+        ),
+        "openai_error_message_hint_buckets": message_hint_buckets,
         "response_parse_bucket": "zero",
         "structured_output_observed_bucket": "zero",
         "usage_present_bucket": "zero",
@@ -1041,11 +1118,71 @@ def _classify_openai_exception(exc: Exception) -> dict[str, Any]:
 
 def _exception_hint(exc: Exception) -> str:
     parts: list[str] = [type(exc).__name__]
-    for attr in ("type", "code"):
-        value = getattr(exc, attr, None)
-        if isinstance(value, str):
+    text = str(exc)
+    if text:
+        parts.append(text)
+    for attr in ("type", "code", "param", "message"):
+        value = _openai_error_field(exc, attr)
+        if value:
             parts.append(value)
     return " ".join(parts)
+
+
+def _openai_error_code_bucket(exc: Exception) -> str:
+    return _bucket_from_patterns(
+        _openai_error_field(exc, "code"),
+        OPENAI_ERROR_CODE_BUCKET_PATTERNS,
+    )
+
+
+def _openai_error_param_bucket(exc: Exception) -> str:
+    return _bucket_from_patterns(
+        _openai_error_field(exc, "param"),
+        OPENAI_ERROR_PARAM_BUCKET_PATTERNS,
+    )
+
+
+def _openai_error_message_hint_buckets(text: str) -> list[str]:
+    return [
+        bucket
+        for bucket, pattern in OPENAI_ERROR_MESSAGE_HINT_PATTERNS
+        if pattern.search(text)
+    ]
+
+
+def _openai_error_field(exc: Exception, field: str) -> str:
+    value = getattr(exc, field, None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    body = getattr(exc, "body", None)
+    body_value = _mapping_field(body, field)
+    if body_value:
+        return body_value
+    if isinstance(body, Mapping):
+        nested_error = body.get("error")
+        nested_value = _mapping_field(nested_error, field)
+        if nested_value:
+            return nested_value
+    return ""
+
+
+def _mapping_field(value: Any, field: str) -> str:
+    if not isinstance(value, Mapping):
+        return ""
+    raw = value.get(field)
+    return raw.strip() if isinstance(raw, str) and raw.strip() else ""
+
+
+def _bucket_from_patterns(
+    value: str,
+    patterns: Sequence[tuple[str, re.Pattern[str]]],
+) -> str:
+    if not value:
+        return "zero"
+    for bucket, pattern in patterns:
+        if pattern.search(value):
+            return bucket
+    return "other_sanitized"
 
 
 def _status_error_type_bucket(status_code: int | None) -> str:
@@ -1149,6 +1286,10 @@ def _base_report(
         "live_result_class_bucket": "zero",
         "http_status_bucket": "zero",
         "openai_error_type_bucket": "zero",
+        "openai_error_code_bucket": "zero",
+        "openai_error_param_bucket": "zero",
+        "openai_error_message_hint_count_bucket": "zero",
+        "openai_error_message_hint_buckets": [],
         "response_parse_bucket": "zero",
         "structured_output_observed_bucket": "zero",
         "usage_present_bucket": "zero",
@@ -1166,9 +1307,11 @@ def _base_report(
 
 
 def _merge_request_shape_report(report: dict[str, Any], summary: Mapping[str, Any]) -> None:
-    report["request_shape_valid_bucket"] = summary["request_shape_valid_bucket"]
-    report["request_shape_issue_count_bucket"] = summary["request_shape_issue_count_bucket"]
-    report["request_shape_issue_buckets"] = list(summary["request_shape_issue_buckets"])
+    for key in REQUEST_SHAPE_REPORT_KEYS:
+        if key not in summary:
+            continue
+        value = summary[key]
+        report[key] = list(value) if isinstance(value, list) else value
 
 
 def _set_status(report: dict[str, Any], status: str, check: str | None = None) -> None:
@@ -1274,6 +1417,26 @@ def _report_contains_raw_values(report: Mapping[str, Any], raw_values: set[str])
         "rate_limit_error",
         "server_error",
         "api_timeout_error",
+        "json_schema",
+        "response_format",
+        "unsupported_parameter",
+        "unsupported_value",
+        "invalid_type",
+        "missing_required_parameter",
+        "context_length_exceeded",
+        "model_not_found",
+        "model_parameter",
+        "model_access",
+        "rate_limit",
+        "insufficient_quota",
+        "invalid_api_key",
+        "optional_null",
+        "max_output_tokens",
+        "prompt_cache_key",
+        "text_format",
+        "input_context",
+        "tools",
+        "reasoning",
     }
     return any(value not in public_literals and value in rendered for value in raw_values)
 

@@ -379,6 +379,16 @@ def test_default_mode_does_not_read_runtime_db_key_sdk_or_openai() -> None:
     assert report["openai_key_file_read_bucket"] == "zero"
     assert report["sdk_import_bucket"] == "zero"
     assert report["request_shape_valid_bucket"] == "one"
+    assert report["top_level_request_key_presence_buckets"]["max_output_tokens"] == "one"
+    assert report["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "one"
+    assert report["optional_null_field_count_bucket"] == "zero"
+    assert report["optional_null_field_name_buckets"] == []
+    assert report["max_output_tokens_presence_bucket"] == "one"
+    assert report["max_output_tokens_null_bucket"] == "zero"
+    assert report["prompt_cache_key_presence_bucket"] == "one"
+    assert report["text_format_type_bucket"] == "json_schema"
+    assert report["json_schema_strict_bucket"] == "one"
+    assert report["tools_count_bucket"] == "zero"
     _assert_no_live_or_downstream(report)
 
 
@@ -467,6 +477,16 @@ def test_approved_db_read_preflight_uses_read_only_transaction_and_builds_reques
     assert report["token_budget_profile_bucket"] == "medium"
     assert report["request_shape_valid_bucket"] == "one"
     assert report["request_shape_issue_count_bucket"] == "zero"
+    assert report["top_level_request_key_presence_buckets"]["max_output_tokens"] == "zero"
+    assert report["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "one"
+    assert report["optional_null_field_count_bucket"] == "zero"
+    assert report["optional_null_field_name_buckets"] == []
+    assert report["max_output_tokens_presence_bucket"] == "zero"
+    assert report["max_output_tokens_null_bucket"] == "zero"
+    assert report["prompt_cache_key_presence_bucket"] == "one"
+    assert report["text_format_type_bucket"] == "json_schema"
+    assert report["json_schema_strict_bucket"] == "one"
+    assert report["tools_count_bucket"] == "zero"
     assert report["openai_key_read_bucket"] == "zero"
     assert report["openai_key_file_read_bucket"] == "zero"
     assert report["sdk_import_bucket"] == "zero"
@@ -641,6 +661,17 @@ def test_approved_live_mode_fake_sdk_performs_exactly_one_call_after_context_bui
     assert request["text"]["format"]["type"] == "json_schema"
     assert request["text"]["format"]["strict"] is True
     assert request["tools"] == []
+    assert "max_output_tokens" not in request
+    assert request["prompt_cache_key"] == (
+        "judge:github_primary:judge_prompt_v1:judge_output_v1:policy_v1"
+    )
+    assert report["top_level_request_key_presence_buckets"]["max_output_tokens"] == "zero"
+    assert report["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "one"
+    assert report["optional_null_field_count_bucket"] == "zero"
+    assert report["optional_null_field_name_buckets"] == []
+    assert report["max_output_tokens_presence_bucket"] == "zero"
+    assert report["max_output_tokens_null_bucket"] == "zero"
+    assert report["prompt_cache_key_presence_bucket"] == "one"
     _assert_no_downstream(report)
     _assert_no_db_writes(session)
 
@@ -699,10 +730,59 @@ def test_approved_live_mode_classifies_fake_sdk_exceptions(
     assert report["live_result_class_bucket"] == result_bucket
     assert report["http_status_bucket"] == http_bucket
     assert report["openai_error_type_bucket"] == openai_error_bucket
+    assert report["openai_error_code_bucket"] in {
+        "zero",
+        "json_schema",
+        "response_format",
+    }
+    assert report["openai_error_param_bucket"] == "zero"
+    assert report["openai_error_message_hint_count_bucket"] in {"zero", "one", "multiple"}
     assert report["response_parse_bucket"] == "zero"
     assert report["structured_output_observed_bucket"] == "zero"
     assert report["usage_present_bucket"] == "zero"
     assert report["checks_failed"] == [f"openai.live_call.{result_bucket}"]
+    _assert_no_raw_values(report, FAKE_ERROR_TEXT, FAKE_REQUEST_ID)
+    _assert_no_downstream(report)
+    _assert_no_db_writes(session)
+
+
+def test_approved_live_mode_reports_sanitized_error_code_param_and_message_hints() -> None:
+    recorder: dict[str, Any] = {}
+    exc = _fake_exception(
+        name="BadRequestError",
+        status_code=400,
+        error_type="invalid_request_error",
+        code="unsupported_parameter",
+        param="max_output_tokens",
+    )
+    exc.body = {
+        "message": (
+            "Unsupported parameter max_output_tokens cannot be null. "
+            + FAKE_ERROR_TEXT
+        ),
+        "code": "unsupported_parameter",
+        "param": "max_output_tokens",
+    }
+
+    result, session = _run_live(
+        sdk_loader=_fake_sdk_loader(recorder, side_effect=exc),
+        forbidden_raw_values=(FAKE_ERROR_TEXT, FAKE_REQUEST_ID),
+    )
+
+    report = result.report
+    assert result.exit_code == 1
+    assert report["contract_status"] == _module().STATUS_LIVE_FAILED
+    assert report["live_result_class_bucket"] == "invalid_request"
+    assert report["http_status_bucket"] == "400"
+    assert report["openai_error_type_bucket"] == "invalid_request_error"
+    assert report["openai_error_code_bucket"] == "unsupported_parameter"
+    assert report["openai_error_param_bucket"] == "max_output_tokens"
+    assert report["openai_error_message_hint_count_bucket"] == "multiple"
+    assert set(report["openai_error_message_hint_buckets"]) >= {
+        "optional_null",
+        "unsupported_parameter",
+        "max_output_tokens",
+    }
     _assert_no_raw_values(report, FAKE_ERROR_TEXT, FAKE_REQUEST_ID)
     _assert_no_downstream(report)
     _assert_no_db_writes(session)
@@ -852,13 +932,15 @@ def _fake_exception(
     status_code: int | None,
     error_type: str | None,
     code: str | None,
+    param: str | None = None,
 ) -> Exception:
     cls = type(name, (Exception,), {})
     exc = cls(FAKE_ERROR_TEXT)
     exc.status_code = status_code
     exc.type = error_type
     exc.code = code
-    exc.body = {"message": FAKE_ERROR_TEXT}
+    exc.param = param
+    exc.body = {"message": FAKE_ERROR_TEXT, "code": code, "param": param}
     exc.request_id = FAKE_REQUEST_ID
     return exc
 

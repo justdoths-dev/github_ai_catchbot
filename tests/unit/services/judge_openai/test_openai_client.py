@@ -3,7 +3,10 @@ from __future__ import annotations
 import pytest
 
 from services.judge_openai.openai_client import OpenAIJudgeClient, OpenAIRequestShapeError
-from services.judge_openai.request_shape import summarize_responses_request_shape
+from services.judge_openai.request_shape import (
+    summarize_responses_request_shape,
+    validate_responses_request_shape,
+)
 from services.judge_openai.service import JudgeOpenAIService
 
 
@@ -13,7 +16,12 @@ def test_openai_client_builds_responses_api_request_without_tools() -> None:
         reasoning_effort="low",
         developer_prompt="developer",
         user_context="user",
-        json_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        json_schema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
         max_output_tokens=500,
         prompt_cache_key="judge:github:v1",
     )
@@ -47,9 +55,19 @@ def test_openai_client_current_judge_schema_passes_request_shape_diagnostic() ->
     assert summary["request_shape_issue_buckets"] == []
     assert summary["model_bucket"] == "locked_hot_path"
     assert summary["reasoning_effort_bucket"] == "low"
+    assert summary["top_level_request_key_presence_buckets"]["max_output_tokens"] == "one"
+    assert summary["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "one"
+    assert summary["optional_null_field_count_bucket"] == "zero"
+    assert summary["optional_null_field_name_buckets"] == []
+    assert summary["text_format_type_bucket"] == "json_schema"
     assert summary["text_format_json_schema_bucket"] == "one"
+    assert summary["json_schema_strict_bucket"] == "one"
     assert summary["strict_schema_bucket"] == "one"
+    assert summary["tools_count_bucket"] == "zero"
     assert summary["tools_bucket"] == "zero"
+    assert summary["max_output_tokens_presence_bucket"] == "one"
+    assert summary["max_output_tokens_null_bucket"] == "zero"
+    assert summary["prompt_cache_key_presence_bucket"] == "one"
     assert summary["openai_call_attempted"] is False
     assert summary["openai_key_file_read_bucket"] == "zero"
     assert summary["database_write_attempted"] is False
@@ -63,12 +81,74 @@ def test_openai_client_omits_missing_prompt_cache_key_for_legacy_events() -> Non
         reasoning_effort="low",
         developer_prompt="developer",
         user_context="user",
-        json_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        json_schema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
         max_output_tokens=500,
         prompt_cache_key=None,
     )
 
     assert "prompt_cache_key" not in request
+
+
+def test_openai_client_omits_none_optional_generation_controls() -> None:
+    request = OpenAIJudgeClient.build_request(
+        model="gpt-5.4-mini",
+        reasoning_effort="low",
+        developer_prompt="developer",
+        user_context="user",
+        json_schema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+        max_output_tokens=None,
+        prompt_cache_key=None,
+    )
+
+    summary = summarize_responses_request_shape(request)
+
+    assert "max_output_tokens" not in request
+    assert "prompt_cache_key" not in request
+    assert summary["top_level_request_key_presence_buckets"]["max_output_tokens"] == "zero"
+    assert summary["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "zero"
+    assert summary["max_output_tokens_presence_bucket"] == "zero"
+    assert summary["max_output_tokens_null_bucket"] == "zero"
+    assert summary["prompt_cache_key_presence_bucket"] == "zero"
+    assert summary["optional_null_field_count_bucket"] == "zero"
+    assert summary["optional_null_field_name_buckets"] == []
+
+
+def test_request_shape_validator_rejects_injected_optional_null_fields() -> None:
+    request = OpenAIJudgeClient.build_request(
+        model="gpt-5.4-mini",
+        reasoning_effort="low",
+        developer_prompt="developer",
+        user_context="user",
+        json_schema=JudgeOpenAIService.judge_output_schema(),
+        max_output_tokens=500,
+        prompt_cache_key="judge:github:v1",
+    )
+    request["max_output_tokens"] = None
+    request["prompt_cache_key"] = None
+
+    diagnostic = validate_responses_request_shape(request)
+    summary = summarize_responses_request_shape(request)
+
+    assert not diagnostic.valid
+    assert "max_output_tokens.null" in diagnostic.issue_codes
+    assert "prompt_cache_key.null" in diagnostic.issue_codes
+    assert summary["request_shape_valid_bucket"] == "zero"
+    assert summary["optional_null_field_count_bucket"] == "multiple"
+    assert summary["optional_null_field_name_buckets"] == [
+        "max_output_tokens",
+        "prompt_cache_key",
+    ]
+    assert summary["max_output_tokens_null_bucket"] == "one"
 
 
 def test_request_shape_diagnostic_flags_unsupported_parameters_without_raw_text() -> None:
