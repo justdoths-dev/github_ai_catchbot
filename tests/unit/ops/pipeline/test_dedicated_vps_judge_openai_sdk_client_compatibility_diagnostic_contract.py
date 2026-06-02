@@ -56,7 +56,9 @@ def test_default_report_passes_with_no_network_mock_sdk_path() -> None:
     assert report["text_format_json_schema_bucket"] == "one"
     assert report["strict_schema_bucket"] == "one"
     assert report["tools_bucket"] == "zero"
-    assert report["prompt_cache_key_present_bucket"] == "one"
+    assert report["prompt_cache_key_present_bucket"] == "zero"
+    if "prompt_cache_key_presence_bucket" in report:
+        assert report["prompt_cache_key_presence_bucket"] == "zero"
     assert report["max_output_tokens_present_bucket"] == "one"
     assert report["openai_call_attempted"] is False
     assert report["live_openai_call_attempted"] is False

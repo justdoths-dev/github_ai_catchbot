@@ -357,6 +357,10 @@ async def generate_report_async(
     )
     raw_values = _raw_values(*forbidden_raw_values)
 
+    _apply_prompt_cache_key_transport_policy(
+        report,
+        internal_prompt_cache_key=DEFAULT_PROMPT_CACHE_KEY,
+    )
     default_request = _build_default_preflight_request()
     raw_values.update(
         _raw_values(DIAGNOSTIC_DEVELOPER_PROMPT, DIAGNOSTIC_USER_CONTEXT)
@@ -594,6 +598,10 @@ async def _build_real_context(
         len(prepared.developer_prompt)
     )
     report["user_context_size_bucket"] = _bucket_size_chars(len(prepared.user_context))
+    _apply_prompt_cache_key_transport_policy(
+        report,
+        internal_prompt_cache_key=judge_run.prompt_cache_key,
+    )
     request = OpenAIJudgeClient.build_request(
         model=judge_run.model,
         reasoning_effort=judge_run.reasoning_effort,
@@ -910,6 +918,17 @@ def _apply_bundle_buckets(report: dict[str, Any], bundle: Any) -> None:
     report["token_budget_profile_bucket"] = _token_budget_profile_bucket(
         bundle.token_budget_profile
     )
+
+
+def _apply_prompt_cache_key_transport_policy(
+    report: dict[str, Any],
+    *,
+    internal_prompt_cache_key: str | None,
+) -> None:
+    report["stored_prompt_cache_key_presence_bucket"] = (
+        "one" if internal_prompt_cache_key and internal_prompt_cache_key.strip() else "zero"
+    )
+    report["prompt_cache_key_transport_policy_bucket"] = "disabled"
 
 
 def _transaction_read_only_enabled(raw_value: Any) -> bool:
@@ -1269,6 +1288,8 @@ def _base_report(
         "supporting_summary_count_bucket": "zero",
         "discovered_link_count_bucket": "zero",
         "token_budget_profile_bucket": "zero",
+        "stored_prompt_cache_key_presence_bucket": "zero",
+        "prompt_cache_key_transport_policy_bucket": "disabled",
         "request_shape_valid_bucket": "zero",
         "request_shape_issue_count_bucket": "zero",
         "request_shape_issue_buckets": [],
@@ -1387,6 +1408,7 @@ def _report_contains_raw_values(report: Mapping[str, Any], raw_values: set[str])
         "large",
         "xlarge",
         "other",
+        "disabled",
         "success",
         "api_status_error",
         "api_connection_error",

@@ -380,12 +380,14 @@ def test_default_mode_does_not_read_runtime_db_key_sdk_or_openai() -> None:
     assert report["sdk_import_bucket"] == "zero"
     assert report["request_shape_valid_bucket"] == "one"
     assert report["top_level_request_key_presence_buckets"]["max_output_tokens"] == "one"
-    assert report["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "one"
+    assert report["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "zero"
+    assert report["stored_prompt_cache_key_presence_bucket"] == "one"
+    assert report["prompt_cache_key_transport_policy_bucket"] == "disabled"
     assert report["optional_null_field_count_bucket"] == "zero"
     assert report["optional_null_field_name_buckets"] == []
     assert report["max_output_tokens_presence_bucket"] == "one"
     assert report["max_output_tokens_null_bucket"] == "zero"
-    assert report["prompt_cache_key_presence_bucket"] == "one"
+    assert report["prompt_cache_key_presence_bucket"] == "zero"
     assert report["text_format_type_bucket"] == "json_schema"
     assert report["json_schema_strict_bucket"] == "one"
     assert report["tools_count_bucket"] == "zero"
@@ -478,12 +480,14 @@ def test_approved_db_read_preflight_uses_read_only_transaction_and_builds_reques
     assert report["request_shape_valid_bucket"] == "one"
     assert report["request_shape_issue_count_bucket"] == "zero"
     assert report["top_level_request_key_presence_buckets"]["max_output_tokens"] == "zero"
-    assert report["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "one"
+    assert report["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "zero"
+    assert report["stored_prompt_cache_key_presence_bucket"] == "one"
+    assert report["prompt_cache_key_transport_policy_bucket"] == "disabled"
     assert report["optional_null_field_count_bucket"] == "zero"
     assert report["optional_null_field_name_buckets"] == []
     assert report["max_output_tokens_presence_bucket"] == "zero"
     assert report["max_output_tokens_null_bucket"] == "zero"
-    assert report["prompt_cache_key_presence_bucket"] == "one"
+    assert report["prompt_cache_key_presence_bucket"] == "zero"
     assert report["text_format_type_bucket"] == "json_schema"
     assert report["json_schema_strict_bucket"] == "one"
     assert report["tools_count_bucket"] == "zero"
@@ -662,16 +666,16 @@ def test_approved_live_mode_fake_sdk_performs_exactly_one_call_after_context_bui
     assert request["text"]["format"]["strict"] is True
     assert request["tools"] == []
     assert "max_output_tokens" not in request
-    assert request["prompt_cache_key"] == (
-        "judge:github_primary:judge_prompt_v1:judge_output_v1:policy_v1"
-    )
+    assert "prompt_cache_key" not in request
     assert report["top_level_request_key_presence_buckets"]["max_output_tokens"] == "zero"
-    assert report["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "one"
+    assert report["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "zero"
+    assert report["stored_prompt_cache_key_presence_bucket"] == "one"
+    assert report["prompt_cache_key_transport_policy_bucket"] == "disabled"
     assert report["optional_null_field_count_bucket"] == "zero"
     assert report["optional_null_field_name_buckets"] == []
     assert report["max_output_tokens_presence_bucket"] == "zero"
     assert report["max_output_tokens_null_bucket"] == "zero"
-    assert report["prompt_cache_key_presence_bucket"] == "one"
+    assert report["prompt_cache_key_presence_bucket"] == "zero"
     _assert_no_downstream(report)
     _assert_no_db_writes(session)
 

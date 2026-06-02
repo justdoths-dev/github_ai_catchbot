@@ -34,7 +34,7 @@ def test_openai_client_builds_responses_api_request_without_tools() -> None:
     assert request["text"]["format"]["strict"] is True
     assert request["tools"] == []
     assert request["max_output_tokens"] == 500
-    assert request["prompt_cache_key"] == "judge:github:v1"
+    assert "prompt_cache_key" not in request
 
 
 def test_openai_client_current_judge_schema_passes_request_shape_diagnostic() -> None:
@@ -56,7 +56,7 @@ def test_openai_client_current_judge_schema_passes_request_shape_diagnostic() ->
     assert summary["model_bucket"] == "locked_hot_path"
     assert summary["reasoning_effort_bucket"] == "low"
     assert summary["top_level_request_key_presence_buckets"]["max_output_tokens"] == "one"
-    assert summary["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "one"
+    assert summary["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "zero"
     assert summary["optional_null_field_count_bucket"] == "zero"
     assert summary["optional_null_field_name_buckets"] == []
     assert summary["text_format_type_bucket"] == "json_schema"
@@ -67,12 +67,32 @@ def test_openai_client_current_judge_schema_passes_request_shape_diagnostic() ->
     assert summary["tools_bucket"] == "zero"
     assert summary["max_output_tokens_presence_bucket"] == "one"
     assert summary["max_output_tokens_null_bucket"] == "zero"
-    assert summary["prompt_cache_key_presence_bucket"] == "one"
+    assert summary["prompt_cache_key_presence_bucket"] == "zero"
     assert summary["openai_call_attempted"] is False
     assert summary["openai_key_file_read_bucket"] == "zero"
     assert summary["database_write_attempted"] is False
     assert summary["redis_write_attempted"] is False
     assert summary["raw_values_emitted"] is False
+
+
+def test_request_shape_diagnostic_detects_injected_prompt_cache_key() -> None:
+    request = OpenAIJudgeClient.build_request(
+        model="gpt-5.4-mini",
+        reasoning_effort="low",
+        developer_prompt="developer",
+        user_context="user",
+        json_schema=JudgeOpenAIService.judge_output_schema(),
+        max_output_tokens=500,
+        prompt_cache_key="judge:github:v1",
+    )
+    request["prompt_cache_key"] = "judge:github:v1"
+
+    diagnostic = validate_responses_request_shape(request)
+    summary = summarize_responses_request_shape(request)
+
+    assert diagnostic.valid
+    assert summary["top_level_request_key_presence_buckets"]["prompt_cache_key"] == "one"
+    assert summary["prompt_cache_key_presence_bucket"] == "one"
 
 
 def test_openai_client_omits_missing_prompt_cache_key_for_legacy_events() -> None:

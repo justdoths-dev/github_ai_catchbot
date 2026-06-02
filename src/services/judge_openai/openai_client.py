@@ -102,9 +102,9 @@ class OpenAIJudgeClient:
         }
         if max_output_tokens is not None:
             request["max_output_tokens"] = max_output_tokens
-        # Older replayed judge.call.requested events may not have this optional cache hint.
-        if prompt_cache_key:
-            request["prompt_cache_key"] = prompt_cache_key
+        # OpenAI transport compatibility guard after a live 400 on
+        # prompt_cache_key: keep the internal audit/cache-intent argument but
+        # omit it from Responses API request kwargs.
         return request
 
     @staticmethod
