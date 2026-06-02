@@ -46,6 +46,16 @@ def test_business_rules_reject_empty_reason_codes() -> None:
     assert decision.reason_code == "validator_missing_reason_codes"
 
 
+def test_business_rules_reject_score_outside_0_to_100() -> None:
+    payload = valid_payload()
+    payload["scores"]["evidence_strength"] = 101
+
+    decision = AnalysisValidatorBusinessRules().validate_semantics(payload=payload, bundle=_bundle())
+
+    assert decision.action == "failed_terminal"
+    assert decision.reason_code == "validator_score_range_invalid"
+
+
 def test_business_rules_reject_inspect_now_with_evidence_strength_below_50() -> None:
     payload = valid_payload()
     payload["model_proposed_verdict"] = "inspect_now"

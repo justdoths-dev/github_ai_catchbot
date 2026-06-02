@@ -215,6 +215,21 @@ async def test_worker_rehydrates_judge_output_ready_from_event_outbox_trigger_id
 
 
 @pytest.mark.asyncio
+async def test_missing_judge_run_writes_terminal_state_transition_no_policy_outbox() -> None:
+    repository, job, run, _output_record = _repo_with_valid_case()
+    del repository.runs[run.judge_run_id]
+
+    await _handle(repository, job)
+
+    assert repository.state_transitions[0]["object_type"] == "judge_run"
+    assert repository.state_transitions[0]["object_id"] == run.judge_run_id
+    assert repository.state_transitions[0]["from_state"] is None
+    assert repository.state_transitions[0]["to_state"] == "analysis_failed_missing_run"
+    assert repository.state_transitions[0]["reason_code"] == "validator_missing_judge_run"
+    assert repository.outbox == []
+
+
+@pytest.mark.asyncio
 async def test_missing_judge_output_marks_run_failed_terminal_and_writes_state_transition_no_policy_outbox() -> None:
     repository, job, run, output = _repo_with_valid_case()
     del repository.outputs[output.judge_output_id]

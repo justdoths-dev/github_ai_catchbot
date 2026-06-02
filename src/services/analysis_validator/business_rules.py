@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from numbers import Real
 from typing import Any
 
 from .models import BundleValidationContext, ValidationDecision
@@ -48,6 +49,8 @@ class AnalysisValidatorBusinessRules:
         scores = payload.get("scores")
         if not isinstance(scores, dict):
             return self._semantic("validator_schema_invalid")
+        if self._has_out_of_range_numeric_score(scores):
+            return self._semantic("validator_score_range_invalid")
 
         comparables = payload.get("comparables")
         if (
@@ -79,6 +82,15 @@ class AnalysisValidatorBusinessRules:
     def _score(scores: dict[str, Any], field: str) -> int | None:
         value = scores.get(field)
         return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @staticmethod
+    def _has_out_of_range_numeric_score(scores: dict[str, Any]) -> bool:
+        for value in scores.values():
+            if isinstance(value, bool) or not isinstance(value, Real):
+                continue
+            if value < 0 or value > 100:
+                return True
+        return False
 
     @staticmethod
     def _is_truncated(finish_reason: str | None) -> bool:

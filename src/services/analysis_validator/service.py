@@ -68,6 +68,7 @@ class AnalysisValidatorService:
     async def handle_job(self, job: JudgeOutputReadyJob) -> None:
         judge_run = await self._repository.load_judge_run(job.judge_run_id)
         if judge_run is None:
+            await self._missing_judge_run(job)
             return
 
         judge_output = await self._repository.load_judge_output(job.judge_output_id)
@@ -132,6 +133,16 @@ class AnalysisValidatorService:
                 judge_output_id=judge_output.judge_output_id,
                 candidate_group_id=judge_output.candidate_group_id,
                 bundle_id=judge_run.bundle_id,
+            )
+
+    async def _missing_judge_run(self, job: JudgeOutputReadyJob) -> None:
+        async with self._repository.transaction():
+            await self._repository.insert_state_transition(
+                object_type="judge_run",
+                object_id=job.judge_run_id,
+                from_state=None,
+                to_state="analysis_failed_missing_run",
+                reason_code="validator_missing_judge_run",
             )
 
     async def _transition_only(
