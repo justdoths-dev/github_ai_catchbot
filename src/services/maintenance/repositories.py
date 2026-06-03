@@ -21,6 +21,7 @@ from .models import (
     RetryPromotionCandidate,
     SelectedPlanRecoveryRow,
 )
+from .retry_policy import DELIVERY_RESULT_NOOP_ERROR_CODE, DELIVERY_RESULT_NOOP_STAGE_NAME
 
 
 class AsyncSessionLike(Protocol):
@@ -317,6 +318,39 @@ class MaintenanceRepository:
                 "attempt_status": attempt_status,
                 "error_code": error_code,
             },
+        )
+
+    async def count_delivery_result_noop_job_attempts(self, notification_plan_id: UUID) -> int:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT COUNT(*)
+                FROM job_attempts
+                WHERE stage_name = :stage_name
+                  AND queue_name = :queue_name
+                  AND root_object_type = 'notification_plan'
+                  AND root_object_id = CAST(:notification_plan_id AS uuid)
+                  AND attempt_status = 'succeeded'::job_attempt_status_enum
+                  AND error_code = :error_code
+                """
+            ),
+            {
+                "stage_name": DELIVERY_RESULT_NOOP_STAGE_NAME,
+                "queue_name": MAINTENANCE_QUEUE_NAME,
+                "notification_plan_id": str(notification_plan_id),
+                "error_code": DELIVERY_RESULT_NOOP_ERROR_CODE,
+            },
+        )
+        return int(result.scalar_one())
+
+    async def insert_delivery_result_noop_job_attempt(self, notification_plan_id: UUID) -> None:
+        await self.insert_job_attempt(
+            stage_name=DELIVERY_RESULT_NOOP_STAGE_NAME,
+            queue_name=MAINTENANCE_QUEUE_NAME,
+            root_object_type="notification_plan",
+            root_object_id=notification_plan_id,
+            attempt_status="succeeded",
+            error_code=DELIVERY_RESULT_NOOP_ERROR_CODE,
         )
 
     async def load_delivery_gate_snapshot(self) -> DeliveryGateSnapshot:

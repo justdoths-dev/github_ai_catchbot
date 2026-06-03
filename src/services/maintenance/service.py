@@ -10,6 +10,7 @@ from .delivery_replay import REPLAY_REQUESTED_EVENT_TYPE, evaluate_delivery_repl
 from .delivery_retry import DELIVERY_RESULT_EVENT_TYPE, evaluate_retry_promotion
 from .models import NotificationPlanRecord, OutboxEvent, ReplayRequestRecord, RetryPromotionCandidate
 from .repositories import delivery_result_from_outbox, replay_requested_from_outbox
+from .retry_policy import DeliveryResultDryRunNoopDecision, classify_delivery_result_dry_run_noop
 
 
 class MaintenanceRepositoryProtocol(Protocol):
@@ -34,6 +35,7 @@ class MaintenanceRepositoryProtocol(Protocol):
         attempt_status: str,
         error_code: str | None = None,
     ) -> None: ...
+    async def insert_delivery_result_noop_job_attempt(self, notification_plan_id: UUID) -> None: ...
 
 
 class MaintenanceService:
@@ -151,6 +153,23 @@ class MaintenanceService:
                             error_code=decision.reason_code,
                         )
         return action_count
+
+    async def record_delivery_result_dry_run_noop_success(
+        self,
+        *,
+        notification_plan_id: UUID,
+        delivery_status: str,
+        delivery_reason: str | None,
+    ) -> DeliveryResultDryRunNoopDecision:
+        decision = classify_delivery_result_dry_run_noop(
+            delivery_status=delivery_status,
+            delivery_reason=delivery_reason,
+        )
+        if decision.action != "mark_logical_noop_success":
+            return decision
+        async with self._repository.transaction():
+            await self._repository.insert_delivery_result_noop_job_attempt(notification_plan_id)
+        return decision
 
     async def handle_replay_trigger_event(self, trigger_event_id: str | UUID) -> None:
         event_id = _parse_uuid(trigger_event_id)
