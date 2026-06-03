@@ -91,6 +91,8 @@ class FakeSession:
         payload_override: dict[str, Any] | None = None,
         primary_artifact_type: str = "github_repo",
         read_only_value: str = "on",
+        implicit_read_transaction: bool = False,
+        fail_begin_if_transaction_open: bool = False,
     ) -> None:
         self.trigger_event_id = uuid4()
         self.judge_run_id = uuid4()
@@ -108,7 +110,10 @@ class FakeSession:
         self.notification_delivery_count = notification_delivery_count
         self.notification_intent_count = notification_intent_count
         self.read_only_value = read_only_value
+        self.implicit_read_transaction = implicit_read_transaction
+        self.fail_begin_if_transaction_open = fail_begin_if_transaction_open
         self.transaction_open = False
+        self.explicit_transaction_open = False
         self.statements: list[str] = []
         self.analyses: list[tuple[UUID, dict[str, Any]]] = []
         self.state_transitions: list[dict[str, Any]] = []
@@ -121,6 +126,8 @@ class FakeSession:
         self.candidate_current_analysis_mutations: list[dict[str, Any]] = []
         self.committed = False
         self.rolled_back = False
+        self.rollback_count = 0
+        self.begin_count = 0
         self.closed = False
 
         payload = payload_override or _inspect_now_payload()
@@ -186,6 +193,7 @@ class FakeSession:
     @asynccontextmanager
     async def _begin(self):
         self.transaction_open = True
+        self.explicit_transaction_open = True
         try:
             yield self
         except Exception:
@@ -194,9 +202,13 @@ class FakeSession:
         else:
             self.committed = True
         finally:
+            self.explicit_transaction_open = False
             self.transaction_open = False
 
     def begin(self):
+        self.begin_count += 1
+        if self.fail_begin_if_transaction_open and self.transaction_open:
+            raise AssertionError("explicit begin attempted while read transaction is open")
         return self._begin()
 
     async def execute(self, statement: Any, params: dict[str, Any] | None = None) -> FakeResult:
@@ -204,6 +216,9 @@ class FakeSession:
         normalized = _normalize(str(statement))
         self.statements.append(normalized)
         module = _module()
+        first = normalized.split()[0].upper()
+        if self.implicit_read_transaction and not self.explicit_transaction_open and first == "SELECT":
+            self.transaction_open = True
 
         if normalized == _normalize(module.SET_TRANSACTION_READ_ONLY_QUERY):
             return FakeResult()
@@ -289,7 +304,6 @@ class FakeSession:
             )
             return FakeResult()
 
-        first = normalized.split()[0].upper()
         if "JUDGE_OUTPUTS" in normalized and first in {"INSERT", "UPDATE", "DELETE"}:
             self.judge_output_mutations.append({"statement": normalized, "params": params})
             return FakeResult()
@@ -316,6 +330,8 @@ class FakeSession:
 
     async def rollback(self) -> None:
         self.rolled_back = True
+        self.rollback_count += 1
+        self.transaction_open = False
 
     async def close(self) -> None:
         self.closed = True
@@ -666,6 +682,44 @@ def test_db_read_preflight_rejects_missing_target_chat_for_non_suppress() -> Non
     assert result.report["checks_failed"] == ["config.target_chat_id_unavailable"]
     assert result.report["analysis_delivery_decision_bucket"] == "send_now"
     _assert_no_writes(session)
+
+
+def test_db_write_handles_existing_read_transaction_before_explicit_write() -> None:
+    result, session = _run_report(
+        approve_db_write=True,
+        session=FakeSession(
+            payload_override=_skip_payload(),
+            implicit_read_transaction=True,
+            fail_begin_if_transaction_open=True,
+        ),
+        runtime_reader=_runtime_reader_without_chat,
+    )
+
+    report = result.report
+    assert result.exit_code == 0
+    assert report["contract_status"] == _module().STATUS_DB_WRITE_PASSED
+    assert report["database_write_attempted"] is True
+    assert report["policy_engine_started"] is True
+    assert report["analysis_rows_written_bucket"] == "one"
+    assert report["policy_state_transitions_written_bucket"] == "one"
+    assert report["notification_plan_intent_outbox_written_bucket"] == "zero"
+    assert report["analysis_verdict_bucket"] == "skip"
+    assert report["analysis_delivery_decision_bucket"] == "suppress"
+    assert report["judge_outputs_written_bucket"] == "zero"
+    assert report["judge_outputs_mutation_attempted"] is False
+    assert report["candidate_bundle_mutation_attempted"] is False
+    assert report["candidate_current_analysis_mutation_attempted"] is False
+    assert session.rollback_count >= 1
+    assert session.begin_count == 1
+    assert session.committed is True
+    assert session.closed is True
+    assert len(session.analyses) == 1
+    assert len(session.state_transitions) == 1
+    assert session.notification_outbox == []
+    assert session.judge_output_mutations == []
+    assert session.candidate_bundle_mutations == []
+    assert session.candidate_current_analysis_mutations == []
+    _assert_no_forbidden_downstream(report)
 
 
 def test_db_write_fake_success_writes_one_analysis_transition_and_plan_intent() -> None:

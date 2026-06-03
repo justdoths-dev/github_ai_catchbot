@@ -897,6 +897,9 @@ async def _run_service_handoff(
         _set_status(report, STATUS_WRITE_FAILED, "service.rehydrate_job")
         return
 
+    if session.in_transaction():
+        await session.rollback()
+
     report["database_write_attempted"] = True
     report["policy_engine_started"] = True
     async with session.begin():
