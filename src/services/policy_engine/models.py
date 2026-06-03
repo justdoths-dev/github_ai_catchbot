@@ -119,7 +119,7 @@ class NotificationPlanIntent:
     render_profile: str
     dedupe_subject_key: str
     material_change_hash: str
-    send_after: str
+    send_after: str | None
     suppress_reason_code: str | None = None
 
 

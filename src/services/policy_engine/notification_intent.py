@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 from .config import PolicyEngineConfig
@@ -50,7 +49,7 @@ class NotificationIntentBuilder:
             render_profile=render_profile,
             dedupe_subject_key=str(analysis.candidate_group_id),
             material_change_hash=material_change_hash,
-            send_after=datetime.now(timezone.utc).isoformat(),
+            send_after=None,
             suppress_reason_code=evaluation.suppress_reason_code,
         )
 
