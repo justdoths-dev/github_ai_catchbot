@@ -6,10 +6,18 @@ from typing import Protocol
 from uuid import UUID
 
 from .config import MaintenanceConfig
+from .delivery_result_worker import DeliveryResultWorker
 from .delivery_replay import REPLAY_REQUESTED_EVENT_TYPE, evaluate_delivery_replay
-from .delivery_retry import DELIVERY_RESULT_EVENT_TYPE, evaluate_retry_promotion
-from .models import NotificationPlanRecord, OutboxEvent, ReplayRequestRecord, RetryPromotionCandidate
-from .repositories import delivery_result_from_outbox, replay_requested_from_outbox
+from .delivery_retry import evaluate_retry_promotion
+from .models import (
+    DeliveryResultWorkerResult,
+    LatestDeliveryRecord,
+    NotificationPlanRecord,
+    OutboxEvent,
+    ReplayRequestRecord,
+    RetryPromotionCandidate,
+)
+from .repositories import replay_requested_from_outbox
 from .retry_policy import DeliveryResultDryRunNoopDecision, classify_delivery_result_dry_run_noop
 
 
@@ -17,6 +25,7 @@ class MaintenanceRepositoryProtocol(Protocol):
     def transaction(self): ...
     async def load_outbox_event(self, event_id: UUID) -> OutboxEvent | None: ...
     async def load_notification_plan(self, notification_plan_id: UUID) -> NotificationPlanRecord | None: ...
+    async def load_latest_delivery_record(self, notification_plan_id: UUID) -> LatestDeliveryRecord | None: ...
     async def count_delivery_attempts(self, notification_plan_id: UUID) -> int: ...
     async def load_due_retry_candidates(self, limit: int, now: datetime) -> list[RetryPromotionCandidate]: ...
     async def insert_plan_created_outbox(
@@ -35,7 +44,10 @@ class MaintenanceRepositoryProtocol(Protocol):
         attempt_status: str,
         error_code: str | None = None,
     ) -> None: ...
-    async def insert_delivery_result_noop_job_attempt(self, notification_plan_id: UUID) -> None: ...
+    async def count_delivery_result_noop_job_attempts(self, notification_plan_id: UUID) -> int: ...
+    async def insert_delivery_result_noop_job_attempt(self, notification_plan_id: UUID) -> bool: ...
+    async def count_delivery_result_sent_success_job_attempts(self, notification_delivery_record_id: UUID) -> int: ...
+    async def insert_delivery_result_sent_success_job_attempt(self, notification_delivery_record_id: UUID) -> bool: ...
 
 
 class MaintenanceService:
@@ -52,59 +64,15 @@ class MaintenanceService:
         self._logger = logger or logging.getLogger(__name__)
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
 
-    async def handle_maintenance_trigger_event(self, trigger_event_id: str | UUID) -> None:
+    async def handle_maintenance_trigger_event(self, trigger_event_id: str | UUID) -> DeliveryResultWorkerResult | None:
         event_id = _parse_uuid(trigger_event_id)
         if event_id is None:
             self._logger.warning("maintenance_invalid_trigger_event_id")
-            return
-        event = await self._repository.load_outbox_event(event_id)
-        if event is None or event.event_type != DELIVERY_RESULT_EVENT_TYPE:
-            return
-        delivery_result = delivery_result_from_outbox(event)
-        if delivery_result is None:
-            return
-
-        plan = await self._repository.load_notification_plan(delivery_result.notification_plan_id)
-        attempt_count = await self._repository.count_delivery_attempts(delivery_result.notification_plan_id) if plan else 0
-        decision = evaluate_retry_promotion(
-            delivery_status=delivery_result.delivery_status,
-            plan=plan,
-            latest_attempt_count=attempt_count,
-            max_attempts=self._config.delivery_retry_max_attempts,
-            enabled=self._config.enable_delivery_retry_promotion,
-            now=self._now_fn(),
-        )
-        async with self._repository.transaction():
-            if decision.action == "emit_retry_intent" and plan is not None and decision.dedupe_key and decision.payload:
-                await self._repository.insert_plan_created_outbox(
-                    notification_plan_id=plan.notification_plan_id,
-                    dedupe_key=decision.dedupe_key,
-                    payload_json=decision.payload,
-                )
-                await self._record_job_attempt(
-                    queue_name=self._config.maintenance_queue_name,
-                    root_object_id=plan.notification_plan_id,
-                    status="succeeded",
-                    error_code=None,
-                )
-            elif decision.action == "dead_letter_retry_ceiling" and plan is not None:
-                await self._repository.insert_retry_ceiling_dead_letter(
-                    notification_plan_id=plan.notification_plan_id,
-                    retry_count=attempt_count,
-                )
-                await self._record_job_attempt(
-                    queue_name=self._config.maintenance_queue_name,
-                    root_object_id=plan.notification_plan_id,
-                    status="failed_terminal",
-                    error_code=decision.reason_code,
-                )
-            else:
-                await self._record_job_attempt(
-                    queue_name=self._config.maintenance_queue_name,
-                    root_object_id=delivery_result.notification_plan_id,
-                    status="succeeded" if plan is not None else "failed_terminal",
-                    error_code=None if plan is not None else "notification_plan_missing",
-                )
+            return None
+        return await DeliveryResultWorker(
+            repository=self._repository,
+            logger=self._logger,
+        ).handle_trigger_event(event_id)
 
     async def promote_due_retries_once(self, limit: int | None = None) -> int:
         if not self._config.enable_delivery_retry_promotion:

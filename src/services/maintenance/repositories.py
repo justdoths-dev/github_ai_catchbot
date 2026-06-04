@@ -348,15 +348,49 @@ class MaintenanceRepository:
         )
         return int(result.scalar_one())
 
-    async def insert_delivery_result_noop_job_attempt(self, notification_plan_id: UUID) -> None:
-        await self.insert_job_attempt(
-            stage_name=DELIVERY_RESULT_NOOP_STAGE_NAME,
-            queue_name=MAINTENANCE_QUEUE_NAME,
-            root_object_type="notification_plan",
-            root_object_id=notification_plan_id,
-            attempt_status="succeeded",
-            error_code=DELIVERY_RESULT_NOOP_ERROR_CODE,
+    async def insert_delivery_result_noop_job_attempt(self, notification_plan_id: UUID) -> bool:
+        result = await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO job_attempts (
+                    stage_name, queue_name, root_object_type, root_object_id,
+                    attempt_no, started_at, finished_at, attempt_status, error_code, created_at
+                )
+                SELECT
+                    :stage_name,
+                    :queue_name,
+                    :root_object_type,
+                    CAST(:root_object_id AS uuid),
+                    1,
+                    now(),
+                    now(),
+                    CAST(:attempt_status AS job_attempt_status_enum),
+                    :error_code,
+                    now()
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM job_attempts
+                    WHERE stage_name = :stage_name
+                      AND queue_name = :queue_name
+                      AND root_object_type = :root_object_type
+                      AND root_object_id = CAST(:root_object_id AS uuid)
+                      AND attempt_status = CAST(:attempt_status AS job_attempt_status_enum)
+                      AND error_code = :error_code
+                )
+                RETURNING job_attempt_id
+                """
+            ),
+            {
+                "stage_name": DELIVERY_RESULT_NOOP_STAGE_NAME,
+                "queue_name": MAINTENANCE_QUEUE_NAME,
+                "root_object_type": "notification_plan",
+                "root_object_id": str(notification_plan_id),
+                "notification_plan_id": str(notification_plan_id),
+                "attempt_status": "succeeded",
+                "error_code": DELIVERY_RESULT_NOOP_ERROR_CODE,
+            },
         )
+        return result.scalar_one_or_none() is not None
 
     async def count_delivery_result_sent_success_job_attempts(self, notification_delivery_record_id: UUID) -> int:
         result = await self._session.execute(
@@ -381,15 +415,49 @@ class MaintenanceRepository:
         )
         return int(result.scalar_one())
 
-    async def insert_delivery_result_sent_success_job_attempt(self, notification_delivery_record_id: UUID) -> None:
-        await self.insert_job_attempt(
-            stage_name=DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME,
-            queue_name=MAINTENANCE_QUEUE_NAME,
-            root_object_type="notification_delivery_record",
-            root_object_id=notification_delivery_record_id,
-            attempt_status="succeeded",
-            error_code=DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE,
+    async def insert_delivery_result_sent_success_job_attempt(self, notification_delivery_record_id: UUID) -> bool:
+        result = await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO job_attempts (
+                    stage_name, queue_name, root_object_type, root_object_id,
+                    attempt_no, started_at, finished_at, attempt_status, error_code, created_at
+                )
+                SELECT
+                    :stage_name,
+                    :queue_name,
+                    :root_object_type,
+                    CAST(:root_object_id AS uuid),
+                    1,
+                    now(),
+                    now(),
+                    CAST(:attempt_status AS job_attempt_status_enum),
+                    :error_code,
+                    now()
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM job_attempts
+                    WHERE stage_name = :stage_name
+                      AND queue_name = :queue_name
+                      AND root_object_type = :root_object_type
+                      AND root_object_id = CAST(:root_object_id AS uuid)
+                      AND attempt_status = CAST(:attempt_status AS job_attempt_status_enum)
+                      AND error_code = :error_code
+                )
+                RETURNING job_attempt_id
+                """
+            ),
+            {
+                "stage_name": DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME,
+                "queue_name": MAINTENANCE_QUEUE_NAME,
+                "root_object_type": "notification_delivery_record",
+                "root_object_id": str(notification_delivery_record_id),
+                "notification_delivery_record_id": str(notification_delivery_record_id),
+                "attempt_status": "succeeded",
+                "error_code": DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE,
+            },
         )
+        return result.scalar_one_or_none() is not None
 
     async def load_delivery_gate_snapshot(self) -> DeliveryGateSnapshot:
         result = await self._session.execute(

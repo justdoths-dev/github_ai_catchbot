@@ -19,6 +19,18 @@ def test_sent_delivery_result_is_terminal_success_without_retry_replay_or_dlq() 
     assert decision.retry_intent_allowed is False
 
 
+def test_edited_delivery_result_is_terminal_success_without_retry_replay_or_dlq() -> None:
+    decision = classify_delivery_result_sent_success(delivery_status="edited")
+
+    assert decision.action == "mark_terminal_success"
+    assert decision.maintenance_classification == DELIVERY_RESULT_SENT_SUCCESS_CLASSIFICATION
+    assert decision.reason_code == DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE
+    assert decision.auto_retry_allowed is False
+    assert decision.dead_letter_allowed is False
+    assert decision.replay_dispatch_allowed is False
+    assert decision.retry_intent_allowed is False
+
+
 def test_failed_retryable_is_future_retry_candidate_not_sent_success() -> None:
     decision = classify_delivery_result_sent_success(delivery_status="failed_retryable")
 

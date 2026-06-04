@@ -11,6 +11,23 @@ ReplayAction = Literal["reject", "emit_replay_intent"]
 GateMode = Literal["restricted", "full"]
 GateStatus = Literal["pass", "fail", "warn"]
 RecoveryMode = Literal["replay-selected", "retry-selected-due"]
+DeliveryResultWorkerClassification = Literal[
+    "ignored",
+    "unsupported",
+    "terminal_success",
+    "logical_noop_success",
+    "retryable_candidate",
+    "terminal_failure",
+]
+DeliveryResultWorkerAction = Literal[
+    "ignored",
+    "unsupported",
+    "mark_terminal_success",
+    "mark_logical_noop_success",
+    "already_marked",
+    "record_retryable_interpretation",
+    "record_terminal_failure",
+]
 
 
 @dataclass(slots=True, frozen=True)
@@ -44,6 +61,19 @@ class DeliveryResultEvent:
     attempt_count: int | None
     transport_error_code: str | None
     transport_error_class: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class DeliveryResultWorkerResult:
+    processed: bool
+    classification: DeliveryResultWorkerClassification
+    action: DeliveryResultWorkerAction
+    reason_code: str
+    marker_written: bool = False
+    already_marked: bool = False
+    retry_intent_written: bool = False
+    dead_letter_written: bool = False
+    replay_request_written: bool = False
 
 
 @dataclass(slots=True, frozen=True)

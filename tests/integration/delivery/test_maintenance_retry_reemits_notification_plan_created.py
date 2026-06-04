@@ -7,7 +7,7 @@ import pytest
 from services.maintenance.service import MaintenanceService
 from services.outbox_relay.models import OutboxEventRow
 from services.outbox_relay.routing import OutboxRouteResolver
-from tests.component.services.maintenance._fakes import FakeRepository, config, outbox_event, plan
+from tests.component.services.maintenance._fakes import FakeRepository, config, latest_delivery_record, outbox_event, plan
 
 
 def _route_row(row: dict) -> OutboxEventRow:
@@ -25,12 +25,17 @@ def _route_row(row: dict) -> OutboxEventRow:
 
 
 @pytest.mark.asyncio
-async def test_delivery_result_routes_to_maintenance_and_retry_reenters_notification_send() -> None:
+async def test_delivery_result_routes_to_maintenance_and_due_scan_retry_reenters_notification_send() -> None:
     resolver = OutboxRouteResolver()
     repository = FakeRepository()
     notification_plan = plan()
     repository.plans[notification_plan.notification_plan_id] = notification_plan
     repository.delivery_attempt_counts[notification_plan.notification_plan_id] = 1
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        delivery_status="failed_retryable",
+        attempt_count=1,
+    )
     delivery_result_event = outbox_event(
         "notification.delivery.result.v1",
         aggregate_id=notification_plan.notification_plan_id,
@@ -55,6 +60,9 @@ async def test_delivery_result_routes_to_maintenance_and_retry_reenters_notifica
         )
     )
     await MaintenanceService(config(), repository=repository).handle_maintenance_trigger_event(delivery_result_event.event_id)
+    assert repository.plan_created_outbox == []
+
+    await MaintenanceService(config(), repository=repository).promote_due_retries_once()
     retry_route = resolver.resolve(_route_row(repository.plan_created_outbox[0]))
 
     assert initial_route.queue_name == "q.maintenance"

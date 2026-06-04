@@ -4,7 +4,7 @@ import pytest
 
 from services.maintenance.service import MaintenanceService
 
-from ._fakes import FakeRepository, config, outbox_event, plan
+from ._fakes import FakeRepository, config, latest_delivery_record, outbox_event, plan
 
 
 @pytest.mark.asyncio
@@ -13,6 +13,13 @@ async def test_send_disabled_suppressed_result_does_not_auto_retry_or_mutate_pla
     notification_plan = plan(status="suppressed", send_after=None, suppress_reason_code="notification_send_flag_disabled")
     original_plan = notification_plan
     repository.plans[notification_plan.notification_plan_id] = notification_plan
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        delivery_status="suppressed",
+        attempt_count=1,
+        transport_error_code="notification_send_flag_disabled",
+        transport_error_class=None,
+    )
     event = outbox_event(
         "notification.delivery.result.v1",
         aggregate_id=notification_plan.notification_plan_id,

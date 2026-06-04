@@ -13,6 +13,12 @@ from services.maintenance.models import (
     RetryPromotionCandidate,
     StreamMessage,
 )
+from services.maintenance.retry_policy import (
+    DELIVERY_RESULT_NOOP_ERROR_CODE,
+    DELIVERY_RESULT_NOOP_STAGE_NAME,
+    DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE,
+    DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME,
+)
 
 
 class Tx:
@@ -44,6 +50,9 @@ class FakeRepository:
 
     async def load_notification_plan(self, notification_plan_id: UUID):
         return self.plans.get(notification_plan_id)
+
+    async def load_latest_delivery_record(self, notification_plan_id: UUID):
+        return self.latest_delivery_records.get(notification_plan_id)
 
     async def count_delivery_attempts(self, notification_plan_id: UUID) -> int:
         return self.delivery_attempt_counts.get(notification_plan_id, 0)
@@ -114,6 +123,56 @@ class FakeRepository:
 
     async def insert_job_attempt(self, **kwargs) -> None:
         self.job_attempts.append(kwargs)
+
+    async def count_delivery_result_noop_job_attempts(self, notification_plan_id: UUID) -> int:
+        return sum(
+            1
+            for row in self.job_attempts
+            if row["stage_name"] == DELIVERY_RESULT_NOOP_STAGE_NAME
+            and row["queue_name"] == "q.maintenance"
+            and row["root_object_type"] == "notification_plan"
+            and row["root_object_id"] == notification_plan_id
+            and row["attempt_status"] == "succeeded"
+            and row["error_code"] == DELIVERY_RESULT_NOOP_ERROR_CODE
+        )
+
+    async def insert_delivery_result_noop_job_attempt(self, notification_plan_id: UUID) -> bool:
+        if await self.count_delivery_result_noop_job_attempts(notification_plan_id):
+            return False
+        await self.insert_job_attempt(
+            stage_name=DELIVERY_RESULT_NOOP_STAGE_NAME,
+            queue_name="q.maintenance",
+            root_object_type="notification_plan",
+            root_object_id=notification_plan_id,
+            attempt_status="succeeded",
+            error_code=DELIVERY_RESULT_NOOP_ERROR_CODE,
+        )
+        return True
+
+    async def count_delivery_result_sent_success_job_attempts(self, notification_delivery_record_id: UUID) -> int:
+        return sum(
+            1
+            for row in self.job_attempts
+            if row["stage_name"] == DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME
+            and row["queue_name"] == "q.maintenance"
+            and row["root_object_type"] == "notification_delivery_record"
+            and row["root_object_id"] == notification_delivery_record_id
+            and row["attempt_status"] == "succeeded"
+            and row["error_code"] == DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE
+        )
+
+    async def insert_delivery_result_sent_success_job_attempt(self, notification_delivery_record_id: UUID) -> bool:
+        if await self.count_delivery_result_sent_success_job_attempts(notification_delivery_record_id):
+            return False
+        await self.insert_job_attempt(
+            stage_name=DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME,
+            queue_name="q.maintenance",
+            root_object_type="notification_delivery_record",
+            root_object_id=notification_delivery_record_id,
+            attempt_status="succeeded",
+            error_code=DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE,
+        )
+        return True
 
 
 class FakeConsumer:
@@ -196,14 +255,16 @@ def latest_delivery_record(
     notification_plan_id: UUID,
     delivery_status: str = "failed_retryable",
     attempt_count: int = 1,
+    transport_error_code: str | None = "telegram_retryable_error",
+    transport_error_class: str | None = "retryable",
 ) -> LatestDeliveryRecord:
     return LatestDeliveryRecord(
         notification_delivery_record_id=uuid4(),
         notification_plan_id=notification_plan_id,
         delivery_status=delivery_status,
         attempt_count=attempt_count,
-        transport_error_code="telegram_retryable_error",
-        transport_error_class="retryable",
+        transport_error_code=transport_error_code,
+        transport_error_class=transport_error_class,
         telegram_response_json=None,
         created_at=datetime.now(timezone.utc),
     )

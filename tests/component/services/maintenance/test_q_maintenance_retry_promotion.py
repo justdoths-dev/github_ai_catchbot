@@ -6,16 +6,21 @@ from services.maintenance.models import StreamMessage
 from services.maintenance.service import MaintenanceService
 from services.maintenance.worker import MaintenanceQueueWorker
 
-from ._fakes import FakeConsumer, FakeRepository, config, outbox_event, plan
+from ._fakes import FakeConsumer, FakeRepository, config, latest_delivery_record, outbox_event, plan
 
 
 @pytest.mark.asyncio
-async def test_worker_rehydrates_delivery_result_and_emits_retry_intent_without_plan_mutation() -> None:
+async def test_worker_rehydrates_delivery_result_and_records_retryable_without_retry_intent_or_plan_mutation() -> None:
     repository = FakeRepository()
     notification_plan = plan()
     original_plan = notification_plan
     repository.plans[notification_plan.notification_plan_id] = notification_plan
     repository.delivery_attempt_counts[notification_plan.notification_plan_id] = 1
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        delivery_status="failed_retryable",
+        attempt_count=1,
+    )
     event = outbox_event(
         "notification.delivery.result.v1",
         aggregate_id=notification_plan.notification_plan_id,
@@ -43,14 +48,12 @@ async def test_worker_rehydrates_delivery_result_and_emits_retry_intent_without_
     worker = MaintenanceQueueWorker(config(), consumer=consumer, service=service)
 
     result = await worker.run_once()
-    await service.handle_maintenance_trigger_event(event.event_id)
 
     assert result.processed == 1
     assert consumer.acked == ["1-0"]
-    assert len(repository.plan_created_outbox) == 1
-    row = repository.plan_created_outbox[0]
-    assert row["event_type"] == "notification.plan.created.v1"
-    assert row["payload_json"]["notification_plan_id"] == str(notification_plan.notification_plan_id)
-    assert row["payload_json"]["retry_attempt"] == 2
+    assert repository.plan_created_outbox == []
+    assert repository.dead_letters == []
+    assert len(repository.job_attempts) == 1
+    assert repository.job_attempts[0]["attempt_status"] == "failed_retryable"
+    assert repository.job_attempts[0]["error_code"] == "delivery_result_failed_retryable_due_scan_candidate"
     assert repository.plans[notification_plan.notification_plan_id] == original_plan
-    assert len(repository.plan_created_outbox) == 1

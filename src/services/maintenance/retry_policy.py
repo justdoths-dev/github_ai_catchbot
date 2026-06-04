@@ -90,7 +90,7 @@ def classify_delivery_result_sent_success(
     *,
     delivery_status: str,
 ) -> DeliveryResultSentSuccessDecision:
-    if delivery_status == "sent":
+    if delivery_status in {"sent", "edited"}:
         return DeliveryResultSentSuccessDecision(
             action="mark_terminal_success",
             maintenance_classification=DELIVERY_RESULT_SENT_SUCCESS_CLASSIFICATION,

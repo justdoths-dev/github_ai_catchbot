@@ -5,7 +5,7 @@ import logging
 from typing import Protocol
 
 from .config import MaintenanceConfig
-from .models import StreamMessage, WorkerBatchResult
+from .models import DeliveryResultWorkerResult, StreamMessage, WorkerBatchResult
 
 
 class RedisStreamConsumerProtocol(Protocol):
@@ -15,7 +15,7 @@ class RedisStreamConsumerProtocol(Protocol):
 
 
 class MaintenanceServiceProtocol(Protocol):
-    async def handle_maintenance_trigger_event(self, trigger_event_id: str) -> None: ...
+    async def handle_maintenance_trigger_event(self, trigger_event_id: str) -> DeliveryResultWorkerResult | None: ...
     async def handle_replay_trigger_event(self, trigger_event_id: str) -> None: ...
     async def promote_due_retries_once(self, limit: int | None = None) -> int: ...
 
