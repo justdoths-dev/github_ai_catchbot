@@ -21,7 +21,12 @@ from .models import (
     RetryPromotionCandidate,
     SelectedPlanRecoveryRow,
 )
-from .retry_policy import DELIVERY_RESULT_NOOP_ERROR_CODE, DELIVERY_RESULT_NOOP_STAGE_NAME
+from .retry_policy import (
+    DELIVERY_RESULT_NOOP_ERROR_CODE,
+    DELIVERY_RESULT_NOOP_STAGE_NAME,
+    DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE,
+    DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME,
+)
 
 
 class AsyncSessionLike(Protocol):
@@ -351,6 +356,39 @@ class MaintenanceRepository:
             root_object_id=notification_plan_id,
             attempt_status="succeeded",
             error_code=DELIVERY_RESULT_NOOP_ERROR_CODE,
+        )
+
+    async def count_delivery_result_sent_success_job_attempts(self, notification_delivery_record_id: UUID) -> int:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT COUNT(*)
+                FROM job_attempts
+                WHERE stage_name = :stage_name
+                  AND queue_name = :queue_name
+                  AND root_object_type = 'notification_delivery_record'
+                  AND root_object_id = CAST(:notification_delivery_record_id AS uuid)
+                  AND attempt_status = 'succeeded'::job_attempt_status_enum
+                  AND error_code = :error_code
+                """
+            ),
+            {
+                "stage_name": DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME,
+                "queue_name": MAINTENANCE_QUEUE_NAME,
+                "notification_delivery_record_id": str(notification_delivery_record_id),
+                "error_code": DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE,
+            },
+        )
+        return int(result.scalar_one())
+
+    async def insert_delivery_result_sent_success_job_attempt(self, notification_delivery_record_id: UUID) -> None:
+        await self.insert_job_attempt(
+            stage_name=DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME,
+            queue_name=MAINTENANCE_QUEUE_NAME,
+            root_object_type="notification_delivery_record",
+            root_object_id=notification_delivery_record_id,
+            attempt_status="succeeded",
+            error_code=DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE,
         )
 
     async def load_delivery_gate_snapshot(self) -> DeliveryGateSnapshot:

@@ -7,13 +7,29 @@ from typing import Literal
 DELIVERY_RESULT_NOOP_STAGE_NAME = "maintenance_delivery_result"
 DELIVERY_RESULT_NOOP_ERROR_CODE = "delivery_result_suppressed_dry_run_noop"
 DELIVERY_RESULT_NOOP_CLASSIFICATION = "logical_noop_success"
+DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME = "maintenance_delivery_result"
+DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE = "delivery_result_sent_terminal_success"
+DELIVERY_RESULT_SENT_SUCCESS_CLASSIFICATION = "terminal_success"
 
 DeliveryResultNoopAction = Literal["mark_logical_noop_success", "block"]
+DeliveryResultSentSuccessAction = Literal["mark_terminal_success", "block"]
 
 
 @dataclass(slots=True, frozen=True)
 class DeliveryResultDryRunNoopDecision:
     action: DeliveryResultNoopAction
+    maintenance_classification: str
+    reason_code: str
+    auto_retry_allowed: bool
+    dead_letter_allowed: bool
+    replay_dispatch_allowed: bool
+    retry_intent_allowed: bool
+    future_auto_retry_candidate: bool = False
+
+
+@dataclass(slots=True, frozen=True)
+class DeliveryResultSentSuccessDecision:
+    action: DeliveryResultSentSuccessAction
     maintenance_classification: str
     reason_code: str
     auto_retry_allowed: bool
@@ -63,6 +79,42 @@ def classify_delivery_result_dry_run_noop(
         action="block",
         maintenance_classification="out_of_scope",
         reason_code="delivery_result_not_dry_run_noop_target",
+        auto_retry_allowed=False,
+        dead_letter_allowed=False,
+        replay_dispatch_allowed=False,
+        retry_intent_allowed=False,
+    )
+
+
+def classify_delivery_result_sent_success(
+    *,
+    delivery_status: str,
+) -> DeliveryResultSentSuccessDecision:
+    if delivery_status == "sent":
+        return DeliveryResultSentSuccessDecision(
+            action="mark_terminal_success",
+            maintenance_classification=DELIVERY_RESULT_SENT_SUCCESS_CLASSIFICATION,
+            reason_code=DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE,
+            auto_retry_allowed=False,
+            dead_letter_allowed=False,
+            replay_dispatch_allowed=False,
+            retry_intent_allowed=False,
+        )
+    if delivery_status == "failed_retryable":
+        return DeliveryResultSentSuccessDecision(
+            action="block",
+            maintenance_classification="out_of_scope",
+            reason_code="failed_retryable_requires_due_retry_path",
+            auto_retry_allowed=False,
+            dead_letter_allowed=False,
+            replay_dispatch_allowed=False,
+            retry_intent_allowed=False,
+            future_auto_retry_candidate=True,
+        )
+    return DeliveryResultSentSuccessDecision(
+        action="block",
+        maintenance_classification="out_of_scope",
+        reason_code="delivery_result_not_sent_success_target",
         auto_retry_allowed=False,
         dead_letter_allowed=False,
         replay_dispatch_allowed=False,
