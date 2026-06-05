@@ -26,6 +26,7 @@ async def test_due_failed_retryable_enabled_below_ceiling_emits_retry_intent() -
     assert processed == 1
     assert len(repository.plan_created_outbox) == 1
     assert repository.plan_created_outbox[0]["payload_json"]["retry_attempt"] == 2
+    assert repository.plan_created_outbox[0]["payload_json"]["previous_attempt_count"] == 1
     assert repository.dead_letters == []
 
 

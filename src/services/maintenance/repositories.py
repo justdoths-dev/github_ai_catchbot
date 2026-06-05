@@ -134,9 +134,9 @@ class MaintenanceRepository:
                        ldr.transport_error_class AS ldr_transport_error_class,
                        ldr.telegram_response_json AS ldr_telegram_response_json,
                        ldr.created_at AS ldr_created_at,
-                       COALESCE(dac.delivery_attempt_count, 0) AS delivery_attempt_count
+                       COALESCE(ldr.attempt_count, 0) AS delivery_attempt_count
                 FROM notification_plans np
-                LEFT JOIN LATERAL (
+                JOIN LATERAL (
                     SELECT notification_delivery_record_id, notification_plan_id, delivery_status,
                            attempt_count, transport_error_code, transport_error_class,
                            telegram_response_json, created_at
@@ -145,14 +145,10 @@ class MaintenanceRepository:
                     ORDER BY ndr.created_at DESC
                     LIMIT 1
                 ) ldr ON true
-                LEFT JOIN LATERAL (
-                    SELECT count(*)::int AS delivery_attempt_count
-                    FROM notification_delivery_records ndr_count
-                    WHERE ndr_count.notification_plan_id = np.notification_plan_id
-                ) dac ON true
                 WHERE np.status = 'failed_retryable'::notification_status_enum
                   AND np.send_after IS NOT NULL
                   AND np.send_after <= :now
+                  AND ldr.delivery_status = 'failed_retryable'::notification_status_enum
                 ORDER BY np.send_after ASC, np.created_at ASC
                 LIMIT :limit
                 """
@@ -168,6 +164,9 @@ class MaintenanceRepository:
         dedupe_key: str,
         payload_json: dict[str, Any],
     ) -> bool:
+        analysis_id = _uuid_or_none(payload_json.get("analysis_id"))
+        aggregate_type = "analysis" if analysis_id is not None else "notification_plan"
+        aggregate_id = analysis_id or notification_plan_id
         result = await self._session.execute(
             sa.text(
                 """
@@ -175,8 +174,8 @@ class MaintenanceRepository:
                     event_type, aggregate_type, aggregate_id, dedupe_key, payload_json, status, created_at
                 ) VALUES (
                     'notification.plan.created.v1',
-                    'notification_plan',
-                    CAST(:notification_plan_id AS uuid),
+                    :aggregate_type,
+                    CAST(:aggregate_id AS uuid),
                     :dedupe_key,
                     CAST(:payload_json AS jsonb),
                     'pending'::outbox_status_enum,
@@ -187,7 +186,8 @@ class MaintenanceRepository:
                 """
             ),
             {
-                "notification_plan_id": str(notification_plan_id),
+                "aggregate_type": aggregate_type,
+                "aggregate_id": str(aggregate_id),
                 "dedupe_key": dedupe_key,
                 "payload_json": _jsonb_dumps(payload_json),
             },
@@ -830,8 +830,6 @@ def _latest_delivery_from_due_row(row: Any) -> LatestDeliveryRecord | None:
 def _retry_candidate_from_row(row: Any) -> RetryPromotionCandidate:
     latest_delivery = _latest_delivery_from_due_row(row)
     delivery_attempt_count = int(row["delivery_attempt_count"])
-    if latest_delivery is not None:
-        delivery_attempt_count = max(delivery_attempt_count, latest_delivery.attempt_count)
     return RetryPromotionCandidate(
         plan=_plan_from_row(row),
         latest_delivery=latest_delivery,

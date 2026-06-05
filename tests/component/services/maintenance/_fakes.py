@@ -69,9 +69,9 @@ class FakeRepository:
             if notification_plan.send_after is None or notification_plan.send_after > now:
                 continue
             latest_delivery = self.latest_delivery_records.get(notification_plan.notification_plan_id)
-            delivery_attempt_count = self.delivery_attempt_counts.get(notification_plan.notification_plan_id, 0)
-            if latest_delivery is not None:
-                delivery_attempt_count = max(delivery_attempt_count, latest_delivery.attempt_count)
+            if latest_delivery is None or latest_delivery.delivery_status != "failed_retryable":
+                continue
+            delivery_attempt_count = latest_delivery.attempt_count
             candidates.append(
                 RetryPromotionCandidate(
                     plan=notification_plan,
@@ -86,11 +86,13 @@ class FakeRepository:
     async def insert_plan_created_outbox(self, *, notification_plan_id: UUID, dedupe_key: str, payload_json: dict):
         if any(row["dedupe_key"] == dedupe_key for row in self.plan_created_outbox):
             return False
+        aggregate_id = UUID(str(payload_json["analysis_id"])) if payload_json.get("analysis_id") else notification_plan_id
+        aggregate_type = "analysis" if payload_json.get("analysis_id") else "notification_plan"
         self.plan_created_outbox.append(
             {
                 "event_type": "notification.plan.created.v1",
-                "aggregate_type": "notification_plan",
-                "aggregate_id": notification_plan_id,
+                "aggregate_type": aggregate_type,
+                "aggregate_id": aggregate_id,
                 "dedupe_key": dedupe_key,
                 "payload_json": payload_json,
             }

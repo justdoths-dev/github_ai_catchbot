@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from services.maintenance.service import MaintenanceService
@@ -37,3 +39,33 @@ async def test_send_disabled_suppressed_result_does_not_auto_retry_or_mutate_pla
     assert repository.plan_created_outbox == []
     assert repository.dead_letters == []
     assert repository.plans[notification_plan.notification_plan_id] == original_plan
+
+
+@pytest.mark.asyncio
+async def test_send_disabled_suppressed_due_scan_does_not_emit_retry_or_dead_letter() -> None:
+    now = datetime.now(timezone.utc)
+    repository = FakeRepository()
+    notification_plan = plan(
+        status="suppressed",
+        send_after=now - timedelta(seconds=1),
+        suppress_reason_code="notification_send_flag_disabled",
+    )
+    original_plan = notification_plan
+    latest = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        delivery_status="suppressed",
+        attempt_count=1,
+        transport_error_code="notification_send_flag_disabled",
+        transport_error_class=None,
+    )
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest
+    service = MaintenanceService(config(), repository=repository, now_fn=lambda: now)
+
+    processed = await service.promote_due_retries_once()
+
+    assert processed == 0
+    assert repository.plan_created_outbox == []
+    assert repository.dead_letters == []
+    assert repository.plans[notification_plan.notification_plan_id] == original_plan
+    assert repository.latest_delivery_records[notification_plan.notification_plan_id] == latest

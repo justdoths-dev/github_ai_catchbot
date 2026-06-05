@@ -37,10 +37,16 @@ def _plan():
 
 
 def test_retry_intent_payload_contains_required_notifier_fields() -> None:
-    payload = build_retry_intent_payload(plan=_plan(), retry_reason="due_retry_promotion", retry_attempt=2)
+    payload = build_retry_intent_payload(
+        plan=_plan(),
+        retry_reason="due_retry_promotion",
+        previous_attempt_count=1,
+        retry_attempt=2,
+    )
 
     assert REQUIRED_RETRY_PAYLOAD_FIELDS <= payload.keys()
     assert payload["send_after"] is None
+    assert payload["previous_attempt_count"] == 1
     assert payload["retry_attempt"] == 2
 
 

@@ -83,7 +83,7 @@ class MaintenanceService:
         action_count = 0
         for candidate in candidates:
             plan = candidate.plan
-            delivery_status = candidate.latest_delivery.delivery_status if candidate.latest_delivery is not None else plan.status
+            delivery_status = candidate.latest_delivery.delivery_status if candidate.latest_delivery is not None else ""
             decision = evaluate_retry_promotion(
                 delivery_status=delivery_status,
                 plan=plan,

@@ -58,7 +58,7 @@ class MaintenanceConfig:
                 block_ms=int(_read("MAINTENANCE_BLOCK_MS", "5000")),
                 retry_scan_poll_sec=int(_read("MAINTENANCE_NOTIFICATION_RETRY_POLL_SEC", "30")),
                 delivery_retry_max_attempts=int(
-                    _read("DELIVERY_RETRY_MAX_ATTEMPTS", _read("NOTIFICATION_RETRY_MAX_ATTEMPTS", "3"))
+                    _read("DELIVERY_RETRY_MAX_ATTEMPTS", _read("NOTIFICATION_RETRY_MAX_ATTEMPTS", "5"))
                 ),
                 enable_notification_send=_bool_env(_read("ENABLE_NOTIFICATION_SEND", "false")),
                 notifier_telegram_dry_run=_bool_env(_read("NOTIFIER_TELEGRAM_DRY_RUN", "true")),

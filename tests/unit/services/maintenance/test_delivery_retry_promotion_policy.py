@@ -43,6 +43,7 @@ def test_failed_retryable_due_enabled_below_ceiling_emits_retry_intent() -> None
     assert decision.payload is not None
     assert decision.payload["notification_plan_id"] == str(plan.notification_plan_id)
     assert decision.payload["retry_reason"] == "due_retry_promotion"
+    assert decision.payload["previous_attempt_count"] == 2
 
 
 def test_failed_retryable_future_send_after_noops() -> None:
@@ -113,3 +114,17 @@ def test_retry_ceiling_reached_uses_dead_letter_path() -> None:
 
     assert decision.action == "dead_letter_retry_ceiling"
     assert decision.reason_code == "max_notification_retry_attempts_exceeded"
+
+
+def test_missing_latest_delivery_status_noops_even_when_plan_is_failed_retryable() -> None:
+    decision = evaluate_retry_promotion(
+        delivery_status="",
+        plan=_plan(),
+        latest_attempt_count=1,
+        max_attempts=3,
+        enabled=True,
+        now=datetime.now(timezone.utc),
+    )
+
+    assert decision.action == "noop"
+    assert decision.reason_code == "delivery_status_not_retryable"

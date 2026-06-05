@@ -25,6 +25,7 @@ REQUIRED_RETRY_PAYLOAD_FIELDS = {
     "send_after",
     "suppress_reason_code",
     "retry_reason",
+    "previous_attempt_count",
     "retry_attempt",
 }
 
@@ -58,6 +59,7 @@ def evaluate_retry_promotion(
     payload = build_retry_intent_payload(
         plan=plan,
         retry_reason="due_retry_promotion",
+        previous_attempt_count=latest_attempt_count,
         retry_attempt=retry_attempt,
     )
     return DeliveryRetryDecision(
@@ -77,8 +79,11 @@ def build_retry_intent_payload(
     *,
     plan: NotificationPlanRecord,
     retry_reason: str,
+    previous_attempt_count: int | None = None,
     retry_attempt: int,
 ) -> dict[str, Any]:
+    if previous_attempt_count is None:
+        previous_attempt_count = max(retry_attempt - 1, 0)
     return {
         "notification_plan_id": str(plan.notification_plan_id),
         "analysis_id": str(plan.analysis_id),
@@ -93,6 +98,7 @@ def build_retry_intent_payload(
         "send_after": None,
         "suppress_reason_code": plan.suppress_reason_code,
         "retry_reason": retry_reason,
+        "previous_attempt_count": previous_attempt_count,
         "retry_attempt": retry_attempt,
     }
 
