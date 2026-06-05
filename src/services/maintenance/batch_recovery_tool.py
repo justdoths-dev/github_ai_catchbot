@@ -4,6 +4,11 @@ from datetime import datetime, timezone
 from typing import Protocol
 from uuid import UUID, uuid4
 
+from .batch_recovery import (
+    BATCH_RECOVERY_OPEN_REPLAY_EXISTS,
+    BATCH_RECOVERY_PLAN_MISSING,
+    classify_selected_plan_for_delivery_replay,
+)
 from .config import MaintenanceConfig
 from .models import RecoveryBatchResult, SelectedPlanRecoveryRow
 
@@ -49,7 +54,7 @@ class DeliveryBatchRecoveryTool:
 
         for plan_id in normalized_plan_ids:
             row = rows_by_id.get(plan_id)
-            reason = "notification_plan_not_found" if row is None else self._validate_replay_row(row)
+            reason = BATCH_RECOVERY_PLAN_MISSING if row is None else self._validate_replay_row(row)
             if reason is None and row is not None:
                 accepted_plan_ids.append(row.notification_plan_id)
             else:
@@ -60,7 +65,7 @@ class DeliveryBatchRecoveryTool:
             requested_by=requested_by,
         )
         if inserted_count < len(accepted_plan_ids):
-            skipped["open_replay_request_exists_at_insert"] = len(accepted_plan_ids) - inserted_count
+            skipped[BATCH_RECOVERY_OPEN_REPLAY_EXISTS] = len(accepted_plan_ids) - inserted_count
 
         return RecoveryBatchResult(
             recovery_batch_id=recovery_batch_id,
@@ -113,17 +118,7 @@ class DeliveryBatchRecoveryTool:
         )
 
     def _validate_replay_row(self, row: SelectedPlanRecoveryRow) -> str | None:
-        if row.has_open_replay_request:
-            return "open_replay_request_exists"
-        if row.has_delivery_dlq:
-            return None
-        if row.delivery_status == "suppressed" and row.send_disabled:
-            return None
-        if row.delivery_status == "failed_terminal":
-            return None
-        if row.delivery_status == "failed_retryable":
-            return "failed_retryable_requires_due_retry_path"
-        return "replay_not_allowed_for_status"
+        return classify_selected_plan_for_delivery_replay(row)
 
     def _validate_due_retry_row(self, row: SelectedPlanRecoveryRow, *, now: datetime) -> str | None:
         if row.delivery_status != "failed_retryable":

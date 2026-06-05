@@ -73,6 +73,8 @@ def _row(
     send_disabled: bool = False,
     has_open_replay_request: bool = False,
     has_delivery_dlq: bool = False,
+    delivery_dlq_next_manual_action: str | None = None,
+    delivery_dlq_replay_hint: str | None = None,
 ) -> SelectedPlanRecoveryRow:
     now = datetime.now(timezone.utc)
     return SelectedPlanRecoveryRow(
@@ -94,6 +96,8 @@ def _row(
         send_disabled=send_disabled,
         has_open_replay_request=has_open_replay_request,
         has_delivery_dlq=has_delivery_dlq,
+        delivery_dlq_next_manual_action=delivery_dlq_next_manual_action,
+        delivery_dlq_replay_hint=delivery_dlq_replay_hint,
     )
 
 
@@ -102,7 +106,11 @@ async def test_replay_selected_accepts_send_disabled_suppress_failed_terminal_an
     rows = [
         _row(delivery_status="suppressed", send_disabled=True),
         _row(delivery_status="failed_terminal"),
-        _row(delivery_status="failed_retryable", has_delivery_dlq=True),
+        _row(
+            delivery_status="failed_retryable",
+            has_delivery_dlq=True,
+            delivery_dlq_next_manual_action="request_explicit_delivery_replay",
+        ),
     ]
     repository = FakeRecoveryRepository(rows)
     result = await DeliveryBatchRecoveryTool(_config(), repository=repository).replay_selected(
@@ -125,7 +133,7 @@ async def test_replay_selected_rejects_failed_retryable_due_rows() -> None:
     )
 
     assert result.accepted_count == 0
-    assert result.skipped_reason_codes == {"failed_retryable_requires_due_retry_path": 1}
+    assert result.skipped_reason_codes == {"batch_recovery_not_replay_candidate": 1}
     assert repository.replay_inserts == []
 
 
@@ -138,7 +146,7 @@ async def test_replay_selected_skips_open_replay_requests() -> None:
     )
 
     assert result.accepted_count == 0
-    assert result.skipped_reason_codes == {"open_replay_request_exists": 1}
+    assert result.skipped_reason_codes == {"batch_recovery_open_replay_exists": 1}
 
 
 @pytest.mark.asyncio

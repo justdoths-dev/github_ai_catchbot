@@ -64,7 +64,7 @@ async def test_replay_selected_insert_path_accounts_for_duplicate_open_replay_re
     assert result.accepted_count == 2
     assert result.emitted_count == 1
     assert result.skipped_count == 1
-    assert result.skipped_reason_codes == {"open_replay_request_exists_at_insert": 1}
+    assert result.skipped_reason_codes == {"batch_recovery_open_replay_exists": 1}
     assert repository.insert_calls == [[first.notification_plan_id, second.notification_plan_id]]
 
 
@@ -85,6 +85,6 @@ async def test_replay_selected_counts_invalid_ids_and_insert_duplicates_as_skipp
     assert result.skipped_reason_codes == {
         "invalid_notification_plan_id": 1,
         "duplicate_notification_plan_id": 1,
-        "open_replay_request_exists_at_insert": 1,
+        "batch_recovery_open_replay_exists": 1,
     }
     assert repository.insert_calls == [[first.notification_plan_id, second.notification_plan_id]]

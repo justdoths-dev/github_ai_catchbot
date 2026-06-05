@@ -668,13 +668,9 @@ class MaintenanceRepository:
                            AND rr.root_object_id = np.notification_plan_id
                            AND rr.status IN ('requested', 'dispatched', 'pending')
                        ) AS has_open_replay_request,
-                       EXISTS (
-                         SELECT 1
-                         FROM dead_letter_entries dle
-                         WHERE dle.root_object_type = 'notification_plan'
-                           AND dle.root_object_id = np.notification_plan_id
-                           AND dle.queue_name IN ('q.notification.send', 'q.maintenance', 'q.replay')
-                       ) AS has_delivery_dlq
+                       dld.dead_letter_entry_id IS NOT NULL AS has_delivery_dlq,
+                       dld.next_manual_action AS delivery_dlq_next_manual_action,
+                       dld.replay_hint AS delivery_dlq_replay_hint
                 FROM notification_plans np
                 LEFT JOIN LATERAL (
                     SELECT ndr.telegram_chat_id,
@@ -687,6 +683,17 @@ class MaintenanceRepository:
                     ORDER BY ndr.created_at DESC
                     LIMIT 1
                 ) ldr ON true
+                LEFT JOIN LATERAL (
+                    SELECT dle.dead_letter_entry_id,
+                           dle.next_manual_action,
+                           dle.replay_hint
+                    FROM dead_letter_entries dle
+                    WHERE dle.root_object_type = 'notification_plan'
+                      AND dle.root_object_id = np.notification_plan_id
+                      AND dle.queue_name IN ('q.notification.send', 'q.maintenance', 'q.replay')
+                    ORDER BY dle.last_failed_at DESC NULLS LAST, dle.dead_letter_entry_id DESC
+                    LIMIT 1
+                ) dld ON true
                 WHERE np.notification_plan_id = ANY(CAST(:plan_ids AS uuid[]))
                 ORDER BY np.notification_plan_id
                 """
@@ -913,4 +920,6 @@ def _selected_recovery_row_from_row(row: Any) -> SelectedPlanRecoveryRow:
         send_disabled=bool(row["send_disabled"]),
         has_open_replay_request=bool(row["has_open_replay_request"]),
         has_delivery_dlq=bool(row["has_delivery_dlq"]),
+        delivery_dlq_next_manual_action=_string_or_none(row["delivery_dlq_next_manual_action"]),
+        delivery_dlq_replay_hint=_string_or_none(row["delivery_dlq_replay_hint"]),
     )

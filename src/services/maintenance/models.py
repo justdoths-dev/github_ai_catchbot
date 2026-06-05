@@ -207,6 +207,8 @@ class SelectedPlanRecoveryRow:
     send_disabled: bool = False
     has_open_replay_request: bool = False
     has_delivery_dlq: bool = False
+    delivery_dlq_next_manual_action: str | None = None
+    delivery_dlq_replay_hint: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
