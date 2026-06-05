@@ -16,7 +16,10 @@ async def test_full_gate_runner_keeps_operator_review_and_duplicate_ratio_warn_o
 
     assert report.gate_status == "warn"
     assert report.blocking_reason_codes == []
-    assert report.warning_reason_codes == ["delivery_gate_operator_review_required"]
+    assert report.warning_reason_codes == [
+        "delivery_gate_duplicate_noop_ratio_review_required",
+        "delivery_gate_operator_review_required",
+    ]
     assert report.metrics[-1].metric_name == "duplicate_noop_ratio_1h"
     assert report.metrics[-1].severity == "warn"
-    assert report.metrics[-1].passed is True
+    assert report.metrics[-1].passed is False

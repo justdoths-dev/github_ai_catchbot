@@ -94,7 +94,6 @@ async def test_restricted_gate_passes_on_healthy_snapshot() -> None:
     assert [metric.metric_name for metric in report.metrics] == [
         "success_rate_1h",
         "high_source_to_delivery_p95_sec",
-        "plan_to_transport_p95_sec",
         "due_retry_oldest_lag_sec",
         "open_delivery_dlq_count",
         "unexpected_send_disabled_count",
@@ -113,21 +112,17 @@ async def test_restricted_gate_fails_on_open_dlq() -> None:
 
 
 @pytest.mark.asyncio
-async def test_restricted_gate_fails_when_runtime_flags_are_not_ready() -> None:
+async def test_restricted_gate_does_not_treat_runtime_flags_as_hot_path_policy() -> None:
     report = await DeliveryGateRunner(
         _config(send_enabled=False, dry_run=True, retry_promotion_enabled=False),
         repository=FakeGateRepository(_snapshot()),
     ).run(mode="restricted")
 
-    assert report.gate_status == "fail"
-    assert report.blocking_reason_codes[:3] == [
-        "delivery_gate_flag_send_disabled",
-        "delivery_gate_dry_run_enabled",
-        "delivery_gate_retry_promotion_disabled",
-    ]
+    assert report.gate_status == "pass"
+    assert report.blocking_reason_codes == []
     assert report.recommended_flag_patch == {
-        "ENABLE_NOTIFICATION_SEND": False,
-        "MAINTENANCE_ENABLE_NOTIFICATION_RETRY_PROMOTION": False,
+        "ENABLE_NOTIFICATION_SEND": True,
+        "MAINTENANCE_ENABLE_NOTIFICATION_RETRY_PROMOTION": True,
         "NOTIFIER_TELEGRAM_DRY_RUN": False,
     }
 
@@ -144,7 +139,6 @@ async def test_full_gate_warns_when_only_operator_review_is_missing() -> None:
     assert [metric.metric_name for metric in report.metrics] == [
         "success_rate_1h",
         "high_source_to_delivery_p95_sec",
-        "plan_to_transport_p95_sec",
         "due_retry_oldest_lag_sec",
         "open_delivery_dlq_count",
         "unexpected_send_disabled_count",
@@ -176,7 +170,6 @@ async def test_blocking_reason_order_follows_evaluation_order_without_sorting() 
             _snapshot(
                 success_rate_1h=0.5,
                 high_source_to_delivery_p95_sec=130,
-                plan_to_transport_p95_sec=140,
                 due_retry_oldest_lag_sec=150,
                 open_delivery_dlq_count=1,
                 unexpected_send_disabled_count=1,
@@ -187,7 +180,6 @@ async def test_blocking_reason_order_follows_evaluation_order_without_sorting() 
     assert report.blocking_reason_codes == [
         "delivery_gate_success_rate_below_threshold",
         "delivery_gate_high_e2e_p95_too_high",
-        "delivery_gate_plan_to_transport_p95_too_high",
         "delivery_gate_due_retry_lag_too_high",
         "delivery_gate_open_dlq_present",
         "delivery_gate_unexpected_send_disabled_rows_present",
