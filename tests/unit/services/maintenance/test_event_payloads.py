@@ -61,6 +61,7 @@ def test_replay_intent_payload_contains_required_notifier_fields() -> None:
     assert REQUIRED_REPLAY_PAYLOAD_FIELDS <= payload.keys()
     assert payload["send_after"] is None
     assert payload["replay_request_id"] == str(replay_request_id)
+    assert payload["replay_reason"] == "explicit_delivery_replay"
 
 
 def test_dedupe_keys_are_deterministic() -> None:
@@ -77,6 +78,7 @@ def test_dedupe_keys_are_deterministic() -> None:
         send_after=plan.send_after,
     )
     assert replay_intent_dedupe_key(replay_request_id) == replay_intent_dedupe_key(replay_request_id)
+    assert replay_intent_dedupe_key(replay_request_id) == f"notify:replay-intent:{replay_request_id}"
 
 
 def test_no_new_queue_names() -> None:

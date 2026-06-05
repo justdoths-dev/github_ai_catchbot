@@ -49,7 +49,6 @@ def evaluate_delivery_replay(
     if plan.notification_plan_id != replay_request.root_object_id:
         return DeliveryReplayDecision(action="reject", reason_code="replay_request_plan_mismatch")
 
-    reason = replay_reason or "explicit_delivery_replay"
     return DeliveryReplayDecision(
         action="emit_replay_intent",
         reason_code="explicit_delivery_replay",
@@ -57,7 +56,7 @@ def evaluate_delivery_replay(
         payload=build_replay_intent_payload(
             plan=plan,
             replay_request_id=replay_request.replay_request_id,
-            replay_reason=reason,
+            replay_reason="explicit_delivery_replay",
         ),
     )
 

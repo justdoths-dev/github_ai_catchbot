@@ -95,6 +95,7 @@ class FakeRepository:
                 "aggregate_id": aggregate_id,
                 "dedupe_key": dedupe_key,
                 "payload_json": payload_json,
+                "status": "pending",
             }
         )
         return True
