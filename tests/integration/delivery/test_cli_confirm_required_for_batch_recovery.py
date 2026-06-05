@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from services.maintenance import main as maintenance_main
@@ -26,29 +28,31 @@ async def test_delivery_gate_does_not_require_confirm(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_replay_selected_requires_confirm_write_before_runner_is_called(monkeypatch) -> None:
+async def test_replay_selected_requires_operator_confirmation_before_runner_is_called(monkeypatch, capsys) -> None:
     calls: list[str] = []
 
     async def fake_run_batch_recovery(config, args):
         calls.append(args.recovery_mode)
         return 0
 
-    monkeypatch.setattr(maintenance_main.MaintenanceConfig, "from_env", classmethod(lambda cls: _config()))
     monkeypatch.setattr(maintenance_main, "_run_batch_recovery", fake_run_batch_recovery)
 
-    with pytest.raises(SystemExit) as exc:
-        await maintenance_main._run(
-            [
-                "batch-recovery",
-                "replay-selected",
-                "--plan-id",
-                "00000000-0000-0000-0000-000000000001",
-                "--requested-by",
-                "ops",
-            ]
-        )
+    exit_code = await maintenance_main._run(
+        [
+            "batch-recovery",
+            "replay-selected",
+            "--plan-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--requested-by",
+            "ops",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
 
-    assert exc.value.code == 2
+    assert exit_code == 2
+    assert payload["status"] == "rejected"
+    assert payload["reason_code"] == "batch_recovery_operator_confirmation_required"
+    assert payload["created_count"] == 0
     assert calls == []
 
 

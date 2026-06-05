@@ -5,7 +5,9 @@ import argparse
 import json
 import logging
 from dataclasses import asdict
+from uuid import UUID
 
+from .batch_recovery import prepare_delivery_replay_requests_for_selected_plans
 from .batch_recovery_tool import DeliveryBatchRecoveryTool
 from .config import MaintenanceConfig
 from .delivery_gate_runner import DeliveryGateRunner
@@ -37,13 +39,80 @@ def build_parser() -> argparse.ArgumentParser:
     replay = recovery_subcommands.add_parser("replay-selected")
     replay.add_argument("--plan-id", action="append", required=True)
     replay.add_argument("--requested-by", required=True)
-    replay.add_argument("--confirm", choices=["write"], required=True)
+    replay.add_argument("--operator-confirmed", action="store_true")
 
     retry = recovery_subcommands.add_parser("retry-selected-due")
     retry.add_argument("--plan-id", action="append", required=True)
     retry.add_argument("--requested-by", required=True)
     retry.add_argument("--confirm", choices=["write"], required=True)
     return parser
+
+
+class _NoWriteSelectedReplayRepository:
+    async def load_selected_recovery_rows(self, notification_plan_ids: list[UUID]):
+        raise AssertionError("unconfirmed or invalid replay-selected command must not load selected rows")
+
+    async def insert_replay_requests_for_selected_plans(self, *, plan_ids: list[UUID], requested_by: str) -> int:
+        raise AssertionError("unconfirmed or invalid replay-selected command must not write replay requests")
+
+
+async def run_replay_selected_batch_recovery(args: argparse.Namespace, repository, *, emit_json=print) -> int:
+    selected_plan_ids, invalid_plan_ids = _normalize_notification_plan_ids(args.plan_id)
+    if invalid_plan_ids:
+        emit_json(_to_json(_invalid_plan_id_result(args.plan_id, invalid_plan_ids)))
+        return 2
+
+    result = await prepare_delivery_replay_requests_for_selected_plans(
+        repository=repository,
+        selected_plan_ids=selected_plan_ids,
+        requested_by=args.requested_by,
+        operator_confirmed=bool(args.operator_confirmed),
+    )
+    emit_json(_to_json(asdict(result)))
+    return 2 if result.status == "rejected" else 0
+
+
+def _normalize_notification_plan_ids(raw_plan_ids: list[str]) -> tuple[list[UUID], list[str]]:
+    selected_plan_ids: list[UUID] = []
+    invalid_plan_ids: list[str] = []
+    for raw_plan_id in raw_plan_ids:
+        try:
+            selected_plan_ids.append(UUID(str(raw_plan_id)))
+        except (TypeError, ValueError, AttributeError):
+            invalid_plan_ids.append(str(raw_plan_id))
+    return selected_plan_ids, invalid_plan_ids
+
+
+def _has_invalid_notification_plan_id(raw_plan_ids: list[str]) -> bool:
+    return bool(_normalize_notification_plan_ids(raw_plan_ids)[1])
+
+
+def _invalid_plan_id_result(raw_plan_ids: list[str], invalid_plan_ids: list[str]) -> dict:
+    invalid = set(invalid_plan_ids)
+    return {
+        "status": "rejected",
+        "reason_code": "invalid_notification_plan_id",
+        "requested_count": len(raw_plan_ids),
+        "created_count": 0,
+        "skipped_count": len(raw_plan_ids),
+        "results": [
+            {
+                "notification_plan_id": str(raw_plan_id),
+                "action": "skipped",
+                "reason_code": (
+                    "invalid_notification_plan_id"
+                    if str(raw_plan_id) in invalid
+                    else "batch_recovery_input_rejected"
+                ),
+                "replay_request_created": False,
+            }
+            for raw_plan_id in raw_plan_ids
+        ],
+    }
+
+
+def _to_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str, indent=2, sort_keys=True)
 
 
 async def _run_worker(config: MaintenanceConfig) -> int:
@@ -140,17 +209,22 @@ async def _run_delivery_gate(config: MaintenanceConfig, args: argparse.Namespace
 async def _run_batch_recovery(config: MaintenanceConfig, args: argparse.Namespace) -> int:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
 
+    if args.recovery_mode == "replay-selected" and (
+        not args.operator_confirmed or _has_invalid_notification_plan_id(args.plan_id)
+    ):
+        return await run_replay_selected_batch_recovery(args, _NoWriteSelectedReplayRepository())
+
     engine = create_async_engine(config.database_url, future=True)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     try:
         async with session_factory.begin() as session:
             repository = MaintenanceRepository(session)
-            tool = DeliveryBatchRecoveryTool(config, repository=repository)
             if args.recovery_mode == "replay-selected":
-                result = await tool.replay_selected(plan_ids=args.plan_id, requested_by=args.requested_by)
+                return await run_replay_selected_batch_recovery(args, repository)
             else:
+                tool = DeliveryBatchRecoveryTool(config, repository=repository)
                 result = await tool.retry_selected_due(plan_ids=args.plan_id, requested_by=args.requested_by)
-            print(json.dumps(asdict(result), ensure_ascii=False, default=str, indent=2, sort_keys=False))
+            print(_to_json(asdict(result)))
             return 0
     finally:
         await engine.dispose()
@@ -159,8 +233,12 @@ async def _run_batch_recovery(config: MaintenanceConfig, args: argparse.Namespac
 async def _run(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    config = MaintenanceConfig.from_env()
     command = args.command or "worker"
+    if command == "batch-recovery" and args.recovery_mode == "replay-selected" and (
+        not args.operator_confirmed or _has_invalid_notification_plan_id(args.plan_id)
+    ):
+        return await run_replay_selected_batch_recovery(args, _NoWriteSelectedReplayRepository())
+    config = MaintenanceConfig.from_env()
     if command == "worker":
         return await _run_worker(config)
     if command == "delivery-gate":
