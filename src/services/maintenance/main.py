@@ -72,6 +72,24 @@ async def run_replay_selected_batch_recovery(args: argparse.Namespace, repositor
     return 2 if result.status == "rejected" else 0
 
 
+async def run_retry_selected_due_batch_recovery(
+    config: MaintenanceConfig,
+    args: argparse.Namespace,
+    repository,
+    *,
+    emit_json=print,
+) -> int:
+    selected_plan_ids, invalid_plan_ids = _normalize_notification_plan_ids(args.plan_id)
+    if invalid_plan_ids:
+        emit_json(_to_json(_invalid_retry_plan_id_result(args.plan_id, invalid_plan_ids)))
+        return 2
+
+    tool = DeliveryBatchRecoveryTool(config, repository=repository)
+    result = await tool.retry_selected_due(plan_ids=selected_plan_ids, requested_by=args.requested_by)
+    emit_json(_to_json(asdict(result)))
+    return 0
+
+
 def _normalize_notification_plan_ids(raw_plan_ids: list[str]) -> tuple[list[UUID], list[str]]:
     selected_plan_ids: list[UUID] = []
     invalid_plan_ids: list[str] = []
@@ -105,6 +123,36 @@ def _invalid_plan_id_result(raw_plan_ids: list[str], invalid_plan_ids: list[str]
                     else "batch_recovery_input_rejected"
                 ),
                 "replay_request_created": False,
+            }
+            for raw_plan_id in raw_plan_ids
+        ],
+    }
+
+
+def _invalid_retry_plan_id_result(raw_plan_ids: list[str], invalid_plan_ids: list[str]) -> dict:
+    invalid = set(invalid_plan_ids)
+    valid_rejected_count = len(raw_plan_ids) - len(invalid_plan_ids)
+    skipped_reason_codes = {"invalid_notification_plan_id": len(invalid_plan_ids)}
+    if valid_rejected_count:
+        skipped_reason_codes["batch_recovery_input_rejected"] = valid_rejected_count
+    return {
+        "status": "rejected",
+        "reason_code": "invalid_notification_plan_id",
+        "requested_count": len(raw_plan_ids),
+        "created_count": 0,
+        "emitted_count": 0,
+        "skipped_count": len(raw_plan_ids),
+        "skipped_reason_codes": skipped_reason_codes,
+        "results": [
+            {
+                "notification_plan_id": str(raw_plan_id),
+                "action": "skipped",
+                "reason_code": (
+                    "invalid_notification_plan_id"
+                    if str(raw_plan_id) in invalid
+                    else "batch_recovery_input_rejected"
+                ),
+                "manual_retry_intent_emitted": False,
             }
             for raw_plan_id in raw_plan_ids
         ],
@@ -207,12 +255,16 @@ async def _run_delivery_gate(config: MaintenanceConfig, args: argparse.Namespace
 
 
 async def _run_batch_recovery(config: MaintenanceConfig, args: argparse.Namespace) -> int:
-    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
-
     if args.recovery_mode == "replay-selected" and (
         not args.operator_confirmed or _has_invalid_notification_plan_id(args.plan_id)
     ):
         return await run_replay_selected_batch_recovery(args, _NoWriteSelectedReplayRepository())
+    if args.recovery_mode == "retry-selected-due" and _has_invalid_notification_plan_id(args.plan_id):
+        _, invalid_plan_ids = _normalize_notification_plan_ids(args.plan_id)
+        print(_to_json(_invalid_retry_plan_id_result(args.plan_id, invalid_plan_ids)))
+        return 2
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
 
     engine = create_async_engine(config.database_url, future=True)
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -222,10 +274,7 @@ async def _run_batch_recovery(config: MaintenanceConfig, args: argparse.Namespac
             if args.recovery_mode == "replay-selected":
                 return await run_replay_selected_batch_recovery(args, repository)
             else:
-                tool = DeliveryBatchRecoveryTool(config, repository=repository)
-                result = await tool.retry_selected_due(plan_ids=args.plan_id, requested_by=args.requested_by)
-            print(_to_json(asdict(result)))
-            return 0
+                return await run_retry_selected_due_batch_recovery(config, args, repository)
     finally:
         await engine.dispose()
 
@@ -238,6 +287,12 @@ async def _run(argv: list[str] | None = None) -> int:
         not args.operator_confirmed or _has_invalid_notification_plan_id(args.plan_id)
     ):
         return await run_replay_selected_batch_recovery(args, _NoWriteSelectedReplayRepository())
+    if command == "batch-recovery" and args.recovery_mode == "retry-selected-due" and _has_invalid_notification_plan_id(
+        args.plan_id
+    ):
+        _, invalid_plan_ids = _normalize_notification_plan_ids(args.plan_id)
+        print(_to_json(_invalid_retry_plan_id_result(args.plan_id, invalid_plan_ids)))
+        return 2
     config = MaintenanceConfig.from_env()
     if command == "worker":
         return await _run_worker(config)
