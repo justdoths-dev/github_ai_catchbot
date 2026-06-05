@@ -129,6 +129,13 @@ class NotifierTelegramService:
                 reason_code=action.reason_code or "notification_noop",
             )
             return
+        if _should_terminal_duplicate_noop(plan_row, transport_enabled=self._config.transport_enabled):
+            await self._transition(
+                intent,
+                to_state=str(plan_row.get("status")),
+                reason_code="notification_duplicate_terminal_noop",
+            )
+            return
 
         render = self._renderer.render(
             notification_plan_id=intent.notification_plan_id,
@@ -435,6 +442,17 @@ def _is_future(value: datetime | None) -> bool:
     if value is None:
         return False
     return _as_utc(value) > datetime.now(timezone.utc)
+
+
+def _should_terminal_duplicate_noop(plan_row: dict | None, *, transport_enabled: bool) -> bool:
+    if plan_row is None:
+        return False
+    status = str(plan_row.get("status") or "")
+    if status in {"sent", "edited"}:
+        return True
+    if status in {"suppressed", "failed_terminal"} and not transport_enabled:
+        return True
+    return False
 
 
 def _edit_window_exceeded(created_at: datetime, edit_window_minutes: int) -> bool:
