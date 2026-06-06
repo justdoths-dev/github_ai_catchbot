@@ -5,6 +5,7 @@ from typing import Any
 from .models import ValidationDecision
 
 
+_EXPECTED_SCHEMA_VERSION = "judge_output_v1"
 _REQUIRED_TOP_LEVEL_FIELDS = {
     "judge_schema_version",
     "candidate_group_id",
@@ -88,6 +89,8 @@ class JudgeOutputSchemaRegistry:
         for field in _STRING_FIELDS:
             if not isinstance(payload.get(field), str):
                 return self._schema_invalid()
+        if payload["judge_schema_version"] != _EXPECTED_SCHEMA_VERSION:
+            return self._schema_invalid()
 
         if len(payload["headline"]) > self._max_headline_chars:
             return self._schema_invalid()

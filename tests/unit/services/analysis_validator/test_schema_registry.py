@@ -80,3 +80,13 @@ def test_schema_registry_enforces_score_range() -> None:
 
     assert decision.action == "failed_terminal"
     assert decision.reason_code == "validator_score_range_invalid"
+
+
+def test_schema_registry_requires_judge_output_v1_schema_version() -> None:
+    payload = valid_payload()
+    payload["judge_schema_version"] = "judge_output_v2"
+
+    decision = _registry().validate(payload)
+
+    assert decision.action == "failed_terminal"
+    assert decision.reason_code == "validator_schema_invalid"

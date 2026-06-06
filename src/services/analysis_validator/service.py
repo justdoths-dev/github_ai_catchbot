@@ -114,6 +114,13 @@ class AnalysisValidatorService:
         if schema_decision.action != "forward_policy":
             await self._terminal(judge_run=judge_run, decision=schema_decision)
             return
+        if payload["candidate_group_id"] != str(judge_output.candidate_group_id):
+            await self._terminal(
+                judge_run=judge_run,
+                transition_to_state="analysis_failed_identity_mismatch",
+                reason_code="validator_payload_candidate_mismatch",
+            )
+            return
 
         semantic_decision = self._business_rules.validate_semantics(payload=payload, bundle=bundle)
         if semantic_decision.action == "failed_terminal":
