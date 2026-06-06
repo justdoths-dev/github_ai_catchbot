@@ -11,6 +11,7 @@ from .batch_recovery import prepare_delivery_replay_requests_for_selected_plans
 from .batch_recovery_tool import DeliveryBatchRecoveryTool
 from .config import MaintenanceConfig
 from .delivery_gate_runner import DeliveryGateRunner
+from .mvp_readiness import run_restricted_live_mvp_readiness
 from .redis_streams import RedisStreamConsumer
 from .repositories import MaintenanceRepository
 from .service import MaintenanceService
@@ -32,6 +33,11 @@ def build_parser() -> argparse.ArgumentParser:
     gate.add_argument("--mode", choices=["restricted", "full"], required=True)
     gate.add_argument("--format", choices=["json"], default="json")
     gate.add_argument("--operator-review-passed", choices=["true", "false"], default=None)
+
+    mvp = subcommands.add_parser("mvp-readiness")
+    mvp.add_argument("--mode", choices=["restricted"], required=True)
+    mvp.add_argument("--format", choices=["json"], default="json")
+    mvp.add_argument("--operator-review-passed", choices=["true", "false"], default=None)
 
     recovery = subcommands.add_parser("batch-recovery")
     recovery_subcommands = recovery.add_subparsers(dest="recovery_mode", required=True)
@@ -88,6 +94,30 @@ async def run_retry_selected_due_batch_recovery(
     result = await tool.retry_selected_due(plan_ids=selected_plan_ids, requested_by=args.requested_by)
     emit_json(_to_json(asdict(result)))
     return 0
+
+
+async def run_mvp_readiness(
+    config: MaintenanceConfig,
+    args: argparse.Namespace,
+    delivery_gate_runner,
+    *,
+    recovery_cli_surface: dict[str, bool],
+    upstream_component_statuses: dict[str, str] | None = None,
+    emit_json=print,
+) -> int:
+    del args
+    report = await run_restricted_live_mvp_readiness(
+        config=config,
+        delivery_gate_runner=delivery_gate_runner,
+        recovery_cli_surface=recovery_cli_surface,
+        upstream_component_statuses=upstream_component_statuses,
+    )
+    emit_json(_to_json(asdict(report)))
+    if report.readiness_status == "pass":
+        return 0
+    if report.readiness_status == "warn":
+        return 3
+    return 2
 
 
 def _normalize_notification_plan_ids(raw_plan_ids: list[str]) -> tuple[list[UUID], list[str]]:
@@ -254,6 +284,24 @@ async def _run_delivery_gate(config: MaintenanceConfig, args: argparse.Namespace
         await engine.dispose()
 
 
+async def _run_mvp_readiness(config: MaintenanceConfig, args: argparse.Namespace) -> int:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
+
+    engine = create_async_engine(config.database_url, future=True)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            runner = DeliveryGateRunner(config, repository=MaintenanceRepository(session))
+            return await run_mvp_readiness(
+                config,
+                args,
+                runner,
+                recovery_cli_surface=_detect_recovery_cli_surface(build_parser()),
+            )
+    finally:
+        await engine.dispose()
+
+
 async def _run_batch_recovery(config: MaintenanceConfig, args: argparse.Namespace) -> int:
     if args.recovery_mode == "replay-selected" and (
         not args.operator_confirmed or _has_invalid_notification_plan_id(args.plan_id)
@@ -279,6 +327,54 @@ async def _run_batch_recovery(config: MaintenanceConfig, args: argparse.Namespac
         await engine.dispose()
 
 
+def _detect_recovery_cli_surface(parser: argparse.ArgumentParser) -> dict[str, bool]:
+    return {
+        "batch_recovery_replay_selected_operator_confirmed": _parser_accepts(
+            parser,
+            [
+                "batch-recovery",
+                "replay-selected",
+                "--plan-id",
+                "00000000-0000-0000-0000-000000000001",
+                "--requested-by",
+                "ops",
+                "--operator-confirmed",
+            ],
+        ),
+        "batch_recovery_retry_selected_due_confirm_write": _parser_accepts(
+            parser,
+            [
+                "batch-recovery",
+                "retry-selected-due",
+                "--plan-id",
+                "00000000-0000-0000-0000-000000000001",
+                "--requested-by",
+                "ops",
+                "--confirm",
+                "write",
+            ],
+        ),
+        "delivery_gate_restricted_mode": _parser_accepts(
+            parser,
+            [
+                "delivery-gate",
+                "--mode",
+                "restricted",
+                "--format",
+                "json",
+            ],
+        ),
+    }
+
+
+def _parser_accepts(parser: argparse.ArgumentParser, argv: list[str]) -> bool:
+    try:
+        parser.parse_args(argv)
+    except SystemExit:
+        return False
+    return True
+
+
 async def _run(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -298,6 +394,8 @@ async def _run(argv: list[str] | None = None) -> int:
         return await _run_worker(config)
     if command == "delivery-gate":
         return await _run_delivery_gate(config, args)
+    if command == "mvp-readiness":
+        return await _run_mvp_readiness(config, args)
     if command == "batch-recovery":
         return await _run_batch_recovery(config, args)
     parser.error(f"unsupported command: {command}")

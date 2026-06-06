@@ -10,6 +10,10 @@ DeliveryRetryAction = Literal["noop", "emit_retry_intent", "dead_letter_retry_ce
 ReplayAction = Literal["reject", "emit_replay_intent"]
 GateMode = Literal["restricted", "full"]
 GateStatus = Literal["pass", "fail", "warn"]
+MvpReadinessMode = Literal["restricted"]
+MvpReadinessCheckStatus = Literal["pass", "warn", "fail", "unknown"]
+MvpReadinessSeverity = Literal["block", "warn", "info"]
+MvpReadinessStatus = Literal["pass", "warn", "fail"]
 RecoveryMode = Literal["replay-selected", "retry-selected-due"]
 DeliveryResultWorkerClassification = Literal[
     "ignored",
@@ -185,6 +189,28 @@ class DeliveryGateSnapshot:
     replay_guard_reject_count_24h: int
     retry_ceiling_exceeded_count_24h: int
     duplicate_noop_ratio_1h: float | None
+
+
+@dataclass(slots=True, frozen=True)
+class MvpReadinessCheck:
+    check_name: str
+    status: MvpReadinessCheckStatus
+    severity: MvpReadinessSeverity
+    reason_code: str | None
+    observed_value: object | None = None
+    expected_value: object | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class MvpReadinessReportV1:
+    schema_version: str
+    mode: MvpReadinessMode
+    readiness_status: MvpReadinessStatus
+    blocking_reason_codes: list[str]
+    warning_reason_codes: list[str]
+    checks: list[MvpReadinessCheck]
+    recommended_next_action: str
+    recommended_flag_patch: dict[str, object]
 
 
 @dataclass(slots=True, frozen=True)
