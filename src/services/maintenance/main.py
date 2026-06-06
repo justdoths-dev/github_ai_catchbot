@@ -4,12 +4,19 @@ import asyncio
 import argparse
 import json
 import logging
+import os
+from collections.abc import Mapping
 from dataclasses import asdict
 from uuid import UUID
 
 from .batch_recovery import prepare_delivery_replay_requests_for_selected_plans
 from .batch_recovery_tool import DeliveryBatchRecoveryTool
 from .config import MaintenanceConfig
+from .db_shape_preflight import (
+    SCHEMA_VERSION as DB_SHAPE_PREFLIGHT_SCHEMA_VERSION,
+    SqlAlchemyDbShapeIntrospectionRepository,
+    run_db_shape_preflight,
+)
 from .delivery_gate_runner import DeliveryGateRunner
 from .mvp_readiness import run_restricted_live_mvp_readiness
 from .redis_streams import RedisStreamConsumer
@@ -38,6 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
     mvp.add_argument("--mode", choices=["restricted"], required=True)
     mvp.add_argument("--format", choices=["json"], default="json")
     mvp.add_argument("--operator-review-passed", choices=["true", "false"], default=None)
+
+    db_shape = subcommands.add_parser("db-shape-preflight")
+    db_shape.add_argument("--format", choices=["json"], default="json")
 
     recovery = subcommands.add_parser("batch-recovery")
     recovery_subcommands = recovery.add_subparsers(dest="recovery_mode", required=True)
@@ -118,6 +128,12 @@ async def run_mvp_readiness(
     if report.readiness_status == "warn":
         return 3
     return 2
+
+
+async def run_db_shape_preflight_command(repository, *, emit_json=print, report_runner=run_db_shape_preflight) -> int:
+    report = await report_runner(repository)
+    emit_json(_to_json(asdict(report)))
+    return 0 if report.status == "pass" else 2
 
 
 def _normalize_notification_plan_ids(raw_plan_ids: list[str]) -> tuple[list[UUID], list[str]]:
@@ -302,6 +318,81 @@ async def _run_mvp_readiness(config: MaintenanceConfig, args: argparse.Namespace
         await engine.dispose()
 
 
+async def _run_db_shape_preflight(
+    args: argparse.Namespace,
+    *,
+    env: Mapping[str, str] | None = None,
+    emit_json=print,
+    session_factory_builder=None,
+    report_runner=run_db_shape_preflight,
+) -> int:
+    del args
+    try:
+        database_url = _read_database_url_from_env(env)
+    except ValueError:
+        emit_json(_to_json(_db_shape_preflight_error_payload("database_url_required")))
+        return 1
+
+    if session_factory_builder is None:
+        session_factory_builder = _build_db_shape_preflight_session_factory
+
+    try:
+        session_factory, dispose = session_factory_builder(database_url)
+        try:
+            async with session_factory() as session:
+                repository = SqlAlchemyDbShapeIntrospectionRepository(session)
+                return await run_db_shape_preflight_command(
+                    repository,
+                    emit_json=emit_json,
+                    report_runner=report_runner,
+                )
+        finally:
+            await dispose()
+    except Exception:
+        emit_json(_to_json(_db_shape_preflight_error_payload("db_shape_preflight_runtime_error")))
+        return 1
+
+
+def _read_database_url_from_env(env: Mapping[str, str] | None = None) -> str:
+    source = os.environ if env is None else env
+    database_url = source.get("DATABASE_URL", "").strip()
+    if not database_url:
+        raise ValueError("database_url_required")
+    return database_url
+
+
+def _build_db_shape_preflight_session_factory(database_url: str):
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
+
+    engine = create_async_engine(database_url, future=True)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def dispose() -> None:
+        await engine.dispose()
+
+    return session_factory, dispose
+
+
+def _db_shape_preflight_error_payload(reason_code: str) -> dict:
+    return {
+        "schema_version": DB_SHAPE_PREFLIGHT_SCHEMA_VERSION,
+        "status": "fail",
+        "missing_tables": [],
+        "missing_columns": [],
+        "missing_enum_labels": [],
+        "warnings": [reason_code],
+        "checks": [
+            {
+                "check_name": "runtime_configuration",
+                "status": "fail",
+                "check_type": "runtime_configuration",
+                "expected": "valid_db_shape_preflight_runtime",
+                "observed": reason_code,
+            }
+        ],
+    }
+
+
 async def _run_batch_recovery(config: MaintenanceConfig, args: argparse.Namespace) -> int:
     if args.recovery_mode == "replay-selected" and (
         not args.operator_confirmed or _has_invalid_notification_plan_id(args.plan_id)
@@ -379,6 +470,8 @@ async def _run(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     command = args.command or "worker"
+    if command == "db-shape-preflight":
+        return await _run_db_shape_preflight(args)
     if command == "batch-recovery" and args.recovery_mode == "replay-selected" and (
         not args.operator_confirmed or _has_invalid_notification_plan_id(args.plan_id)
     ):
