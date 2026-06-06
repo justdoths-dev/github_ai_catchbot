@@ -7,6 +7,7 @@ import logging
 import os
 from collections.abc import Mapping
 from dataclasses import asdict
+from pathlib import Path
 from uuid import UUID
 
 from .batch_recovery import prepare_delivery_replay_requests_for_selected_plans
@@ -23,6 +24,17 @@ from .redis_streams import RedisStreamConsumer
 from .repositories import MaintenanceRepository
 from .service import MaintenanceService
 from .worker import DueRetryPromotionWorker, MaintenanceQueueWorker, ReplayQueueWorker
+
+DB_SHAPE_PREFLIGHT_SOURCE_REASON_CODES = {
+    "database_url_required",
+    "database_url_file_missing",
+    "database_url_file_empty",
+    "env_file_missing",
+    "env_file_no_database_url",
+    "env_file_database_url_file_missing",
+    "env_file_database_url_file_empty",
+    "ambiguous_database_url_source",
+}
 
 
 def _build_logger(level: str) -> logging.Logger:
@@ -48,6 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     db_shape = subcommands.add_parser("db-shape-preflight")
     db_shape.add_argument("--format", choices=["json"], default="json")
+    db_shape.add_argument("--database-url-file")
+    db_shape.add_argument("--env-file")
 
     recovery = subcommands.add_parser("batch-recovery")
     recovery_subcommands = recovery.add_subparsers(dest="recovery_mode", required=True)
@@ -130,9 +144,18 @@ async def run_mvp_readiness(
     return 2
 
 
-async def run_db_shape_preflight_command(repository, *, emit_json=print, report_runner=run_db_shape_preflight) -> int:
+async def run_db_shape_preflight_command(
+    repository,
+    *,
+    emit_json=print,
+    report_runner=run_db_shape_preflight,
+    database_url_source: str | None = None,
+) -> int:
     report = await report_runner(repository)
-    emit_json(_to_json(asdict(report)))
+    payload = asdict(report)
+    if database_url_source is not None:
+        payload["database_url_source"] = database_url_source
+    emit_json(_to_json(payload))
     return 0 if report.status == "pass" else 2
 
 
@@ -326,11 +349,11 @@ async def _run_db_shape_preflight(
     session_factory_builder=None,
     report_runner=run_db_shape_preflight,
 ) -> int:
-    del args
     try:
-        database_url = _read_database_url_from_env(env)
-    except ValueError:
-        emit_json(_to_json(_db_shape_preflight_error_payload("database_url_required")))
+        database_url, database_url_source = _resolve_database_url_source(args, env=env)
+    except ValueError as exc:
+        reason_code = _db_shape_preflight_source_reason_code(exc)
+        emit_json(_to_json(_db_shape_preflight_error_payload(reason_code)))
         return 1
 
     if session_factory_builder is None:
@@ -343,6 +366,7 @@ async def _run_db_shape_preflight(
                 repository = SqlAlchemyDbShapeIntrospectionRepository(session)
                 return await run_db_shape_preflight_command(
                     repository,
+                    database_url_source=database_url_source,
                     emit_json=emit_json,
                     report_runner=report_runner,
                 )
@@ -359,6 +383,97 @@ def _read_database_url_from_env(env: Mapping[str, str] | None = None) -> str:
     if not database_url:
         raise ValueError("database_url_required")
     return database_url
+
+
+def _db_shape_preflight_source_reason_code(exc: ValueError) -> str:
+    reason_code = str(exc)
+    if reason_code in DB_SHAPE_PREFLIGHT_SOURCE_REASON_CODES:
+        return reason_code
+    return "database_url_required"
+
+
+def _resolve_database_url_source(args: argparse.Namespace, *, env: Mapping[str, str] | None = None) -> tuple[str, str]:
+    database_url_file = getattr(args, "database_url_file", None)
+    env_file = getattr(args, "env_file", None)
+    if database_url_file and env_file:
+        raise ValueError("ambiguous_database_url_source")
+
+    source = os.environ if env is None else env
+    database_url = source.get("DATABASE_URL", "").strip()
+    if database_url:
+        return database_url, "env"
+
+    if database_url_file:
+        return _read_database_url_from_file(
+            database_url_file,
+            missing_reason_code="database_url_file_missing",
+            empty_reason_code="database_url_file_empty",
+        ), "database_url_file"
+
+    if env_file:
+        return _resolve_database_url_from_env_file(env_file)
+
+    raise ValueError("database_url_required")
+
+
+def _resolve_database_url_from_env_file(env_file: str) -> tuple[str, str]:
+    values = _read_minimal_env_file(env_file)
+    database_url = values.get("DATABASE_URL", "").strip()
+    if database_url:
+        return database_url, "env_file_database_url"
+
+    database_url_file = values.get("DATABASE_URL_FILE", "").strip()
+    if not database_url_file:
+        raise ValueError("env_file_no_database_url")
+
+    return _read_database_url_from_file(
+        database_url_file,
+        missing_reason_code="env_file_database_url_file_missing",
+        empty_reason_code="env_file_database_url_file_empty",
+    ), "env_file_database_url_file"
+
+
+def _read_database_url_from_file(
+    path: str,
+    *,
+    missing_reason_code: str,
+    empty_reason_code: str,
+) -> str:
+    database_url_path = Path(path)
+    if not database_url_path.is_file():
+        raise ValueError(missing_reason_code)
+    try:
+        database_url = database_url_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        raise ValueError(missing_reason_code) from None
+    if not database_url:
+        raise ValueError(empty_reason_code)
+    return database_url
+
+
+def _read_minimal_env_file(env_file: str) -> dict[str, str]:
+    env_path = Path(env_file)
+    if not env_path.is_file():
+        raise ValueError("env_file_missing")
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        raise ValueError("env_file_missing") from None
+
+    values: dict[str, str] = {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in {"DATABASE_URL", "DATABASE_URL_FILE"}:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    return values
 
 
 def _build_db_shape_preflight_session_factory(database_url: str):

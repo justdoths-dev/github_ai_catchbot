@@ -13,13 +13,13 @@ from services.maintenance.db_shape_preflight import (
 )
 
 
-def _args():
-    return maintenance_main.build_parser().parse_args(["db-shape-preflight", "--format", "json"])
+def _args(*extra: str):
+    return maintenance_main.build_parser().parse_args(["db-shape-preflight", "--format", "json", *extra])
 
 
 @pytest.mark.asyncio
 async def test_db_shape_preflight_command_returns_deterministic_json_with_fake_session() -> None:
-    database_url = "fake-database-url-for-test"
+    database_url = "opaque-process-db-source-value"
     disposed: list[bool] = []
     emitted: list[str] = []
 
@@ -27,7 +27,11 @@ async def test_db_shape_preflight_command_returns_deterministic_json_with_fake_s
         _args(),
         env={"DATABASE_URL": database_url},
         emit_json=emitted.append,
-        session_factory_builder=_session_factory_builder(FakeMetadataSession(), disposed),
+        session_factory_builder=_session_factory_builder(
+            FakeMetadataSession(),
+            disposed,
+            expected_database_url=database_url,
+        ),
     )
     first_payload = json.loads(emitted[0])
     emitted.clear()
@@ -35,7 +39,11 @@ async def test_db_shape_preflight_command_returns_deterministic_json_with_fake_s
         _args(),
         env={"DATABASE_URL": database_url},
         emit_json=emitted.append,
-        session_factory_builder=_session_factory_builder(FakeMetadataSession(), disposed),
+        session_factory_builder=_session_factory_builder(
+            FakeMetadataSession(),
+            disposed,
+            expected_database_url=database_url,
+        ),
     )
 
     assert exit_code == 0
@@ -47,9 +55,268 @@ async def test_db_shape_preflight_command_returns_deterministic_json_with_fake_s
     assert first_payload["missing_columns"] == []
     assert first_payload["missing_enum_labels"] == []
     assert first_payload["warnings"] == []
+    assert first_payload["database_url_source"] == "env"
     assert first_payload["checks"][0]["check_name"] == "read_only_transaction_guard"
     assert database_url not in json.dumps(first_payload, sort_keys=True)
+    assert "opaque-process-db-source-value" not in emitted[0]
     assert disposed == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_db_shape_preflight_database_url_file_resolves_and_is_not_printed(tmp_path) -> None:
+    database_url = "opaque-file-db-source-value"
+    database_url_file = tmp_path / "database-url.txt"
+    database_url_file.write_text(f"  {database_url}\n", encoding="utf-8")
+    emitted: list[str] = []
+
+    exit_code = await maintenance_main._run_db_shape_preflight(
+        _args("--database-url-file", str(database_url_file)),
+        env={},
+        emit_json=emitted.append,
+        session_factory_builder=_session_factory_builder(
+            FakeMetadataSession(),
+            [],
+            expected_database_url=database_url,
+        ),
+    )
+    payload = json.loads(emitted[0])
+
+    assert exit_code == 0
+    assert payload["schema_version"] == "db_shape_preflight_v1"
+    assert payload["status"] == "pass"
+    assert payload["database_url_source"] == "database_url_file"
+    assert database_url not in emitted[0]
+    assert str(database_url_file) not in emitted[0]
+    assert "opaque-file-db-source-value" not in emitted[0]
+
+
+@pytest.mark.asyncio
+async def test_db_shape_preflight_database_url_file_missing_returns_sanitized_reason(tmp_path) -> None:
+    emitted: list[str] = []
+    missing_file = tmp_path / "missing-database-url.txt"
+
+    exit_code = await maintenance_main._run_db_shape_preflight(
+        _args("--database-url-file", str(missing_file)),
+        env={},
+        emit_json=emitted.append,
+        session_factory_builder=lambda database_url: (_ for _ in ()).throw(AssertionError(database_url)),
+    )
+    payload = json.loads(emitted[0])
+
+    assert exit_code == 1
+    assert payload["status"] == "fail"
+    assert payload["warnings"] == ["database_url_file_missing"]
+    assert str(missing_file) not in emitted[0]
+
+
+@pytest.mark.asyncio
+async def test_db_shape_preflight_database_url_file_empty_returns_sanitized_reason(tmp_path) -> None:
+    emitted: list[str] = []
+    database_url_file = tmp_path / "empty-database-url.txt"
+    database_url_file.write_text("  \n", encoding="utf-8")
+
+    exit_code = await maintenance_main._run_db_shape_preflight(
+        _args("--database-url-file", str(database_url_file)),
+        env={},
+        emit_json=emitted.append,
+        session_factory_builder=lambda database_url: (_ for _ in ()).throw(AssertionError(database_url)),
+    )
+    payload = json.loads(emitted[0])
+
+    assert exit_code == 1
+    assert payload["status"] == "fail"
+    assert payload["warnings"] == ["database_url_file_empty"]
+    assert str(database_url_file) not in emitted[0]
+
+
+@pytest.mark.asyncio
+async def test_db_shape_preflight_env_file_database_url_resolves_and_is_not_printed(tmp_path) -> None:
+    database_url = "opaque-env-file-db-source-value"
+    env_file = tmp_path / "runtime.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "# ignored comment",
+                "IGNORED_KEY=ignored-value",
+                f'DATABASE_URL="{database_url}"',
+                "DATABASE_URL_FILE=/ignored/when/database/url/is/present",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    emitted: list[str] = []
+
+    exit_code = await maintenance_main._run_db_shape_preflight(
+        _args("--env-file", str(env_file)),
+        env={},
+        emit_json=emitted.append,
+        session_factory_builder=_session_factory_builder(
+            FakeMetadataSession(),
+            [],
+            expected_database_url=database_url,
+        ),
+    )
+    payload = json.loads(emitted[0])
+
+    assert exit_code == 0
+    assert payload["schema_version"] == "db_shape_preflight_v1"
+    assert payload["status"] == "pass"
+    assert payload["database_url_source"] == "env_file_database_url"
+    assert database_url not in emitted[0]
+    assert str(env_file) not in emitted[0]
+    assert "opaque-env-file-db-source-value" not in emitted[0]
+    assert "ignored-value" not in emitted[0]
+
+
+@pytest.mark.asyncio
+async def test_db_shape_preflight_env_file_database_url_file_resolves_and_is_not_printed(tmp_path) -> None:
+    database_url = "opaque-env-file-db-file-source-value"
+    database_url_file = tmp_path / "database-url.txt"
+    database_url_file.write_text(f"{database_url}\n", encoding="utf-8")
+    env_file = tmp_path / "runtime.env"
+    env_file.write_text(f"DATABASE_URL_FILE='{database_url_file}'\n", encoding="utf-8")
+    emitted: list[str] = []
+
+    exit_code = await maintenance_main._run_db_shape_preflight(
+        _args("--env-file", str(env_file)),
+        env={},
+        emit_json=emitted.append,
+        session_factory_builder=_session_factory_builder(
+            FakeMetadataSession(),
+            [],
+            expected_database_url=database_url,
+        ),
+    )
+    payload = json.loads(emitted[0])
+
+    assert exit_code == 0
+    assert payload["schema_version"] == "db_shape_preflight_v1"
+    assert payload["status"] == "pass"
+    assert payload["database_url_source"] == "env_file_database_url_file"
+    assert database_url not in emitted[0]
+    assert str(env_file) not in emitted[0]
+    assert str(database_url_file) not in emitted[0]
+    assert "opaque-env-file-db-file-source-value" not in emitted[0]
+
+
+@pytest.mark.asyncio
+async def test_db_shape_preflight_env_file_missing_returns_sanitized_reason(tmp_path) -> None:
+    emitted: list[str] = []
+    env_file = tmp_path / "missing.env"
+
+    exit_code = await maintenance_main._run_db_shape_preflight(
+        _args("--env-file", str(env_file)),
+        env={},
+        emit_json=emitted.append,
+        session_factory_builder=lambda database_url: (_ for _ in ()).throw(AssertionError(database_url)),
+    )
+    payload = json.loads(emitted[0])
+
+    assert exit_code == 1
+    assert payload["status"] == "fail"
+    assert payload["warnings"] == ["env_file_missing"]
+    assert str(env_file) not in emitted[0]
+
+
+@pytest.mark.asyncio
+async def test_db_shape_preflight_env_file_without_database_url_returns_sanitized_reason(tmp_path) -> None:
+    emitted: list[str] = []
+    env_file = tmp_path / "runtime.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "# ignored comment",
+                "REDIS_URL=ignored-redis-source-value",
+                "NOT_A_DATABASE_URL=ignored-database-source-value",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = await maintenance_main._run_db_shape_preflight(
+        _args("--env-file", str(env_file)),
+        env={},
+        emit_json=emitted.append,
+        session_factory_builder=lambda database_url: (_ for _ in ()).throw(AssertionError(database_url)),
+    )
+    payload = json.loads(emitted[0])
+
+    assert exit_code == 1
+    assert payload["status"] == "fail"
+    assert payload["warnings"] == ["env_file_no_database_url"]
+    assert str(env_file) not in emitted[0]
+    assert "ignored-redis-source-value" not in emitted[0]
+    assert "ignored-database-source-value" not in emitted[0]
+
+
+@pytest.mark.asyncio
+async def test_db_shape_preflight_env_file_database_url_file_missing_returns_sanitized_reason(tmp_path) -> None:
+    emitted: list[str] = []
+    missing_database_url_file = tmp_path / "missing-database-url.txt"
+    env_file = tmp_path / "runtime.env"
+    env_file.write_text(f"DATABASE_URL_FILE={missing_database_url_file}\n", encoding="utf-8")
+
+    exit_code = await maintenance_main._run_db_shape_preflight(
+        _args("--env-file", str(env_file)),
+        env={},
+        emit_json=emitted.append,
+        session_factory_builder=lambda database_url: (_ for _ in ()).throw(AssertionError(database_url)),
+    )
+    payload = json.loads(emitted[0])
+
+    assert exit_code == 1
+    assert payload["status"] == "fail"
+    assert payload["warnings"] == ["env_file_database_url_file_missing"]
+    assert str(env_file) not in emitted[0]
+    assert str(missing_database_url_file) not in emitted[0]
+
+
+@pytest.mark.asyncio
+async def test_db_shape_preflight_env_file_database_url_file_empty_returns_sanitized_reason(tmp_path) -> None:
+    emitted: list[str] = []
+    database_url_file = tmp_path / "empty-database-url.txt"
+    database_url_file.write_text("\n", encoding="utf-8")
+    env_file = tmp_path / "runtime.env"
+    env_file.write_text(f"DATABASE_URL_FILE={database_url_file}\n", encoding="utf-8")
+
+    exit_code = await maintenance_main._run_db_shape_preflight(
+        _args("--env-file", str(env_file)),
+        env={},
+        emit_json=emitted.append,
+        session_factory_builder=lambda database_url: (_ for _ in ()).throw(AssertionError(database_url)),
+    )
+    payload = json.loads(emitted[0])
+
+    assert exit_code == 1
+    assert payload["status"] == "fail"
+    assert payload["warnings"] == ["env_file_database_url_file_empty"]
+    assert str(env_file) not in emitted[0]
+    assert str(database_url_file) not in emitted[0]
+
+
+@pytest.mark.asyncio
+async def test_db_shape_preflight_ambiguous_source_returns_sanitized_reason(tmp_path) -> None:
+    emitted: list[str] = []
+    database_url_file = tmp_path / "database-url.txt"
+    database_url_file.write_text("opaque-ambiguous-file-source-value\n", encoding="utf-8")
+    env_file = tmp_path / "runtime.env"
+    env_file.write_text("DATABASE_URL=opaque-ambiguous-env-file-source-value\n", encoding="utf-8")
+
+    exit_code = await maintenance_main._run_db_shape_preflight(
+        _args("--database-url-file", str(database_url_file), "--env-file", str(env_file)),
+        env={},
+        emit_json=emitted.append,
+        session_factory_builder=lambda database_url: (_ for _ in ()).throw(AssertionError(database_url)),
+    )
+    payload = json.loads(emitted[0])
+
+    assert exit_code == 1
+    assert payload["status"] == "fail"
+    assert payload["warnings"] == ["ambiguous_database_url_source"]
+    assert str(database_url_file) not in emitted[0]
+    assert str(env_file) not in emitted[0]
+    assert "opaque-ambiguous-file-source-value" not in emitted[0]
+    assert "opaque-ambiguous-env-file-source-value" not in emitted[0]
 
 
 @pytest.mark.asyncio
@@ -156,9 +423,14 @@ async def test_db_shape_preflight_dispatch_does_not_load_global_config(monkeypat
     assert calls == ["db-shape-preflight"]
 
 
-def _session_factory_builder(session, disposed: list[bool]):
+def _session_factory_builder(
+    session,
+    disposed: list[bool],
+    *,
+    expected_database_url: str = "fake-database-url-for-test",
+):
     def build(database_url: str):
-        assert database_url == "fake-database-url-for-test"
+        assert database_url == expected_database_url
 
         async def dispose() -> None:
             disposed.append(True)
