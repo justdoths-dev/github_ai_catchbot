@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from json import JSONDecodeError
 from typing import Any, AsyncIterator, Protocol
 from uuid import UUID
 
@@ -372,7 +373,10 @@ def _json_loads(value: Any) -> Any:
     if value is None:
         return None
     if isinstance(value, str):
-        return json.loads(value)
+        try:
+            return json.loads(value)
+        except (JSONDecodeError, TypeError):
+            return None
     return value
 
 

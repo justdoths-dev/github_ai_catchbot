@@ -1,0 +1,12 @@
+{
+  "trigger_event_id": "77777777-7777-4777-8777-777777777777",
+  "judge_run_id": "88888888-8888-4888-8888-888888888888",
+  "judge_output_id": "99999999-9999-4999-8999-999999999999",
+  "bundle_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "candidate_group_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  "current_primary_artifact_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+  "current_primary_artifact_type": "github_repo",
+  "prompt_version": "judge_prompt_v1",
+  "policy_version": "verdict_policy_v1",
+  "delivery_policy_version": "delivery_policy_v1"
+}

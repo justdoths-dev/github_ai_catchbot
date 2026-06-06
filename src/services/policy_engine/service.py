@@ -80,6 +80,9 @@ class PolicyEngineService:
         return await self._repository.load_job_by_trigger_event_id(parsed_trigger_event_id)
 
     async def handle_job(self, job: AnalysisPolicyJob) -> None:
+        if job.event_type != "analysis.policy.apply.v1":
+            return
+
         candidate = await self._repository.load_candidate_context(job.candidate_group_id)
         if candidate is None:
             await self._candidate_transition(
