@@ -1,0 +1,76 @@
+{
+  "event_outbox": [
+    {
+      "event_id": "20000000-0000-4000-8000-000000000101",
+      "event_type": "notification.delivery.result.v1",
+      "aggregate_type": "notification_plan",
+      "aggregate_id": "20000000-0000-4000-8000-000000000201",
+      "dedupe_key": "notification-delivery-result:send-disabled-noop:20000000-0000-4000-8000-000000000301",
+      "payload_json": {
+        "notification_plan_id": "20000000-0000-4000-8000-000000000201",
+        "notification_delivery_record_id": "20000000-0000-4000-8000-000000000301",
+        "delivery_status": "suppressed",
+        "telegram_chat_id": 12345,
+        "telegram_message_id": null,
+        "attempt_count": 0,
+        "transport_error_code": "notification_send_flag_disabled",
+        "transport_error_class": null,
+        "edited": false
+      },
+      "status": "pending",
+      "created_at": "2026-06-06T00:00:00+00:00"
+    }
+  ],
+  "notification_plans": [
+    {
+      "notification_plan_id": "20000000-0000-4000-8000-000000000201",
+      "analysis_id": "20000000-0000-4000-8000-000000000401",
+      "candidate_group_id": "20000000-0000-4000-8000-000000000501",
+      "delivery_decision": "send_now",
+      "urgency_profile": "high",
+      "target_chat_id": 12345,
+      "target_thread_id": null,
+      "render_profile": "telegram_single_alert_high_v1",
+      "dedupe_subject_key": "offline-send-disabled-noop-subject",
+      "material_change_hash": "offline-send-disabled-noop-material",
+      "send_after": null,
+      "suppress_reason_code": "notification_send_flag_disabled",
+      "status": "suppressed"
+    }
+  ],
+  "notification_renders": [
+    {
+      "notification_render_id": "20000000-0000-4000-8000-000000000601",
+      "notification_plan_id": "20000000-0000-4000-8000-000000000201",
+      "render_profile": "telegram_single_alert_high_v1",
+      "render_hash": "offline-send-disabled-noop-render",
+      "created_at": "2026-06-06T00:00:01+00:00"
+    }
+  ],
+  "notification_delivery_records": [
+    {
+      "notification_delivery_record_id": "20000000-0000-4000-8000-000000000301",
+      "notification_plan_id": "20000000-0000-4000-8000-000000000201",
+      "delivery_status": "suppressed",
+      "result_status": "suppressed",
+      "telegram_chat_id": 12345,
+      "telegram_message_id": null,
+      "attempt_count": 0,
+      "transport_error_code": "notification_send_flag_disabled",
+      "transport_error_class": null,
+      "telegram_response_json": {
+        "dry_run": false,
+        "send_disabled": true,
+        "send_enabled": false,
+        "transport_skipped": true,
+        "reason_code": "notification_send_flag_disabled",
+        "delivery_action": "send"
+      },
+      "created_at": "2026-06-06T00:00:02+00:00"
+    }
+  ],
+  "pipeline_runs": [],
+  "job_attempts": [],
+  "replay_requests": [],
+  "dead_letter_entries": []
+}
