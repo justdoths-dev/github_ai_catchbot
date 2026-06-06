@@ -48,9 +48,10 @@ class JudgeOpenAIRepository:
         bundle_id = _uuid_or_none(payload.get("bundle_id"))
         if judge_run_id is None or bundle_id is None:
             return None
-        required = ["model", "reasoning_effort", "prompt_version", "prompt_cache_key"]
+        required = ["model", "reasoning_effort", "prompt_version"]
         if any(not payload.get(key) for key in required):
             return None
+        prompt_cache_key = payload.get("prompt_cache_key")
 
         return JudgeCallJob(
             trigger_event_id=UUID(str(row["event_id"])),
@@ -60,7 +61,7 @@ class JudgeOpenAIRepository:
             model=str(payload["model"]),
             reasoning_effort=str(payload["reasoning_effort"]),
             prompt_version=str(payload["prompt_version"]),
-            prompt_cache_key=str(payload["prompt_cache_key"]),
+            prompt_cache_key=str(prompt_cache_key) if prompt_cache_key else None,
         )
 
     async def load_judge_run(self, judge_run_id: UUID) -> JudgeRunRecord | None:

@@ -242,7 +242,11 @@ class JudgeOpenAIService:
             job.model != judge_run.model
             or job.reasoning_effort != judge_run.reasoning_effort
             or job.prompt_version != judge_run.prompt_version
-            or job.prompt_cache_key != judge_run.prompt_cache_key
+            or (
+                job.prompt_cache_key is not None
+                and judge_run.prompt_cache_key is not None
+                and job.prompt_cache_key != judge_run.prompt_cache_key
+            )
         )
 
     @staticmethod
@@ -254,7 +258,6 @@ class JudgeOpenAIService:
                 job.model,
                 job.reasoning_effort,
                 job.prompt_version,
-                job.prompt_cache_key,
             ]
         )
 
@@ -265,7 +268,6 @@ class JudgeOpenAIService:
                 judge_run.model,
                 judge_run.reasoning_effort,
                 judge_run.prompt_version,
-                judge_run.prompt_cache_key,
             ]
         )
 

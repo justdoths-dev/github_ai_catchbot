@@ -550,7 +550,7 @@ async def test_openai_transient_exception_marks_failed_retryable_without_output_
     await _handle(repository, client, job)
 
     assert repository.status_history == ["running", "failed_retryable"]
-    assert repository.finished[0]["finish_reason"] == "RateLimitError"
+    assert repository.finished[0]["finish_reason"] == "openai_transport_retryable"
     assert repository.outputs == []
     assert repository.outbox == []
 

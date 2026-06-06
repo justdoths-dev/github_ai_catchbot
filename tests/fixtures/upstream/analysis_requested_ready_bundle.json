@@ -1,0 +1,13 @@
+{
+  "trigger_event_id": "33333333-3333-4333-8333-333333333333",
+  "candidate_group_id": "44444444-4444-4444-8444-444444444444",
+  "bundle_id": "55555555-5555-4555-8555-555555555555",
+  "judge_profile": "github_primary",
+  "escalation_allowed": true,
+  "ready_for_analysis": true,
+  "bundle_profile_version": "bundle_profile_v1",
+  "reroot_count": 0,
+  "token_budget_profile": "small",
+  "member_count": 1,
+  "supporting_count": 0
+}

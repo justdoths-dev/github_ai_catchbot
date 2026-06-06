@@ -222,7 +222,9 @@ class AnalysisRouterRepository:
         self,
         *,
         judge_run_id: UUID,
+        candidate_group_id: UUID,
         bundle_id: UUID,
+        judge_profile: str,
         model: str,
         reasoning_effort: str,
         prompt_version: str,
@@ -230,7 +232,9 @@ class AnalysisRouterRepository:
     ) -> None:
         payload = {
             "judge_run_id": str(judge_run_id),
+            "candidate_group_id": str(candidate_group_id),
             "bundle_id": str(bundle_id),
+            "judge_profile": judge_profile,
             "model": model,
             "reasoning_effort": reasoning_effort,
             "prompt_version": prompt_version,

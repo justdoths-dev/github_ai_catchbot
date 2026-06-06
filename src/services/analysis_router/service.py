@@ -112,7 +112,9 @@ class AnalysisRouterService:
 
             await self._repository.insert_judge_call_requested_outbox(
                 judge_run_id=judge_run_id,
+                candidate_group_id=job.candidate_group_id,
                 bundle_id=job.bundle_id,
+                judge_profile=decision.judge_profile or "",
                 model=decision.model or "",
                 reasoning_effort=decision.reasoning_effort or "",
                 prompt_version=decision.prompt_version or "",
