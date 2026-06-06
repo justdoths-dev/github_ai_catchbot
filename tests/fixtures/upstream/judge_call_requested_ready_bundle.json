@@ -1,0 +1,31 @@
+{
+  "trigger_event_id": "00000000-0000-4000-8000-000000000201",
+  "judge_run_id": "00000000-0000-4000-8000-000000000202",
+  "candidate_group_id": "00000000-0000-4000-8000-000000000203",
+  "bundle_id": "00000000-0000-4000-8000-000000000204",
+  "current_primary_artifact_id": "00000000-0000-4000-8000-000000000205",
+  "judge_profile": "github_primary",
+  "model": "gpt-5.4-mini",
+  "reasoning_effort": "low",
+  "prompt_version": "judge_github_primary_v1",
+  "schema_version": "judge_output_v1",
+  "policy_version": "verdict_policy_v1",
+  "prompt_cache_key": "judge:github_primary:judge_github_primary_v1:judge_output_v1:verdict_policy_v1",
+  "primary_summary": {
+    "artifact_type": "github_repo",
+    "title": "Fixture evidence bundle",
+    "summary": "A deterministic fake bundle for judge-openai handoff acceptance."
+  },
+  "supporting_summaries_json": [
+    {
+      "artifact_type": "x_post",
+      "summary": "A supporting fake signal is present."
+    }
+  ],
+  "discovered_links_summary_json": [],
+  "evidence_limitations": [
+    "fixture-only evidence"
+  ],
+  "token_budget_profile": "small",
+  "reroot_count": 0
+}

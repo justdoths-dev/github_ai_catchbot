@@ -11,7 +11,7 @@ from .context_builder import JudgeContextBuilder
 from .models import JudgeCallJob, JudgeRunRecord, OpenAIJudgeResult, OpenAIJudgeUsage
 from .openai_client import OpenAIPermanentError, OpenAIRequestShapeError, OpenAITransientError
 from .preflight import HeuristicSanitizingPreflight, NoopModelContextPreflight
-from .prompt_library import PromptLibrary, UnsupportedJudgeProfileError
+from .prompt_library import PromptLibrary, UnsupportedJudgeProfileError, UnsupportedPromptVersionError
 from .repositories import JudgeOpenAIRepository
 from .response_mapper import OpenAIResponseMapper
 
@@ -111,6 +111,13 @@ class JudgeOpenAIService:
                 judge_profile=judge_run.judge_profile,
                 prompt_version=judge_run.prompt_version,
             )
+        except UnsupportedPromptVersionError:
+            await self._finish_without_output(
+                judge_run=judge_run,
+                status="failed_terminal",
+                finish_reason="unsupported_prompt_version",
+            )
+            return
         except UnsupportedJudgeProfileError:
             await self._finish_without_output(
                 judge_run=judge_run,

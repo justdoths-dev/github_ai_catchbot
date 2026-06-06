@@ -5,14 +5,41 @@ class UnsupportedJudgeProfileError(ValueError):
     pass
 
 
+class UnsupportedPromptVersionError(ValueError):
+    pass
+
+
 class PromptLibrary:
     _SUPPORTED = {"github_primary", "x_primary", "text_idea_primary"}
+    _SUPPORTED_PROMPT_VERSIONS = {
+        "github_primary": frozenset(
+            {
+                "judge_github_primary_v1",
+                "judge_output_v1",
+                "judge_prompt_v1",
+            }
+        ),
+        "x_primary": frozenset(
+            {
+                "judge_x_primary_v1",
+                "judge_output_v1",
+                "judge_prompt_v1",
+            }
+        ),
+        "text_idea_primary": frozenset(
+            {
+                "judge_text_idea_primary_v1",
+                "judge_output_v1",
+                "judge_prompt_v1",
+            }
+        ),
+    }
 
     def render(self, *, judge_profile: str, prompt_version: str) -> str:
         if judge_profile not in self._SUPPORTED:
             raise UnsupportedJudgeProfileError(f"unsupported judge_profile: {judge_profile}")
-        if not prompt_version:
-            raise UnsupportedJudgeProfileError("prompt_version must not be empty")
+        if prompt_version not in self._SUPPORTED_PROMPT_VERSIONS[judge_profile]:
+            raise UnsupportedPromptVersionError(f"unsupported prompt_version: {prompt_version}")
 
         profile_guidance = {
             "github_primary": (
