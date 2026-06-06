@@ -1,0 +1,36 @@
+{
+  "trigger_event_id": "10000000-0000-4000-8000-000000000101",
+  "candidate_group_id": "10000000-0000-4000-8000-000000000102",
+  "bundle_id": "10000000-0000-4000-8000-000000000103",
+  "current_primary_artifact_id": "10000000-0000-4000-8000-000000000104",
+  "source_message_id": "10000000-0000-4000-8000-000000000105",
+  "judge_profile": "github_primary",
+  "escalation_allowed": true,
+  "ready_for_analysis": true,
+  "bundle_profile_version": "bundle_profile_v1",
+  "reroot_count": 0,
+  "token_budget_profile": "small",
+  "member_count": 1,
+  "supporting_count": 1,
+  "current_primary_artifact_type": "github_repo",
+  "primary_canonical_url": null,
+  "primary_canonical_id": "offline-hot-path-fixture",
+  "source_message_link": null,
+  "source_text_surface": "Synthetic offline fixture source text.",
+  "primary_summary": {
+    "artifact_type": "github_repo",
+    "title": "Offline hot path fixture",
+    "summary": "A deterministic fake bundle for analysis-to-delivery acceptance."
+  },
+  "supporting_summaries_json": [
+    {
+      "artifact_type": "text_idea",
+      "summary": "Synthetic supporting evidence is present."
+    }
+  ],
+  "discovered_links_summary_json": [],
+  "evidence_limitations": [
+    "fixture-only evidence"
+  ],
+  "target_chat_id": 12345
+}
