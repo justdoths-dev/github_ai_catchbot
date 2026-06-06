@@ -1,0 +1,29 @@
+{
+  "source_message_id": "22222222-2222-4222-8222-222222222222",
+  "source_version_no": 1,
+  "platform": "telegram",
+  "chat_id": "-1001000000001",
+  "message_id": 7002,
+  "text_body": "Launch thread: https://x.com/example_dev/status/1881234567890123456\nRepo: https://github.com/example/example-tool\nAI workflow helper for repository triage.",
+  "caption_text": null,
+  "text_surface": "Launch thread: https://x.com/example_dev/status/1881234567890123456\nRepo: https://github.com/example/example-tool\nAI workflow helper for repository triage.",
+  "entities_json": [],
+  "url_surface_json": [
+    {
+      "observed_url": "https://x.com/example_dev/status/1881234567890123456",
+      "source_kind": "entity",
+      "context_path": "entities_json[0]"
+    },
+    {
+      "observed_url": "https://github.com/example/example-tool",
+      "source_kind": "entity",
+      "context_path": "entities_json[1]"
+    }
+  ],
+  "posted_at": "2026-06-06T00:01:00Z",
+  "raw_message_json": {
+    "platform": "telegram",
+    "chat_id": "-1001000000001",
+    "message_id": 7002
+  }
+}

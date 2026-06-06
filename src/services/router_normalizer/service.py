@@ -208,20 +208,8 @@ class RouterNormalizerService:
         artifacts: list[CanonicalArtifact],
         artifact_ids: dict[str, UUID],
     ) -> int:
-        related_by_primary: dict[str, list[CanonicalArtifact]] = {}
-        primary_by_id: dict[str, CanonicalArtifact] = {}
-        for artifact in artifacts:
-            if artifact.artifact_type in {"github_subpath", "github_repo_page"} and artifact.inferred_repo is not None:
-                primary = artifact.inferred_repo
-                related_by_primary.setdefault(primary.canonical_id, []).append(artifact)
-            else:
-                primary = artifact
-                related_by_primary.setdefault(primary.canonical_id, [])
-            primary_by_id[primary.canonical_id] = primary
-
         group_count = 0
-        for primary_id, related in related_by_primary.items():
-            primary = primary_by_id[primary_id]
+        for primary, related in _candidate_group_plan(artifacts):
             primary_artifact_id = artifact_ids[primary.canonical_id]
             group_id = await self._repository.upsert_candidate_group(
                 source_message_id=snapshot.source_message_id,
@@ -253,6 +241,51 @@ class RouterNormalizerService:
                 )
             group_count += 1
         return group_count
+
+
+def _candidate_group_plan(artifacts: list[CanonicalArtifact]) -> list[tuple[CanonicalArtifact, list[CanonicalArtifact]]]:
+    """Plan provisional candidate groups without crossing into enrichment."""
+    github_primaries = [artifact for artifact in artifacts if artifact.artifact_type in {"github_repo", "github_gist"}]
+    if github_primaries:
+        return [
+            (
+                primary,
+                [
+                    artifact
+                    for artifact in artifacts
+                    if artifact.canonical_id != primary.canonical_id
+                    and not _is_other_github_primary(artifact, primary)
+                    and _supports_github_primary(artifact, primary)
+                ],
+            )
+            for primary in github_primaries
+        ]
+
+    for primary_type in ("x_post", "web_article", "text_idea", "unknown_link", "short_url_unresolved"):
+        primaries = [artifact for artifact in artifacts if artifact.artifact_type == primary_type]
+        if primaries:
+            return [
+                (
+                    primary,
+                    [
+                        artifact
+                        for artifact in artifacts
+                        if artifact.canonical_id != primary.canonical_id and artifact.artifact_type != primary_type
+                    ],
+                )
+                for primary in primaries
+            ]
+    return []
+
+
+def _is_other_github_primary(artifact: CanonicalArtifact, primary: CanonicalArtifact) -> bool:
+    return artifact.artifact_type in {"github_repo", "github_gist"} and artifact.canonical_id != primary.canonical_id
+
+
+def _supports_github_primary(artifact: CanonicalArtifact, primary: CanonicalArtifact) -> bool:
+    if artifact.artifact_type in {"github_subpath", "github_repo_page"}:
+        return artifact.inferred_repo is not None and artifact.inferred_repo.canonical_id == primary.canonical_id
+    return True
 
 
 def _with_inferred_repo_anchors(artifacts: list[CanonicalArtifact]) -> list[CanonicalArtifact]:

@@ -1,0 +1,24 @@
+{
+  "source_message_id": "11111111-1111-4111-8111-111111111111",
+  "source_version_no": 1,
+  "platform": "telegram",
+  "chat_id": "-1001000000001",
+  "message_id": 7001,
+  "text_body": "New dev tool: https://github.com/example/example-tool\nAI workflow helper with README, tests, and examples for coding agents.",
+  "caption_text": null,
+  "text_surface": "New dev tool: https://github.com/example/example-tool\nAI workflow helper with README, tests, and examples for coding agents.",
+  "entities_json": [],
+  "url_surface_json": [
+    {
+      "observed_url": "https://github.com/example/example-tool",
+      "source_kind": "entity",
+      "context_path": "entities_json[0]"
+    }
+  ],
+  "posted_at": "2026-06-06T00:00:00Z",
+  "raw_message_json": {
+    "platform": "telegram",
+    "chat_id": "-1001000000001",
+    "message_id": 7001
+  }
+}
