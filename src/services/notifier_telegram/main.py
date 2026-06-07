@@ -315,12 +315,10 @@ async def create_canary_plan_with_repository(
         return _CreateCanaryPlanResult(reason_code="canary_plan_conflict")
 
     async with repository.transaction():
-        inserted_plan_id = await repository.insert_notification_plan(draft)
-    if inserted_plan_id != identity.notification_plan_id:
-        return _CreateCanaryPlanResult(reason_code="canary_plan_conflict")
+        await repository.insert_notification_plan(draft)
 
     created_plan = await repository.load_notification_plan(identity.notification_plan_id)
-    if created_plan is None:
+    if created_plan is None or not _plan_matches_expected_canary(created_plan, draft):
         return _CreateCanaryPlanResult(reason_code="canary_plan_conflict")
     return await _created_or_existing_canary_plan_result(
         repository,

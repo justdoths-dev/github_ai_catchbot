@@ -20,6 +20,12 @@ SOURCE_PLAN_ID = UUID("00000000-0000-0000-0000-000000000001")
 CANARY_KEY = "stable-canary_01"
 
 
+class InsertReturnsNoneRepository(FakeRepository):
+    async def insert_notification_plan(self, draft: NotificationPlanDraft):
+        await super().insert_notification_plan(draft)
+        return None
+
+
 def _create_canary_argv(*extra: str) -> list[str]:
     return [
         "create-canary-plan",
@@ -234,6 +240,29 @@ async def test_creates_canary_plan_from_existing_sent_send_now_source_plan_and_i
     assert second_payload["status"] == "existing"
     assert second_payload["notification_plan_id"] == str(canary_plan_id)
     assert list(repository.plans).count(canary_plan_id) == 1
+    assert repository.operations.count("plan") == 1
+    _assert_no_delivery_side_effects(repository)
+
+
+@pytest.mark.asyncio
+async def test_insert_returning_none_still_reloads_created_canary_plan_as_ready() -> None:
+    repository = InsertReturnsNoneRepository()
+    base_repository, intent = repo_with_valid_case()
+    repository.jobs = base_repository.jobs
+    repository.analyses = base_repository.analyses
+    repository.judge_outputs = base_repository.judge_outputs
+    repository.candidates = base_repository.candidates
+    _store_source_plan(repository, intent, status="sent")
+
+    exit_code, payload = await _run_create(repository, intent.notification_plan_id)
+
+    assert exit_code == 0
+    assert payload["status"] == "created"
+    assert payload["plan_status"] == "planned"
+    assert payload["send_after_due"] is True
+    assert payload["target_chat_id_present"] is True
+    assert payload["ready_for_send_canary"] is True
+    assert UUID(payload["notification_plan_id"]) in repository.plans
     assert repository.operations.count("plan") == 1
     _assert_no_delivery_side_effects(repository)
 
