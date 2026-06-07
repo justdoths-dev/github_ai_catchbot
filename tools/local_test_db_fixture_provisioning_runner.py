@@ -148,7 +148,12 @@ def redact_database_url(database_url: str | None) -> str:
         host = f"[{host}]"
     port = f":{parsed.port}" if parsed.port is not None else ""
     netloc = f"{userinfo}{host}{port}"
-    return urlunsplit((parsed.scheme, netloc, parsed.path, _redact_query(parsed.query), ""))
+    query = _redact_query(parsed.query)
+
+    if not parsed.netloc:
+        return _urlunsplit_preserving_empty_netloc(parsed.scheme, "", parsed.path, query)
+
+    return urlunsplit((parsed.scheme, netloc, parsed.path, query, ""))
 
 
 def parse_database_url_for_guard(database_url: str) -> ParsedDatabaseUrl:
@@ -452,7 +457,22 @@ def _validate_app_env(env: Mapping[str, str]) -> tuple[bool, list[str]]:
 def _replace_database_name(database_url: str, target_database_name: str) -> str:
     split = urlsplit(database_url)
     path = "/" + quote(target_database_name, safe="")
-    return urlunsplit((split.scheme, split.netloc, path, split.query, ""))
+    return _urlunsplit_preserving_empty_netloc(split.scheme, split.netloc, path, split.query)
+
+
+def _urlunsplit_preserving_empty_netloc(scheme: str, netloc: str, path: str, query: str) -> str:
+    """Preserve SQLAlchemy/psycopg socket URLs such as postgresql:///db?host=/var/run/postgresql.
+
+    urllib.parse.urlunsplit collapses an empty-netloc URL into `scheme:/path`,
+    which SQLAlchemy rejects for PostgreSQL URLs. For local Unix-socket URLs,
+    the triple-slash form is intentional and must be preserved.
+    """
+
+    if netloc:
+        return urlunsplit((scheme, netloc, path, query, ""))
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    suffix = f"?{query}" if query else ""
+    return f"{scheme}://{normalized_path}{suffix}"
 
 
 def _redact_query(query: str) -> str:

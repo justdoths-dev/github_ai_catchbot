@@ -237,6 +237,56 @@ def test_provision_with_fake_injected_executor_calls_expected_operations_in_orde
     assert executor.calls[2][1] == SAFE_ADMIN_URL.replace("/postgres", f"/{SAFE_TARGET_DB}")
 
 
+def test_replace_database_name_preserves_socket_style_local_url() -> None:
+    socket_admin_url = "postgresql+psycopg:///postgres?host=/var/run/postgresql"
+
+    assert (
+        runner._replace_database_name(socket_admin_url, SAFE_TARGET_DB)
+        == "postgresql+psycopg:///github_ai_catchbot_test?host=/var/run/postgresql"
+    )
+
+
+def test_redact_database_url_preserves_socket_style_local_url_shape() -> None:
+    socket_admin_url = "postgresql+psycopg:///postgres?host=/var/run/postgresql"
+
+    assert (
+        runner.redact_database_url(socket_admin_url)
+        == "postgresql+psycopg:///postgres?host=/var/run/postgresql"
+    )
+
+
+def test_provision_with_socket_style_url_builds_valid_target_url() -> None:
+    executor = FakeExecutor()
+    socket_admin_url = "postgresql+psycopg:///postgres?host=/var/run/postgresql"
+    expected_target_url = "postgresql+psycopg:///github_ai_catchbot_test?host=/var/run/postgresql"
+
+    result = _run(
+        "provision",
+        "--admin-database-url",
+        socket_admin_url,
+        "--target-database-name",
+        SAFE_TARGET_DB,
+        "--target-owner",
+        "local_owner",
+        "--confirm-local-test-db-provisioning",
+        "--apply-existing-migrations",
+        "--no-dry-run",
+        executor=executor,
+    )
+
+    assert result.exit_code == 0
+    assert result.report["status"] == "pass"
+    assert [call[0] for call in executor.calls] == [
+        "ensure_database",
+        "apply_existing_migrations",
+        "fetch_present_tables",
+    ]
+    assert executor.calls[1][1] == expected_target_url
+    assert executor.calls[2][1] == expected_target_url
+
+
+
+
 def test_provision_apply_migrations_fails_safely_when_migration_infra_is_missing(tmp_path: Path) -> None:
     executor = FakeExecutor()
     args = _parse_args(
