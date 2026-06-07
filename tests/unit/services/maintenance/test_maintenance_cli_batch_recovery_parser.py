@@ -17,6 +17,8 @@ def test_parser_accepts_confirmed_replay_selected_command() -> None:
             "--requested-by",
             "test/operator",
             "--operator-confirmed",
+            "--env-file",
+            "/tmp/runtime.env",
         ]
     )
 
@@ -28,6 +30,7 @@ def test_parser_accepts_confirmed_replay_selected_command() -> None:
     ]
     assert args.requested_by == "test/operator"
     assert args.operator_confirmed is True
+    assert args.env_file == "/tmp/runtime.env"
 
 
 def test_delivery_gate_rejects_recovery_flags() -> None:

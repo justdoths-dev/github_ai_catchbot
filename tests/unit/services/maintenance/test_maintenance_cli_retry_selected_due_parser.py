@@ -18,6 +18,8 @@ def test_parser_accepts_retry_selected_due_multiple_plan_ids_with_confirm_write(
             "test/operator",
             "--confirm",
             "write",
+            "--env-file",
+            "/tmp/runtime.env",
         ]
     )
 
@@ -29,6 +31,7 @@ def test_parser_accepts_retry_selected_due_multiple_plan_ids_with_confirm_write(
     ]
     assert args.requested_by == "test/operator"
     assert args.confirm == "write"
+    assert args.env_file == "/tmp/runtime.env"
 
 
 def test_retry_selected_due_missing_confirm_is_parse_error() -> None:

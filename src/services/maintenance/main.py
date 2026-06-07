@@ -6,13 +6,14 @@ import json
 import logging
 import os
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from uuid import UUID
 
 from .batch_recovery import prepare_delivery_replay_requests_for_selected_plans
 from .batch_recovery_tool import DeliveryBatchRecoveryTool
-from .config import MaintenanceConfig
+from .config import MaintenanceConfig, MaintenanceConfigurationError
 from .db_shape_preflight import (
     SCHEMA_VERSION as DB_SHAPE_PREFLIGHT_SCHEMA_VERSION,
     SqlAlchemyDbShapeIntrospectionRepository,
@@ -36,6 +37,55 @@ DB_SHAPE_PREFLIGHT_SOURCE_REASON_CODES = {
     "ambiguous_database_url_source",
 }
 
+ONE_SHOT_RUNTIME_CONFIG_SCHEMA_VERSION = "maintenance_one_shot_runtime_config_v1"
+ONE_SHOT_RUNTIME_CONFIG_REASON_CODES = {
+    "env_file_missing",
+    "env_file_no_runtime_config",
+    "env_file_database_url_file_missing",
+    "env_file_database_url_file_empty",
+    "env_file_redis_url_file_missing",
+    "env_file_redis_url_file_empty",
+    "maintenance_runtime_config_error",
+}
+
+ONE_SHOT_RUNTIME_ENV_VALUE_KEYS = {
+    "APP_ENV",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "MAINTENANCE_QUEUE_NAME",
+    "MAINTENANCE_CONSUMER_GROUP",
+    "MAINTENANCE_CONSUMER_NAME",
+    "REPLAY_QUEUE_NAME",
+    "REPLAY_CONSUMER_GROUP",
+    "REPLAY_CONSUMER_NAME",
+    "MAINTENANCE_BATCH_SIZE",
+    "MAINTENANCE_BLOCK_MS",
+    "MAINTENANCE_NOTIFICATION_RETRY_POLL_SEC",
+    "DELIVERY_RETRY_MAX_ATTEMPTS",
+    "NOTIFICATION_RETRY_MAX_ATTEMPTS",
+    "ENABLE_NOTIFICATION_SEND",
+    "NOTIFIER_TELEGRAM_DRY_RUN",
+    "NOTIFIER_TELEGRAM_ALLOW_EDITS",
+    "MAINTENANCE_ENABLE_NOTIFICATION_RETRY_PROMOTION",
+    "ENABLE_REPLAY_TO_PROD_DB",
+    "DELIVERY_GATE_MIN_SUCCESS_RATE_1H",
+    "DELIVERY_GATE_MIN_SUCCESS_RATE_24H",
+    "DELIVERY_GATE_MAX_HIGH_SOURCE_TO_DELIVERY_P95_SEC",
+    "DELIVERY_GATE_MAX_PLAN_TO_TRANSPORT_P95_SEC",
+    "DELIVERY_GATE_MAX_DUE_RETRY_LAG_SEC",
+    "DELIVERY_GATE_MAX_OPEN_DLQ_COUNT",
+    "DELIVERY_GATE_MAX_SEND_DISABLED_COUNT",
+    "DELIVERY_GATE_MAX_REPLAY_GUARD_REJECT_COUNT",
+    "DELIVERY_GATE_REQUIRE_OPERATOR_REVIEW_FOR_FULL",
+    "LOG_LEVEL",
+}
+ONE_SHOT_RUNTIME_ENV_FILE_KEYS = {"DATABASE_URL_FILE", "REDIS_URL_FILE"}
+ONE_SHOT_RUNTIME_ENV_KEYS = ONE_SHOT_RUNTIME_ENV_VALUE_KEYS | ONE_SHOT_RUNTIME_ENV_FILE_KEYS
+
+
+class _MaintenanceOneShotRuntimeConfigError(ValueError):
+    pass
+
 
 def _build_logger(level: str) -> logging.Logger:
     logging.basicConfig(level=getattr(logging, level, logging.INFO))
@@ -52,11 +102,13 @@ def build_parser() -> argparse.ArgumentParser:
     gate.add_argument("--mode", choices=["restricted", "full"], required=True)
     gate.add_argument("--format", choices=["json"], default="json")
     gate.add_argument("--operator-review-passed", choices=["true", "false"], default=None)
+    gate.add_argument("--env-file")
 
     mvp = subcommands.add_parser("mvp-readiness")
     mvp.add_argument("--mode", choices=["restricted"], required=True)
     mvp.add_argument("--format", choices=["json"], default="json")
     mvp.add_argument("--operator-review-passed", choices=["true", "false"], default=None)
+    mvp.add_argument("--env-file")
 
     db_shape = subcommands.add_parser("db-shape-preflight")
     db_shape.add_argument("--format", choices=["json"], default="json")
@@ -70,11 +122,13 @@ def build_parser() -> argparse.ArgumentParser:
     replay.add_argument("--plan-id", action="append", required=True)
     replay.add_argument("--requested-by", required=True)
     replay.add_argument("--operator-confirmed", action="store_true")
+    replay.add_argument("--env-file")
 
     retry = recovery_subcommands.add_parser("retry-selected-due")
     retry.add_argument("--plan-id", action="append", required=True)
     retry.add_argument("--requested-by", required=True)
     retry.add_argument("--confirm", choices=["write"], required=True)
+    retry.add_argument("--env-file")
     return parser
 
 
@@ -451,7 +505,7 @@ def _read_database_url_from_file(
     return database_url
 
 
-def _read_minimal_env_file(env_file: str) -> dict[str, str]:
+def _read_minimal_env_file(env_file: str, *, allowed_keys: set[str] | None = None) -> dict[str, str]:
     env_path = Path(env_file)
     if not env_path.is_file():
         raise ValueError("env_file_missing")
@@ -461,19 +515,136 @@ def _read_minimal_env_file(env_file: str) -> dict[str, str]:
         raise ValueError("env_file_missing") from None
 
     values: dict[str, str] = {}
+    if allowed_keys is None:
+        allowed_keys = {"DATABASE_URL", "DATABASE_URL_FILE"}
     for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        if key not in {"DATABASE_URL", "DATABASE_URL_FILE"}:
+        if key not in allowed_keys:
             continue
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
         values[key] = value
     return values
+
+
+def _load_maintenance_one_shot_runtime_config(
+    args: argparse.Namespace,
+    *,
+    env_file_overlay: dict[str, str] | None = None,
+) -> MaintenanceConfig:
+    env_file = getattr(args, "env_file", None)
+    if not env_file:
+        return MaintenanceConfig.from_env()
+
+    overlay = env_file_overlay if env_file_overlay is not None else _resolve_one_shot_runtime_env_file_overlay(env_file)
+    try:
+        with _temporary_environment_defaults(overlay):
+            return MaintenanceConfig.from_env()
+    except (MaintenanceConfigurationError, ValueError, TypeError) as exc:
+        raise _MaintenanceOneShotRuntimeConfigError("maintenance_runtime_config_error") from exc
+
+
+def _resolve_one_shot_runtime_env_file_overlay(
+    env_file: str,
+    *,
+    process_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    try:
+        values = _read_minimal_env_file(env_file, allowed_keys=ONE_SHOT_RUNTIME_ENV_KEYS)
+    except ValueError as exc:
+        raise _MaintenanceOneShotRuntimeConfigError(_one_shot_runtime_config_reason_code(exc)) from None
+
+    if not values:
+        raise _MaintenanceOneShotRuntimeConfigError("env_file_no_runtime_config")
+
+    source = os.environ if process_env is None else process_env
+    overlay: dict[str, str] = {}
+    for key in ONE_SHOT_RUNTIME_ENV_VALUE_KEYS:
+        value = values.get(key, "").strip()
+        if value and key not in source:
+            overlay[key] = value
+
+    _resolve_one_shot_runtime_file_value(
+        values,
+        source=source,
+        overlay=overlay,
+        file_key="DATABASE_URL_FILE",
+        target_key="DATABASE_URL",
+        missing_reason_code="env_file_database_url_file_missing",
+        empty_reason_code="env_file_database_url_file_empty",
+    )
+    _resolve_one_shot_runtime_file_value(
+        values,
+        source=source,
+        overlay=overlay,
+        file_key="REDIS_URL_FILE",
+        target_key="REDIS_URL",
+        missing_reason_code="env_file_redis_url_file_missing",
+        empty_reason_code="env_file_redis_url_file_empty",
+    )
+    return overlay
+
+
+def _resolve_one_shot_runtime_file_value(
+    values: Mapping[str, str],
+    *,
+    source: Mapping[str, str],
+    overlay: dict[str, str],
+    file_key: str,
+    target_key: str,
+    missing_reason_code: str,
+    empty_reason_code: str,
+) -> None:
+    if target_key in source or target_key in overlay or file_key not in values:
+        return
+    try:
+        overlay[target_key] = _read_database_url_from_file(
+            values.get(file_key, "").strip(),
+            missing_reason_code=missing_reason_code,
+            empty_reason_code=empty_reason_code,
+        )
+    except ValueError as exc:
+        raise _MaintenanceOneShotRuntimeConfigError(_one_shot_runtime_config_reason_code(exc)) from None
+
+
+@contextmanager
+def _temporary_environment_defaults(values: Mapping[str, str]):
+    added: list[str] = []
+    try:
+        for key, value in values.items():
+            if key in os.environ:
+                continue
+            os.environ[key] = value
+            added.append(key)
+        yield
+    finally:
+        for key in reversed(added):
+            os.environ.pop(key, None)
+
+
+def _one_shot_runtime_config_reason_code(exc: ValueError) -> str:
+    reason_code = str(exc)
+    if reason_code in ONE_SHOT_RUNTIME_CONFIG_REASON_CODES:
+        return reason_code
+    return "maintenance_runtime_config_error"
+
+
+def _maintenance_one_shot_runtime_config_error_payload(reason_code: str) -> dict:
+    return {
+        "schema_version": ONE_SHOT_RUNTIME_CONFIG_SCHEMA_VERSION,
+        "status": "fail",
+        "reason_code": reason_code,
+        "warnings": [reason_code],
+    }
+
+
+def _one_shot_command_uses_explicit_env_file(command: str, args: argparse.Namespace) -> bool:
+    return command in {"delivery-gate", "mvp-readiness", "batch-recovery"} and bool(getattr(args, "env_file", None))
 
 
 def _build_db_shape_preflight_session_factory(database_url: str):
@@ -587,6 +758,14 @@ async def _run(argv: list[str] | None = None) -> int:
     command = args.command or "worker"
     if command == "db-shape-preflight":
         return await _run_db_shape_preflight(args)
+    runtime_env_overlay: dict[str, str] | None = None
+    if _one_shot_command_uses_explicit_env_file(command, args):
+        try:
+            runtime_env_overlay = _resolve_one_shot_runtime_env_file_overlay(args.env_file)
+        except _MaintenanceOneShotRuntimeConfigError as exc:
+            reason_code = _one_shot_runtime_config_reason_code(exc)
+            print(_to_json(_maintenance_one_shot_runtime_config_error_payload(reason_code)))
+            return 1
     if command == "batch-recovery" and args.recovery_mode == "replay-selected" and (
         not args.operator_confirmed or _has_invalid_notification_plan_id(args.plan_id)
     ):
@@ -597,7 +776,12 @@ async def _run(argv: list[str] | None = None) -> int:
         _, invalid_plan_ids = _normalize_notification_plan_ids(args.plan_id)
         print(_to_json(_invalid_retry_plan_id_result(args.plan_id, invalid_plan_ids)))
         return 2
-    config = MaintenanceConfig.from_env()
+    try:
+        config = _load_maintenance_one_shot_runtime_config(args, env_file_overlay=runtime_env_overlay)
+    except _MaintenanceOneShotRuntimeConfigError as exc:
+        reason_code = _one_shot_runtime_config_reason_code(exc)
+        print(_to_json(_maintenance_one_shot_runtime_config_error_payload(reason_code)))
+        return 1
     if command == "worker":
         return await _run_worker(config)
     if command == "delivery-gate":
