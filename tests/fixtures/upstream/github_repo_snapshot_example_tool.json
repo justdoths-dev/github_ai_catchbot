@@ -1,0 +1,101 @@
+{
+  "schema_version": "github_repo_snapshot_fixture_v1",
+  "artifact_canonical_id": "github:repo:example/example-tool",
+  "artifact_type": "github_repo",
+  "provider": "github",
+  "snapshot_type": "github_repo",
+  "status": "ready",
+  "content_anchor": "commit:1111111111111111111111111111111111111111",
+  "auth_mode": "anonymous_degraded",
+  "normalized_projection": {
+    "artifact_type": "github_repo",
+    "description": "Synthetic local fixture for a developer workflow helper.",
+    "focus_kind": "repo",
+    "focus_path": null,
+    "forks": 1,
+    "open_issues": 0,
+    "page_path": null,
+    "pushed_at": "2026-06-01T00:00:00Z",
+    "repo_homepage": null,
+    "stars": 42,
+    "tree_truncated": false,
+    "watchers": 3
+  },
+  "raw_payload_ref": null,
+  "evidence_limitations": [
+    "synthetic local fixture; no GitHub API call"
+  ],
+  "fetch_anomalies": [],
+  "repo": {
+    "repo_full_name": "example/example-tool",
+    "default_branch": "main",
+    "resolved_ref": "1111111111111111111111111111111111111111",
+    "content_anchor_commit_sha": "1111111111111111111111111111111111111111",
+    "repo_flags_json": {
+      "archived": false,
+      "fork": false,
+      "template": false
+    },
+    "license_spdx": "MIT",
+    "topics_json": [
+      "ai",
+      "developer-tools"
+    ],
+    "readme_excerpt": "Example Tool is a synthetic AI workflow helper fixture with README, tests, examples, and CI evidence.",
+    "detected_build_systems_json": [
+      "python"
+    ],
+    "detected_languages_json": [
+      "Python"
+    ],
+    "key_paths_json": [
+      "README.md",
+      "pyproject.toml"
+    ],
+    "test_paths_json": [
+      "tests/test_example_tool.py"
+    ],
+    "ci_paths_json": [
+      ".github/workflows/test.yml"
+    ],
+    "examples_paths_json": [
+      "examples/basic.py"
+    ],
+    "docs_paths_json": [
+      "docs/usage.md"
+    ],
+    "release_summary_json": {
+      "has_prerelease_pattern": false,
+      "has_release_assets": false,
+      "latest_release_published_at": "2026-06-01T00:00:00Z",
+      "release_asset_download_count_topk": [],
+      "release_count_recent": 1
+    }
+  },
+  "file_samples": [
+    {
+      "path": "README.md",
+      "role": "README",
+      "size_bytes": 112,
+      "content_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "excerpt": "Example Tool is a synthetic local fixture for coding-agent workflow triage.",
+      "raw_blob_ref": null
+    },
+    {
+      "path": "pyproject.toml",
+      "role": "manifest",
+      "size_bytes": 96,
+      "content_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "excerpt": "[project]\nname = \"example-tool\"\nversion = \"0.1.0\"",
+      "raw_blob_ref": null
+    },
+    {
+      "path": "tests/test_example_tool.py",
+      "role": "tests",
+      "size_bytes": 88,
+      "content_hash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "excerpt": "def test_example_tool_fixture():\n    assert True",
+      "raw_blob_ref": null
+    }
+  ]
+}
