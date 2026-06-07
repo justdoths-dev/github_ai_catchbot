@@ -30,7 +30,7 @@ class NotifierTelegramConfig:
     log_level: str
 
     @classmethod
-    def from_env(cls) -> "NotifierTelegramConfig":
+    def from_env(cls, *, require_transport_token: bool = True) -> "NotifierTelegramConfig":
         def _read(name: str, default: str = "") -> str:
             return os.getenv(name, default).strip()
 
@@ -59,14 +59,14 @@ class NotifierTelegramConfig:
             )
         except ValueError as exc:
             raise NotifierTelegramConfigurationError(str(exc)) from exc
-        cfg.validate()
+        cfg.validate(require_transport_token=require_transport_token)
         return cfg
 
     @property
     def transport_enabled(self) -> bool:
         return self.enable_notification_send and not self.dry_run
 
-    def validate(self) -> None:
+    def validate(self, *, require_transport_token: bool = True) -> None:
         if not self.database_url:
             raise NotifierTelegramConfigurationError("DATABASE_URL is required")
         if not self.redis_url:
@@ -85,7 +85,7 @@ class NotifierTelegramConfig:
             raise NotifierTelegramConfigurationError("NOTIFIER_TELEGRAM_MAX_MESSAGE_CHARS must be between 500 and 4096")
         if self.edit_window_minutes <= 0:
             raise NotifierTelegramConfigurationError("NOTIFIER_TELEGRAM_EDIT_WINDOW_MINUTES must be > 0")
-        if self.transport_enabled and not self.telegram_bot_token:
+        if require_transport_token and self.transport_enabled and not self.telegram_bot_token:
             raise NotifierTelegramConfigurationError("TELEGRAM_BOT_TOKEN is required when Telegram transport is enabled")
 
 

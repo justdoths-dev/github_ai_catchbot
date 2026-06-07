@@ -85,9 +85,10 @@ class NotifierTelegramRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT notification_plan_id, analysis_id, candidate_group_id, target_chat_id,
-                       target_thread_id, render_profile, dedupe_subject_key,
-                       material_change_hash, send_after, status
+                SELECT notification_plan_id, analysis_id, candidate_group_id, delivery_decision,
+                       urgency_profile, target_chat_id, target_thread_id, render_profile,
+                       dedupe_subject_key, material_change_hash, send_after,
+                       suppress_reason_code, status
                 FROM notification_plans
                 WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
                 """
@@ -96,6 +97,38 @@ class NotifierTelegramRepository:
         )
         row = result.mappings().first()
         return dict(row) if row else None
+
+    async def load_notification_plan_intent(self, notification_plan_id: UUID) -> NotificationIntentJob | None:
+        row = await self.load_notification_plan(notification_plan_id)
+        if row is None:
+            return None
+        analysis_id = _uuid_or_none(row.get("analysis_id"))
+        candidate_group_id = _uuid_or_none(row.get("candidate_group_id"))
+        target_chat_id = _int_or_none(row.get("target_chat_id"))
+        if None in {analysis_id, candidate_group_id, target_chat_id}:
+            return None
+        delivery_decision = str(row.get("delivery_decision") or "")
+        urgency_profile = str(row.get("urgency_profile") or "")
+        dedupe_subject_key = str(row.get("dedupe_subject_key") or "")
+        material_change_hash = str(row.get("material_change_hash") or "")
+        if not delivery_decision or not urgency_profile or not dedupe_subject_key or not material_change_hash:
+            return None
+        return NotificationIntentJob(
+            trigger_event_id=notification_plan_id,
+            event_type="notification.plan.created.v1",
+            notification_plan_id=notification_plan_id,
+            analysis_id=analysis_id,
+            candidate_group_id=candidate_group_id,
+            delivery_decision=delivery_decision,  # type: ignore[arg-type]
+            urgency_profile=urgency_profile,  # type: ignore[arg-type]
+            target_chat_id=int(target_chat_id),
+            target_thread_id=_int_or_none(row.get("target_thread_id")),
+            render_profile=_string_or_none(row.get("render_profile")),
+            dedupe_subject_key=dedupe_subject_key,
+            material_change_hash=material_change_hash,
+            send_after=_datetime_or_none(row.get("send_after")),
+            suppress_reason_code=_string_or_none(row.get("suppress_reason_code")),
+        )
 
     async def load_existing_plan_by_material(
         self,
@@ -107,9 +140,10 @@ class NotifierTelegramRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT notification_plan_id, analysis_id, candidate_group_id, target_chat_id,
-                       target_thread_id, render_profile, dedupe_subject_key,
-                       material_change_hash, send_after, status
+                SELECT notification_plan_id, analysis_id, candidate_group_id, delivery_decision,
+                       urgency_profile, target_chat_id, target_thread_id, render_profile,
+                       dedupe_subject_key, material_change_hash, send_after,
+                       suppress_reason_code, status
                 FROM notification_plans
                 WHERE analysis_id = CAST(:analysis_id AS uuid)
                   AND target_chat_id = :target_chat_id

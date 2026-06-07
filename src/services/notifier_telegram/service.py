@@ -30,6 +30,7 @@ class NotifierTelegramRepositoryProtocol(Protocol):
     def transaction(self): ...
     async def load_intent_job(self, trigger_event_id: UUID) -> NotificationIntentJob | None: ...
     async def load_notification_plan(self, notification_plan_id: UUID) -> dict | None: ...
+    async def load_notification_plan_intent(self, notification_plan_id: UUID) -> NotificationIntentJob | None: ...
     async def load_existing_plan_by_material(
         self, *, analysis_id: UUID, target_chat_id: int, material_change_hash: str
     ) -> dict | None: ...
@@ -68,11 +69,22 @@ class NotifierTelegramService:
         self._telegram_client = telegram_client
         self._logger = logger or logging.getLogger(__name__)
 
-    async def handle_trigger_event(self, trigger_event_id: str | UUID) -> None:
+    async def handle_trigger_event(self, trigger_event_id: str | UUID) -> DeliveryResult | None:
         intent = await self.rehydrate_intent(trigger_event_id)
         if intent is None:
-            return
-        await self.handle_intent(intent)
+            return None
+        return await self.handle_intent(intent)
+
+    async def handle_notification_plan_canary(self, notification_plan_id: str | UUID) -> DeliveryResult | None:
+        try:
+            parsed = UUID(str(notification_plan_id))
+        except (TypeError, ValueError, AttributeError):
+            self._logger.warning("notifier_telegram_invalid_notification_plan_id")
+            return None
+        intent = await self._repository.load_notification_plan_intent(parsed)
+        if intent is None:
+            return None
+        return await self.handle_intent(intent)
 
     async def rehydrate_intent(self, trigger_event_id: str | UUID) -> NotificationIntentJob | None:
         try:
@@ -82,30 +94,42 @@ class NotifierTelegramService:
             return None
         return await self._repository.load_intent_job(parsed)
 
-    async def handle_intent(self, intent: NotificationIntentJob) -> None:
+    async def handle_intent(self, intent: NotificationIntentJob) -> DeliveryResult | None:
         analysis = await self._repository.load_analysis(intent.analysis_id)
         if analysis is None or analysis.candidate_group_id != intent.candidate_group_id:
             await self._transition(intent, to_state="failed_terminal", reason_code="notification_intent_context_mismatch")
-            return
+            return None
         if analysis.delivery_decision != intent.delivery_decision:
             await self._transition(intent, to_state="failed_terminal", reason_code="notification_delivery_decision_mismatch")
-            return
+            return None
         if intent.delivery_decision == "suppress" or not intent.target_chat_id:
             await self._concretize_plan(intent, status="suppressed")
             await self._transition(intent, to_state="suppressed", reason_code=intent.suppress_reason_code or "notification_suppressed")
-            return
+            return DeliveryResult(
+                delivery_status="suppressed",
+                telegram_chat_id=intent.target_chat_id,
+                telegram_message_id=None,
+                attempt_count=0,
+                transport_error_code=intent.suppress_reason_code or "notification_suppressed",
+            )
         if intent.delivery_decision == "send_digest" or (
             intent.urgency_profile == "digest" and not self._config.enable_digest_runtime
         ):
             await self._concretize_plan(intent, status="suppressed")
             await self._transition(intent, to_state="suppressed", reason_code="notification_digest_deferred")
-            return
+            return DeliveryResult(
+                delivery_status="suppressed",
+                telegram_chat_id=intent.target_chat_id,
+                telegram_message_id=None,
+                attempt_count=0,
+                transport_error_code="notification_digest_deferred",
+            )
 
         judge_output = await self._repository.load_judge_output_render_fields(analysis.judge_output_id)
         candidate = await self._repository.load_candidate_render_context(intent.candidate_group_id)
         if candidate is None:
             await self._transition(intent, to_state="failed_terminal", reason_code="notification_missing_candidate_render_context")
-            return
+            return None
 
         plan_id = await self._concretize_plan(intent, status="planned")
         if plan_id != intent.notification_plan_id:
@@ -119,7 +143,13 @@ class NotifierTelegramService:
                 to_state=str(plan_row.get("status") if plan_row else "planned"),
                 reason_code="notification_send_after_deferred",
             )
-            return
+            return DeliveryResult(
+                delivery_status=str(plan_row.get("status") if plan_row else "planned"),  # type: ignore[arg-type]
+                telegram_chat_id=intent.target_chat_id,
+                telegram_message_id=None,
+                attempt_count=0,
+                transport_error_code="notification_send_after_deferred",
+            )
 
         action = await self.decide_delivery_action(intent, candidate=candidate)
         if action.mode == "noop":
@@ -128,14 +158,26 @@ class NotifierTelegramService:
                 to_state=str(plan_row.get("status") if plan_row else "planned"),
                 reason_code=action.reason_code or "notification_noop",
             )
-            return
+            return DeliveryResult(
+                delivery_status="suppressed",
+                telegram_chat_id=intent.target_chat_id,
+                telegram_message_id=None,
+                attempt_count=0,
+                transport_error_code=action.reason_code or "notification_noop",
+            )
         if _should_terminal_duplicate_noop(plan_row, transport_enabled=self._config.transport_enabled):
             await self._transition(
                 intent,
                 to_state=str(plan_row.get("status")),
                 reason_code="notification_duplicate_terminal_noop",
             )
-            return
+            return DeliveryResult(
+                delivery_status=str(plan_row.get("status")),  # type: ignore[arg-type]
+                telegram_chat_id=intent.target_chat_id,
+                telegram_message_id=None,
+                attempt_count=0,
+                transport_error_code="notification_duplicate_terminal_noop",
+            )
 
         render = self._renderer.render(
             notification_plan_id=intent.notification_plan_id,
@@ -208,6 +250,7 @@ class NotifierTelegramService:
                 transport_error_class=result.transport_error_class,
                 edited=result.edited,
             )
+        return result
 
     async def decide_delivery_action(
         self,

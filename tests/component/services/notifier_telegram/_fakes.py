@@ -52,6 +52,27 @@ class FakeRepository:
         plan = self.plans.get(notification_plan_id)
         return _plan_row(plan) if plan else None
 
+    async def load_notification_plan_intent(self, notification_plan_id: UUID):
+        plan = self.plans.get(notification_plan_id)
+        if plan is None:
+            return None
+        return NotificationIntentJob(
+            trigger_event_id=notification_plan_id,
+            event_type="notification.plan.created.v1",
+            notification_plan_id=plan.notification_plan_id,
+            analysis_id=plan.analysis_id,
+            candidate_group_id=plan.candidate_group_id,
+            delivery_decision=plan.delivery_decision,  # type: ignore[arg-type]
+            urgency_profile=plan.urgency_profile,  # type: ignore[arg-type]
+            target_chat_id=plan.target_chat_id,
+            target_thread_id=plan.target_thread_id,
+            render_profile=plan.render_profile,
+            dedupe_subject_key=plan.dedupe_subject_key,
+            material_change_hash=plan.material_change_hash,
+            send_after=plan.send_after,
+            suppress_reason_code=plan.suppress_reason_code,
+        )
+
     async def load_existing_plan_by_material(self, *, analysis_id: UUID, target_chat_id: int, material_change_hash: str):
         for plan in self.plans.values():
             if (
@@ -306,11 +327,15 @@ def _plan_row(plan: NotificationPlanDraft) -> dict:
     return {
         "notification_plan_id": plan.notification_plan_id,
         "analysis_id": plan.analysis_id,
+        "candidate_group_id": plan.candidate_group_id,
+        "delivery_decision": plan.delivery_decision,
+        "urgency_profile": plan.urgency_profile,
         "target_chat_id": plan.target_chat_id,
         "target_thread_id": plan.target_thread_id,
         "render_profile": plan.render_profile,
         "dedupe_subject_key": plan.dedupe_subject_key,
         "material_change_hash": plan.material_change_hash,
         "send_after": plan.send_after,
+        "suppress_reason_code": plan.suppress_reason_code,
         "status": plan.status,
     }
