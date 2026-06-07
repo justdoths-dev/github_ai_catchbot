@@ -120,7 +120,7 @@ def evaluate_delivery_operations_gate(
         observed_value=snapshot.high_source_to_delivery_p95_sec,
         threshold=config.delivery_gate_max_high_source_to_delivery_p95_sec,
         comparator="<=",
-        passed=_lte(
+        passed=_none_or_lte(
             snapshot.high_source_to_delivery_p95_sec,
             config.delivery_gate_max_high_source_to_delivery_p95_sec,
         ),

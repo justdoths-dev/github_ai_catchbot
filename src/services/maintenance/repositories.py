@@ -507,6 +507,7 @@ class MaintenanceRepository:
                                 'sent'::notification_status_enum,
                                 'edited'::notification_status_enum
                               )
+                              AND ndr.created_at >= now() - interval '1 hour'
                             ORDER BY ndr.created_at DESC
                             LIMIT 1
                         ) dr ON true
