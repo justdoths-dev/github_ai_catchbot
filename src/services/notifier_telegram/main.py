@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import re
 from collections.abc import Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .config import NotifierTelegramConfig, NotifierTelegramConfigurationError
+from .models import NotificationPlanDraft
 from .redis_streams import RedisStreamConsumer
 from .repositories import NotifierTelegramRepository
 from .service import NotifierTelegramService
@@ -18,6 +23,9 @@ from .telegram_client import TelegramBotClient
 from .worker import NotifierTelegramWorker
 
 CANARY_SCHEMA_VERSION = "notifier_one_shot_canary_v1"
+CANARY_PLAN_SCHEMA_VERSION = "notifier_canary_plan_created_v1"
+CANARY_PLAN_SEED_VERSION = "operator-canary-plan-v1"
+CANARY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._-]{6,80}$")
 
 ONE_SHOT_RUNTIME_CONFIG_REASON_CODES = {
     "env_file_missing",
@@ -75,6 +83,13 @@ def build_parser() -> argparse.ArgumentParser:
     send_canary.add_argument("--operator-confirmed", action="store_true")
     send_canary.add_argument("--env-file")
     send_canary.add_argument("--format", choices=["json"], default="json")
+
+    create_canary_plan = subcommands.add_parser("create-canary-plan")
+    create_canary_plan.add_argument("--source-notification-plan-id")
+    create_canary_plan.add_argument("--canary-key")
+    create_canary_plan.add_argument("--operator-confirmed", action="store_true")
+    create_canary_plan.add_argument("--env-file")
+    create_canary_plan.add_argument("--format", choices=["json"], default="json")
     return parser
 
 
@@ -148,6 +163,172 @@ async def _run_send_canary_command(args: argparse.Namespace, *, emit_json=print)
         return 1
 
     return await _run_send_canary(config, args, notification_plan_id, emit_json=emit_json)
+
+
+async def _run_create_canary_plan_command(args: argparse.Namespace, *, emit_json=print) -> int:
+    if not args.operator_confirmed:
+        emit_json(_to_json(_create_canary_rejected_payload("operator_confirmation_required")))
+        return 2
+
+    try:
+        source_notification_plan_id = UUID(str(args.source_notification_plan_id))
+    except (TypeError, ValueError, AttributeError):
+        emit_json(_to_json(_create_canary_rejected_payload("invalid_source_notification_plan_id")))
+        return 2
+
+    canary_key = str(args.canary_key or "")
+    if not _valid_canary_key(canary_key):
+        emit_json(_to_json(_create_canary_rejected_payload("invalid_canary_key")))
+        return 2
+
+    if not getattr(args, "env_file", None):
+        emit_json(_to_json(_create_canary_rejected_payload("env_file_required")))
+        return 2
+
+    try:
+        config = _load_notifier_one_shot_runtime_config(args)
+    except _NotifierOneShotRuntimeConfigError as exc:
+        reason_code = _one_shot_runtime_config_reason_code(exc)
+        emit_json(_to_json(_create_canary_failure_payload(reason_code)))
+        return 1
+
+    return await _run_create_canary_plan(
+        config,
+        source_notification_plan_id,
+        canary_key,
+        emit_json=emit_json,
+    )
+
+
+async def _run_create_canary_plan(
+    config: NotifierTelegramConfig,
+    source_notification_plan_id: UUID,
+    canary_key: str,
+    *,
+    emit_json=print,
+    session_factory_builder=None,
+) -> int:
+    if session_factory_builder is None:
+        session_factory_builder = _build_send_canary_session_factory
+
+    try:
+        session_factory, dispose = session_factory_builder(config.database_url)
+        try:
+            async with session_factory.begin() as session:
+                repository = NotifierTelegramRepository(session)
+                return await run_create_canary_plan_with_repository(
+                    source_notification_plan_id,
+                    canary_key,
+                    repository,
+                    emit_json=emit_json,
+                )
+        finally:
+            await dispose()
+    except Exception:
+        emit_json(_to_json(_create_canary_failure_payload("notifier_runtime_config_error")))
+        return 1
+
+
+async def run_create_canary_plan_with_repository(
+    source_notification_plan_id: UUID,
+    canary_key: str,
+    repository,
+    *,
+    emit_json=print,
+) -> int:
+    result = await create_canary_plan_with_repository(source_notification_plan_id, canary_key, repository)
+    if result.reason_code is not None:
+        emit_json(_to_json(_create_canary_failure_payload(result.reason_code)))
+        return 1
+    emit_json(_to_json(_create_canary_success_payload(result)))
+    return 0
+
+
+async def create_canary_plan_with_repository(
+    source_notification_plan_id: UUID,
+    canary_key: str,
+    repository,
+) -> "_CreateCanaryPlanResult":
+    source_plan = await repository.load_notification_plan(source_notification_plan_id)
+    if source_plan is None:
+        return _CreateCanaryPlanResult(reason_code="source_notification_plan_missing")
+    if str(source_plan.get("delivery_decision") or "") != "send_now":
+        return _CreateCanaryPlanResult(reason_code="source_plan_not_send_now")
+
+    source_analysis_id = _uuid_from_row(source_plan.get("analysis_id"))
+    source_candidate_group_id = _uuid_from_row(source_plan.get("candidate_group_id"))
+    target_chat_id = _int_from_row(source_plan.get("target_chat_id"))
+    if source_analysis_id is None:
+        return _CreateCanaryPlanResult(reason_code="source_analysis_missing")
+    if source_candidate_group_id is None:
+        return _CreateCanaryPlanResult(reason_code="canary_plan_conflict")
+    if target_chat_id is None:
+        return _CreateCanaryPlanResult(reason_code="source_plan_target_chat_missing")
+
+    analysis = await repository.load_analysis(source_analysis_id)
+    if analysis is None:
+        return _CreateCanaryPlanResult(reason_code="source_analysis_missing")
+    if analysis.delivery_decision != "send_now":
+        return _CreateCanaryPlanResult(reason_code="source_analysis_not_send_now")
+    if analysis.candidate_group_id != source_candidate_group_id:
+        return _CreateCanaryPlanResult(reason_code="source_candidate_group_mismatch")
+
+    identity = _canary_identity(
+        source_notification_plan_id=source_notification_plan_id,
+        canary_key=canary_key,
+        analysis_id=source_analysis_id,
+        candidate_group_id=source_candidate_group_id,
+        target_chat_id=target_chat_id,
+    )
+    draft = NotificationPlanDraft(
+        notification_plan_id=identity.notification_plan_id,
+        analysis_id=source_analysis_id,
+        candidate_group_id=source_candidate_group_id,
+        delivery_decision="send_now",
+        urgency_profile=str(source_plan.get("urgency_profile") or "high"),
+        target_chat_id=target_chat_id,
+        target_thread_id=_int_from_row(source_plan.get("target_thread_id")),
+        render_profile=_string_from_row(source_plan.get("render_profile")),
+        dedupe_subject_key=identity.dedupe_subject_key,
+        material_change_hash=identity.material_change_hash,
+        send_after=datetime.now(timezone.utc),
+        suppress_reason_code=None,
+        status="planned",
+    )
+
+    existing_plan = await repository.load_notification_plan(identity.notification_plan_id)
+    if existing_plan is not None:
+        return await _existing_canary_plan_result(
+            repository,
+            source_notification_plan_id=source_notification_plan_id,
+            source_plan=source_plan,
+            expected_draft=draft,
+            existing_plan=existing_plan,
+        )
+
+    material_existing = await repository.load_existing_plan_by_material(
+        analysis_id=draft.analysis_id,
+        target_chat_id=draft.target_chat_id,
+        material_change_hash=draft.material_change_hash,
+    )
+    if material_existing is not None:
+        return _CreateCanaryPlanResult(reason_code="canary_plan_conflict")
+
+    async with repository.transaction():
+        inserted_plan_id = await repository.insert_notification_plan(draft)
+    if inserted_plan_id != identity.notification_plan_id:
+        return _CreateCanaryPlanResult(reason_code="canary_plan_conflict")
+
+    created_plan = await repository.load_notification_plan(identity.notification_plan_id)
+    if created_plan is None:
+        return _CreateCanaryPlanResult(reason_code="canary_plan_conflict")
+    return await _created_or_existing_canary_plan_result(
+        repository,
+        status="created",
+        source_notification_plan_id=source_notification_plan_id,
+        source_plan=source_plan,
+        plan=created_plan,
+    )
 
 
 async def _run_send_canary(
@@ -287,6 +468,208 @@ def _delivery_result_payload(notification_plan_id: UUID, result) -> dict:
         str(result.transport_error_code or "notifier_canary_failed"),
         notification_plan_id=notification_plan_id,
     )
+
+
+@dataclass(slots=True, frozen=True)
+class _CanaryIdentity:
+    notification_plan_id: UUID
+    dedupe_subject_key: str
+    material_change_hash: str
+
+
+@dataclass(slots=True, frozen=True)
+class _CreateCanaryPlanResult:
+    status: str | None = None
+    notification_plan_id: UUID | None = None
+    source_notification_plan_id: UUID | None = None
+    source_plan_status: str | None = None
+    delivery_decision: str | None = None
+    plan_status: str | None = None
+    send_after_due: bool = False
+    target_chat_id_present: bool = False
+    ready_for_send_canary: bool = False
+    reason_code: str | None = None
+
+
+def _valid_canary_key(canary_key: str) -> bool:
+    return bool(CANARY_KEY_PATTERN.fullmatch(canary_key))
+
+
+def _canary_identity(
+    *,
+    source_notification_plan_id: UUID,
+    canary_key: str,
+    analysis_id: UUID,
+    candidate_group_id: UUID,
+    target_chat_id: int,
+) -> _CanaryIdentity:
+    seed = (
+        f"{CANARY_PLAN_SEED_VERSION}|{source_notification_plan_id}|{canary_key}|"
+        f"{analysis_id}|{candidate_group_id}|{target_chat_id}"
+    )
+    return _CanaryIdentity(
+        notification_plan_id=uuid5(NAMESPACE_URL, seed),
+        dedupe_subject_key=f"operator-canary:{source_notification_plan_id}:{canary_key}",
+        material_change_hash=hashlib.sha256(seed.encode("utf-8")).hexdigest(),
+    )
+
+
+async def _existing_canary_plan_result(
+    repository,
+    *,
+    source_notification_plan_id: UUID,
+    source_plan: Mapping[str, object],
+    expected_draft: NotificationPlanDraft,
+    existing_plan: Mapping[str, object],
+) -> _CreateCanaryPlanResult:
+    if not _plan_matches_expected_canary(existing_plan, expected_draft):
+        return _CreateCanaryPlanResult(reason_code="canary_plan_conflict")
+    return await _created_or_existing_canary_plan_result(
+        repository,
+        status="existing",
+        source_notification_plan_id=source_notification_plan_id,
+        source_plan=source_plan,
+        plan=existing_plan,
+    )
+
+
+async def _created_or_existing_canary_plan_result(
+    repository,
+    *,
+    status: str,
+    source_notification_plan_id: UUID,
+    source_plan: Mapping[str, object],
+    plan: Mapping[str, object],
+) -> _CreateCanaryPlanResult:
+    notification_plan_id = _uuid_from_row(plan.get("notification_plan_id"))
+    target_chat_id = _int_from_row(plan.get("target_chat_id"))
+    dedupe_subject_key = str(plan.get("dedupe_subject_key") or "")
+    material_change_hash = str(plan.get("material_change_hash") or "")
+    plan_status = str(plan.get("status") or "")
+    delivery_decision = str(plan.get("delivery_decision") or "")
+    send_after_due = _send_after_due(plan.get("send_after"))
+    target_chat_id_present = target_chat_id is not None
+    already_delivered = plan_status in {"sent", "edited"}
+
+    if target_chat_id is not None and dedupe_subject_key and material_change_hash:
+        successful_delivery = await repository.load_successful_delivery_for_material(
+            dedupe_subject_key=dedupe_subject_key,
+            target_chat_id=target_chat_id,
+            material_change_hash=material_change_hash,
+        )
+        already_delivered = already_delivered or successful_delivery is not None
+
+    ready_for_send_canary = (
+        not already_delivered
+        and notification_plan_id is not None
+        and delivery_decision == "send_now"
+        and plan_status == "planned"
+        and send_after_due
+        and target_chat_id_present
+        and _plan_guard_reason(plan) is None
+    )
+    result_status = "existing_already_delivered" if already_delivered else status
+    return _CreateCanaryPlanResult(
+        status=result_status,
+        notification_plan_id=notification_plan_id,
+        source_notification_plan_id=source_notification_plan_id,
+        source_plan_status=_string_from_row(source_plan.get("status")),
+        delivery_decision=delivery_decision,
+        plan_status=plan_status,
+        send_after_due=send_after_due,
+        target_chat_id_present=target_chat_id_present,
+        ready_for_send_canary=ready_for_send_canary,
+    )
+
+
+def _plan_matches_expected_canary(plan: Mapping[str, object], draft: NotificationPlanDraft) -> bool:
+    return (
+        _uuid_from_row(plan.get("notification_plan_id")) == draft.notification_plan_id
+        and _uuid_from_row(plan.get("analysis_id")) == draft.analysis_id
+        and _uuid_from_row(plan.get("candidate_group_id")) == draft.candidate_group_id
+        and str(plan.get("delivery_decision") or "") == draft.delivery_decision
+        and str(plan.get("urgency_profile") or "") == draft.urgency_profile
+        and _int_from_row(plan.get("target_chat_id")) == draft.target_chat_id
+        and _int_from_row(plan.get("target_thread_id")) == draft.target_thread_id
+        and _string_from_row(plan.get("render_profile")) == draft.render_profile
+        and str(plan.get("dedupe_subject_key") or "") == draft.dedupe_subject_key
+        and str(plan.get("material_change_hash") or "") == draft.material_change_hash
+        and _string_from_row(plan.get("suppress_reason_code")) is None
+    )
+
+
+def _send_after_due(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, datetime):
+        due_at = value
+    else:
+        try:
+            due_at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    if due_at.tzinfo is None:
+        due_at = due_at.replace(tzinfo=timezone.utc)
+    return due_at.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+
+
+def _uuid_from_row(value: object) -> UUID | None:
+    if value is None:
+        return None
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _int_from_row(value: object) -> int | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _string_from_row(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _create_canary_success_payload(result: _CreateCanaryPlanResult) -> dict:
+    payload = {
+        "schema_version": CANARY_PLAN_SCHEMA_VERSION,
+        "status": result.status,
+        "notification_plan_id": str(result.notification_plan_id),
+        "source_notification_plan_id": str(result.source_notification_plan_id),
+        "delivery_decision": result.delivery_decision,
+        "plan_status": result.plan_status,
+        "send_after_due": result.send_after_due,
+        "target_chat_id_present": result.target_chat_id_present,
+        "ready_for_send_canary": result.ready_for_send_canary,
+    }
+    if result.status == "created":
+        payload["source_plan_status"] = result.source_plan_status
+    return payload
+
+
+def _create_canary_rejected_payload(reason_code: str) -> dict:
+    return {
+        "schema_version": CANARY_PLAN_SCHEMA_VERSION,
+        "status": "rejected",
+        "reason_code": reason_code,
+    }
+
+
+def _create_canary_failure_payload(reason_code: str) -> dict:
+    return {
+        "schema_version": CANARY_PLAN_SCHEMA_VERSION,
+        "status": "fail",
+        "reason_code": reason_code,
+        "warnings": [reason_code],
+    }
 
 
 def _load_notifier_one_shot_runtime_config(
@@ -491,6 +874,8 @@ async def _run(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     command = args.command or "worker"
+    if command == "create-canary-plan":
+        return await _run_create_canary_plan_command(args)
     if command == "send-canary":
         return await _run_send_canary_command(args)
     if command == "worker":
