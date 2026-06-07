@@ -33,6 +33,14 @@ RECENT_ACCEPTABLE_LATENCY_SENT = {
     "created_at": REFERENCE_NOW - timedelta(minutes=5),
     "source_to_delivery_sec": 60.0,
 }
+RECENT_OPERATOR_CANARY_HIGH_SOURCE_AGE_SENT = {
+    "delivery_status": "sent",
+    "dedupe_subject_key": "operator-canary:source-plan:stable-canary_01",
+    "posted_at": REFERENCE_NOW - timedelta(days=14),
+    "sent_at": REFERENCE_NOW,
+    "created_at": REFERENCE_NOW - timedelta(minutes=5),
+    "source_to_delivery_sec": 14 * 24 * 60 * 60.0,
+}
 
 
 class FakeGateRepository:
@@ -152,6 +160,38 @@ async def test_stale_sent_row_outside_recent_window_does_not_add_high_e2e_blocke
     assert report.blocking_reason_codes == ["delivery_gate_success_rate_missing"]
 
 
+@pytest.mark.asyncio
+async def test_recent_operator_canary_success_counts_success_rate_but_is_excluded_from_high_e2e_p95() -> None:
+    assert RECENT_OPERATOR_CANARY_HIGH_SOURCE_AGE_SENT["source_to_delivery_sec"] > (
+        _config().delivery_gate_max_high_source_to_delivery_p95_sec
+    )
+    session = FakeSnapshotSession(_snapshot_row(success_rate_1h=1.0, high_source_to_delivery_p95_sec=None))
+    snapshot = await MaintenanceRepository(session).load_delivery_gate_snapshot()
+    success_sql = _cte_fragment(
+        session.executed_sql[0],
+        start="success_1h AS",
+        end="success_24h AS",
+    )
+    high_source_sql = _cte_fragment(
+        session.executed_sql[0],
+        start="high_source_p95 AS",
+        end="plan_transport_p95 AS",
+    )
+
+    assert "operator-canary" not in success_sql
+    assert "notification_plans" not in success_sql
+    assert "np.dedupe_subject_key NOT LIKE 'operator-canary:%'" in high_source_sql
+    report = evaluate_delivery_operations_gate(config=_config(), snapshot=snapshot, mode="restricted")
+    high_metric = next(metric for metric in report.metrics if metric.metric_name == "high_source_to_delivery_p95_sec")
+
+    assert snapshot.success_rate_1h == 1.0
+    assert snapshot.high_source_to_delivery_p95_sec is None
+    assert high_metric.observed_value is None
+    assert high_metric.passed is True
+    assert report.gate_status == "pass"
+    assert "delivery_gate_high_e2e_p95_too_high" not in report.blocking_reason_codes
+
+
 def test_recent_high_latency_sent_row_inside_window_still_blocks_gate() -> None:
     assert RECENT_HIGH_LATENCY_SENT["created_at"] >= REFERENCE_NOW - timedelta(hours=1)
     report = evaluate_delivery_operations_gate(
@@ -163,6 +203,30 @@ def test_recent_high_latency_sent_row_inside_window_still_blocks_gate() -> None:
         mode="restricted",
     )
 
+    assert report.gate_status == "fail"
+    assert report.blocking_reason_codes == ["delivery_gate_high_e2e_p95_too_high"]
+
+
+@pytest.mark.asyncio
+async def test_high_e2e_p95_query_keeps_non_canary_production_rows_eligible() -> None:
+    session = FakeSnapshotSession(
+        _snapshot_row(
+            success_rate_1h=1.0,
+            high_source_to_delivery_p95_sec=RECENT_HIGH_LATENCY_SENT["source_to_delivery_sec"],
+        )
+    )
+    snapshot = await MaintenanceRepository(session).load_delivery_gate_snapshot()
+    high_source_sql = _cte_fragment(
+        session.executed_sql[0],
+        start="high_source_p95 AS",
+        end="plan_transport_p95 AS",
+    )
+
+    assert "np.dedupe_subject_key NOT LIKE 'operator-canary:%'" in high_source_sql
+    assert "np.urgency_profile = 'high'::urgency_profile_enum" in high_source_sql
+    report = evaluate_delivery_operations_gate(config=_config(), snapshot=snapshot, mode="restricted")
+
+    assert snapshot.high_source_to_delivery_p95_sec == RECENT_HIGH_LATENCY_SENT["source_to_delivery_sec"]
     assert report.gate_status == "fail"
     assert report.blocking_reason_codes == ["delivery_gate_high_e2e_p95_too_high"]
 
@@ -182,6 +246,44 @@ def test_recent_acceptable_latency_sent_row_inside_window_passes_high_e2e_metric
     assert report.gate_status == "pass"
     assert report.blocking_reason_codes == []
     assert high_metric.passed is True
+
+
+@pytest.mark.asyncio
+async def test_mixed_canary_and_non_canary_rows_use_only_non_canary_high_e2e_sample() -> None:
+    assert RECENT_OPERATOR_CANARY_HIGH_SOURCE_AGE_SENT["source_to_delivery_sec"] > (
+        _config().delivery_gate_max_high_source_to_delivery_p95_sec
+    )
+    assert RECENT_ACCEPTABLE_LATENCY_SENT["source_to_delivery_sec"] <= (
+        _config().delivery_gate_max_high_source_to_delivery_p95_sec
+    )
+    session = FakeSnapshotSession(
+        _snapshot_row(
+            success_rate_1h=1.0,
+            high_source_to_delivery_p95_sec=RECENT_ACCEPTABLE_LATENCY_SENT["source_to_delivery_sec"],
+        )
+    )
+    snapshot = await MaintenanceRepository(session).load_delivery_gate_snapshot()
+    success_sql = _cte_fragment(
+        session.executed_sql[0],
+        start="success_1h AS",
+        end="success_24h AS",
+    )
+    high_source_sql = _cte_fragment(
+        session.executed_sql[0],
+        start="high_source_p95 AS",
+        end="plan_transport_p95 AS",
+    )
+
+    assert "operator-canary" not in success_sql
+    assert "np.dedupe_subject_key NOT LIKE 'operator-canary:%'" in high_source_sql
+    report = evaluate_delivery_operations_gate(config=_config(), snapshot=snapshot, mode="restricted")
+    high_metric = next(metric for metric in report.metrics if metric.metric_name == "high_source_to_delivery_p95_sec")
+
+    assert snapshot.success_rate_1h == 1.0
+    assert snapshot.high_source_to_delivery_p95_sec == RECENT_ACCEPTABLE_LATENCY_SENT["source_to_delivery_sec"]
+    assert high_metric.passed is True
+    assert report.gate_status == "pass"
+    assert report.blocking_reason_codes == []
 
 
 @pytest.mark.asyncio

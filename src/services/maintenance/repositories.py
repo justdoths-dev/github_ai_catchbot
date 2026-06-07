@@ -512,6 +512,7 @@ class MaintenanceRepository:
                             LIMIT 1
                         ) dr ON true
                         WHERE np.urgency_profile = 'high'::urgency_profile_enum
+                          AND np.dedupe_subject_key NOT LIKE 'operator-canary:%'
                     )
                     SELECT percentile_cont(0.95)
                            WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (delivered_at - source_posted_at)))
