@@ -15,11 +15,25 @@ from tools import local_db_restricted_openai_judge_canary_runner as restricted_r
 
 
 SCHEMA_VERSION = "local_db_live_openai_judge_canary_v1"
+DIAGNOSTIC_SCHEMA_VERSION = "sanitized_openai_responses_request_contract_diagnostic_v1"
 DEFAULT_OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 ALLOWED_OPENAI_API_KEY_ENVS = frozenset({DEFAULT_OPENAI_API_KEY_ENV})
 ALLOWED_OPENAI_MODELS = frozenset({"gpt-5.4-mini"})
+ALLOWED_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+ALLOWED_OPENAI_REQUEST_TOP_LEVEL_KEYS = frozenset(
+    {
+        "model",
+        "reasoning",
+        "input",
+        "text",
+        "tools",
+        "max_output_tokens",
+        "prompt_cache_key",
+    }
+)
 DEFAULT_MAX_OUTPUT_TOKENS = 800
 HARD_MAX_OUTPUT_TOKENS = 1200
+OPENAI_REQUEST_DIAGNOSTIC_CAPTURED = "openai_request_diagnostic_captured"
 FORBIDDEN_LIVE_REQUEST_TOKENS = tuple(
     dict.fromkeys(
         (
@@ -213,6 +227,34 @@ class LiveOpenAIResponsesClientAdapter:
             raise RuntimeError("openai_client_factory_failed") from None
 
 
+class SanitizedOpenAIRequestDiagnosticClientAdapter:
+    def __init__(
+        self,
+        *,
+        max_output_tokens: int,
+        sensitive_values: Sequence[str],
+    ) -> None:
+        self.responses = self
+        self.audit = OpenAIRequestAudit()
+        self.diagnostic: dict[str, Any] | None = None
+        self._max_output_tokens = max_output_tokens
+        self._sensitive_values = tuple(value for value in sensitive_values if value)
+
+    def create(self, **request: Any) -> Any:
+        prepared, checks = prepare_openai_responses_request(
+            request,
+            max_output_tokens=self._max_output_tokens,
+            sensitive_values=self._sensitive_values,
+        )
+        self.audit = checks
+        self.diagnostic = build_sanitized_openai_request_diagnostic(
+            prepared,
+            max_output_tokens=self._max_output_tokens,
+            preparation_error_code=checks.error_code,
+        )
+        raise RuntimeError(OPENAI_REQUEST_DIAGNOSTIC_CAPTURED)
+
+
 async def _await_safely(awaitable: Any, audit: OpenAIRequestAudit) -> Any:
     try:
         return await awaitable
@@ -330,6 +372,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirm-live-openai-call", action="store_true")
     parser.add_argument("--openai-api-key-env", default=DEFAULT_OPENAI_API_KEY_ENV)
     parser.add_argument("--max-output-tokens", type=int, default=DEFAULT_MAX_OUTPUT_TOKENS)
+    parser.add_argument("--print-sanitized-openai-request-diagnostic", action="store_true")
     return parser
 
 
@@ -348,6 +391,9 @@ def run(
     root = repo_root or _repo_root()
     report = _base_report()
     checks_failed: list[str] = []
+    diagnostic_requested = bool(getattr(args, "print_sanitized_openai_request_diagnostic", False))
+    if diagnostic_requested:
+        report["sanitized_openai_request_diagnostic_requested"] = True
 
     if not args.confirm_local_test_db:
         checks_failed.append("confirm_local_test_db_required")
@@ -355,10 +401,11 @@ def run(
     if effective_env.get("APP_ENV", "").strip().lower() != "test":
         checks_failed.append("app_env_test_required")
 
-    if not args.allow_live_openai:
-        checks_failed.append("allow_live_openai_required")
-    if not args.confirm_live_openai_call:
-        checks_failed.append("confirm_live_openai_call_required")
+    if not diagnostic_requested:
+        if not args.allow_live_openai:
+            checks_failed.append("allow_live_openai_required")
+        if not args.confirm_live_openai_call:
+            checks_failed.append("confirm_live_openai_call_required")
 
     api_key_env = str(args.openai_api_key_env or "")
     api_key_env_allowed = api_key_env in ALLOWED_OPENAI_API_KEY_ENVS
@@ -406,6 +453,15 @@ def run(
         checks_failed.append("precondition_missing")
         return _finish(report, checks_failed)
 
+    if diagnostic_requested:
+        return _run_sanitized_openai_request_diagnostic(
+            args,
+            env=effective_env,
+            repo_root=root,
+            report=report,
+            max_output_tokens=int(max_output_tokens),
+        )
+
     api_key = effective_env.get(api_key_env, "")
     if not isinstance(api_key, str) or not api_key.strip():
         checks_failed.append("openai_api_key_missing")
@@ -451,6 +507,54 @@ def run(
         return _finish(report, checks_failed)
 
     checks_failed.extend(_proof_flag_failures(report))
+    return _finish(report, checks_failed)
+
+
+def _run_sanitized_openai_request_diagnostic(
+    args: argparse.Namespace,
+    *,
+    env: Mapping[str, str],
+    repo_root: Path,
+    report: dict[str, Any],
+    max_output_tokens: int,
+) -> RunnerResult:
+    adapter = SanitizedOpenAIRequestDiagnosticClientAdapter(
+        max_output_tokens=max_output_tokens,
+        sensitive_values=(args.database_url,),
+    )
+    restricted_args = argparse.Namespace(
+        database_url=args.database_url,
+        source_fixture=args.source_fixture,
+        github_snapshot_fixture=args.github_snapshot_fixture,
+        replay_namespace=args.replay_namespace,
+        confirm_local_test_db=True,
+    )
+
+    report["restricted_judge_canary_delegated"] = True
+    try:
+        delegated = restricted_runner.run(
+            restricted_args,
+            env=env,
+            openai_client=adapter,
+            repo_root=repo_root,
+        )
+    except Exception:  # noqa: BLE001 - diagnostic output must stay sanitized.
+        if adapter.diagnostic is None:
+            return _finish(report, ["restricted_judge_canary_failed"])
+        delegated = restricted_runner.RunnerResult(exit_code=1, report={})
+
+    _merge_delegated_report(report, delegated.report, adapter.audit)
+    if adapter.diagnostic is None:
+        delegated_failures = [
+            failure
+            for failure in list(delegated.report.get("checks_failed") or [])
+            if failure != "RuntimeError"
+        ]
+        checks_failed = delegated_failures or ["openai_request_diagnostic_not_captured"]
+        return _finish(report, checks_failed)
+
+    report["openai_request_diagnostic"] = adapter.diagnostic
+    checks_failed = [adapter.audit.error_code] if adapter.audit.error_code is not None else []
     return _finish(report, checks_failed)
 
 
@@ -505,6 +609,169 @@ def prepare_openai_responses_request(
         return prepared, audit
 
     return prepared, audit
+
+
+def build_sanitized_openai_request_diagnostic(
+    prepared_request: Mapping[str, Any],
+    *,
+    max_output_tokens: int,
+    preparation_error_code: str | None = None,
+) -> dict[str, Any]:
+    request = dict(prepared_request)
+    model = request.get("model")
+    model_allowed = model in ALLOWED_OPENAI_MODELS
+    tools = request.get("tools")
+    text_format = _mapping(_mapping(request.get("text")).get("format"))
+    schema = _mapping(text_format.get("schema"))
+    required = schema.get("required")
+    properties = _mapping(schema.get("properties"))
+    input_items = request.get("input")
+    reasoning = _mapping(request.get("reasoning"))
+    max_output_value = request.get("max_output_tokens")
+
+    unsupported_top_level_keys = set(request) - ALLOWED_OPENAI_REQUEST_TOP_LEVEL_KEYS
+    diagnostic: dict[str, Any] = {
+        "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+        "request_preparation_error_code": preparation_error_code,
+        "top_level_keys": _diagnostic_key_list(request.keys()),
+        "unsupported_top_level_keys": _diagnostic_key_list(unsupported_top_level_keys),
+        "unsupported_top_level_key_count": len(unsupported_top_level_keys),
+        "model_allowed": model_allowed,
+        "model": model if isinstance(model, str) and model_allowed else None,
+        "input_item_count": len(input_items) if isinstance(input_items, list) else 0,
+        "input_items": _input_item_diagnostics(input_items),
+        "input_text_content_present": _input_text_content_present(input_items),
+        "tools_count": len(tools) if isinstance(tools, list) else None,
+        "tools_empty": tools == [],
+        "max_output_tokens": max_output_value if _positive_int(max_output_value) else None,
+        "max_output_tokens_cap": max_output_tokens,
+        "max_output_tokens_cap_status": _max_output_tokens_cap_status(
+            max_output_value,
+            max_output_tokens=max_output_tokens,
+        ),
+        "reasoning_keys": _diagnostic_key_list(reasoning.keys()),
+        "reasoning_effort": _diagnostic_reasoning_effort(reasoning.get("effort")),
+        "text_format_keys": _diagnostic_key_list(text_format.keys()),
+        "text_format_type": _diagnostic_scalar(text_format.get("type")),
+        "text_format_name": _diagnostic_scalar(text_format.get("name")),
+        "text_format_strict": text_format.get("strict") if isinstance(text_format.get("strict"), bool) else None,
+        "json_schema_top_level_keys": _diagnostic_key_list(schema.keys()),
+        "json_schema_required_count": len(required) if isinstance(required, list) else None,
+        "json_schema_property_keys": _diagnostic_key_list(properties.keys()),
+    }
+    return diagnostic
+
+
+def _input_item_diagnostics(input_items: Any) -> list[dict[str, Any]]:
+    if not isinstance(input_items, list):
+        return []
+    diagnostics: list[dict[str, Any]] = []
+    for index, item in enumerate(input_items):
+        item_mapping = _mapping(item)
+        content = item_mapping.get("content")
+        content_items = content if isinstance(content, list) else []
+        diagnostics.append(
+            {
+                "index": index,
+                "keys": _diagnostic_key_list(item_mapping.keys()),
+                "role": _diagnostic_scalar(item_mapping.get("role")),
+                "content_count": len(content_items),
+                "content_items": _content_item_diagnostics(content_items),
+            }
+        )
+    return diagnostics
+
+
+def _content_item_diagnostics(content_items: Sequence[Any]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for index, item in enumerate(content_items):
+        item_mapping = _mapping(item)
+        text = item_mapping.get("text")
+        diagnostics.append(
+            {
+                "index": index,
+                "keys": _diagnostic_key_list(item_mapping.keys()),
+                "type": _diagnostic_scalar(item_mapping.get("type")),
+                "has_text": isinstance(text, str) and bool(text),
+            }
+        )
+    return diagnostics
+
+
+def _input_text_content_present(input_items: Any) -> bool:
+    if not isinstance(input_items, list):
+        return False
+    for item in input_items:
+        content = _mapping(item).get("content")
+        if not isinstance(content, list):
+            continue
+        for content_item in content:
+            content_mapping = _mapping(content_item)
+            if content_mapping.get("type") == "input_text":
+                text = content_mapping.get("text")
+                if isinstance(text, str) and bool(text):
+                    return True
+    return False
+
+
+def _diagnostic_key_list(keys: Any) -> list[str]:
+    return sorted(dict.fromkeys(_diagnostic_key_name(key) for key in keys))
+
+
+def _diagnostic_key_name(key: Any) -> str:
+    value = str(key)
+    lowered = value.lower()
+    if any(
+        token in lowered
+        for token in (
+            "authorization",
+            "api_key",
+            "openai_api_key",
+            "access_token",
+            "bearer",
+            "client_secret",
+            "private_key",
+            "secret",
+            "password",
+            "database_url",
+            "db_url",
+        )
+    ):
+        return "<redacted_sensitive_key>"
+    if len(value) > 80 or "\n" in value or "\r" in value:
+        return "<redacted_key>"
+    return value
+
+
+def _diagnostic_scalar(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if len(value) > 80 or "\n" in value or "\r" in value:
+        return "<redacted_value>"
+    lowered = value.lower()
+    if any(pattern.search(value) for pattern in SECRET_LIKE_PATTERNS):
+        return "<redacted_value>"
+    if any(token in lowered for token in ("authorization", "api_key", "access_token", "client_secret")):
+        return "<redacted_value>"
+    return value
+
+
+def _diagnostic_reasoning_effort(value: Any) -> str | None:
+    return value if isinstance(value, str) and value in ALLOWED_REASONING_EFFORTS else None
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _max_output_tokens_cap_status(value: Any, *, max_output_tokens: int) -> str:
+    if value is None:
+        return "missing"
+    if not _positive_int(value):
+        return "invalid"
+    if value > max_output_tokens:
+        return "above_cap"
+    return "within_cap"
 
 
 def _strict_judge_output_schema_valid(request: Mapping[str, Any]) -> bool:

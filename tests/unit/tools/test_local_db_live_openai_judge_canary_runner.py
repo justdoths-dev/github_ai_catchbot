@@ -22,6 +22,9 @@ PASSWORD_URL = f"{PG_SCHEME}://local_user:{SECRET_VALUE}@127.0.0.1:5432/{SAFE_DA
 FAKE_API_KEY = "unit_fake_openai_key"
 RAW_EXCEPTION_MESSAGE = "raw exception message with unit_fake_openai_key should stay hidden"
 RAW_RESPONSE_BODY = "raw OpenAI response body should stay hidden"
+RAW_PROMPT_TEXT = "unit raw prompt text should stay hidden"
+RAW_EVIDENCE_TEXT = "unit raw evidence text should stay hidden"
+RAW_SCHEMA_DESCRIPTION = "unit raw schema description should stay hidden"
 GROUP_ID = UUID("11111111-1111-4111-8111-111111111111")
 BUNDLE_ID = UUID("22222222-2222-4222-8222-222222222222")
 JUDGE_RUN_ID = UUID("33333333-3333-4333-8333-333333333333")
@@ -382,6 +385,163 @@ def test_classified_failure_output_omits_raw_exception_response_prompt_key_and_d
         "FakeOpenAIException",
     ):
         assert forbidden not in text
+
+
+def test_sanitized_openai_request_diagnostic_includes_structure_without_text_or_secret_values() -> None:
+    request = _openai_request()
+    request["input"][0]["content"][0]["text"] = RAW_PROMPT_TEXT
+    request["input"][1]["content"][0]["text"] = json.dumps(
+        {
+            "evidence": RAW_EVIDENCE_TEXT,
+            "database_url": PASSWORD_URL,
+            "openai_key": FAKE_API_KEY,
+        }
+    )
+    prepared, audit = runner.prepare_openai_responses_request(
+        request,
+        max_output_tokens=runner.DEFAULT_MAX_OUTPUT_TOKENS,
+        sensitive_values=(PASSWORD_URL, FAKE_API_KEY),
+    )
+
+    diagnostic = runner.build_sanitized_openai_request_diagnostic(
+        prepared,
+        max_output_tokens=runner.DEFAULT_MAX_OUTPUT_TOKENS,
+        preparation_error_code=audit.error_code,
+    )
+    text = runner.render_json({"diagnostic": diagnostic})
+
+    assert diagnostic["schema_version"] == runner.DIAGNOSTIC_SCHEMA_VERSION
+    assert diagnostic["request_preparation_error_code"] == "openai_request_sensitive_content_rejected"
+    assert diagnostic["top_level_keys"] == [
+        "input",
+        "max_output_tokens",
+        "model",
+        "prompt_cache_key",
+        "reasoning",
+        "text",
+        "tools",
+    ]
+    assert diagnostic["model_allowed"] is True
+    assert diagnostic["model"] == "gpt-5.4-mini"
+    assert diagnostic["input_item_count"] == 2
+    assert diagnostic["input_items"][0]["role"] == "developer"
+    assert diagnostic["input_items"][1]["role"] == "user"
+    assert diagnostic["input_items"][0]["content_items"][0]["type"] == "input_text"
+    assert diagnostic["input_items"][0]["content_items"][0]["keys"] == ["text", "type"]
+    assert diagnostic["input_items"][0]["content_items"][0]["has_text"] is True
+    assert diagnostic["input_text_content_present"] is True
+    assert diagnostic["tools_count"] == 0
+    assert diagnostic["tools_empty"] is True
+    assert diagnostic["max_output_tokens"] == runner.DEFAULT_MAX_OUTPUT_TOKENS
+    assert diagnostic["max_output_tokens_cap_status"] == "within_cap"
+    assert diagnostic["reasoning_keys"] == ["effort"]
+    assert diagnostic["reasoning_effort"] == "low"
+    for forbidden in (
+        RAW_PROMPT_TEXT,
+        RAW_EVIDENCE_TEXT,
+        PASSWORD_URL,
+        SECRET_VALUE,
+        FAKE_API_KEY,
+        RAW_EXCEPTION_MESSAGE,
+        RAW_RESPONSE_BODY,
+    ):
+        assert forbidden not in text
+
+
+def test_sanitized_openai_request_diagnostic_reports_schema_structure_without_descriptions() -> None:
+    request = _openai_request()
+    schema = request["text"]["format"]["schema"]
+    schema["description"] = RAW_SCHEMA_DESCRIPTION
+    schema["properties"]["headline"]["description"] = RAW_SCHEMA_DESCRIPTION
+
+    diagnostic = runner.build_sanitized_openai_request_diagnostic(
+        request,
+        max_output_tokens=runner.DEFAULT_MAX_OUTPUT_TOKENS,
+    )
+    text = runner.render_json({"diagnostic": diagnostic})
+
+    assert diagnostic["text_format_keys"] == ["name", "schema", "strict", "type"]
+    assert diagnostic["text_format_type"] == "json_schema"
+    assert diagnostic["text_format_name"] == "judge_output_v1"
+    assert diagnostic["text_format_strict"] is True
+    assert "description" in diagnostic["json_schema_top_level_keys"]
+    assert diagnostic["json_schema_required_count"] == len(runner.restricted_runner.REQUIRED_OUTPUT_KEYS)
+    assert diagnostic["json_schema_property_keys"] == sorted(runner.restricted_runner.REQUIRED_OUTPUT_KEYS)
+    assert RAW_SCHEMA_DESCRIPTION not in text
+
+
+def test_sanitized_openai_request_diagnostic_detects_unsupported_top_level_keys_without_values() -> None:
+    request = _openai_request()
+    request["unsupported_unit_key"] = {"body": RAW_EVIDENCE_TEXT}
+
+    diagnostic = runner.build_sanitized_openai_request_diagnostic(
+        request,
+        max_output_tokens=runner.DEFAULT_MAX_OUTPUT_TOKENS,
+    )
+    text = runner.render_json({"diagnostic": diagnostic})
+
+    assert diagnostic["unsupported_top_level_keys"] == ["unsupported_unit_key"]
+    assert diagnostic["unsupported_top_level_key_count"] == 1
+    assert "unsupported_unit_key" in diagnostic["top_level_keys"]
+    assert RAW_EVIDENCE_TEXT not in text
+
+
+def test_diagnostic_flag_captures_request_without_live_authority_api_key_or_client(monkeypatch) -> None:
+    calls = []
+
+    def fake_restricted_run(args, *, env, openai_client, repo_root):
+        calls.append(
+            {
+                "args": args,
+                "env": dict(env),
+                "openai_client_type": type(openai_client).__name__,
+                "repo_root": repo_root,
+            }
+        )
+        try:
+            openai_client.responses.create(**_openai_request())
+        except RuntimeError as exc:
+            assert str(exc) == runner.OPENAI_REQUEST_DIAGNOSTIC_CAPTURED
+        else:  # pragma: no cover - explicit assertion path.
+            raise AssertionError("diagnostic adapter did not stop before an OpenAI response")
+        report = _restricted_pass_report()
+        report.update(
+            {
+                "status": "fail",
+                "openai_structured_output_received": False,
+                "judge_output_created": False,
+                "judge_run_updated": False,
+                "judge_output_ready_event_created": False,
+                "checks_failed": ["RuntimeError"],
+            }
+        )
+        return runner.restricted_runner.RunnerResult(exit_code=1, report=report)
+
+    monkeypatch.setattr(runner.restricted_runner, "run", fake_restricted_run)
+    factory = FactoryRecorder()
+    args = _parse_args("--confirm-local-test-db", "--print-sanitized-openai-request-diagnostic")
+
+    result = runner.run(
+        args,
+        env={"APP_ENV": "test"},
+        live_client_factory=factory,
+        repo_root=ROOT,
+    )
+
+    assert result.exit_code == 0
+    assert result.report["status"] == "pass"
+    assert result.report["checks_failed"] == []
+    assert result.report["sanitized_openai_request_diagnostic_requested"] is True
+    assert result.report["live_openai_authority_confirmed"] is False
+    assert result.report["openai_api_key_present"] is False
+    assert result.report["openai_client_created"] is False
+    assert result.report["live_openai_called"] is False
+    assert result.report["openai_request_diagnostic"]["model"] == "gpt-5.4-mini"
+    assert calls[0]["openai_client_type"] == "SanitizedOpenAIRequestDiagnosticClientAdapter"
+    assert factory.calls == []
+    assert "allow_live_openai_required" not in result.report["checks_failed"]
+    assert "confirm_live_openai_call_required" not in result.report["checks_failed"]
+    assert "openai_api_key_missing" not in result.report["checks_failed"]
 
 
 def test_adapter_rejects_disallowed_model() -> None:
