@@ -750,6 +750,7 @@ async def _verify_durable_rows(
 ) -> ReplayExecutionResult:
     import sqlalchemy as sa
 
+    expected_canonical_id = _expected_github_repo_canonical_id(fixture)
     source_message = await _exists(
         connection,
         """
@@ -814,9 +815,9 @@ async def _verify_durable_rows(
         """
         SELECT 1
         FROM artifact_registry
-        WHERE canonical_id = 'github:repo:example/example-tool'
+        WHERE canonical_id = :expected_canonical_id
         """,
-        {},
+        {"expected_canonical_id": expected_canonical_id},
     )
     observation = await _exists(
         connection,
@@ -838,11 +839,12 @@ async def _verify_durable_rows(
         FROM candidate_group_proposals
         WHERE source_message_id = CAST(:source_message_id AS uuid)
           AND source_version_no = :source_version_no
-          AND dedupe_subject_key = 'github:repo:example/example-tool'
+          AND dedupe_subject_key = :expected_canonical_id
         """,
         {
             "source_message_id": str(fixture.source_message_id),
             "source_version_no": fixture.source_version_no,
+            "expected_canonical_id": expected_canonical_id,
         },
     )
     member = await _exists(
@@ -870,11 +872,12 @@ async def _verify_durable_rows(
           ON ar.artifact_id = eo.aggregate_id
         WHERE eo.event_type = :event_type
           AND eo.dedupe_key LIKE :dedupe_prefix
-          AND ar.canonical_id = 'github:repo:example/example-tool'
+          AND ar.canonical_id = :expected_canonical_id
         """,
         {
             "event_type": ENRICH_EVENT_TYPE,
             "dedupe_prefix": f"local-db-source-candidate:{replay_namespace}:artifact.enrich:%",
+            "expected_canonical_id": expected_canonical_id,
         },
     )
     result = ReplayExecutionResult(
@@ -966,6 +969,23 @@ def _fixture_content_hash(fixture: SourceFixture) -> str:
 
 def _logical_post_key(fixture: SourceFixture, replay_namespace: str) -> str:
     return f"{replay_namespace}:telegram:{fixture.chat_id}:{fixture.message_id}"
+
+
+def _expected_github_repo_canonical_id(fixture: SourceFixture) -> str:
+    for item in fixture.url_surface_json:
+        if not isinstance(item, Mapping):
+            continue
+        observed_url = str(item.get("observed_url") or "")
+        try:
+            parsed = urlsplit(observed_url)
+        except ValueError:
+            continue
+        if (parsed.hostname or "").lower() != "github.com":
+            continue
+        path_parts = [unquote(part) for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 2 and path_parts[0] and path_parts[1]:
+            return f"github:repo:{path_parts[0]}/{path_parts[1]}".lower()
+    return "github:repo:example/example-tool"
 
 
 def _json_dumps(value: Any) -> str:

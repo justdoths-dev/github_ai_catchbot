@@ -1,0 +1,24 @@
+{
+  "source_message_id": "22222222-2222-4222-8222-222222222222",
+  "source_version_no": 1,
+  "platform": "telegram",
+  "chat_id": "-1001000000002",
+  "message_id": 8001,
+  "text_body": "Public repo canary target: https://github.com/octocat/Hello-World\nRestricted GitHub read-only canary should snapshot public metadata, default branch commit, and README excerpt.",
+  "caption_text": null,
+  "text_surface": "Public repo canary target: https://github.com/octocat/Hello-World\nRestricted GitHub read-only canary should snapshot public metadata, default branch commit, and README excerpt.",
+  "entities_json": [],
+  "url_surface_json": [
+    {
+      "observed_url": "https://github.com/octocat/Hello-World",
+      "source_kind": "entity",
+      "context_path": "entities_json[0]"
+    }
+  ],
+  "posted_at": "2026-06-09T00:00:00Z",
+  "raw_message_json": {
+    "platform": "telegram",
+    "chat_id": "-1001000000002",
+    "message_id": 8001
+  }
+}
