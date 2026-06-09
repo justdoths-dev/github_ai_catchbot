@@ -20,6 +20,8 @@ SAFE_SOCKET_URL = f"{PG_SCHEME}:///{SAFE_DATABASE_NAME}?host={SOCKET_HOST}"
 SECRET_VALUE = "local" + "_" + "secret"
 PASSWORD_URL = f"{PG_SCHEME}://local_user:{SECRET_VALUE}@127.0.0.1:5432/{SAFE_DATABASE_NAME}"
 FAKE_API_KEY = "unit_fake_openai_key"
+RAW_EXCEPTION_MESSAGE = "raw exception message with unit_fake_openai_key should stay hidden"
+RAW_RESPONSE_BODY = "raw OpenAI response body should stay hidden"
 GROUP_ID = UUID("11111111-1111-4111-8111-111111111111")
 BUNDLE_ID = UUID("22222222-2222-4222-8222-222222222222")
 JUDGE_RUN_ID = UUID("33333333-3333-4333-8333-333333333333")
@@ -52,6 +54,71 @@ class FactoryRecorder:
         client = RecordingLiveClient(response=self.response)
         self.clients.append(client)
         return client
+
+
+class RaisingResponses:
+    def __init__(self, exc: Exception) -> None:
+        self.calls = []
+        self.exc = exc
+
+    def create(self, **request):
+        self.calls.append(request)
+        raise self.exc
+
+
+class RaisingLiveClient:
+    def __init__(self, exc: Exception) -> None:
+        self.responses = RaisingResponses(exc)
+
+
+class RaisingFactory:
+    def __init__(self, exc: Exception) -> None:
+        self.calls = []
+        self.clients = []
+        self.exc = exc
+
+    def __call__(self, *, api_key: str):
+        self.calls.append(api_key)
+        client = RaisingLiveClient(self.exc)
+        self.clients.append(client)
+        return client
+
+
+class FakeOpenAIException(Exception):
+    def __init__(
+        self,
+        message: str = RAW_EXCEPTION_MESSAGE,
+        *,
+        status_code: int | str | None = None,
+        code: str | None = None,
+        error_type: str | None = None,
+        body: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.type = error_type
+        self.body = body
+
+
+class AuthenticationError(FakeOpenAIException):
+    pass
+
+
+class PermissionDeniedError(FakeOpenAIException):
+    pass
+
+
+class RateLimitError(FakeOpenAIException):
+    pass
+
+
+class APIConnectionError(FakeOpenAIException):
+    pass
+
+
+class APITimeoutError(FakeOpenAIException):
+    pass
 
 
 def _parse_args(*extra: str):
@@ -249,6 +316,74 @@ def test_sdk_missing_is_reported_without_requiring_openai_package(monkeypatch) -
     assert result.report["live_openai_called"] is False
 
 
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (AuthenticationError(), "openai_authentication_failed"),
+        (PermissionDeniedError(), "openai_permission_denied"),
+        (RateLimitError(), "openai_rate_limited"),
+        (FakeOpenAIException(status_code=404, code="model_not_found"), "openai_model_not_found_or_unavailable"),
+        (FakeOpenAIException(status_code=400, error_type="invalid_request_error"), "openai_bad_request"),
+        (
+            FakeOpenAIException(
+                status_code=429,
+                body={
+                    "error": {
+                        "code": "insufficient_quota",
+                        "type": "rate_limit_error",
+                        "message": RAW_RESPONSE_BODY,
+                    }
+                },
+            ),
+            "openai_quota_or_billing_failed",
+        ),
+        (APIConnectionError(), "openai_connection_failed"),
+        (APITimeoutError(), "openai_timeout"),
+        (FakeOpenAIException(status_code=503), "openai_server_error"),
+        (FakeOpenAIException(code="unknown_error_code"), "openai_responses_create_failed"),
+    ],
+)
+def test_classifies_openai_responses_create_exceptions(exc: Exception, expected: str) -> None:
+    assert runner.classify_openai_responses_create_exception(exc) == expected
+
+
+def test_classified_failure_output_omits_raw_exception_response_prompt_key_and_db(monkeypatch) -> None:
+    _patch_restricted_run(monkeypatch, call_openai=True, catch_openai_error=True)
+    exc = FakeOpenAIException(
+        status_code=400,
+        body={
+            "error": {
+                "code": "invalid_request_error",
+                "type": "invalid_request_error",
+                "message": RAW_RESPONSE_BODY,
+            }
+        },
+    )
+    factory = RaisingFactory(exc)
+    args = _authorized_args()
+    args.database_url = PASSWORD_URL
+
+    result = _run(args, live_client_factory=factory)
+    text = runner.render_json(result.report)
+
+    assert result.exit_code == 1
+    assert result.report["checks_failed"] == ["openai_bad_request"]
+    assert result.report["openai_client_created"] is True
+    assert result.report["live_openai_called"] is True
+    assert factory.calls == [FAKE_API_KEY]
+    for forbidden in (
+        PASSWORD_URL,
+        SECRET_VALUE,
+        FAKE_API_KEY,
+        RAW_EXCEPTION_MESSAGE,
+        RAW_RESPONSE_BODY,
+        "Synthetic local fixture for a developer workflow helper.",
+        "example/example-tool",
+        "FakeOpenAIException",
+    ):
+        assert forbidden not in text
+
+
 def test_adapter_rejects_disallowed_model() -> None:
     request = _openai_request()
     request["model"] = "gpt-5.4"
@@ -287,7 +422,7 @@ def test_adapter_rejects_non_strict_schema() -> None:
     [
         SAFE_SOCKET_URL,
         FAKE_API_KEY,
-        "sk-testsecretvalue123456",
+        "sk-" + "testsecretvalue123456",
         "web_search",
         "file_search",
     ],

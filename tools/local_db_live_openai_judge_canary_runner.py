@@ -54,6 +54,66 @@ SIDE_EFFECT_FALSE_KEYS = (
     "analysis_created",
     "notification_created",
 )
+OPENAI_QUOTA_OR_BILLING_MARKERS = (
+    "insufficient_quota",
+    "quota_exceeded",
+    "billing_hard_limit",
+    "billing_hard_limit_reached",
+    "billing_not_active",
+    "billing",
+    "payment_required",
+)
+OPENAI_AUTHENTICATION_MARKERS = (
+    "authenticationerror",
+    "authentication_error",
+    "invalid_api_key",
+    "incorrect_api_key",
+    "expired_api_key",
+    "missing_api_key",
+)
+OPENAI_PERMISSION_MARKERS = (
+    "permissiondeniederror",
+    "permission_denied",
+    "access_denied",
+    "forbidden",
+)
+OPENAI_RATE_LIMIT_MARKERS = (
+    "ratelimiterror",
+    "rate_limit_error",
+    "rate_limit_exceeded",
+    "rate_limited",
+)
+OPENAI_MODEL_UNAVAILABLE_MARKERS = (
+    "notfounderror",
+    "not_found",
+    "model_not_found",
+    "model_not_available",
+    "model_unavailable",
+)
+OPENAI_BAD_REQUEST_MARKERS = (
+    "badrequesterror",
+    "bad_request",
+    "invalidrequesterror",
+    "invalid_request_error",
+)
+OPENAI_TIMEOUT_MARKERS = (
+    "apitimeouterror",
+    "timeout",
+    "timedout",
+    "timed_out",
+)
+OPENAI_CONNECTION_MARKERS = (
+    "apiconnectionerror",
+    "connectionerror",
+    "connection_error",
+    "connecterror",
+)
+OPENAI_SERVER_ERROR_MARKERS = (
+    "internalservererror",
+    "servererror",
+    "server_error",
+    "serviceunavailableerror",
+)
 
 LiveClientFactory = Callable[..., Any]
 
@@ -117,9 +177,10 @@ class LiveOpenAIResponsesClientAdapter:
         self.audit.live_openai_called = True
         try:
             response = create(**prepared)
-        except Exception:  # noqa: BLE001 - never expose live exception text.
-            self.audit.error_code = "openai_responses_create_failed"
-            raise RuntimeError("openai_responses_create_failed") from None
+        except Exception as exc:  # noqa: BLE001 - never expose live exception text.
+            classified_code = classify_openai_responses_create_exception(exc)
+            self.audit.error_code = classified_code
+            raise RuntimeError(classified_code) from None
         if inspect.isawaitable(response):
             return _await_safely(response, self.audit)
         return response
@@ -155,9 +216,102 @@ class LiveOpenAIResponsesClientAdapter:
 async def _await_safely(awaitable: Any, audit: OpenAIRequestAudit) -> Any:
     try:
         return await awaitable
-    except Exception:  # noqa: BLE001 - never expose live response/transport details.
-        audit.error_code = "openai_responses_create_failed"
-        raise RuntimeError("openai_responses_create_failed") from None
+    except Exception as exc:  # noqa: BLE001 - never expose live response/transport details.
+        classified_code = classify_openai_responses_create_exception(exc)
+        audit.error_code = classified_code
+        raise RuntimeError(classified_code) from None
+
+
+def classify_openai_responses_create_exception(exc: Exception) -> str:
+    markers = _openai_exception_markers(exc)
+    status_code = _openai_exception_status_code(exc)
+
+    if _marker_matches(markers, OPENAI_QUOTA_OR_BILLING_MARKERS):
+        return "openai_quota_or_billing_failed"
+    if _marker_matches(markers, OPENAI_AUTHENTICATION_MARKERS) or status_code == 401:
+        return "openai_authentication_failed"
+    if _marker_matches(markers, OPENAI_PERMISSION_MARKERS) or status_code == 403:
+        return "openai_permission_denied"
+    if _marker_matches(markers, OPENAI_RATE_LIMIT_MARKERS) or status_code == 429:
+        return "openai_rate_limited"
+    if _marker_matches(markers, OPENAI_MODEL_UNAVAILABLE_MARKERS) or status_code == 404:
+        return "openai_model_not_found_or_unavailable"
+    if _marker_matches(markers, OPENAI_BAD_REQUEST_MARKERS) or status_code == 400:
+        return "openai_bad_request"
+    if status_code == 402:
+        return "openai_quota_or_billing_failed"
+    if _marker_matches(markers, OPENAI_TIMEOUT_MARKERS) or status_code == 408:
+        return "openai_timeout"
+    if _marker_matches(markers, OPENAI_CONNECTION_MARKERS):
+        return "openai_connection_failed"
+    if _marker_matches(markers, OPENAI_SERVER_ERROR_MARKERS) or (
+        status_code is not None and 500 <= status_code <= 599
+    ):
+        return "openai_server_error"
+    return "openai_responses_create_failed"
+
+
+def _openai_exception_markers(exc: Exception) -> tuple[str, ...]:
+    markers: list[str] = []
+    for cls in type(exc).__mro__:
+        if cls is object:
+            continue
+        markers.append(cls.__name__)
+    markers.extend(_openai_exception_code_type_values(exc))
+    return tuple(normalized for value in markers if (normalized := _safe_marker(value)))
+
+
+def _openai_exception_code_type_values(exc: Exception) -> tuple[str, ...]:
+    values: list[str] = []
+    for field in ("code", "type"):
+        value = _safe_getattr(exc, field)
+        if isinstance(value, str):
+            values.append(value)
+
+    body = _safe_getattr(exc, "body")
+    if isinstance(body, Mapping):
+        values.extend(_mapping_code_type_values(body))
+        nested_error = body.get("error")
+        if isinstance(nested_error, Mapping):
+            values.extend(_mapping_code_type_values(nested_error))
+    return tuple(values)
+
+
+def _mapping_code_type_values(value: Mapping[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    for field in ("code", "type"):
+        field_value = value.get(field)
+        if isinstance(field_value, str):
+            values.append(field_value)
+    return tuple(values)
+
+
+def _openai_exception_status_code(exc: Exception) -> int | None:
+    for field in ("status_code", "status"):
+        value = _safe_getattr(exc, field)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
+
+
+def _safe_getattr(value: Any, name: str) -> Any:
+    try:
+        return getattr(value, name)
+    except Exception:  # noqa: BLE001 - live SDK fields must not break classification.
+        return None
+
+
+def _safe_marker(value: str) -> str | None:
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized or None
+
+
+def _marker_matches(markers: Sequence[str], expected: Sequence[str]) -> bool:
+    return any(token in marker for marker in markers for token in expected)
 
 
 def build_parser() -> argparse.ArgumentParser:
