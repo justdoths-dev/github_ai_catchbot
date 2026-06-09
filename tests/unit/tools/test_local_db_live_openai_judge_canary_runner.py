@@ -1,0 +1,508 @@
+from __future__ import annotations
+
+import ast
+import json
+from pathlib import Path
+from uuid import UUID
+
+import pytest
+
+from tools import local_db_live_openai_judge_canary_runner as runner
+
+
+ROOT = Path(__file__).resolve().parents[3]
+SOURCE_FIXTURE = "tests/fixtures/upstream/source_message_github_repo_signal.json"
+GITHUB_FIXTURE = "tests/fixtures/upstream/github_repo_snapshot_example_tool.json"
+PG_SCHEME = "postgresql+psycopg"
+SAFE_DATABASE_NAME = "github_ai_catchbot_test"
+SOCKET_HOST = "/var/run/postgresql"
+SAFE_SOCKET_URL = f"{PG_SCHEME}:///{SAFE_DATABASE_NAME}?host={SOCKET_HOST}"
+SECRET_VALUE = "local" + "_" + "secret"
+PASSWORD_URL = f"{PG_SCHEME}://local_user:{SECRET_VALUE}@127.0.0.1:5432/{SAFE_DATABASE_NAME}"
+FAKE_API_KEY = "unit_fake_openai_key"
+GROUP_ID = UUID("11111111-1111-4111-8111-111111111111")
+BUNDLE_ID = UUID("22222222-2222-4222-8222-222222222222")
+JUDGE_RUN_ID = UUID("33333333-3333-4333-8333-333333333333")
+ARTIFACT_ID = UUID("44444444-4444-4444-8444-444444444444")
+
+
+class RecordingResponses:
+    def __init__(self, response=None) -> None:
+        self.calls = []
+        self.response = response or {"status": "completed", "output_text": "{}"}
+
+    def create(self, **request):
+        self.calls.append(request)
+        return self.response
+
+
+class RecordingLiveClient:
+    def __init__(self, response=None) -> None:
+        self.responses = RecordingResponses(response=response)
+
+
+class FactoryRecorder:
+    def __init__(self, response=None) -> None:
+        self.calls = []
+        self.clients = []
+        self.response = response
+
+    def __call__(self, *, api_key: str):
+        self.calls.append(api_key)
+        client = RecordingLiveClient(response=self.response)
+        self.clients.append(client)
+        return client
+
+
+def _parse_args(*extra: str):
+    return runner.build_parser().parse_args(
+        [
+            "--database-url",
+            SAFE_SOCKET_URL,
+            "--source-fixture",
+            SOURCE_FIXTURE,
+            "--github-snapshot-fixture",
+            GITHUB_FIXTURE,
+            "--replay-namespace",
+            "unit-live-openai-judge-canary",
+            *extra,
+        ]
+    )
+
+
+def _authorized_args(*extra: str):
+    return _parse_args(
+        "--confirm-local-test-db",
+        "--allow-live-openai",
+        "--confirm-live-openai-call",
+        "--openai-api-key-env",
+        "OPENAI_API_KEY",
+        *extra,
+    )
+
+
+def _run(args=None, *, env=None, live_client_factory=None):
+    return runner.run(
+        args or _authorized_args(),
+        env=env or {"APP_ENV": "test", "OPENAI_API_KEY": FAKE_API_KEY},
+        live_client_factory=live_client_factory,
+        repo_root=ROOT,
+    )
+
+
+def test_pass_delegates_to_restricted_runner_and_returns_stable_authority_flags(monkeypatch) -> None:
+    restricted_calls = _patch_restricted_run(monkeypatch, call_openai=True)
+    factory = FactoryRecorder()
+
+    result = _run(live_client_factory=factory)
+
+    assert result.exit_code == 0
+    assert result.report == _expected_pass_report()
+    assert len(restricted_calls) == 1
+    assert restricted_calls[0]["args"].confirm_local_test_db is True
+    assert factory.calls == [FAKE_API_KEY]
+    assert factory.clients[0].responses.calls[0]["max_output_tokens"] == runner.DEFAULT_MAX_OUTPUT_TOKENS
+
+
+def test_refuses_missing_confirm_local_test_db_before_delegate_or_client_creation(monkeypatch) -> None:
+    restricted_calls = _patch_restricted_run(monkeypatch, call_openai=True)
+    factory = FactoryRecorder()
+
+    result = _run(_parse_args("--allow-live-openai", "--confirm-live-openai-call"), live_client_factory=factory)
+
+    assert result.exit_code == 1
+    assert result.report["checks_failed"] == ["confirm_local_test_db_required"]
+    assert restricted_calls == []
+    assert factory.calls == []
+
+
+def test_refuses_missing_allow_live_openai(monkeypatch) -> None:
+    restricted_calls = _patch_restricted_run(monkeypatch, call_openai=True)
+    factory = FactoryRecorder()
+
+    result = _run(
+        _parse_args("--confirm-local-test-db", "--confirm-live-openai-call"),
+        live_client_factory=factory,
+    )
+
+    assert result.exit_code == 1
+    assert result.report["checks_failed"] == ["allow_live_openai_required"]
+    assert restricted_calls == []
+    assert factory.calls == []
+
+
+def test_refuses_missing_confirm_live_openai_call(monkeypatch) -> None:
+    restricted_calls = _patch_restricted_run(monkeypatch, call_openai=True)
+    factory = FactoryRecorder()
+
+    result = _run(_parse_args("--confirm-local-test-db", "--allow-live-openai"), live_client_factory=factory)
+
+    assert result.exit_code == 1
+    assert result.report["checks_failed"] == ["confirm_live_openai_call_required"]
+    assert restricted_calls == []
+    assert factory.calls == []
+
+
+def test_refuses_app_env_prod_before_delegate_or_client_creation(monkeypatch) -> None:
+    restricted_calls = _patch_restricted_run(monkeypatch, call_openai=True)
+    factory = FactoryRecorder()
+
+    result = _run(env={"APP_ENV": "prod", "OPENAI_API_KEY": FAKE_API_KEY}, live_client_factory=factory)
+
+    assert result.exit_code == 1
+    assert result.report["checks_failed"] == ["app_env_test_required"]
+    assert restricted_calls == []
+    assert factory.calls == []
+
+
+def test_refuses_unsafe_database_url_before_delegate_or_client_creation(monkeypatch) -> None:
+    restricted_calls = _patch_restricted_run(monkeypatch, call_openai=True)
+    factory = FactoryRecorder()
+    args = runner.build_parser().parse_args(
+        [
+            "--database-url",
+            "postgresql+psycopg://db.example.com/github_ai_catchbot_prod",
+            "--source-fixture",
+            SOURCE_FIXTURE,
+            "--github-snapshot-fixture",
+            GITHUB_FIXTURE,
+            "--replay-namespace",
+            "unit-live-openai-unsafe-db",
+            "--confirm-local-test-db",
+            "--allow-live-openai",
+            "--confirm-live-openai-call",
+        ]
+    )
+
+    result = _run(args, live_client_factory=factory)
+
+    assert result.exit_code == 1
+    assert result.report["database_url_guard_passed"] is False
+    assert "database_url_remote_host_rejected" in result.report["checks_failed"]
+    assert restricted_calls == []
+    assert factory.calls == []
+
+
+def test_refuses_disallowed_openai_api_key_env_before_reading_key_or_delegating(monkeypatch) -> None:
+    restricted_calls = _patch_restricted_run(monkeypatch, call_openai=True)
+    factory = FactoryRecorder()
+
+    result = _run(
+        _authorized_args("--openai-api-key-env", "OTHER_OPENAI_KEY"),
+        env={"APP_ENV": "test", "OTHER_OPENAI_KEY": "other"},
+        live_client_factory=factory,
+    )
+
+    assert result.exit_code == 1
+    assert result.report["openai_api_key_env_allowed"] is False
+    assert result.report["openai_api_key_present"] is False
+    assert result.report["checks_failed"] == ["openai_api_key_env_disallowed"]
+    assert restricted_calls == []
+    assert factory.calls == []
+
+
+def test_refuses_missing_api_key_env_after_non_secret_gates_and_before_delegate(monkeypatch) -> None:
+    restricted_calls = _patch_restricted_run(monkeypatch, call_openai=True)
+    factory = FactoryRecorder()
+
+    result = _run(env={"APP_ENV": "test"}, live_client_factory=factory)
+
+    assert result.exit_code == 1
+    assert result.report["database_url_guard_passed"] is True
+    assert result.report["openai_api_key_env_allowed"] is True
+    assert result.report["openai_api_key_present"] is False
+    assert result.report["checks_failed"] == ["openai_api_key_missing"]
+    assert restricted_calls == []
+    assert factory.calls == []
+
+
+def test_reuse_pass_does_not_create_client_or_call_live_openai(monkeypatch) -> None:
+    _patch_restricted_run(monkeypatch, call_openai=False)
+    factory = FactoryRecorder()
+
+    result = _run(live_client_factory=factory)
+
+    assert result.exit_code == 0
+    assert result.report["existing_judge_output_reused"] is True
+    assert result.report["openai_client_created"] is False
+    assert result.report["live_openai_called"] is False
+    assert result.report["openai_request_max_output_tokens_capped"] is False
+    assert factory.calls == []
+
+
+def test_sdk_missing_is_reported_without_requiring_openai_package(monkeypatch) -> None:
+    _patch_restricted_run(monkeypatch, call_openai=True, catch_openai_error=True)
+
+    real_import = __import__
+
+    def guarded_import(name, *args, **kwargs):  # noqa: ANN001
+        if name == "openai":
+            raise ImportError("missing")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", guarded_import)
+    result = _run(live_client_factory=None)
+
+    assert result.exit_code == 1
+    assert result.report["checks_failed"] == ["openai_sdk_missing"]
+    assert result.report["openai_client_created"] is False
+    assert result.report["live_openai_called"] is False
+
+
+def test_adapter_rejects_disallowed_model() -> None:
+    request = _openai_request()
+    request["model"] = "gpt-5.4"
+    adapter = _adapter()
+
+    with pytest.raises(RuntimeError, match="openai_request_model_disallowed"):
+        adapter.responses.create(**request)
+
+    assert adapter.audit.model_allowed is False
+
+
+def test_adapter_rejects_non_empty_tools() -> None:
+    request = _openai_request()
+    request["tools"] = [{"type": "web_search"}]
+    adapter = _adapter()
+
+    with pytest.raises(RuntimeError, match="openai_request_tools_not_disabled"):
+        adapter.responses.create(**request)
+
+    assert adapter.audit.tools_disabled is False
+
+
+def test_adapter_rejects_non_strict_schema() -> None:
+    request = _openai_request()
+    request["text"]["format"]["strict"] = False
+    adapter = _adapter()
+
+    with pytest.raises(RuntimeError, match="openai_request_schema_not_strict"):
+        adapter.responses.create(**request)
+
+    assert adapter.audit.strict_schema_valid is False
+
+
+@pytest.mark.parametrize(
+    "unsafe_value",
+    [
+        SAFE_SOCKET_URL,
+        FAKE_API_KEY,
+        "sk-testsecretvalue123456",
+        "web_search",
+        "file_search",
+    ],
+)
+def test_adapter_rejects_sensitive_or_external_fetch_request_content(unsafe_value: str) -> None:
+    request = _openai_request()
+    request["input"][1]["content"][0]["text"] = json.dumps({"unsafe": unsafe_value})
+    adapter = _adapter()
+
+    with pytest.raises(RuntimeError, match="openai_request_sensitive_content_rejected"):
+        adapter.responses.create(**request)
+
+    assert adapter.audit.sensitive_content_absent is False
+
+
+def test_adapter_applies_max_output_token_cap_before_forwarding() -> None:
+    request = _openai_request()
+    request.pop("max_output_tokens", None)
+    factory = FactoryRecorder()
+    adapter = _adapter(factory=factory, max_output_tokens=777)
+
+    response = adapter.responses.create(**request)
+
+    assert response["status"] == "completed"
+    assert adapter.audit.max_output_tokens_capped is True
+    assert factory.clients[0].responses.calls[0]["max_output_tokens"] == 777
+
+
+def test_sanitized_output_does_not_contain_db_url_or_api_key(monkeypatch) -> None:
+    _patch_restricted_run(monkeypatch, call_openai=True)
+    factory = FactoryRecorder()
+    args = _authorized_args()
+    args.database_url = PASSWORD_URL
+
+    result = _run(args, live_client_factory=factory)
+    text = runner.render_json(result.report)
+
+    assert result.exit_code == 0
+    assert PASSWORD_URL not in text
+    assert SECRET_VALUE not in text
+    assert FAKE_API_KEY not in text
+
+
+def test_runner_source_has_no_forbidden_runtime_imports_or_downstream_clients() -> None:
+    source = (ROOT / "tools/local_db_live_openai_judge_canary_runner.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    top_level_imports = {
+        alias.name.split(".", 1)[0]
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    top_level_imports.update(
+        node.module.split(".", 1)[0]
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module
+    )
+
+    assert {"redis", "telegram", "docker", "systemd", "requests", "httpx", "aiohttp", "urllib"}.isdisjoint(
+        top_level_imports
+    )
+    assert "policy_engine" not in source
+    assert "notifier_telegram" not in source
+    assert "openai_base_url" not in source
+    assert "OPENAI_BASE_URL" not in source
+    assert "os.getenv" not in source
+    assert 'os.environ["OPENAI_API_KEY"]' not in source
+
+
+def _patch_restricted_run(monkeypatch, *, call_openai: bool, catch_openai_error: bool = False):
+    calls = []
+
+    def fake_run(args, *, env, openai_client, repo_root):
+        calls.append({"args": args, "env": dict(env), "repo_root": repo_root})
+        if call_openai:
+            try:
+                openai_client.responses.create(**_openai_request())
+            except Exception:
+                if not catch_openai_error:
+                    raise
+                report = _restricted_pass_report()
+                report.update(
+                    {
+                        "status": "fail",
+                        "openai_structured_output_received": False,
+                        "judge_output_created": False,
+                        "judge_run_updated": False,
+                        "judge_output_ready_event_created": False,
+                        "checks_failed": ["RuntimeError"],
+                    }
+                )
+                return runner.restricted_runner.RunnerResult(exit_code=1, report=report)
+        return runner.restricted_runner.RunnerResult(exit_code=0, report=_restricted_pass_report())
+
+    monkeypatch.setattr(runner.restricted_runner, "run", fake_run)
+    return calls
+
+
+def _adapter(*, factory: FactoryRecorder | None = None, max_output_tokens: int = runner.DEFAULT_MAX_OUTPUT_TOKENS):
+    return runner.LiveOpenAIResponsesClientAdapter(
+        api_key=FAKE_API_KEY,
+        live_client_factory=factory or FactoryRecorder(),
+        max_output_tokens=max_output_tokens,
+        sensitive_values=(FAKE_API_KEY, SAFE_SOCKET_URL),
+    )
+
+
+def _openai_request() -> dict[str, object]:
+    return runner.restricted_runner.build_openai_responses_request(
+        judge_run=_judge_run(),
+        bundle=_bundle_context(),
+    )
+
+
+def _judge_run() -> runner.restricted_runner.JudgeRunRecord:
+    return runner.restricted_runner.JudgeRunRecord(
+        judge_run_id=JUDGE_RUN_ID,
+        bundle_id=BUNDLE_ID,
+        judge_profile="github_primary",
+        model="gpt-5.4-mini",
+        reasoning_effort="low",
+        prompt_version="judge_github_primary_v1",
+        schema_version="judge_output_v1",
+        policy_version="verdict_policy_v1",
+        prompt_cache_key="judge:github_primary:judge_github_primary_v1:judge_output_v1:verdict_policy_v1",
+        status="pending",
+    )
+
+
+def _bundle_context() -> runner.restricted_runner.BundleContext:
+    return runner.restricted_runner.BundleContext(
+        bundle_id=BUNDLE_ID,
+        candidate_group_id=GROUP_ID,
+        current_primary_artifact_id=ARTIFACT_ID,
+        current_bundle_id=BUNDLE_ID,
+        primary_summary={
+            "repo_full_name": "example/example-tool",
+            "headline": "Synthetic local fixture for a developer workflow helper.",
+            "test_paths": ["tests/test_example_tool.py"],
+            "ci_paths": [".github/workflows/test.yml"],
+            "docs_paths": ["docs/usage.md"],
+        },
+        supporting_summaries_json=[{"artifact_id": str(ARTIFACT_ID), "kind": "github_repo"}],
+        discovered_links_summary_json=[],
+        evidence_limitations=["synthetic local fixture; no live OpenAI call"],
+        token_budget_profile="small",
+        reroot_count=0,
+        ready_for_analysis=True,
+    )
+
+
+def _restricted_pass_report() -> dict[str, object]:
+    return {
+        "schema_version": "local_db_restricted_openai_judge_canary_v1",
+        "status": "pass",
+        "database_url_guard_passed": True,
+        "openai_live_call_authorized": False,
+        "openai_client_injected": True,
+        "analysis_router_replay_confirmed": True,
+        "judge_call_requested_event_found": True,
+        "judge_run_loaded": True,
+        "evidence_bundle_loaded": True,
+        "judge_request_built": True,
+        "judge_request_uses_bundle_only": True,
+        "openai_responses_request_shape_valid": True,
+        "openai_structured_output_received": True,
+        "judge_output_created": True,
+        "judge_run_updated": True,
+        "judge_output_ready_event_created": True,
+        "live_openai_called": False,
+        "telegram_called": False,
+        "live_github_called": False,
+        "workers_started": False,
+        "redis_mutation": False,
+        "production_db_write": False,
+        "alembic_or_ddl_ran": False,
+        "analysis_created": False,
+        "notification_created": False,
+        "checks_failed": [],
+    }
+
+
+def _expected_pass_report() -> dict[str, object]:
+    return {
+        "schema_version": "local_db_live_openai_judge_canary_v1",
+        "status": "pass",
+        "database_url_guard_passed": True,
+        "live_openai_authority_confirmed": True,
+        "openai_api_key_env_allowed": True,
+        "openai_api_key_present": True,
+        "openai_client_created": True,
+        "restricted_judge_canary_delegated": True,
+        "analysis_router_replay_confirmed": True,
+        "judge_call_requested_event_found": True,
+        "judge_run_loaded": True,
+        "evidence_bundle_loaded": True,
+        "judge_request_built": True,
+        "judge_request_uses_bundle_only": True,
+        "openai_responses_request_shape_valid": True,
+        "openai_request_model_allowed": True,
+        "openai_request_tools_disabled": True,
+        "openai_request_max_output_tokens_capped": True,
+        "openai_structured_output_received": True,
+        "judge_output_created": True,
+        "judge_run_updated": True,
+        "judge_output_ready_event_created": True,
+        "live_openai_called": True,
+        "existing_judge_output_reused": False,
+        "telegram_called": False,
+        "live_github_called": False,
+        "workers_started": False,
+        "redis_mutation": False,
+        "production_db_write": False,
+        "alembic_or_ddl_ran": False,
+        "analysis_created": False,
+        "notification_created": False,
+        "checks_failed": [],
+    }
