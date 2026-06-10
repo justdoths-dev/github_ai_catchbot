@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import json
 from pathlib import Path
 from uuid import UUID
@@ -29,6 +30,7 @@ GROUP_ID = UUID("11111111-1111-4111-8111-111111111111")
 BUNDLE_ID = UUID("22222222-2222-4222-8222-222222222222")
 JUDGE_RUN_ID = UUID("33333333-3333-4333-8333-333333333333")
 ARTIFACT_ID = UUID("44444444-4444-4444-8444-444444444444")
+PROMPT_CACHE_KEY = "judge:github_primary:judge_github_primary_v1:judge_output_v1:verdict_policy_v1"
 
 
 class RecordingResponses:
@@ -173,7 +175,12 @@ def test_pass_delegates_to_restricted_runner_and_returns_stable_authority_flags(
     assert len(restricted_calls) == 1
     assert restricted_calls[0]["args"].confirm_local_test_db is True
     assert factory.calls == [FAKE_API_KEY]
-    assert factory.clients[0].responses.calls[0]["max_output_tokens"] == runner.DEFAULT_MAX_OUTPUT_TOKENS
+    forwarded_request = factory.clients[0].responses.calls[0]
+    assert forwarded_request["max_output_tokens"] == runner.DEFAULT_MAX_OUTPUT_TOKENS
+    assert "prompt_cache_key" not in forwarded_request
+    assert result.report["openai_request_prompt_cache_key_present_before_prepare"] is True
+    assert result.report["openai_request_prompt_cache_key_omitted_from_live_request"] is True
+    assert PROMPT_CACHE_KEY not in runner.render_json(result.report)
 
 
 def test_refuses_missing_confirm_local_test_db_before_delegate_or_client_creation(monkeypatch) -> None:
@@ -441,8 +448,44 @@ def test_classified_failure_output_omits_raw_exception_response_prompt_key_and_d
         "Synthetic local fixture for a developer workflow helper.",
         "example/example-tool",
         "FakeOpenAIException",
+        PROMPT_CACHE_KEY,
     ):
         assert forbidden not in text
+
+
+def test_prepare_omits_prompt_cache_key_without_mutating_input_request() -> None:
+    request = _openai_request()
+    original_request = copy.deepcopy(request)
+
+    prepared, audit = runner.prepare_openai_responses_request(
+        request,
+        max_output_tokens=runner.DEFAULT_MAX_OUTPUT_TOKENS,
+        sensitive_values=(),
+    )
+
+    assert request == original_request
+    assert request["prompt_cache_key"] == PROMPT_CACHE_KEY
+    assert "prompt_cache_key" not in prepared
+    assert audit.prompt_cache_key_present_before_prepare is True
+    assert audit.prompt_cache_key_omitted_from_live_request is True
+    assert audit.request_shape_valid is True
+
+
+def test_adapter_forwards_live_request_without_prompt_cache_key_and_keeps_original_request() -> None:
+    request = _openai_request()
+    original_request = copy.deepcopy(request)
+    factory = FactoryRecorder()
+    adapter = _adapter(factory=factory)
+
+    response = adapter.responses.create(**request)
+
+    assert response["status"] == "completed"
+    assert request == original_request
+    assert request["prompt_cache_key"] == PROMPT_CACHE_KEY
+    forwarded_request = factory.clients[0].responses.calls[0]
+    assert "prompt_cache_key" not in forwarded_request
+    assert adapter.audit.prompt_cache_key_present_before_prepare is True
+    assert adapter.audit.prompt_cache_key_omitted_from_live_request is True
 
 
 def test_sanitized_openai_request_diagnostic_includes_structure_without_text_or_secret_values() -> None:
@@ -465,6 +508,8 @@ def test_sanitized_openai_request_diagnostic_includes_structure_without_text_or_
         prepared,
         max_output_tokens=runner.DEFAULT_MAX_OUTPUT_TOKENS,
         preparation_error_code=audit.error_code,
+        prompt_cache_key_present_before_prepare=audit.prompt_cache_key_present_before_prepare,
+        prompt_cache_key_omitted_from_live_request=audit.prompt_cache_key_omitted_from_live_request,
     )
     text = runner.render_json({"diagnostic": diagnostic})
 
@@ -474,11 +519,13 @@ def test_sanitized_openai_request_diagnostic_includes_structure_without_text_or_
         "input",
         "max_output_tokens",
         "model",
-        "prompt_cache_key",
         "reasoning",
         "text",
         "tools",
     ]
+    assert diagnostic["prompt_cache_key_present_before_prepare"] is True
+    assert diagnostic["prompt_cache_key_present_in_prepared_request"] is False
+    assert diagnostic["prompt_cache_key_omitted_from_live_request"] is True
     assert diagnostic["model_allowed"] is True
     assert diagnostic["model"] == "gpt-5.4-mini"
     assert diagnostic["input_item_count"] == 2
@@ -502,6 +549,7 @@ def test_sanitized_openai_request_diagnostic_includes_structure_without_text_or_
         FAKE_API_KEY,
         RAW_EXCEPTION_MESSAGE,
         RAW_RESPONSE_BODY,
+        PROMPT_CACHE_KEY,
     ):
         assert forbidden not in text
 
@@ -529,6 +577,7 @@ def test_sanitized_openai_request_diagnostic_reports_schema_structure_without_de
     assert diagnostic["json_schema_subset_issue_codes"] == []
     assert diagnostic["json_schema_subset_issues"] == []
     assert RAW_SCHEMA_DESCRIPTION not in text
+    assert PROMPT_CACHE_KEY not in text
 
 
 def test_sanitized_openai_request_diagnostic_detects_unsupported_top_level_keys_without_values() -> None:
@@ -545,6 +594,7 @@ def test_sanitized_openai_request_diagnostic_detects_unsupported_top_level_keys_
     assert diagnostic["unsupported_top_level_key_count"] == 1
     assert "unsupported_unit_key" in diagnostic["top_level_keys"]
     assert RAW_EVIDENCE_TEXT not in text
+    assert PROMPT_CACHE_KEY not in text
 
 
 def test_structured_output_subset_validator_accepts_valid_minimal_schema() -> None:
@@ -710,12 +760,20 @@ def test_diagnostic_flag_captures_request_without_live_authority_api_key_or_clie
     assert result.report["openai_api_key_present"] is False
     assert result.report["openai_client_created"] is False
     assert result.report["live_openai_called"] is False
-    assert result.report["openai_request_diagnostic"]["model"] == "gpt-5.4-mini"
+    diagnostic = result.report["openai_request_diagnostic"]
+    assert diagnostic["model"] == "gpt-5.4-mini"
+    assert diagnostic["prompt_cache_key_present_before_prepare"] is True
+    assert diagnostic["prompt_cache_key_present_in_prepared_request"] is False
+    assert diagnostic["prompt_cache_key_omitted_from_live_request"] is True
+    assert "prompt_cache_key" not in diagnostic["top_level_keys"]
+    assert result.report["openai_request_prompt_cache_key_present_before_prepare"] is True
+    assert result.report["openai_request_prompt_cache_key_omitted_from_live_request"] is True
     assert calls[0]["openai_client_type"] == "SanitizedOpenAIRequestDiagnosticClientAdapter"
     assert factory.calls == []
     assert "allow_live_openai_required" not in result.report["checks_failed"]
     assert "confirm_live_openai_call_required" not in result.report["checks_failed"]
     assert "openai_api_key_missing" not in result.report["checks_failed"]
+    assert PROMPT_CACHE_KEY not in runner.render_json(result.report)
 
 
 def test_adapter_rejects_disallowed_model() -> None:
@@ -783,6 +841,7 @@ def test_adapter_applies_max_output_token_cap_before_forwarding() -> None:
     assert response["status"] == "completed"
     assert adapter.audit.max_output_tokens_capped is True
     assert factory.clients[0].responses.calls[0]["max_output_tokens"] == 777
+    assert "prompt_cache_key" not in factory.clients[0].responses.calls[0]
 
 
 def test_sanitized_output_does_not_contain_db_url_or_api_key(monkeypatch) -> None:
@@ -798,6 +857,7 @@ def test_sanitized_output_does_not_contain_db_url_or_api_key(monkeypatch) -> Non
     assert PASSWORD_URL not in text
     assert SECRET_VALUE not in text
     assert FAKE_API_KEY not in text
+    assert PROMPT_CACHE_KEY not in text
 
 
 def test_runner_source_has_no_forbidden_runtime_imports_or_downstream_clients() -> None:
@@ -891,7 +951,7 @@ def _judge_run() -> runner.restricted_runner.JudgeRunRecord:
         prompt_version="judge_github_primary_v1",
         schema_version="judge_output_v1",
         policy_version="verdict_policy_v1",
-        prompt_cache_key="judge:github_primary:judge_github_primary_v1:judge_output_v1:verdict_policy_v1",
+        prompt_cache_key=PROMPT_CACHE_KEY,
         status="pending",
     )
 
@@ -969,6 +1029,8 @@ def _expected_pass_report() -> dict[str, object]:
         "openai_request_model_allowed": True,
         "openai_request_tools_disabled": True,
         "openai_request_max_output_tokens_capped": True,
+        "openai_request_prompt_cache_key_present_before_prepare": True,
+        "openai_request_prompt_cache_key_omitted_from_live_request": True,
         "openai_structured_output_received": True,
         "judge_output_created": True,
         "judge_run_updated": True,

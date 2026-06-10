@@ -184,6 +184,8 @@ class OpenAIRequestAudit:
     tools_disabled: bool = False
     strict_schema_valid: bool = False
     max_output_tokens_capped: bool = False
+    prompt_cache_key_present_before_prepare: bool = False
+    prompt_cache_key_omitted_from_live_request: bool = False
     sensitive_content_absent: bool = False
     openai_client_created: bool = False
     live_openai_called: bool = False
@@ -289,6 +291,8 @@ class SanitizedOpenAIRequestDiagnosticClientAdapter:
             prepared,
             max_output_tokens=self._max_output_tokens,
             preparation_error_code=checks.error_code,
+            prompt_cache_key_present_before_prepare=checks.prompt_cache_key_present_before_prepare,
+            prompt_cache_key_omitted_from_live_request=checks.prompt_cache_key_omitted_from_live_request,
         )
         raise RuntimeError(OPENAI_REQUEST_DIAGNOSTIC_CAPTURED)
 
@@ -635,6 +639,7 @@ def prepare_openai_responses_request(
 ) -> tuple[dict[str, Any], OpenAIRequestAudit]:
     audit = OpenAIRequestAudit(request_seen=True)
     prepared = copy.deepcopy(dict(request))
+    audit.prompt_cache_key_present_before_prepare = "prompt_cache_key" in prepared
 
     audit.model_allowed = prepared.get("model") in ALLOWED_OPENAI_MODELS
     if not audit.model_allowed:
@@ -664,6 +669,10 @@ def prepare_openai_responses_request(
         audit.error_code = "openai_request_max_output_tokens_uncapped"
         return prepared, audit
 
+    if audit.prompt_cache_key_present_before_prepare:
+        prepared.pop("prompt_cache_key", None)
+        audit.prompt_cache_key_omitted_from_live_request = "prompt_cache_key" not in prepared
+
     audit.sensitive_content_absent = not _contains_forbidden_live_request_content(
         prepared,
         sensitive_values=sensitive_values,
@@ -685,8 +694,18 @@ def build_sanitized_openai_request_diagnostic(
     *,
     max_output_tokens: int,
     preparation_error_code: str | None = None,
+    prompt_cache_key_present_before_prepare: bool | None = None,
+    prompt_cache_key_omitted_from_live_request: bool | None = None,
 ) -> dict[str, Any]:
     request = dict(prepared_request)
+    prompt_cache_key_present_in_prepared_request = "prompt_cache_key" in request
+    if prompt_cache_key_present_before_prepare is None:
+        prompt_cache_key_present_before_prepare = prompt_cache_key_present_in_prepared_request
+    if prompt_cache_key_omitted_from_live_request is None:
+        prompt_cache_key_omitted_from_live_request = (
+            prompt_cache_key_present_before_prepare
+            and not prompt_cache_key_present_in_prepared_request
+        )
     model = request.get("model")
     model_allowed = model in ALLOWED_OPENAI_MODELS
     tools = request.get("tools")
@@ -706,6 +725,9 @@ def build_sanitized_openai_request_diagnostic(
         "top_level_keys": _diagnostic_key_list(request.keys()),
         "unsupported_top_level_keys": _diagnostic_key_list(unsupported_top_level_keys),
         "unsupported_top_level_key_count": len(unsupported_top_level_keys),
+        "prompt_cache_key_present_before_prepare": bool(prompt_cache_key_present_before_prepare),
+        "prompt_cache_key_present_in_prepared_request": prompt_cache_key_present_in_prepared_request,
+        "prompt_cache_key_omitted_from_live_request": bool(prompt_cache_key_omitted_from_live_request),
         "model_allowed": model_allowed,
         "model": model if isinstance(model, str) and model_allowed else None,
         "input_item_count": len(input_items) if isinstance(input_items, list) else 0,
@@ -1074,6 +1096,12 @@ def _merge_delegated_report(
         report["openai_request_model_allowed"] = audit.model_allowed
         report["openai_request_tools_disabled"] = audit.tools_disabled
         report["openai_request_max_output_tokens_capped"] = audit.max_output_tokens_capped
+        report["openai_request_prompt_cache_key_present_before_prepare"] = (
+            audit.prompt_cache_key_present_before_prepare
+        )
+        report["openai_request_prompt_cache_key_omitted_from_live_request"] = (
+            audit.prompt_cache_key_omitted_from_live_request
+        )
     else:
         report["openai_responses_request_shape_valid"] = bool(
             delegated.get("openai_responses_request_shape_valid")
@@ -1118,6 +1146,8 @@ def _proof_flag_failures(report: Mapping[str, Any]) -> list[str]:
             [
                 "openai_client_created",
                 "openai_request_max_output_tokens_capped",
+                "openai_request_prompt_cache_key_present_before_prepare",
+                "openai_request_prompt_cache_key_omitted_from_live_request",
                 "live_openai_called",
             ]
         )
@@ -1146,6 +1176,8 @@ def _base_report() -> dict[str, Any]:
         "openai_request_model_allowed": False,
         "openai_request_tools_disabled": False,
         "openai_request_max_output_tokens_capped": False,
+        "openai_request_prompt_cache_key_present_before_prepare": False,
+        "openai_request_prompt_cache_key_omitted_from_live_request": False,
         "openai_structured_output_received": False,
         "judge_output_created": False,
         "judge_run_updated": False,
