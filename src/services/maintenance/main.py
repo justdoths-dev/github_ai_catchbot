@@ -20,6 +20,10 @@ from .db_shape_preflight import (
     run_db_shape_preflight,
 )
 from .delivery_gate_runner import DeliveryGateRunner
+from .delivery_gate_preflight import (
+    load_delivery_gate_preflight_report,
+    run_delivery_gate_preflight,
+)
 from .mvp_readiness import run_restricted_live_mvp_readiness
 from .redis_streams import RedisStreamConsumer
 from .repositories import MaintenanceRepository
@@ -103,6 +107,12 @@ def build_parser() -> argparse.ArgumentParser:
     gate.add_argument("--format", choices=["json"], default="json")
     gate.add_argument("--operator-review-passed", choices=["true", "false"], default=None)
     gate.add_argument("--env-file")
+
+    gate_preflight = subcommands.add_parser("delivery-gate-preflight")
+    gate_preflight.add_argument("--mode", required=True)
+    gate_preflight.add_argument("--operator-review-passed", action="store_true")
+    gate_preflight.add_argument("--output", default="json")
+    gate_preflight.add_argument("--env-file")
 
     mvp = subcommands.add_parser("mvp-readiness")
     mvp.add_argument("--mode", choices=["restricted"], required=True)
@@ -375,6 +385,48 @@ async def _run_delivery_gate(config: MaintenanceConfig, args: argparse.Namespace
             return 2
     finally:
         await engine.dispose()
+
+
+def _load_delivery_gate_preflight_config(args: argparse.Namespace) -> MaintenanceConfig:
+    overlay: dict[str, str] = {}
+    if getattr(args, "env_file", None):
+        overlay.update(_resolve_one_shot_runtime_env_file_overlay(args.env_file))
+    if "REDIS_URL" not in os.environ and "REDIS_URL" not in overlay:
+        overlay["REDIS_URL"] = "redis://127.0.0.1:6379/0"
+
+    if getattr(args, "env_file", None):
+        return _load_maintenance_one_shot_runtime_config(args, env_file_overlay=overlay)
+    with _temporary_environment_defaults(overlay):
+        return MaintenanceConfig.from_env()
+
+
+async def _run_delivery_gate_preflight(args: argparse.Namespace) -> int:
+    operator_review_passed = True if args.operator_review_passed else None
+
+    async def load_report(config: MaintenanceConfig, mode, review_passed):
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
+
+        engine = create_async_engine(config.database_url, future=True)
+        session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        try:
+            async with session_factory() as session:
+                repository = MaintenanceRepository(session)
+                return await load_delivery_gate_preflight_report(
+                    config,
+                    repository,
+                    mode=mode,
+                    operator_review_passed=review_passed,
+                )
+        finally:
+            await engine.dispose()
+
+    return await run_delivery_gate_preflight(
+        mode=args.mode,
+        output=args.output,
+        operator_review_passed=operator_review_passed,
+        load_config=lambda: _load_delivery_gate_preflight_config(args),
+        load_report=load_report,
+    )
 
 
 async def _run_mvp_readiness(config: MaintenanceConfig, args: argparse.Namespace) -> int:
@@ -758,6 +810,8 @@ async def _run(argv: list[str] | None = None) -> int:
     command = args.command or "worker"
     if command == "db-shape-preflight":
         return await _run_db_shape_preflight(args)
+    if command == "delivery-gate-preflight":
+        return await _run_delivery_gate_preflight(args)
     runtime_env_overlay: dict[str, str] | None = None
     if _one_shot_command_uses_explicit_env_file(command, args):
         try:
