@@ -138,6 +138,16 @@ OPENAI_BAD_REQUEST_MARKERS = (
     "invalidrequesterror",
     "invalid_request_error",
 )
+OPENAI_BAD_REQUEST_SUBCODE_MARKERS = (
+    ("openai_bad_request_json_schema", ("json_schema", "schema")),
+    ("openai_bad_request_text_format", ("text.format", "text_format", "response_format")),
+    ("openai_bad_request_prompt_cache_key", ("prompt_cache_key", "prompt_cache")),
+    ("openai_bad_request_max_output_tokens", ("max_output_tokens", "max_tokens")),
+    ("openai_bad_request_tools", ("tool_choice", "tools")),
+    ("openai_bad_request_reasoning", ("reasoning",)),
+    ("openai_bad_request_input", ("input",)),
+    ("openai_bad_request_model", ("model",)),
+)
 OPENAI_TIMEOUT_MARKERS = (
     "apitimeouterror",
     "timeout",
@@ -307,7 +317,7 @@ def classify_openai_responses_create_exception(exc: Exception) -> str:
     if _marker_matches(markers, OPENAI_MODEL_UNAVAILABLE_MARKERS) or status_code == 404:
         return "openai_model_not_found_or_unavailable"
     if _marker_matches(markers, OPENAI_BAD_REQUEST_MARKERS) or status_code == 400:
-        return "openai_bad_request"
+        return _classify_openai_bad_request(exc)
     if status_code == 402:
         return "openai_quota_or_billing_failed"
     if _marker_matches(markers, OPENAI_TIMEOUT_MARKERS) or status_code == 408:
@@ -319,6 +329,32 @@ def classify_openai_responses_create_exception(exc: Exception) -> str:
     ):
         return "openai_server_error"
     return "openai_responses_create_failed"
+
+
+def _classify_openai_bad_request(exc: Exception) -> str:
+    markers = _openai_bad_request_detail_markers(exc)
+    for subcode, expected in OPENAI_BAD_REQUEST_SUBCODE_MARKERS:
+        if _marker_matches(markers, expected):
+            return subcode
+    return "openai_bad_request"
+
+
+def _openai_bad_request_detail_markers(exc: Exception) -> tuple[str, ...]:
+    values: list[str] = []
+    values.extend(_openai_exception_code_type_values(exc))
+
+    param = _safe_getattr(exc, "param")
+    if isinstance(param, str):
+        values.append(param)
+
+    body = _safe_getattr(exc, "body")
+    if isinstance(body, Mapping):
+        values.extend(_mapping_param_values(body))
+        nested_error = body.get("error")
+        if isinstance(nested_error, Mapping):
+            values.extend(_mapping_param_values(nested_error))
+
+    return tuple(normalized for value in values if (normalized := _safe_marker(value)))
 
 
 def _openai_exception_markers(exc: Exception) -> tuple[str, ...]:
@@ -354,6 +390,11 @@ def _mapping_code_type_values(value: Mapping[str, Any]) -> tuple[str, ...]:
         if isinstance(field_value, str):
             values.append(field_value)
     return tuple(values)
+
+
+def _mapping_param_values(value: Mapping[str, Any]) -> tuple[str, ...]:
+    param = value.get("param")
+    return (param,) if isinstance(param, str) else ()
 
 
 def _openai_exception_status_code(exc: Exception) -> int | None:

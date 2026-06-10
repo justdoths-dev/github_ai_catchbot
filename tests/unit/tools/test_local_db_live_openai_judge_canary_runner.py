@@ -95,12 +95,14 @@ class FakeOpenAIException(Exception):
         status_code: int | str | None = None,
         code: str | None = None,
         error_type: str | None = None,
+        param: str | None = None,
         body: dict[str, object] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.type = error_type
+        self.param = param
         self.body = body
 
 
@@ -348,6 +350,62 @@ def test_sdk_missing_is_reported_without_requiring_openai_package(monkeypatch) -
 )
 def test_classifies_openai_responses_create_exceptions(exc: Exception, expected: str) -> None:
     assert runner.classify_openai_responses_create_exception(exc) == expected
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            FakeOpenAIException(status_code=400, body={"error": {"param": "model"}}),
+            "openai_bad_request_model",
+        ),
+        (FakeOpenAIException(status_code=400, param="reasoning"), "openai_bad_request_reasoning"),
+        (FakeOpenAIException(status_code=400, param="text.format"), "openai_bad_request_text_format"),
+        (FakeOpenAIException(status_code=400, param="response_format"), "openai_bad_request_text_format"),
+        (FakeOpenAIException(status_code=400, param="text.format.schema.properties"), "openai_bad_request_json_schema"),
+        (FakeOpenAIException(status_code=400, param="input"), "openai_bad_request_input"),
+        (FakeOpenAIException(status_code=400, param="prompt_cache_key"), "openai_bad_request_prompt_cache_key"),
+        (FakeOpenAIException(status_code=400, param="max_output_tokens"), "openai_bad_request_max_output_tokens"),
+        (FakeOpenAIException(status_code=400, param="tools"), "openai_bad_request_tools"),
+        (FakeOpenAIException(status_code=400, body={"param": "tool_choice"}), "openai_bad_request_tools"),
+        (
+            FakeOpenAIException(
+                status_code=400,
+                body={"error": {"code": "invalid_json_schema", "type": "invalid_request_error"}},
+            ),
+            "openai_bad_request_json_schema",
+        ),
+    ],
+)
+def test_classifies_openai_bad_request_safe_structured_subcodes(exc: Exception, expected: str) -> None:
+    assert runner.classify_openai_responses_create_exception(exc) == expected
+
+
+def test_bad_request_message_fields_are_ignored_and_never_rendered(monkeypatch) -> None:
+    _patch_restricted_run(monkeypatch, call_openai=True, catch_openai_error=True)
+    raw_error_message = "raw OpenAI error message mentions model reasoning schema tools input"
+    exc = FakeOpenAIException(
+        raw_error_message,
+        status_code=400,
+        body={
+            "message": raw_error_message,
+            "error": {
+                "code": "invalid_request_error",
+                "type": "invalid_request_error",
+                "message": raw_error_message,
+            },
+        },
+    )
+    factory = RaisingFactory(exc)
+
+    assert runner.classify_openai_responses_create_exception(exc) == "openai_bad_request"
+
+    result = _run(live_client_factory=factory)
+    text = runner.render_json(result.report)
+
+    assert result.exit_code == 1
+    assert result.report["checks_failed"] == ["openai_bad_request"]
+    assert raw_error_message not in text
 
 
 def test_classified_failure_output_omits_raw_exception_response_prompt_key_and_db(monkeypatch) -> None:
