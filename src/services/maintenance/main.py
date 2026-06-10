@@ -24,6 +24,7 @@ from .delivery_gate_preflight import (
     load_delivery_gate_preflight_report,
     run_delivery_gate_preflight,
 )
+from .delivery_gate_preflight_invocation import run_delivery_gate_preflight_invocation_proof
 from .mvp_readiness import run_restricted_live_mvp_readiness
 from .redis_streams import RedisStreamConsumer
 from .repositories import MaintenanceRepository
@@ -113,6 +114,15 @@ def build_parser() -> argparse.ArgumentParser:
     gate_preflight.add_argument("--operator-review-passed", action="store_true")
     gate_preflight.add_argument("--output", default="json")
     gate_preflight.add_argument("--env-file")
+
+    gate_preflight_invocation = subcommands.add_parser("delivery-gate-preflight-invocation-proof")
+    gate_preflight_invocation.add_argument("--mode", required=True)
+    gate_preflight_invocation.add_argument("--operator-review-passed", action="store_true")
+    gate_preflight_invocation.add_argument("--output", default="json")
+    gate_preflight_invocation.add_argument(
+        "--require-gate-status",
+        choices=["pass", "warn", "fail"],
+    )
 
     mvp = subcommands.add_parser("mvp-readiness")
     mvp.add_argument("--mode", choices=["restricted"], required=True)
@@ -812,6 +822,13 @@ async def _run(argv: list[str] | None = None) -> int:
         return await _run_db_shape_preflight(args)
     if command == "delivery-gate-preflight":
         return await _run_delivery_gate_preflight(args)
+    if command == "delivery-gate-preflight-invocation-proof":
+        return await run_delivery_gate_preflight_invocation_proof(
+            mode=args.mode,
+            output=args.output,
+            require_gate_status=args.require_gate_status,
+            operator_review_passed=args.operator_review_passed,
+        )
     runtime_env_overlay: dict[str, str] | None = None
     if _one_shot_command_uses_explicit_env_file(command, args):
         try:
