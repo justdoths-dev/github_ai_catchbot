@@ -71,10 +71,28 @@ REQUIRED_OUTPUT_KEYS = (
     "model_confidence_band",
 )
 REQUIRED_SCORE_KEYS = (
-    "evidence_strength",
     "novelty",
-    "implementation_signal",
-    "urgency",
+    "practical_usefulness",
+    "evidence_strength",
+    "hype_penalty",
+    "confidence",
+    "code_quality",
+    "maintenance_signal",
+    "specificity",
+    "reproducibility_signal",
+)
+REQUIRED_INTEGER_SCORE_KEYS = (
+    "novelty",
+    "practical_usefulness",
+    "evidence_strength",
+    "hype_penalty",
+    "confidence",
+)
+OPTIONAL_NULLABLE_SCORE_KEYS = (
+    "code_quality",
+    "maintenance_signal",
+    "specificity",
+    "reproducibility_signal",
 )
 SAFE_EXCEPTION_MESSAGES = {
     "judge_output_payload_mismatch",
@@ -389,10 +407,15 @@ def build_fake_judge_output_payload(bundle: BundleContext) -> dict[str, Any]:
         ),
         "comparables": [],
         "scores": {
-            "evidence_strength": 0.62,
-            "novelty": 0.41,
-            "implementation_signal": 0.58,
-            "urgency": 0.32,
+            "novelty": 41,
+            "practical_usefulness": 58,
+            "evidence_strength": 62,
+            "hype_penalty": 20,
+            "confidence": 55,
+            "code_quality": 58,
+            "maintenance_signal": 57,
+            "specificity": None,
+            "reproducibility_signal": None,
         },
         "reason_codes": [
             "github_repo_fixture_evidence",
@@ -424,8 +447,14 @@ def structured_output_schema_valid(payload: Mapping[str, Any]) -> bool:
     scores = payload.get("scores")
     if not isinstance(scores, Mapping) or set(scores) != set(REQUIRED_SCORE_KEYS):
         return False
-    if not all(isinstance(scores[key], float) and 0 <= scores[key] <= 1 for key in REQUIRED_SCORE_KEYS):
-        return False
+    for key in REQUIRED_INTEGER_SCORE_KEYS:
+        value = scores.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 100:
+            return False
+    for key in OPTIONAL_NULLABLE_SCORE_KEYS:
+        value = scores.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 100):
+            return False
     for key in (
         "comparables",
         "reason_codes",

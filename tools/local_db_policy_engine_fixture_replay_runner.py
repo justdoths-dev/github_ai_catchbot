@@ -459,20 +459,16 @@ def build_material_change_hash(
 
 def build_policy_scores(payload: Mapping[str, Any]) -> dict[str, int]:
     raw_scores = payload.get("scores") if isinstance(payload.get("scores"), Mapping) else {}
-    implementation_signal = _score(raw_scores, "implementation_signal")
-    novelty = _score(raw_scores, "novelty")
     return {
-        "novelty": novelty,
-        "practical_usefulness": _score(raw_scores, "practical_usefulness", fallback=implementation_signal),
+        "novelty": _score(raw_scores, "novelty"),
+        "practical_usefulness": _score(raw_scores, "practical_usefulness"),
         "evidence_strength": _score(raw_scores, "evidence_strength"),
         "hype_penalty": _score(raw_scores, "hype_penalty"),
         "confidence": _score(raw_scores, "confidence", fallback=_confidence_band_score(payload.get("model_confidence_band"))),
-        "code_quality": _score(raw_scores, "code_quality", fallback=implementation_signal),
-        "maintenance_signal": _score(raw_scores, "maintenance_signal", fallback=implementation_signal),
-        "specificity": _score(raw_scores, "specificity", fallback=novelty),
-        "reproducibility_signal": _score(raw_scores, "reproducibility_signal", fallback=implementation_signal),
-        "implementation_signal": implementation_signal,
-        "urgency": _score(raw_scores, "urgency"),
+        "code_quality": _score(raw_scores, "code_quality"),
+        "maintenance_signal": _score(raw_scores, "maintenance_signal"),
+        "specificity": _score(raw_scores, "specificity"),
+        "reproducibility_signal": _score(raw_scores, "reproducibility_signal"),
     }
 
 

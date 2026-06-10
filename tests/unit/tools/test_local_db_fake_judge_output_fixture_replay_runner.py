@@ -274,6 +274,12 @@ def test_fake_judge_output_payload_has_required_judge_output_v1_fields() -> None
     assert payload["headline"] == "example/example-tool"
     assert payload["model_proposed_verdict"] == "later"
     assert payload["model_confidence_band"] == "medium"
+    assert set(payload["scores"]) == set(runner.REQUIRED_SCORE_KEYS)
+    assert payload["scores"]["practical_usefulness"] == 58
+    assert payload["scores"]["code_quality"] == 58
+    assert payload["scores"]["specificity"] is None
+    assert "implementation_signal" not in payload["scores"]
+    assert "urgency" not in payload["scores"]
     assert runner.structured_output_schema_valid(payload)
 
 

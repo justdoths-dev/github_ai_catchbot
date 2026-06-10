@@ -70,8 +70,30 @@ REQUIRED_OUTPUT_KEYS = (
     "model_confidence_band",
 )
 REQUIRED_SCORE_KEYS = (
-    "evidence_strength",
     "novelty",
+    "practical_usefulness",
+    "evidence_strength",
+    "hype_penalty",
+    "confidence",
+    "code_quality",
+    "maintenance_signal",
+    "specificity",
+    "reproducibility_signal",
+)
+REQUIRED_INTEGER_SCORE_KEYS = (
+    "novelty",
+    "practical_usefulness",
+    "evidence_strength",
+    "hype_penalty",
+    "confidence",
+)
+OPTIONAL_NULLABLE_SCORE_KEYS = (
+    "code_quality",
+    "maintenance_signal",
+    "specificity",
+    "reproducibility_signal",
+)
+LEGACY_OPTIONAL_SCORE_KEYS = (
     "implementation_signal",
     "urgency",
 )
@@ -427,10 +449,29 @@ def validate_judge_output_v1_payload(payload: Mapping[str, Any]) -> tuple[bool, 
             if key not in scores:
                 failures.append(f"scores.{key}:missing")
                 continue
+        for key in REQUIRED_INTEGER_SCORE_KEYS:
+            if key not in scores:
+                continue
+            value = scores.get(key)
+            if isinstance(value, bool) or not isinstance(value, Real):
+                failures.append(f"scores.{key}:not_numeric")
+            elif value < 0 or value > 100:
+                failures.append(f"scores.{key}:out_of_range")
+        for key in OPTIONAL_NULLABLE_SCORE_KEYS:
+            value = scores.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, Real):
+                failures.append(f"scores.{key}:not_numeric")
+            elif value < 0 or value > 100:
+                failures.append(f"scores.{key}:out_of_range")
+        for key in LEGACY_OPTIONAL_SCORE_KEYS:
+            if key not in scores:
+                continue
             value = scores[key]
             if isinstance(value, bool) or not isinstance(value, Real):
                 failures.append(f"scores.{key}:not_numeric")
-            elif value < 0 or value > 1:
+            elif value < 0 or value > 100:
                 failures.append(f"scores.{key}:out_of_range")
 
     return not failures, tuple(failures)

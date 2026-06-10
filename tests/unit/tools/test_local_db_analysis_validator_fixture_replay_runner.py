@@ -283,6 +283,19 @@ def test_judge_output_v1_schema_helper_accepts_prior_fake_payload() -> None:
 
     assert ok is True
     assert failures == ()
+    assert "implementation_signal" not in payload["scores"]
+    assert "urgency" not in payload["scores"]
+
+
+def test_schema_helper_accepts_optional_legacy_scores_without_requiring_them() -> None:
+    payload = _fake_payload()
+    payload["scores"]["implementation_signal"] = 58
+    payload["scores"]["urgency"] = 32
+
+    ok, failures = runner.validate_judge_output_v1_payload(payload)
+
+    assert ok is True
+    assert failures == ()
 
 
 def test_schema_helper_accepts_skip_model_proposed_verdict() -> None:
@@ -325,14 +338,24 @@ def test_schema_helper_rejects_missing_required_fields() -> None:
     assert "missing:headline" in failures
 
 
-def test_schema_helper_rejects_score_outside_zero_to_one() -> None:
+def test_schema_helper_rejects_missing_locked_required_score() -> None:
     payload = _fake_payload()
-    payload["scores"]["urgency"] = 1.1
+    del payload["scores"]["practical_usefulness"]
 
     ok, failures = runner.validate_judge_output_v1_payload(payload)
 
     assert ok is False
-    assert "scores.urgency:out_of_range" in failures
+    assert "scores.practical_usefulness:missing" in failures
+
+
+def test_schema_helper_rejects_score_outside_zero_to_hundred() -> None:
+    payload = _fake_payload()
+    payload["scores"]["hype_penalty"] = 101
+
+    ok, failures = runner.validate_judge_output_v1_payload(payload)
+
+    assert ok is False
+    assert "scores.hype_penalty:out_of_range" in failures
 
 
 def test_semantic_validator_rejects_candidate_group_mismatch() -> None:

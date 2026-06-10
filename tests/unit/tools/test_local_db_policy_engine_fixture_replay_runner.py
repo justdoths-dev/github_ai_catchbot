@@ -259,6 +259,35 @@ def test_deterministic_verdict_policy_returns_later_for_fake_judge_payload() -> 
     assert scores["practical_usefulness"] == 58
     assert scores["confidence"] == 55
     assert scores["code_quality"] == 58
+    assert "implementation_signal" not in scores
+    assert "urgency" not in scores
+
+
+def test_deterministic_verdict_policy_ignores_legacy_scores_when_present() -> None:
+    payload = _fake_payload()
+    payload["scores"].update(
+        {
+            "practical_usefulness": 10,
+            "evidence_strength": 10,
+            "confidence": 10,
+            "code_quality": 100,
+            "implementation_signal": 100,
+            "urgency": 100,
+        }
+    )
+
+    verdict, reason_codes, scores = runner.evaluate_verdict_policy(
+        payload=payload,
+        current_primary_artifact_type="github_repo",
+    )
+
+    assert verdict == "skip"
+    assert reason_codes == ["policy_threshold_skip"]
+    assert scores["practical_usefulness"] == 10
+    assert scores["evidence_strength"] == 10
+    assert scores["confidence"] == 10
+    assert "implementation_signal" not in scores
+    assert "urgency" not in scores
 
 
 def test_deterministic_delivery_policy_returns_fixture_default_send_now() -> None:
