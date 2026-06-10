@@ -166,7 +166,7 @@ def _delivery_gate_reason_codes(delivery_gate_report: DeliveryGateReportV1) -> d
         elif metric.metric_name == "success_rate_24h":
             reason_by_metric[metric.metric_name] = "delivery_gate_24h_success_rate_below_threshold"
         elif metric.metric_name == "replay_guard_reject_count_24h":
-            reason_by_metric[metric.metric_name] = "delivery_gate_prod_replay_guard_rejects_present"
+            reason_by_metric[metric.metric_name] = "delivery_gate_replay_guard_rejects_present"
         elif metric.metric_name == "retry_ceiling_exceeded_count_24h":
             reason_by_metric[metric.metric_name] = "delivery_gate_retry_ceiling_exceeded_rows_present"
         elif metric.metric_name == "oldest_delivery_dlq_age_sec":

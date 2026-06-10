@@ -92,6 +92,9 @@ async def test_restricted_gate_passes_on_healthy_snapshot() -> None:
     }
     assert repository.load_count == 1
     assert [metric.metric_name for metric in report.metrics] == [
+        "enable_notification_send",
+        "notifier_telegram_dry_run",
+        "maintenance_retry_promotion",
         "success_rate_1h",
         "high_source_to_delivery_p95_sec",
         "due_retry_oldest_lag_sec",
@@ -112,17 +115,21 @@ async def test_restricted_gate_fails_on_open_dlq() -> None:
 
 
 @pytest.mark.asyncio
-async def test_restricted_gate_does_not_treat_runtime_flags_as_hot_path_policy() -> None:
+async def test_restricted_gate_fails_closed_on_runtime_flags() -> None:
     report = await DeliveryGateRunner(
         _config(send_enabled=False, dry_run=True, retry_promotion_enabled=False),
         repository=FakeGateRepository(_snapshot()),
     ).run(mode="restricted")
 
-    assert report.gate_status == "pass"
-    assert report.blocking_reason_codes == []
+    assert report.gate_status == "fail"
+    assert report.blocking_reason_codes == [
+        "delivery_gate_flag_send_disabled",
+        "delivery_gate_dry_run_enabled",
+        "delivery_gate_retry_promotion_disabled",
+    ]
     assert report.recommended_flag_patch == {
-        "ENABLE_NOTIFICATION_SEND": True,
-        "MAINTENANCE_ENABLE_NOTIFICATION_RETRY_PROMOTION": True,
+        "ENABLE_NOTIFICATION_SEND": False,
+        "MAINTENANCE_ENABLE_NOTIFICATION_RETRY_PROMOTION": False,
         "NOTIFIER_TELEGRAM_DRY_RUN": False,
     }
 
@@ -137,6 +144,9 @@ async def test_full_gate_warns_when_only_operator_review_is_missing() -> None:
     assert report.operator_review_required is True
     assert report.operator_review_passed is None
     assert [metric.metric_name for metric in report.metrics] == [
+        "enable_notification_send",
+        "notifier_telegram_dry_run",
+        "maintenance_retry_promotion",
         "success_rate_1h",
         "high_source_to_delivery_p95_sec",
         "due_retry_oldest_lag_sec",
@@ -197,7 +207,7 @@ async def test_full_gate_fails_on_replay_guard_rejects_or_retry_ceiling_rows() -
 
     assert report.gate_status == "fail"
     assert report.blocking_reason_codes == [
-        "delivery_gate_prod_replay_guard_rejects_present",
+        "delivery_gate_replay_guard_rejects_present",
         "delivery_gate_retry_ceiling_exceeded_rows_present",
     ]
 

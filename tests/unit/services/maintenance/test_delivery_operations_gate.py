@@ -81,6 +81,9 @@ async def test_restricted_gate_passes_minimal_healthy_snapshot() -> None:
     assert report.blocking_reason_codes == []
     assert report.warning_reason_codes == []
     assert [metric.metric_name for metric in report.metrics] == [
+        "enable_notification_send",
+        "notifier_telegram_dry_run",
+        "maintenance_retry_promotion",
         "success_rate_1h",
         "high_source_to_delivery_p95_sec",
         "due_retry_oldest_lag_sec",
@@ -308,7 +311,7 @@ async def test_full_gate_fails_on_replay_guard_rejects() -> None:
     ).run(mode="full", operator_review_passed=True)
 
     assert report.gate_status == "fail"
-    assert report.blocking_reason_codes == ["delivery_gate_prod_replay_guard_rejects_present"]
+    assert report.blocking_reason_codes == ["delivery_gate_replay_guard_rejects_present"]
 
 
 @pytest.mark.asyncio
@@ -332,6 +335,9 @@ async def test_full_gate_uses_stable_metric_and_reason_order() -> None:
     ).run(mode="full")
 
     assert [metric.metric_name for metric in report.metrics] == [
+        "enable_notification_send",
+        "notifier_telegram_dry_run",
+        "maintenance_retry_promotion",
         "success_rate_1h",
         "high_source_to_delivery_p95_sec",
         "due_retry_oldest_lag_sec",
@@ -350,7 +356,7 @@ async def test_full_gate_uses_stable_metric_and_reason_order() -> None:
         "delivery_gate_open_dlq_present",
         "delivery_gate_unexpected_send_disabled_rows_present",
         "delivery_gate_24h_success_rate_below_threshold",
-        "delivery_gate_prod_replay_guard_rejects_present",
+        "delivery_gate_replay_guard_rejects_present",
         "delivery_gate_retry_ceiling_exceeded_rows_present",
         "delivery_gate_delivery_dlq_oldest_age_too_high",
     ]
