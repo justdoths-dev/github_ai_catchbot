@@ -33,7 +33,35 @@ ALLOWED_OPENAI_REQUEST_TOP_LEVEL_KEYS = frozenset(
 )
 DEFAULT_MAX_OUTPUT_TOKENS = 800
 HARD_MAX_OUTPUT_TOKENS = 1200
+OPENAI_STRUCTURED_OUTPUT_MAX_OBJECT_DEPTH = 10
+OPENAI_STRUCTURED_OUTPUT_MAX_PROPERTY_COUNT = 5000
+OPENAI_SCHEMA_SUBSET_ISSUE_SAMPLE_LIMIT = 20
 OPENAI_REQUEST_DIAGNOSTIC_CAPTURED = "openai_request_diagnostic_captured"
+OPENAI_STRUCTURED_OUTPUT_SCHEMA_KEYWORDS = frozenset(
+    {
+        "$defs",
+        "$ref",
+        "additionalProperties",
+        "anyOf",
+        "const",
+        "description",
+        "enum",
+        "exclusiveMaximum",
+        "exclusiveMinimum",
+        "format",
+        "items",
+        "maxItems",
+        "maximum",
+        "minItems",
+        "minimum",
+        "multipleOf",
+        "pattern",
+        "properties",
+        "required",
+        "title",
+        "type",
+    }
+)
 FORBIDDEN_LIVE_REQUEST_TOKENS = tuple(
     dict.fromkeys(
         (
@@ -628,6 +656,7 @@ def build_sanitized_openai_request_diagnostic(
     input_items = request.get("input")
     reasoning = _mapping(request.get("reasoning"))
     max_output_value = request.get("max_output_tokens")
+    schema_subset_issues = validate_openai_structured_output_schema_subset(schema)
 
     unsupported_top_level_keys = set(request) - ALLOWED_OPENAI_REQUEST_TOP_LEVEL_KEYS
     diagnostic: dict[str, Any] = {
@@ -658,8 +687,145 @@ def build_sanitized_openai_request_diagnostic(
         "json_schema_top_level_keys": _diagnostic_key_list(schema.keys()),
         "json_schema_required_count": len(required) if isinstance(required, list) else None,
         "json_schema_property_keys": _diagnostic_key_list(properties.keys()),
+        "json_schema_subset_issue_count": len(schema_subset_issues),
+        "json_schema_subset_issue_codes": _diagnostic_key_list(
+            issue.get("issue_code") for issue in schema_subset_issues
+        ),
+        "json_schema_subset_issues": schema_subset_issues[:OPENAI_SCHEMA_SUBSET_ISSUE_SAMPLE_LIMIT],
     }
     return diagnostic
+
+
+def validate_openai_structured_output_schema_subset(schema: Mapping[str, Any]) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    object_property_count = 0
+
+    def add_issue(issue_code: str, schema_path: str, *, key: Any | None = None) -> None:
+        issue: dict[str, Any] = {
+            "issue_code": issue_code,
+            "schema_path": schema_path,
+        }
+        if key is not None:
+            issue["key"] = _diagnostic_key_name(key)
+        issues.append(issue)
+
+    def visit(node: Any, path: str, *, object_depth: int, root: bool = False, property_key: Any | None = None) -> None:
+        nonlocal object_property_count
+        if not isinstance(node, Mapping):
+            if root:
+                add_issue("root_not_object", path)
+            return
+
+        for raw_key in sorted(node, key=str):
+            if raw_key not in OPENAI_STRUCTURED_OUTPUT_SCHEMA_KEYWORDS:
+                add_issue(
+                    "unsupported_schema_keyword",
+                    _schema_path_join(path, raw_key),
+                    key=raw_key,
+                )
+
+        if root:
+            if node.get("type") != "object":
+                add_issue("root_not_object", path)
+            if "anyOf" in node:
+                add_issue("root_anyof_disallowed", path)
+
+        if not root and "type" not in node and "anyOf" not in node and "$ref" not in node:
+            add_issue("property_missing_type", path, key=property_key)
+
+        schema_types = _schema_type_names(node.get("type"))
+        if "object" in schema_types:
+            current_object_depth = object_depth + 1
+            if current_object_depth > OPENAI_STRUCTURED_OUTPUT_MAX_OBJECT_DEPTH:
+                add_issue("excessive_nesting_depth_candidate", path)
+
+            properties = node.get("properties")
+            required = node.get("required")
+
+            if "properties" not in node:
+                add_issue("object_missing_properties", path)
+                property_items: list[tuple[Any, Any]] = []
+            elif not isinstance(properties, Mapping):
+                add_issue("properties_not_object", _schema_path_join(path, "properties"))
+                property_items = []
+            else:
+                object_property_count += len(properties)
+                property_items = sorted(properties.items(), key=lambda item: str(item[0]))
+
+            required_names: set[str] | None
+            if "required" not in node:
+                add_issue("object_missing_required", path)
+                required_names = None
+            elif not isinstance(required, list) or not all(isinstance(item, str) for item in required):
+                add_issue("required_not_list", _schema_path_join(path, "required"))
+                required_names = None
+            else:
+                required_names = set(required)
+
+            if node.get("additionalProperties") is not False:
+                add_issue("object_missing_additional_properties_false", path)
+
+            if isinstance(properties, Mapping) and required_names is not None:
+                property_names = {str(name) for name in properties}
+                for missing_required in sorted(property_names - required_names):
+                    add_issue(
+                        "required_property_mismatch",
+                        _schema_path_join(path, "required"),
+                        key=missing_required,
+                    )
+                for unknown_required in sorted(required_names - property_names):
+                    add_issue(
+                        "required_property_mismatch",
+                        _schema_path_join(path, "required"),
+                        key=unknown_required,
+                    )
+
+            for child_key, child_schema in property_items:
+                visit(
+                    child_schema,
+                    _schema_path_join(path, "properties", child_key),
+                    object_depth=current_object_depth,
+                    property_key=child_key,
+                )
+
+        if "array" in schema_types:
+            if "items" not in node:
+                add_issue("array_missing_items", path, key=property_key)
+            else:
+                visit(
+                    node.get("items"),
+                    _schema_path_join(path, "items"),
+                    object_depth=object_depth,
+                )
+
+        any_of = node.get("anyOf")
+        if isinstance(any_of, list):
+            for index, candidate in enumerate(any_of):
+                visit(
+                    candidate,
+                    _schema_path_join(path, "anyOf", index),
+                    object_depth=object_depth,
+                )
+
+        defs = node.get("$defs")
+        if isinstance(defs, Mapping):
+            for definition_name, definition_schema in sorted(defs.items(), key=lambda item: str(item[0])):
+                visit(
+                    definition_schema,
+                    _schema_path_join(path, "$defs", definition_name),
+                    object_depth=object_depth,
+                    property_key=definition_name,
+                )
+
+    visit(schema, "", object_depth=0, root=True)
+    if object_property_count > OPENAI_STRUCTURED_OUTPUT_MAX_PROPERTY_COUNT:
+        issues.append(
+            {
+                "issue_code": "excessive_property_count_candidate",
+                "schema_path": "",
+            }
+        )
+    return issues
 
 
 def _input_item_diagnostics(input_items: Any) -> list[dict[str, Any]]:
@@ -758,6 +924,23 @@ def _diagnostic_scalar(value: Any) -> str | None:
 
 def _diagnostic_reasoning_effort(value: Any) -> str | None:
     return value if isinstance(value, str) and value in ALLOWED_REASONING_EFFORTS else None
+
+
+def _schema_type_names(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, list):
+        return {item for item in value if isinstance(item, str)}
+    return set()
+
+
+def _schema_path_join(path: str, *segments: Any) -> str:
+    suffix = "".join(f"/{_json_pointer_escape(_diagnostic_key_name(segment))}" for segment in segments)
+    return f"{path}{suffix}"
+
+
+def _json_pointer_escape(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
 
 
 def _positive_int(value: Any) -> bool:

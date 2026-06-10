@@ -467,6 +467,9 @@ def test_sanitized_openai_request_diagnostic_reports_schema_structure_without_de
     assert "description" in diagnostic["json_schema_top_level_keys"]
     assert diagnostic["json_schema_required_count"] == len(runner.restricted_runner.REQUIRED_OUTPUT_KEYS)
     assert diagnostic["json_schema_property_keys"] == sorted(runner.restricted_runner.REQUIRED_OUTPUT_KEYS)
+    assert diagnostic["json_schema_subset_issue_count"] == 0
+    assert diagnostic["json_schema_subset_issue_codes"] == []
+    assert diagnostic["json_schema_subset_issues"] == []
     assert RAW_SCHEMA_DESCRIPTION not in text
 
 
@@ -484,6 +487,119 @@ def test_sanitized_openai_request_diagnostic_detects_unsupported_top_level_keys_
     assert diagnostic["unsupported_top_level_key_count"] == 1
     assert "unsupported_unit_key" in diagnostic["top_level_keys"]
     assert RAW_EVIDENCE_TEXT not in text
+
+
+def test_structured_output_subset_validator_accepts_valid_minimal_schema() -> None:
+    assert runner.validate_openai_structured_output_schema_subset(_minimal_openai_schema()) == []
+
+
+def test_structured_output_subset_validator_flags_nested_object_missing_additional_properties_false() -> None:
+    schema = _minimal_openai_schema(
+        {
+            "child": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string"}},
+            }
+        }
+    )
+
+    issues = runner.validate_openai_structured_output_schema_subset(schema)
+
+    assert {
+        "issue_code": "object_missing_additional_properties_false",
+        "schema_path": "/properties/child",
+    } in issues
+
+
+def test_structured_output_subset_validator_flags_nested_required_property_mismatch() -> None:
+    schema = _minimal_openai_schema(
+        {
+            "child": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["name"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "age": {"type": "integer"},
+                },
+            }
+        }
+    )
+
+    issues = runner.validate_openai_structured_output_schema_subset(schema)
+
+    assert {
+        "issue_code": "required_property_mismatch",
+        "schema_path": "/properties/child/required",
+        "key": "age",
+    } in issues
+
+
+def test_structured_output_subset_validator_flags_property_missing_type() -> None:
+    schema = _minimal_openai_schema({"name": {"description": RAW_SCHEMA_DESCRIPTION}})
+
+    issues = runner.validate_openai_structured_output_schema_subset(schema)
+
+    assert {
+        "issue_code": "property_missing_type",
+        "schema_path": "/properties/name",
+        "key": "name",
+    } in issues
+
+
+def test_structured_output_subset_validator_flags_array_missing_items() -> None:
+    schema = _minimal_openai_schema({"tags": {"type": "array"}})
+
+    issues = runner.validate_openai_structured_output_schema_subset(schema)
+
+    assert {
+        "issue_code": "array_missing_items",
+        "schema_path": "/properties/tags",
+        "key": "tags",
+    } in issues
+
+
+def test_structured_output_subset_validator_flags_root_anyof() -> None:
+    schema = _minimal_openai_schema()
+    schema["anyOf"] = [_minimal_openai_schema()]
+
+    issues = runner.validate_openai_structured_output_schema_subset(schema)
+
+    assert {
+        "issue_code": "root_anyof_disallowed",
+        "schema_path": "",
+    } in issues
+
+
+def test_structured_output_subset_validator_flags_unsupported_keywords_without_leaking_descriptions() -> None:
+    schema = _minimal_openai_schema(
+        {
+            "name": {
+                "type": "string",
+                "description": RAW_SCHEMA_DESCRIPTION,
+                "default": RAW_SCHEMA_DESCRIPTION,
+            }
+        }
+    )
+
+    issues = runner.validate_openai_structured_output_schema_subset(schema)
+    text = runner.render_json({"issues": issues})
+
+    assert {
+        "issue_code": "unsupported_schema_keyword",
+        "schema_path": "/properties/name/default",
+        "key": "default",
+    } in issues
+    assert RAW_SCHEMA_DESCRIPTION not in text
+
+
+def test_real_openai_request_schema_matches_local_structured_output_subset() -> None:
+    schema = _openai_request()["text"]["format"]["schema"]
+
+    issues = runner.validate_openai_structured_output_schema_subset(schema)
+
+    assert issues == []
 
 
 def test_diagnostic_flag_captures_request_without_live_authority_api_key_or_client(monkeypatch) -> None:
@@ -695,6 +811,16 @@ def _openai_request() -> dict[str, object]:
         judge_run=_judge_run(),
         bundle=_bundle_context(),
     )
+
+
+def _minimal_openai_schema(properties: dict[str, object] | None = None) -> dict[str, object]:
+    schema_properties = properties if properties is not None else {"name": {"type": "string"}}
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": list(schema_properties),
+        "properties": schema_properties,
+    }
 
 
 def _judge_run() -> runner.restricted_runner.JudgeRunRecord:
