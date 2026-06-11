@@ -166,18 +166,22 @@ class NotifierTelegramService:
                 transport_error_code=action.reason_code or "notification_noop",
             )
         if _should_terminal_duplicate_noop(plan_row, transport_enabled=self._config.transport_enabled):
-            await self._transition(
-                intent,
-                to_state=str(plan_row.get("status")),
-                reason_code="notification_duplicate_terminal_noop",
+            has_delivery_record = await self._repository.count_delivery_attempts(
+                notification_plan_id=intent.notification_plan_id
             )
-            return DeliveryResult(
-                delivery_status=str(plan_row.get("status")),  # type: ignore[arg-type]
-                telegram_chat_id=intent.target_chat_id,
-                telegram_message_id=None,
-                attempt_count=0,
-                transport_error_code="notification_duplicate_terminal_noop",
-            )
+            if _is_delivered_plan_status(plan_row) or has_delivery_record > 0:
+                await self._transition(
+                    intent,
+                    to_state=str(plan_row.get("status")),
+                    reason_code="notification_duplicate_terminal_noop",
+                )
+                return DeliveryResult(
+                    delivery_status=str(plan_row.get("status")),  # type: ignore[arg-type]
+                    telegram_chat_id=intent.target_chat_id,
+                    telegram_message_id=None,
+                    attempt_count=0,
+                    transport_error_code="notification_duplicate_terminal_noop",
+                )
 
         render = self._renderer.render(
             notification_plan_id=intent.notification_plan_id,
@@ -496,6 +500,12 @@ def _should_terminal_duplicate_noop(plan_row: dict | None, *, transport_enabled:
     if status in {"suppressed", "failed_terminal"} and not transport_enabled:
         return True
     return False
+
+
+def _is_delivered_plan_status(plan_row: dict | None) -> bool:
+    if plan_row is None:
+        return False
+    return str(plan_row.get("status") or "") in {"sent", "edited"}
 
 
 def _edit_window_exceeded(created_at: datetime, edit_window_minutes: int) -> bool:
