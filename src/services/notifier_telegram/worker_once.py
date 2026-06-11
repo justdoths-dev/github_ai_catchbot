@@ -1,0 +1,359 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
+from typing import Any, Protocol
+from uuid import UUID
+
+from .config import NotifierTelegramConfig, NotifierTelegramConfigurationError
+from .models import StreamMessage
+from .redis_streams import RedisStreamConsumer
+from .repositories import NotifierTelegramRepository
+from .service import NotifierTelegramService
+from .telegram_client import TelegramBotClient
+from .worker import NotifierTelegramWorker, RedisStreamConsumerProtocol
+
+SCHEMA_VERSION = "notifier_worker_once_invocation_v1"
+EXPECTED_QUEUE_NAME = "q.notification.send"
+EXPECTED_STAGE_NAME = "notify"
+EXPECTED_ROOT_OBJECT_TYPE = "analysis"
+REQUIRED_THIN_QUEUE_FIELDS = (
+    "job_id",
+    "stage_name",
+    "root_object_type",
+    "root_object_id",
+    "idempotency_key",
+    "pipeline_run_id",
+    "not_before",
+    "trigger_event_id",
+)
+_FORBIDDEN_FIELD_NAMES = {
+    "payload_json",
+    "database_url",
+    "redis_url",
+    "telegram_bot_token",
+    "openai_api_key",
+    "github_token",
+}
+_FORBIDDEN_FIELD_MARKERS = ("password", "secret", "token", "credential", "api_key", "url")
+
+
+class TriggerServiceProtocol(Protocol):
+    async def handle_trigger_event(self, trigger_event_id: str): ...
+
+
+class WorkerOnceRuntimeBuilder(Protocol):
+    async def __call__(
+        self,
+        config: NotifierTelegramConfig,
+        state: "WorkerOnceRuntimeState",
+        logger: logging.Logger,
+    ) -> "WorkerOnceRuntime": ...
+
+
+class WorkerBuilder(Protocol):
+    def __call__(
+        self,
+        config: NotifierTelegramConfig,
+        *,
+        consumer: RedisStreamConsumerProtocol,
+        service: TriggerServiceProtocol,
+        logger: logging.Logger | None = None,
+    ) -> Any: ...
+
+
+@dataclass(slots=True)
+class WorkerOnceRuntimeState:
+    redis_read: bool = False
+    redis_ack: bool = False
+    database_session_opened: bool = False
+
+
+@dataclass(slots=True)
+class WorkerOnceRuntime:
+    consumer: RedisStreamConsumerProtocol
+    service: TriggerServiceProtocol
+    dispose: Callable[[], Awaitable[None]]
+
+
+async def run_worker_once_invocation(
+    *,
+    queue: str | None,
+    confirm_worker_once: bool,
+    output_format: str | None,
+    emit_json=print,
+    config_loader: Callable[[], NotifierTelegramConfig] = NotifierTelegramConfig.from_env,
+    runtime_builder: WorkerOnceRuntimeBuilder | None = None,
+    worker_builder: WorkerBuilder = NotifierTelegramWorker,
+    logger: logging.Logger | None = None,
+) -> int:
+    state = WorkerOnceRuntimeState()
+    config: NotifierTelegramConfig | None = None
+    output = str(output_format or "")
+
+    if not confirm_worker_once:
+        emit_json(_to_json(_payload(status="rejected", reason_code="confirm_worker_once_required", state=state)))
+        return 2
+    if queue != EXPECTED_QUEUE_NAME:
+        emit_json(_to_json(_payload(status="rejected", reason_code="unsupported_queue", state=state, queue=queue)))
+        return 2
+    if output != "json":
+        emit_json(_to_json(_payload(status="rejected", reason_code="unsupported_format", state=state)))
+        return 2
+
+    try:
+        config = replace(config_loader(), queue_name=EXPECTED_QUEUE_NAME, batch_size=1)
+    except (NotifierTelegramConfigurationError, ValueError, TypeError):
+        emit_json(_to_json(_payload(status="failed", reason_code="runtime_config_error", state=state)))
+        return 1
+
+    builder = runtime_builder or build_default_worker_once_runtime
+    runtime: WorkerOnceRuntime | None = None
+    try:
+        runtime = await builder(config, state, logger or logging.getLogger(__name__))
+        messages = await runtime.consumer.read_batch()
+        state.redis_read = True
+        if not messages:
+            emit_json(
+                _to_json(
+                    _payload(
+                        status="empty",
+                        reason_code="no_message_available",
+                        state=state,
+                        config=config,
+                    )
+                )
+            )
+            return 0
+
+        if len(messages) != 1 or _malformed_message(messages[0]):
+            emit_json(
+                _to_json(
+                    _payload(
+                        status="rejected",
+                        reason_code="malformed_message",
+                        state=state,
+                        config=config,
+                        message=messages[0],
+                    )
+                )
+            )
+            return 2
+
+        tracked_service = _TrackedTriggerService(runtime.service)
+        single_message_consumer = _SingleMessageConsumer(messages[0], ack_delegate=runtime.consumer, state=state)
+        worker = worker_builder(
+            config,
+            consumer=single_message_consumer,
+            service=tracked_service,
+            logger=logger,
+        )
+        try:
+            await worker.run_once()
+        except Exception:
+            emit_json(
+                _to_json(
+                    _payload(
+                        status="failed",
+                        reason_code="handler_failed",
+                        state=state,
+                        config=config,
+                        message=messages[0],
+                        handler_called=tracked_service.handler_called,
+                    )
+                )
+            )
+            return 1
+
+        emit_json(
+            _to_json(
+                _payload(
+                    status="processed",
+                    reason_code="processed",
+                    state=state,
+                    config=config,
+                    message=messages[0],
+                    handler_called=tracked_service.handler_called,
+                )
+            )
+        )
+        return 0
+    except Exception:
+        emit_json(_to_json(_payload(status="failed", reason_code="runtime_config_error", state=state, config=config)))
+        return 1
+    finally:
+        if runtime is not None:
+            try:
+                await runtime.dispose()
+            except Exception:
+                pass
+
+
+async def build_default_worker_once_runtime(
+    config: NotifierTelegramConfig,
+    state: WorkerOnceRuntimeState,
+    logger: logging.Logger,
+) -> WorkerOnceRuntime:
+    from redis.asyncio import Redis  # type: ignore[import-not-found]
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
+
+    engine = create_async_engine(config.database_url, future=True)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    redis_client = Redis.from_url(config.redis_url, decode_responses=True)
+    consumer = RedisStreamConsumer(
+        redis_client,
+        queue_name=EXPECTED_QUEUE_NAME,
+        consumer_group=config.consumer_group,
+        consumer_name=config.consumer_name,
+        block_ms=config.block_ms,
+        batch_size=1,
+    )
+    telegram_client = TelegramBotClient(
+        bot_token=config.telegram_bot_token,
+        base_url=config.telegram_api_base_url,
+        timeout_sec=config.request_timeout_sec,
+    )
+
+    class SessionBackedService:
+        async def handle_trigger_event(self, trigger_event_id: str):
+            state.database_session_opened = True
+            async with session_factory.begin() as session:
+                repository = NotifierTelegramRepository(session)
+                service = NotifierTelegramService(
+                    config,
+                    repository=repository,
+                    telegram_client=telegram_client,
+                    logger=logger,
+                )
+                return await service.handle_trigger_event(trigger_event_id)
+
+    async def dispose() -> None:
+        close = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
+        if close is not None:
+            maybe_awaitable = close()
+            if asyncio.iscoroutine(maybe_awaitable):
+                await maybe_awaitable
+        await engine.dispose()
+
+    return WorkerOnceRuntime(consumer=consumer, service=SessionBackedService(), dispose=dispose)
+
+
+class _TrackedTriggerService:
+    def __init__(self, wrapped: TriggerServiceProtocol) -> None:
+        self._wrapped = wrapped
+        self.handler_called = False
+
+    async def handle_trigger_event(self, trigger_event_id: str):
+        self.handler_called = True
+        result = await self._wrapped.handle_trigger_event(trigger_event_id)
+        if result is None:
+            raise _HandlerReturnedNoResult()
+        return result
+
+
+class _HandlerReturnedNoResult(Exception):
+    pass
+
+
+class _SingleMessageConsumer:
+    def __init__(
+        self,
+        message: StreamMessage,
+        *,
+        ack_delegate: RedisStreamConsumerProtocol,
+        state: WorkerOnceRuntimeState,
+    ) -> None:
+        self._message = message
+        self._ack_delegate = ack_delegate
+        self._state = state
+        self._read = False
+
+    async def ensure_group(self) -> None:
+        return None
+
+    async def read_batch(self) -> list[StreamMessage]:
+        if self._read:
+            return []
+        self._read = True
+        return [self._message]
+
+    async def ack(self, message_id: str) -> None:
+        await self._ack_delegate.ack(message_id)
+        self._state.redis_ack = True
+
+
+def _malformed_message(message: StreamMessage) -> bool:
+    fields = message.fields
+    if message.stream != EXPECTED_QUEUE_NAME:
+        return True
+    if set(fields) != set(REQUIRED_THIN_QUEUE_FIELDS):
+        return True
+    if fields.get("stage_name") != EXPECTED_STAGE_NAME:
+        return True
+    if fields.get("root_object_type") != EXPECTED_ROOT_OBJECT_TYPE:
+        return True
+    if _uuid_or_none(fields.get("trigger_event_id")) is None:
+        return True
+    for field_name in fields:
+        normalized = field_name.strip().lower()
+        if normalized in _FORBIDDEN_FIELD_NAMES:
+            return True
+        if any(marker in normalized for marker in _FORBIDDEN_FIELD_MARKERS):
+            return True
+    for required_nonempty in ("job_id", "root_object_id", "idempotency_key"):
+        if not str(fields.get(required_nonempty) or "").strip():
+            return True
+    return False
+
+
+def _payload(
+    *,
+    status: str,
+    reason_code: str,
+    state: WorkerOnceRuntimeState,
+    queue: str | None = EXPECTED_QUEUE_NAME,
+    config: NotifierTelegramConfig | None = None,
+    message: StreamMessage | None = None,
+    handler_called: bool = False,
+) -> dict[str, Any]:
+    trigger_event_id = str((message.fields if message else {}).get("trigger_event_id") or "").strip()
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": status,
+        "reason_code": reason_code,
+        "queue": queue or "",
+        "message_seen": message is not None,
+        "handler_called": handler_called,
+        "acked": state.redis_ack,
+        "trigger_event_id_present": bool(trigger_event_id),
+        "authority": {
+            "telegram_transport_possible": bool(config and config.transport_enabled),
+            "redis_read": state.redis_read,
+            "redis_ack": state.redis_ack,
+            "database_session_opened": state.database_session_opened,
+            "workers_started": False,
+            "run_forever_started": False,
+            "openai_called": False,
+            "github_called": False,
+            "docker_or_systemd_called": False,
+            "subprocess_started": False,
+            "shell_invoked": False,
+            "env_file_mutated": False,
+            "feature_flags_applied": False,
+            "alembic_or_ddl_ran": False,
+        },
+    }
+
+
+def _uuid_or_none(value: object) -> UUID | None:
+    try:
+        return UUID(str(value or ""))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _to_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)

@@ -22,6 +22,7 @@ from .restricted_transport_canary import run_restricted_transport_canary
 from .service import NotifierTelegramService
 from .telegram_client import TelegramBotClient
 from .worker import NotifierTelegramWorker
+from .worker_once import run_worker_once_invocation
 
 CANARY_SCHEMA_VERSION = "notifier_one_shot_canary_v1"
 CANARY_PLAN_SCHEMA_VERSION = "notifier_canary_plan_created_v1"
@@ -78,6 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command")
 
     subcommands.add_parser("worker")
+
+    worker_once = subcommands.add_parser("worker-once")
+    worker_once.add_argument("--queue")
+    worker_once.add_argument("--confirm-worker-once", action="store_true")
+    worker_once.add_argument("--format", default="json")
 
     send_canary = subcommands.add_parser("send-canary")
     send_canary.add_argument("--notification-plan-id", required=True)
@@ -212,6 +218,15 @@ async def _run_restricted_transport_canary_command(args: argparse.Namespace, *, 
         target_chat_id=args.target_chat_id,
         message=args.message,
         confirm_send=args.confirm_send,
+        emit_json=emit_json,
+    )
+
+
+async def _run_worker_once_command(args: argparse.Namespace, *, emit_json=print) -> int:
+    return await run_worker_once_invocation(
+        queue=args.queue,
+        confirm_worker_once=args.confirm_worker_once,
+        output_format=args.format,
         emit_json=emit_json,
     )
 
@@ -890,6 +905,8 @@ async def _run(argv: list[str] | None = None) -> int:
     command = args.command or "worker"
     if command == "restricted-transport-canary":
         return await _run_restricted_transport_canary_command(args)
+    if command == "worker-once":
+        return await _run_worker_once_command(args)
     if command == "create-canary-plan":
         return await _run_create_canary_plan_command(args)
     if command == "send-canary":
