@@ -18,6 +18,7 @@ from .config import NotifierTelegramConfig, NotifierTelegramConfigurationError
 from .models import NotificationPlanDraft
 from .redis_streams import RedisStreamConsumer
 from .repositories import NotifierTelegramRepository
+from .restricted_transport_canary import run_restricted_transport_canary
 from .service import NotifierTelegramService
 from .telegram_client import TelegramBotClient
 from .worker import NotifierTelegramWorker
@@ -90,6 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
     create_canary_plan.add_argument("--operator-confirmed", action="store_true")
     create_canary_plan.add_argument("--env-file")
     create_canary_plan.add_argument("--format", choices=["json"], default="json")
+
+    restricted_transport_canary = subcommands.add_parser("restricted-transport-canary")
+    restricted_transport_canary.add_argument("--target-chat-id", required=True)
+    restricted_transport_canary.add_argument("--message", required=True)
+    restricted_transport_canary.add_argument("--confirm-send", action="store_true")
+    restricted_transport_canary.add_argument("--format", choices=["json"], default="json")
     return parser
 
 
@@ -196,6 +203,15 @@ async def _run_create_canary_plan_command(args: argparse.Namespace, *, emit_json
         config,
         source_notification_plan_id,
         canary_key,
+        emit_json=emit_json,
+    )
+
+
+async def _run_restricted_transport_canary_command(args: argparse.Namespace, *, emit_json=print) -> int:
+    return await run_restricted_transport_canary(
+        target_chat_id=args.target_chat_id,
+        message=args.message,
+        confirm_send=args.confirm_send,
         emit_json=emit_json,
     )
 
@@ -872,6 +888,8 @@ async def _run(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     command = args.command or "worker"
+    if command == "restricted-transport-canary":
+        return await _run_restricted_transport_canary_command(args)
     if command == "create-canary-plan":
         return await _run_create_canary_plan_command(args)
     if command == "send-canary":
