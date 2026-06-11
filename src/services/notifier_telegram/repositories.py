@@ -778,6 +778,101 @@ class NotifierTelegramRepository:
             "delivery_result_outbox_exists": outbox_result.first() is not None,
         }
 
+    async def load_restricted_live_worker_once_proof_verification(
+        self,
+        *,
+        notification_plan_id: UUID,
+    ) -> dict[str, Any]:
+        plan_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT status
+                FROM notification_plans
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        render_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM notification_renders
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        delivery_count_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM notification_delivery_records
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        delivery_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT delivery_status, attempt_count, transport_error_code,
+                       telegram_chat_id, telegram_message_id
+                FROM notification_delivery_records
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        transition_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT to_state, reason_code
+                FROM state_transitions
+                WHERE object_type = 'notification_plan'
+                  AND object_id = CAST(:notification_plan_id AS uuid)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        outbox_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT 1
+                FROM event_outbox
+                WHERE event_type = 'notification.delivery.result.v1'
+                  AND aggregate_type = 'notification_plan'
+                  AND aggregate_id = CAST(:notification_plan_id AS uuid)
+                LIMIT 1
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+
+        delivery_row = delivery_result.mappings().first()
+        transition_row = transition_result.mappings().first()
+        return {
+            "proof_plan_final_status": plan_result.scalar_one_or_none(),
+            "notification_render_count": int(render_result.scalar_one()),
+            "notification_delivery_record_count": int(delivery_count_result.scalar_one()),
+            "delivery_status": str(delivery_row["delivery_status"]) if delivery_row else None,
+            "attempt_count": int(delivery_row["attempt_count"]) if delivery_row else None,
+            "transport_error_code": (
+                str(delivery_row["transport_error_code"])
+                if delivery_row and delivery_row["transport_error_code"]
+                else None
+            ),
+            "telegram_chat_id_present": bool(delivery_row and delivery_row["telegram_chat_id"] is not None),
+            "telegram_message_id_present": bool(delivery_row and delivery_row["telegram_message_id"] is not None),
+            "latest_state_transition_to_state": str(transition_row["to_state"]) if transition_row else None,
+            "latest_state_transition_reason_code": str(transition_row["reason_code"]) if transition_row else None,
+            "delivery_result_outbox_exists": outbox_result.first() is not None,
+        }
+
 
 def _uuid_or_none(value: Any) -> UUID | None:
     if value is None:

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from .config import NotifierTelegramConfig, NotifierTelegramConfigurationError
@@ -33,6 +34,9 @@ SEND_DISABLED_PROOF_SCHEMA_VERSION = "notifier_send_disabled_worker_once_proof_v
 SEND_DISABLED_PROOF_SEED_VERSION = "notifier-send-disabled-worker-once-proof-v1"
 SEND_DISABLED_PROOF_KEY_PATTERN = CANARY_KEY_PATTERN
 SEND_DISABLED_PROOF_REASON_CODE = "notification_send_flag_disabled"
+RESTRICTED_LIVE_PROOF_SCHEMA_VERSION = "notifier_restricted_live_worker_once_proof_v1"
+RESTRICTED_LIVE_PROOF_SEED_VERSION = "notifier-restricted-live-worker-once-proof-v1"
+RESTRICTED_LIVE_PROOF_KEY_PATTERN = CANARY_KEY_PATTERN
 SEND_DISABLED_PROOF_SETUP_REJECTION_REASONS = {
     "source_notification_plan_missing",
     "source_plan_not_send_now",
@@ -43,6 +47,10 @@ SEND_DISABLED_PROOF_SETUP_REJECTION_REASONS = {
     "proof_plan_created_event_exists",
     "proof_notification_plan_conflict",
     "proof_plan_created_event_conflict",
+}
+RESTRICTED_LIVE_PROOF_SETUP_REJECTION_REASONS = SEND_DISABLED_PROOF_SETUP_REJECTION_REASONS | {
+    "source_analysis_not_send_now",
+    "source_candidate_group_mismatch",
 }
 
 ONE_SHOT_RUNTIME_CONFIG_REASON_CODES = {
@@ -120,6 +128,13 @@ def build_parser() -> argparse.ArgumentParser:
     send_disabled_proof.add_argument("--operator-confirmed", action="store_true")
     send_disabled_proof.add_argument("--env-file")
     send_disabled_proof.add_argument("--format", choices=["json"], default="json")
+
+    restricted_live_proof = subcommands.add_parser("restricted-live-worker-once-proof")
+    restricted_live_proof.add_argument("--source-notification-plan-id", required=True)
+    restricted_live_proof.add_argument("--proof-key", required=True)
+    restricted_live_proof.add_argument("--operator-confirmed", action="store_true")
+    restricted_live_proof.add_argument("--env-file")
+    restricted_live_proof.add_argument("--format", choices=["json"], default="json")
 
     restricted_transport_canary = subcommands.add_parser("restricted-transport-canary")
     restricted_transport_canary.add_argument("--target-chat-id", required=True)
@@ -264,6 +279,41 @@ async def _run_send_disabled_worker_once_proof_command(args: argparse.Namespace,
         return 1
 
     return await _run_send_disabled_worker_once_proof(
+        config,
+        source_notification_plan_id,
+        proof_key,
+        emit_json=emit_json,
+    )
+
+
+async def _run_restricted_live_worker_once_proof_command(args: argparse.Namespace, *, emit_json=print) -> int:
+    if not args.operator_confirmed:
+        emit_json(_to_json(_restricted_live_proof_rejected_payload("operator_confirmation_required")))
+        return 2
+
+    try:
+        source_notification_plan_id = UUID(str(args.source_notification_plan_id))
+    except (TypeError, ValueError, AttributeError):
+        emit_json(_to_json(_restricted_live_proof_rejected_payload("invalid_source_notification_plan_id")))
+        return 2
+
+    proof_key = str(args.proof_key or "")
+    if not _valid_restricted_live_proof_key(proof_key):
+        emit_json(_to_json(_restricted_live_proof_rejected_payload("invalid_proof_key")))
+        return 2
+
+    if not getattr(args, "env_file", None):
+        emit_json(_to_json(_restricted_live_proof_rejected_payload("env_file_required")))
+        return 2
+
+    try:
+        config = _load_notifier_one_shot_runtime_config(args)
+    except _NotifierOneShotRuntimeConfigError as exc:
+        reason_code = _one_shot_runtime_config_reason_code(exc)
+        emit_json(_to_json(_restricted_live_proof_failure_payload(reason_code)))
+        return 1
+
+    return await _run_restricted_live_worker_once_proof(
         config,
         source_notification_plan_id,
         proof_key,
@@ -588,6 +638,184 @@ async def create_send_disabled_worker_once_proof_with_repository(
     )
 
 
+async def _run_restricted_live_worker_once_proof(
+    config: NotifierTelegramConfig,
+    source_notification_plan_id: UUID,
+    proof_key: str,
+    *,
+    emit_json=print,
+    session_factory_builder=None,
+    redis_client_builder=None,
+    repository_builder=NotifierTelegramRepository,
+    worker_once_runner: Callable[[NotifierTelegramConfig, Callable[[str], None]], Awaitable[int]] | None = None,
+) -> int:
+    guard_reason = _restricted_live_proof_config_guard_reason(config)
+    if guard_reason is not None:
+        emit_json(_to_json(_restricted_live_proof_rejected_payload(guard_reason)))
+        return 2
+
+    if session_factory_builder is None:
+        session_factory_builder = _build_send_canary_session_factory
+    if redis_client_builder is None:
+        redis_client_builder = _build_send_disabled_proof_redis_client
+    if worker_once_runner is None:
+        worker_once_runner = _run_default_restricted_live_proof_worker_once
+
+    session_factory = None
+    dispose_session_factory = None
+    redis_client = None
+    try:
+        session_factory, dispose_session_factory = session_factory_builder(config.database_url)
+        redis_client = redis_client_builder(config.redis_url)
+
+        initial_redis = await _load_send_disabled_proof_redis_metrics(
+            redis_client,
+            queue_name=EXPECTED_QUEUE_NAME,
+            consumer_group=config.consumer_group,
+        )
+        if initial_redis.reason_code is not None:
+            emit_json(_to_json(_restricted_live_proof_rejected_payload(initial_redis.reason_code)))
+            return 2
+        if initial_redis.pending != 0 or initial_redis.lag != 0:
+            emit_json(_to_json(_restricted_live_proof_rejected_payload("redis_queue_not_idle")))
+            return 2
+
+        async with session_factory.begin() as session:
+            repository = repository_builder(session)
+            setup_result = await create_restricted_live_worker_once_proof_with_repository(
+                source_notification_plan_id,
+                proof_key,
+                repository,
+            )
+        if setup_result.reason_code is not None:
+            if setup_result.reason_code in RESTRICTED_LIVE_PROOF_SETUP_REJECTION_REASONS:
+                emit_json(_to_json(_restricted_live_proof_rejected_payload(setup_result.reason_code)))
+                return 2
+            emit_json(_to_json(_restricted_live_proof_failure_payload(setup_result.reason_code)))
+            return 1
+
+        stream_fields = _restricted_live_proof_stream_fields(setup_result)
+        await redis_client.xadd(EXPECTED_QUEUE_NAME, stream_fields)
+
+        worker_emitted: list[str] = []
+        worker_code = await worker_once_runner(config, worker_emitted.append)
+        worker_payload = _safe_json_object(worker_emitted[0] if worker_emitted else "")
+
+        async with session_factory.begin() as session:
+            repository = repository_builder(session)
+            db_verification = await repository.load_restricted_live_worker_once_proof_verification(
+                notification_plan_id=setup_result.notification_plan_id,
+            )
+
+        final_redis = await _load_send_disabled_proof_redis_metrics(
+            redis_client,
+            queue_name=EXPECTED_QUEUE_NAME,
+            consumer_group=config.consumer_group,
+        )
+        payload = _restricted_live_proof_result_payload(
+            setup_result=setup_result,
+            worker_code=worker_code,
+            worker_payload=worker_payload,
+            db_verification=db_verification,
+            redis_metrics=final_redis,
+        )
+        emit_json(_to_json(payload))
+        return 0 if payload["status"] == "pass" else 1
+    except Exception:
+        emit_json(_to_json(_restricted_live_proof_failure_payload("restricted_live_worker_once_proof_failed")))
+        return 1
+    finally:
+        if redis_client is not None:
+            await _close_maybe_async(redis_client)
+        if dispose_session_factory is not None:
+            await dispose_session_factory()
+
+
+async def create_restricted_live_worker_once_proof_with_repository(
+    source_notification_plan_id: UUID,
+    proof_key: str,
+    repository,
+) -> "_RestrictedLiveProofSetupResult":
+    source_plan = await repository.load_notification_plan(source_notification_plan_id)
+    if source_plan is None:
+        return _RestrictedLiveProofSetupResult(reason_code="source_notification_plan_missing")
+    if str(source_plan.get("delivery_decision") or "") != "send_now":
+        return _RestrictedLiveProofSetupResult(reason_code="source_plan_not_send_now")
+
+    source_analysis_id = _uuid_from_row(source_plan.get("analysis_id"))
+    source_candidate_group_id = _uuid_from_row(source_plan.get("candidate_group_id"))
+    target_chat_id = _int_from_row(source_plan.get("target_chat_id"))
+    if source_analysis_id is None:
+        return _RestrictedLiveProofSetupResult(reason_code="source_analysis_missing")
+    if source_candidate_group_id is None:
+        return _RestrictedLiveProofSetupResult(reason_code="source_candidate_group_missing")
+    if target_chat_id is None or target_chat_id == 0:
+        return _RestrictedLiveProofSetupResult(reason_code="source_plan_target_chat_missing")
+
+    analysis = await repository.load_analysis(source_analysis_id)
+    if analysis is None:
+        return _RestrictedLiveProofSetupResult(reason_code="source_analysis_missing")
+    if analysis.delivery_decision != "send_now":
+        return _RestrictedLiveProofSetupResult(reason_code="source_analysis_not_send_now")
+    if analysis.candidate_group_id != source_candidate_group_id:
+        return _RestrictedLiveProofSetupResult(reason_code="source_candidate_group_mismatch")
+
+    identity = _restricted_live_proof_identity(
+        source_notification_plan_id=source_notification_plan_id,
+        proof_key=proof_key,
+    )
+    if await repository.load_notification_plan(identity.notification_plan_id) is not None:
+        return _RestrictedLiveProofSetupResult(reason_code="proof_notification_plan_exists")
+    if await repository.load_event_outbox(identity.event_id) is not None:
+        return _RestrictedLiveProofSetupResult(reason_code="proof_plan_created_event_exists")
+
+    material_existing = await repository.load_existing_plan_by_material(
+        analysis_id=source_analysis_id,
+        target_chat_id=target_chat_id,
+        material_change_hash=identity.material_change_hash,
+    )
+    if material_existing is not None:
+        return _RestrictedLiveProofSetupResult(reason_code="proof_notification_plan_conflict")
+
+    draft = NotificationPlanDraft(
+        notification_plan_id=identity.notification_plan_id,
+        analysis_id=source_analysis_id,
+        candidate_group_id=source_candidate_group_id,
+        delivery_decision="send_now",
+        urgency_profile=str(source_plan.get("urgency_profile") or "high"),
+        target_chat_id=target_chat_id,
+        target_thread_id=_int_from_row(source_plan.get("target_thread_id")),
+        render_profile=_string_from_row(source_plan.get("render_profile")),
+        dedupe_subject_key=identity.dedupe_subject_key,
+        material_change_hash=identity.material_change_hash,
+        send_after=None,
+        suppress_reason_code=None,
+        status="planned",
+    )
+    payload_json = _restricted_live_proof_plan_created_payload(draft)
+
+    async with repository.transaction():
+        inserted_plan_id = await repository.insert_notification_plan(draft)
+        if inserted_plan_id != identity.notification_plan_id:
+            return _RestrictedLiveProofSetupResult(reason_code="proof_notification_plan_conflict")
+        inserted_event_id = await repository.insert_published_notification_plan_created_outbox(
+            event_id=identity.event_id,
+            notification_plan_id=identity.notification_plan_id,
+            dedupe_key=identity.event_dedupe_key,
+            payload_json=payload_json,
+        )
+        if inserted_event_id != identity.event_id:
+            return _RestrictedLiveProofSetupResult(reason_code="proof_plan_created_event_conflict")
+
+    return _RestrictedLiveProofSetupResult(
+        notification_plan_id=identity.notification_plan_id,
+        source_notification_plan_id=source_notification_plan_id,
+        trigger_event_id=identity.event_id,
+        event_dedupe_key=identity.event_dedupe_key,
+        event_payload_json=payload_json,
+    )
+
+
 async def _run_send_canary(
     config: NotifierTelegramConfig,
     args: argparse.Namespace,
@@ -768,6 +996,25 @@ class _SendDisabledProofSetupResult:
 
 
 @dataclass(slots=True, frozen=True)
+class _RestrictedLiveProofIdentity:
+    notification_plan_id: UUID
+    event_id: UUID
+    dedupe_subject_key: str
+    material_change_hash: str
+    event_dedupe_key: str
+
+
+@dataclass(slots=True, frozen=True)
+class _RestrictedLiveProofSetupResult:
+    notification_plan_id: UUID | None = None
+    source_notification_plan_id: UUID | None = None
+    trigger_event_id: UUID | None = None
+    event_dedupe_key: str | None = None
+    event_payload_json: dict[str, Any] | None = None
+    reason_code: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class _RedisGroupMetrics:
     pending: int | None = None
     lag: int | None = None
@@ -780,6 +1027,10 @@ def _valid_canary_key(canary_key: str) -> bool:
 
 def _valid_send_disabled_proof_key(proof_key: str) -> bool:
     return bool(SEND_DISABLED_PROOF_KEY_PATTERN.fullmatch(proof_key))
+
+
+def _valid_restricted_live_proof_key(proof_key: str) -> bool:
+    return bool(RESTRICTED_LIVE_PROOF_KEY_PATTERN.fullmatch(proof_key))
 
 
 def _canary_identity(
@@ -814,6 +1065,23 @@ def _send_disabled_proof_identity(*, source_notification_plan_id: UUID, proof_ke
     )
 
 
+def _restricted_live_proof_identity(
+    *,
+    source_notification_plan_id: UUID,
+    proof_key: str,
+) -> _RestrictedLiveProofIdentity:
+    seed = f"{RESTRICTED_LIVE_PROOF_SEED_VERSION}|{source_notification_plan_id}|{proof_key}"
+    notification_plan_id = uuid5(NAMESPACE_URL, seed)
+    event_id = uuid5(NAMESPACE_URL, f"{seed}|notification.plan.created.v1")
+    return _RestrictedLiveProofIdentity(
+        notification_plan_id=notification_plan_id,
+        event_id=event_id,
+        dedupe_subject_key=f"proof/restricted-live/{source_notification_plan_id}/{proof_key}",
+        material_change_hash=hashlib.sha256(seed.encode("utf-8")).hexdigest(),
+        event_dedupe_key=f"notification-plan-created:restricted-live-proof:{notification_plan_id}",
+    )
+
+
 def _send_disabled_proof_plan_created_payload(draft: NotificationPlanDraft) -> dict[str, Any]:
     return {
         "notification_plan_id": str(draft.notification_plan_id),
@@ -831,7 +1099,24 @@ def _send_disabled_proof_plan_created_payload(draft: NotificationPlanDraft) -> d
     }
 
 
+def _restricted_live_proof_plan_created_payload(draft: NotificationPlanDraft) -> dict[str, Any]:
+    return _send_disabled_proof_plan_created_payload(draft)
+
+
 def _send_disabled_proof_stream_fields(setup_result: _SendDisabledProofSetupResult) -> dict[str, str]:
+    return {
+        "job_id": str(setup_result.trigger_event_id),
+        "stage_name": EXPECTED_STAGE_NAME,
+        "root_object_type": "notification_plan",
+        "root_object_id": str(setup_result.notification_plan_id),
+        "idempotency_key": str(setup_result.event_dedupe_key or ""),
+        "pipeline_run_id": "",
+        "not_before": "",
+        "trigger_event_id": str(setup_result.trigger_event_id),
+    }
+
+
+def _restricted_live_proof_stream_fields(setup_result: _RestrictedLiveProofSetupResult) -> dict[str, str]:
     return {
         "job_id": str(setup_result.trigger_event_id),
         "stage_name": EXPECTED_STAGE_NAME,
@@ -860,7 +1145,48 @@ def _send_disabled_proof_config_guard_reason(config: NotifierTelegramConfig) -> 
     return None
 
 
+def _restricted_live_proof_config_guard_reason(config: NotifierTelegramConfig) -> str | None:
+    if config.app_env not in {"prod", "production"}:
+        return "app_env_not_prod"
+    if config.queue_name != EXPECTED_QUEUE_NAME:
+        return "notifier_queue_mismatch"
+    if not config.enable_notification_send:
+        return "notification_send_disabled"
+    if config.dry_run:
+        return "notifier_dry_run_enabled"
+    if config.allow_edits:
+        return "notifier_edits_enabled"
+    if not config.transport_enabled:
+        return "telegram_transport_disabled"
+    if not config.telegram_bot_token:
+        return "telegram_bot_token_missing"
+    if _telegram_api_base_url_is_blackhole(config.telegram_api_base_url):
+        return "telegram_api_base_url_blackhole"
+    return None
+
+
+def _telegram_api_base_url_is_blackhole(base_url: str) -> bool:
+    try:
+        hostname = (urlparse(base_url).hostname or "").strip().lower()
+    except ValueError:
+        return False
+    return hostname == "localhost" or hostname == "::1" or hostname.startswith("127.")
+
+
 async def _run_default_send_disabled_proof_worker_once(
+    config: NotifierTelegramConfig,
+    emit_json: Callable[[str], None],
+) -> int:
+    return await run_worker_once_invocation(
+        queue=EXPECTED_QUEUE_NAME,
+        confirm_worker_once=True,
+        output_format="json",
+        emit_json=emit_json,
+        config_loader=lambda: config,
+    )
+
+
+async def _run_default_restricted_live_proof_worker_once(
     config: NotifierTelegramConfig,
     emit_json: Callable[[str], None],
 ) -> int:
@@ -1057,6 +1383,125 @@ def _send_disabled_proof_rejected_payload(
 def _send_disabled_proof_failure_payload(reason_code: str) -> dict:
     return {
         "schema_version": SEND_DISABLED_PROOF_SCHEMA_VERSION,
+        "status": "fail",
+        "reason_code": reason_code,
+        "warnings": [reason_code],
+    }
+
+
+def _restricted_live_proof_result_payload(
+    *,
+    setup_result: _RestrictedLiveProofSetupResult,
+    worker_code: int,
+    worker_payload: dict[str, Any],
+    db_verification: dict[str, Any],
+    redis_metrics: _RedisGroupMetrics,
+) -> dict[str, Any]:
+    checks = _restricted_live_proof_checks(
+        worker_code=worker_code,
+        worker_payload=worker_payload,
+        db_verification=db_verification,
+        redis_metrics=redis_metrics,
+    )
+    failed = [name for name, passed in checks.items() if not passed]
+    status = "pass" if not failed else "fail"
+    reason_code = "restricted_live_worker_once_proof_passed" if not failed else "proof_verification_failed"
+    worker_authority = worker_payload.get("authority") if isinstance(worker_payload.get("authority"), dict) else {}
+    return {
+        "schema_version": RESTRICTED_LIVE_PROOF_SCHEMA_VERSION,
+        "status": status,
+        "reason_code": reason_code,
+        "source_notification_plan_id": str(setup_result.source_notification_plan_id),
+        "proof_notification_plan_id": str(setup_result.notification_plan_id),
+        "trigger_event_id_present": setup_result.trigger_event_id is not None,
+        "event_outbox_published": True,
+        "redis_xadd_count": 1,
+        "worker_once": {
+            "exit_code": worker_code,
+            "status": worker_payload.get("status"),
+            "reason_code": worker_payload.get("reason_code"),
+            "acked": worker_payload.get("acked"),
+            "handler_called": worker_payload.get("handler_called"),
+            "authority": worker_authority,
+        },
+        "db_verification": db_verification,
+        "redis_verification": {
+            "pending": redis_metrics.pending,
+            "lag": redis_metrics.lag,
+            "reason_code": redis_metrics.reason_code,
+        },
+        "authority": {
+            "telegram_transport_possible": worker_authority.get("telegram_transport_possible"),
+            "database_session_opened": worker_authority.get("database_session_opened"),
+            "workers_started": worker_authority.get("workers_started"),
+            "run_forever_started": worker_authority.get("run_forever_started"),
+            "openai_called": worker_authority.get("openai_called"),
+            "github_called": worker_authority.get("github_called"),
+            "docker_or_systemd_called": worker_authority.get("docker_or_systemd_called"),
+            "alembic_or_ddl_ran": worker_authority.get("alembic_or_ddl_ran"),
+        },
+        "checks": checks,
+        "checks_failed": failed,
+    }
+
+
+def _restricted_live_proof_checks(
+    *,
+    worker_code: int,
+    worker_payload: dict[str, Any],
+    db_verification: dict[str, Any],
+    redis_metrics: _RedisGroupMetrics,
+) -> dict[str, bool]:
+    authority = worker_payload.get("authority") if isinstance(worker_payload.get("authority"), dict) else {}
+    latest_reason_code = db_verification.get("latest_state_transition_reason_code")
+    return {
+        "worker_exit_zero": worker_code == 0,
+        "worker_processed": worker_payload.get("status") == "processed",
+        "worker_acked": worker_payload.get("acked") is True,
+        "handler_called": worker_payload.get("handler_called") is True,
+        "telegram_transport_possible_true": authority.get("telegram_transport_possible") is True,
+        "database_session_opened": authority.get("database_session_opened") is True,
+        "workers_started_false": authority.get("workers_started") is False,
+        "run_forever_started_false": authority.get("run_forever_started") is False,
+        "openai_called_false": authority.get("openai_called") is False,
+        "github_called_false": authority.get("github_called") is False,
+        "docker_or_systemd_called_false": authority.get("docker_or_systemd_called") is False,
+        "alembic_or_ddl_ran_false": authority.get("alembic_or_ddl_ran") is False,
+        "proof_plan_sent": str(db_verification.get("proof_plan_final_status") or "") == "sent",
+        "notification_render_created": int(db_verification.get("notification_render_count") or 0) >= 1,
+        "exactly_one_delivery_record": int(db_verification.get("notification_delivery_record_count") or 0) == 1,
+        "delivery_status_sent": db_verification.get("delivery_status") == "sent",
+        "attempt_count_one": db_verification.get("attempt_count") == 1,
+        "transport_error_code_null": db_verification.get("transport_error_code") is None,
+        "telegram_chat_id_present": db_verification.get("telegram_chat_id_present") is True,
+        "telegram_message_id_present": db_verification.get("telegram_message_id_present") is True,
+        "latest_transition_sent": db_verification.get("latest_state_transition_to_state") == "sent",
+        "latest_transition_reason_allowed": latest_reason_code
+        in {"notification_no_recent_delivery", "notification_delivery_result"},
+        "delivery_result_outbox_exists": db_verification.get("delivery_result_outbox_exists") is True,
+        "redis_pending_zero": redis_metrics.pending == 0,
+        "redis_lag_zero": redis_metrics.lag == 0,
+    }
+
+
+def _restricted_live_proof_rejected_payload(
+    reason_code: str,
+    *,
+    proof_notification_plan_id: UUID | None = None,
+) -> dict:
+    payload = {
+        "schema_version": RESTRICTED_LIVE_PROOF_SCHEMA_VERSION,
+        "status": "rejected",
+        "reason_code": reason_code,
+    }
+    if proof_notification_plan_id is not None:
+        payload["proof_notification_plan_id"] = str(proof_notification_plan_id)
+    return payload
+
+
+def _restricted_live_proof_failure_payload(reason_code: str) -> dict:
+    return {
+        "schema_version": RESTRICTED_LIVE_PROOF_SCHEMA_VERSION,
         "status": "fail",
         "reason_code": reason_code,
         "warnings": [reason_code],
@@ -1431,6 +1876,8 @@ async def _run(argv: list[str] | None = None) -> int:
         return await _run_create_canary_plan_command(args)
     if command == "send-disabled-worker-once-proof":
         return await _run_send_disabled_worker_once_proof_command(args)
+    if command == "restricted-live-worker-once-proof":
+        return await _run_restricted_live_worker_once_proof_command(args)
     if command == "send-canary":
         return await _run_send_canary_command(args)
     if command == "worker":
