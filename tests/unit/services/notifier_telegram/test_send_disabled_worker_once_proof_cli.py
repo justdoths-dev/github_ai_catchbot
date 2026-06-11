@@ -22,6 +22,36 @@ from services.notifier_telegram.worker_once import EXPECTED_QUEUE_NAME, WorkerOn
 from tests.component.services.notifier_telegram._fakes import FakeRepository, RaisingTelegramClient, repo_with_valid_case
 
 
+NOTIFIER_RUNTIME_ENV_KEYS = (
+    "APP_ENV",
+    "DATABASE_URL",
+    "DATABASE_URL_FILE",
+    "REDIS_URL",
+    "REDIS_URL_FILE",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN_FILE",
+    "TELEGRAM_API_BASE_URL",
+    "ENABLE_NOTIFICATION_SEND",
+    "NOTIFIER_TELEGRAM_DRY_RUN",
+    "NOTIFIER_TELEGRAM_ALLOW_EDITS",
+    "NOTIFIER_TELEGRAM_MAX_MESSAGE_CHARS",
+    "NOTIFIER_TELEGRAM_EDIT_WINDOW_MINUTES",
+    "NOTIFIER_TELEGRAM_REQUEST_TIMEOUT_SEC",
+    "ENABLE_DIGEST_RUNTIME",
+    "LOG_LEVEL",
+    "NOTIFIER_TELEGRAM_QUEUE_NAME",
+    "NOTIFIER_TELEGRAM_CONSUMER_GROUP",
+    "NOTIFIER_TELEGRAM_CONSUMER_NAME",
+    "NOTIFIER_TELEGRAM_BATCH_SIZE",
+    "NOTIFIER_TELEGRAM_BLOCK_MS",
+)
+
+
+def _clear_notifier_runtime_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in NOTIFIER_RUNTIME_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+
 @pytest.mark.asyncio
 async def test_cli_rejects_without_operator_confirmation() -> None:
     emitted: list[str] = []
@@ -51,7 +81,9 @@ async def test_cli_rejects_without_operator_confirmation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cli_rejects_when_transport_enabled(tmp_path) -> None:
+async def test_cli_rejects_when_transport_enabled(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ENABLE_NOTIFICATION_SEND", "false")
+    _clear_notifier_runtime_env(monkeypatch)
     env_file = tmp_path / "prod.env"
     env_file.write_text(
         "\n".join(
