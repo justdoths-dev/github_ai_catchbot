@@ -98,6 +98,20 @@ class NotifierTelegramRepository:
         row = result.mappings().first()
         return dict(row) if row else None
 
+    async def load_event_outbox(self, event_id: UUID) -> dict[str, Any] | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT event_id, event_type, aggregate_type, aggregate_id, dedupe_key, payload_json, status
+                FROM event_outbox
+                WHERE event_id = CAST(:event_id AS uuid)
+                """
+            ),
+            {"event_id": str(event_id)},
+        )
+        row = result.mappings().first()
+        return dict(row) if row else None
+
     async def load_notification_plan_intent(self, notification_plan_id: UUID) -> NotificationIntentJob | None:
         row = await self.load_notification_plan(notification_plan_id)
         if row is None:
@@ -228,6 +242,52 @@ class NotifierTelegramRepository:
         if existing is None:
             raise RuntimeError("notification plan insert conflicted but existing row was not found")
         return UUID(str(existing["notification_plan_id"]))
+
+    async def insert_published_notification_plan_created_outbox(
+        self,
+        *,
+        event_id: UUID,
+        notification_plan_id: UUID,
+        dedupe_key: str,
+        payload_json: dict[str, Any],
+    ) -> UUID | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO event_outbox (
+                    event_id,
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    dedupe_key,
+                    payload_json,
+                    status,
+                    created_at,
+                    published_at
+                ) VALUES (
+                    CAST(:event_id AS uuid),
+                    'notification.plan.created.v1',
+                    'notification_plan',
+                    CAST(:notification_plan_id AS uuid),
+                    :dedupe_key,
+                    CAST(:payload_json AS jsonb),
+                    'published'::outbox_status_enum,
+                    now(),
+                    now()
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING event_id
+                """
+            ),
+            {
+                "event_id": str(event_id),
+                "notification_plan_id": str(notification_plan_id),
+                "dedupe_key": dedupe_key,
+                "payload_json": _jsonb_dumps(payload_json),
+            },
+        )
+        inserted = result.scalar_one_or_none()
+        return UUID(str(inserted)) if inserted else None
 
     async def load_analysis(self, analysis_id: UUID) -> AnalysisRenderContext | None:
         result = await self._session.execute(
@@ -630,6 +690,93 @@ class NotifierTelegramRepository:
                 "payload_json": _jsonb_dumps(payload),
             },
         )
+
+    async def load_send_disabled_worker_once_proof_verification(
+        self,
+        *,
+        notification_plan_id: UUID,
+    ) -> dict[str, Any]:
+        plan_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT status
+                FROM notification_plans
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        render_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM notification_renders
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        delivery_count_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM notification_delivery_records
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        delivery_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT delivery_status, attempt_count, transport_error_code, telegram_response_json
+                FROM notification_delivery_records
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        transition_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT reason_code
+                FROM state_transitions
+                WHERE object_type = 'notification_plan'
+                  AND object_id = CAST(:notification_plan_id AS uuid)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        outbox_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT 1
+                FROM event_outbox
+                WHERE event_type = 'notification.delivery.result.v1'
+                  AND aggregate_type = 'notification_plan'
+                  AND aggregate_id = CAST(:notification_plan_id AS uuid)
+                LIMIT 1
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+
+        delivery_row = delivery_result.mappings().first()
+        return {
+            "proof_plan_final_status": plan_result.scalar_one_or_none(),
+            "notification_render_count": int(render_result.scalar_one()),
+            "notification_delivery_record_count": int(delivery_count_result.scalar_one()),
+            "delivery_status": str(delivery_row["delivery_status"]) if delivery_row else None,
+            "attempt_count": int(delivery_row["attempt_count"]) if delivery_row else None,
+            "transport_error_code": str(delivery_row["transport_error_code"]) if delivery_row else None,
+            "telegram_response_json": _json_loads(delivery_row["telegram_response_json"]) if delivery_row else None,
+            "latest_state_transition_reason_code": transition_result.scalar_one_or_none(),
+            "delivery_result_outbox_exists": outbox_result.first() is not None,
+        }
 
 
 def _uuid_or_none(value: Any) -> UUID | None:

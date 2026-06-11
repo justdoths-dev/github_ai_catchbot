@@ -20,6 +20,7 @@ SCHEMA_VERSION = "notifier_worker_once_invocation_v1"
 EXPECTED_QUEUE_NAME = "q.notification.send"
 EXPECTED_STAGE_NAME = "notify"
 EXPECTED_ROOT_OBJECT_TYPE = "analysis"
+ALLOWED_ROOT_OBJECT_TYPES = (EXPECTED_ROOT_OBJECT_TYPE, "notification_plan")
 REQUIRED_THIN_QUEUE_FIELDS = (
     "job_id",
     "stage_name",
@@ -327,7 +328,7 @@ def _malformed_message(message: StreamMessage) -> bool:
         return True
     if fields.get("stage_name") != EXPECTED_STAGE_NAME:
         return True
-    if fields.get("root_object_type") != EXPECTED_ROOT_OBJECT_TYPE:
+    if fields.get("root_object_type") not in ALLOWED_ROOT_OBJECT_TYPES:
         return True
     if _uuid_or_none(fields.get("trigger_event_id")) is None:
         return True
