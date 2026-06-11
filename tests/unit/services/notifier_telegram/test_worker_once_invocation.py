@@ -19,6 +19,11 @@ from services.notifier_telegram.worker_once import (
 )
 from tests.unit.services.notifier_telegram._service_fakes import config
 
+AMBIGUOUS_NOGROUP_ERROR = (
+    "NOGROUP No such key 'q.notification.send' or consumer group "
+    "'notifier-telegram' in XREADGROUP with GROUP option"
+)
+
 
 class FakeConfigLoader:
     def __init__(self) -> None:
@@ -30,9 +35,16 @@ class FakeConfigLoader:
 
 
 class FakeConsumer:
-    def __init__(self, messages: list[StreamMessage], events: list[str]) -> None:
+    def __init__(
+        self,
+        messages: list[StreamMessage],
+        events: list[str],
+        *,
+        read_exc: Exception | None = None,
+    ) -> None:
         self._messages = messages
         self._events = events
+        self._read_exc = read_exc
         self.acked: list[str] = []
         self.read_calls = 0
 
@@ -42,6 +54,8 @@ class FakeConsumer:
     async def read_batch(self) -> list[StreamMessage]:
         self.read_calls += 1
         self._events.append("read_batch")
+        if self._read_exc is not None:
+            raise self._read_exc
         return self._messages
 
     async def ack(self, message_id: str) -> None:
@@ -66,10 +80,18 @@ class FakeService:
 
 
 class FakeRuntimeBuilder:
-    def __init__(self, consumer: FakeConsumer, service: FakeService, events: list[str]) -> None:
+    def __init__(
+        self,
+        consumer: FakeConsumer,
+        service: FakeService,
+        events: list[str],
+        *,
+        classify_read_failure=None,
+    ) -> None:
         self._consumer = consumer
         self._service = service
         self._events = events
+        self._classify_read_failure = classify_read_failure
         self.calls = 0
         self.config_batch_sizes: list[int] = []
         self.disposed = 0
@@ -83,7 +105,39 @@ class FakeRuntimeBuilder:
             self.disposed += 1
             self._events.append("dispose")
 
-        return WorkerOnceRuntime(consumer=self._consumer, service=self._service, dispose=dispose)
+        return WorkerOnceRuntime(
+            consumer=self._consumer,
+            service=self._service,
+            dispose=dispose,
+            classify_read_failure=self._classify_read_failure,
+        )
+
+
+class RaisingRuntimeBuilder:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.calls = 0
+
+    async def __call__(self, cfg, state, logger) -> WorkerOnceRuntime:
+        del cfg, state, logger
+        self.calls += 1
+        raise self._exc
+
+
+class FakeRedisReadError(Exception):
+    pass
+
+
+class FakeReadFailureClassifier:
+    def __init__(self, events: list[str], reason_code: str | None) -> None:
+        self._events = events
+        self._reason_code = reason_code
+        self.calls: list[str] = []
+
+    async def __call__(self, exc: BaseException) -> str | None:
+        self.calls.append(str(exc))
+        self._events.append("readiness_probe")
+        return self._reason_code
 
 
 class RecordingWorker:
@@ -208,6 +262,91 @@ async def test_empty_queue_returns_empty_without_handler_or_ack() -> None:
     assert service.calls == []
     assert consumer.acked == []
     assert events == ["read_batch", "dispose"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_builder_failure_reports_runtime_builder_error_without_raw_exception_text() -> None:
+    runtime_builder = RaisingRuntimeBuilder(RuntimeError("RAW_EXCEPTION_SENTINEL DATABASE_URL Traceback"))
+
+    code, payload, output = await _invoke(runtime_builder=runtime_builder)
+
+    assert code == 1
+    assert payload["status"] == "failed"
+    assert payload["reason_code"] == "runtime_builder_error"
+    assert payload["message_seen"] is False
+    assert payload["handler_called"] is False
+    assert payload["acked"] is False
+    assert payload["authority"]["redis_read"] is False
+    assert payload["authority"]["redis_ack"] is False
+    assert payload["authority"]["database_session_opened"] is False
+    assert runtime_builder.calls == 1
+    assert "RAW_EXCEPTION_SENTINEL" not in output
+    assert "DATABASE_URL" not in output
+    assert "Traceback" not in output
+
+
+@pytest.mark.asyncio
+async def test_read_batch_ambiguous_nogroup_probe_reports_stream_missing_without_mutation() -> None:
+    await _assert_redis_read_failure(
+        FakeRedisReadError(AMBIGUOUS_NOGROUP_ERROR),
+        "stream_missing",
+        read_failure_classifier_reason_code="stream_missing",
+        expected_events=["read_batch", "readiness_probe", "dispose"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_batch_ambiguous_nogroup_probe_reports_consumer_group_missing_without_mutation() -> None:
+    await _assert_redis_read_failure(
+        FakeRedisReadError(AMBIGUOUS_NOGROUP_ERROR),
+        "consumer_group_missing",
+        read_failure_classifier_reason_code="consumer_group_missing",
+        expected_events=["read_batch", "readiness_probe", "dispose"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_batch_nogroup_consumer_group_missing_reports_consumer_group_missing() -> None:
+    await _assert_redis_read_failure(
+        FakeRedisReadError("NOGROUP No such consumer group 'notifier-telegram'"),
+        "consumer_group_missing",
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_batch_wrongtype_reports_queue_key_wrong_type() -> None:
+    await _assert_redis_read_failure(
+        FakeRedisReadError("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        "queue_key_wrong_type",
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_batch_generic_exception_reports_redis_read_failed() -> None:
+    await _assert_redis_read_failure(
+        FakeRedisReadError("connection failed"),
+        "redis_read_failed",
+    )
+
+
+@pytest.mark.asyncio
+async def test_redis_read_failure_output_omits_secret_names_traceback_and_raw_exception_text() -> None:
+    _, _, output = await _assert_redis_read_failure(
+        FakeRedisReadError(
+            "RAW_EXCEPTION_SENTINEL DATABASE_URL REDIS_URL TELEGRAM_BOT_TOKEN OPENAI_API_KEY Traceback"
+        ),
+        "redis_read_failed",
+    )
+
+    for forbidden in [
+        "DATABASE_URL",
+        "REDIS_URL",
+        "TELEGRAM_BOT_TOKEN",
+        "OPENAI_API_KEY",
+        "Traceback",
+        "RAW_EXCEPTION_SENTINEL",
+    ]:
+        assert forbidden not in output
 
 
 @pytest.mark.asyncio
@@ -440,3 +579,55 @@ async def _invoke(
 
     assert len(emitted) == 1
     return code, json.loads(emitted[0]), emitted[0]
+
+
+async def _assert_redis_read_failure(
+    exc: Exception,
+    expected_reason_code: str,
+    *,
+    read_failure_classifier_reason_code: str | None = None,
+    expected_events: list[str] | None = None,
+) -> tuple[int, dict[str, Any], str]:
+    RecordingWorker.instances = []
+    events: list[str] = []
+    consumer = FakeConsumer([], events, read_exc=exc)
+    service = FakeService(events)
+    read_failure_classifier = None
+    if read_failure_classifier_reason_code is not None:
+        read_failure_classifier = FakeReadFailureClassifier(events, read_failure_classifier_reason_code)
+    runtime_builder = FakeRuntimeBuilder(
+        consumer,
+        service,
+        events,
+        classify_read_failure=read_failure_classifier,
+    )
+
+    code, payload, output = await _invoke(
+        runtime_builder=runtime_builder,
+        worker_builder=RecordingWorker,
+    )
+
+    assert code == 1
+    assert payload["status"] == "failed"
+    assert payload["reason_code"] == expected_reason_code
+    assert payload["message_seen"] is False
+    assert payload["handler_called"] is False
+    assert payload["acked"] is False
+    assert payload["authority"]["redis_read"] is False
+    assert payload["authority"]["redis_ack"] is False
+    assert payload["authority"]["database_session_opened"] is False
+    assert payload["authority"]["workers_started"] is False
+    assert payload["authority"]["run_forever_started"] is False
+    assert payload["authority"]["openai_called"] is False
+    assert payload["authority"]["github_called"] is False
+    assert payload["authority"]["docker_or_systemd_called"] is False
+    assert consumer.read_calls == 1
+    assert consumer.acked == []
+    assert service.calls == []
+    assert runtime_builder.calls == 1
+    assert runtime_builder.disposed == 1
+    assert RecordingWorker.instances == []
+    if read_failure_classifier is not None:
+        assert read_failure_classifier.calls == [str(exc)]
+    assert events == (expected_events or ["read_batch", "dispose"])
+    return code, payload, output

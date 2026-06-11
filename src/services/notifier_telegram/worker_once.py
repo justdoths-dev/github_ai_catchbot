@@ -77,6 +77,7 @@ class WorkerOnceRuntime:
     consumer: RedisStreamConsumerProtocol
     service: TriggerServiceProtocol
     dispose: Callable[[], Awaitable[None]]
+    classify_read_failure: Callable[[BaseException], Awaitable[str | None]] | None = None
 
 
 async def run_worker_once_invocation(
@@ -114,7 +115,27 @@ async def run_worker_once_invocation(
     runtime: WorkerOnceRuntime | None = None
     try:
         runtime = await builder(config, state, logger or logging.getLogger(__name__))
-        messages = await runtime.consumer.read_batch()
+    except Exception:
+        emit_json(_to_json(_payload(status="failed", reason_code="runtime_builder_error", state=state, config=config)))
+        return 1
+
+    try:
+        try:
+            messages = await runtime.consumer.read_batch()
+        except Exception as exc:
+            reason_code = await _classify_read_batch_failure(exc, runtime)
+            emit_json(
+                _to_json(
+                    _payload(
+                        status="failed",
+                        reason_code=reason_code,
+                        state=state,
+                        config=config,
+                    )
+                )
+            )
+            return 1
+
         state.redis_read = True
         if not messages:
             emit_json(
@@ -182,7 +203,7 @@ async def run_worker_once_invocation(
         )
         return 0
     except Exception:
-        emit_json(_to_json(_payload(status="failed", reason_code="runtime_config_error", state=state, config=config)))
+        emit_json(_to_json(_payload(status="failed", reason_code="handler_failed", state=state, config=config)))
         return 1
     finally:
         if runtime is not None:
@@ -238,7 +259,20 @@ async def build_default_worker_once_runtime(
                 await maybe_awaitable
         await engine.dispose()
 
-    return WorkerOnceRuntime(consumer=consumer, service=SessionBackedService(), dispose=dispose)
+    async def classify_read_failure(exc: BaseException) -> str | None:
+        del exc
+        return await _classify_redis_readiness(
+            redis_client,
+            queue_name=EXPECTED_QUEUE_NAME,
+            consumer_group=config.consumer_group,
+        )
+
+    return WorkerOnceRuntime(
+        consumer=consumer,
+        service=SessionBackedService(),
+        dispose=dispose,
+        classify_read_failure=classify_read_failure,
+    )
 
 
 class _TrackedTriggerService:
@@ -307,6 +341,96 @@ def _malformed_message(message: StreamMessage) -> bool:
         if not str(fields.get(required_nonempty) or "").strip():
             return True
     return False
+
+
+def _classify_read_batch_error(exc: BaseException) -> str:
+    text = _exception_search_text(exc)
+    if "wrongtype" in text or "wrong kind of value" in text:
+        return "queue_key_wrong_type"
+    if "nogroup" in text:
+        stream_missing = (
+            "no such key" in text
+            or "key does not exist" in text
+            or "missing stream" in text
+            or "no such stream" in text
+            or "stream does not exist" in text
+            or "stream_missing" in text
+        )
+        group_missing = "consumer group" in text or "no such group" in text or "group does not exist" in text
+        if group_missing and not stream_missing:
+            return "consumer_group_missing"
+        if stream_missing and group_missing:
+            return "redis_read_failed"
+        if stream_missing:
+            return "stream_missing"
+    return "redis_read_failed"
+
+
+async def _classify_read_batch_failure(exc: BaseException, runtime: WorkerOnceRuntime) -> str:
+    reason_code = _classify_read_batch_error(exc)
+    if reason_code != "redis_read_failed" or "nogroup" not in _exception_search_text(exc):
+        return reason_code
+    if runtime.classify_read_failure is None:
+        return reason_code
+    try:
+        readiness_reason_code = await runtime.classify_read_failure(exc)
+    except Exception:
+        return "redis_read_failed"
+    if readiness_reason_code in {"stream_missing", "queue_key_wrong_type", "consumer_group_missing"}:
+        return readiness_reason_code
+    return "redis_read_failed"
+
+
+async def _classify_redis_readiness(client: Any, *, queue_name: str, consumer_group: str) -> str:
+    try:
+        queue_type = _decode_redis_value(await client.type(queue_name)).strip().lower()
+        if queue_type == "none":
+            return "stream_missing"
+        if queue_type != "stream":
+            return "queue_key_wrong_type"
+        groups = await client.xinfo_groups(queue_name)
+    except Exception:
+        return "redis_read_failed"
+    saw_unknown_group_shape = False
+    for group in groups or []:
+        group_name = _redis_group_name(group)
+        if group_name is None:
+            saw_unknown_group_shape = True
+            continue
+        if group_name == consumer_group:
+            return "redis_read_failed"
+    if saw_unknown_group_shape:
+        return "redis_read_failed"
+    return "consumer_group_missing"
+
+
+def _redis_group_name(group: object) -> str | None:
+    if isinstance(group, dict):
+        for key in ("name", b"name"):
+            if key in group:
+                return _decode_redis_value(group[key])
+    return None
+
+
+def _decode_redis_value(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _exception_search_text(exc: BaseException) -> str:
+    parts: list[str] = [type(exc).__name__]
+    current: BaseException | None = exc
+    while current is not None:
+        parts.append(str(current))
+        for arg in getattr(current, "args", ()):
+            parts.append(str(arg))
+        for attr_name in ("code", "error_code", "message", "detail", "response"):
+            attr_value = getattr(current, attr_name, None)
+            if attr_value is not None:
+                parts.append(str(attr_value))
+        current = current.__cause__ or current.__context__
+    return " ".join(parts).lower()
 
 
 def _payload(
