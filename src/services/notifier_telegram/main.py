@@ -37,6 +37,8 @@ SEND_DISABLED_PROOF_REASON_CODE = "notification_send_flag_disabled"
 RESTRICTED_LIVE_PROOF_SCHEMA_VERSION = "notifier_restricted_live_worker_once_proof_v1"
 RESTRICTED_LIVE_PROOF_SEED_VERSION = "notifier-restricted-live-worker-once-proof-v1"
 RESTRICTED_LIVE_PROOF_KEY_PATTERN = CANARY_KEY_PATTERN
+RESTRICTED_LIVE_QUEUED_WORKER_ONCE_SCHEMA_VERSION = "notifier_restricted_live_queued_worker_once_v1"
+RESTRICTED_LIVE_QUEUED_WORKER_ONCE_DEFAULT_MAX_LAG = 1
 SEND_DISABLED_PROOF_SETUP_REJECTION_REASONS = {
     "source_notification_plan_missing",
     "source_plan_not_send_now",
@@ -135,6 +137,16 @@ def build_parser() -> argparse.ArgumentParser:
     restricted_live_proof.add_argument("--operator-confirmed", action="store_true")
     restricted_live_proof.add_argument("--env-file")
     restricted_live_proof.add_argument("--format", choices=["json"], default="json")
+
+    restricted_live_queued = subcommands.add_parser("restricted-live-queued-worker-once")
+    restricted_live_queued.add_argument("--operator-confirmed", action="store_true")
+    restricted_live_queued.add_argument("--env-file")
+    restricted_live_queued.add_argument(
+        "--max-lag",
+        type=int,
+        default=RESTRICTED_LIVE_QUEUED_WORKER_ONCE_DEFAULT_MAX_LAG,
+    )
+    restricted_live_queued.add_argument("--format", choices=["json"], default="json")
 
     restricted_transport_canary = subcommands.add_parser("restricted-transport-canary")
     restricted_transport_canary.add_argument("--target-chat-id", required=True)
@@ -317,6 +329,34 @@ async def _run_restricted_live_worker_once_proof_command(args: argparse.Namespac
         config,
         source_notification_plan_id,
         proof_key,
+        emit_json=emit_json,
+    )
+
+
+async def _run_restricted_live_queued_worker_once_command(args: argparse.Namespace, *, emit_json=print) -> int:
+    if not args.operator_confirmed:
+        emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload("operator_confirmation_required")))
+        return 2
+
+    if not getattr(args, "env_file", None):
+        emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload("env_file_required")))
+        return 2
+
+    max_lag = getattr(args, "max_lag", RESTRICTED_LIVE_QUEUED_WORKER_ONCE_DEFAULT_MAX_LAG)
+    if not isinstance(max_lag, int) or max_lag < 1:
+        emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload("invalid_max_lag")))
+        return 2
+
+    try:
+        config = _load_notifier_one_shot_runtime_config(args)
+    except _NotifierOneShotRuntimeConfigError as exc:
+        reason_code = _one_shot_runtime_config_reason_code(exc)
+        emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload(reason_code)))
+        return 2
+
+    return await _run_restricted_live_queued_worker_once(
+        config,
+        max_lag=max_lag,
         emit_json=emit_json,
     )
 
@@ -729,6 +769,137 @@ async def _run_restricted_live_worker_once_proof(
             await _close_maybe_async(redis_client)
         if dispose_session_factory is not None:
             await dispose_session_factory()
+
+
+async def _run_restricted_live_queued_worker_once(
+    config: NotifierTelegramConfig,
+    *,
+    max_lag: int = RESTRICTED_LIVE_QUEUED_WORKER_ONCE_DEFAULT_MAX_LAG,
+    emit_json=print,
+    redis_client_builder=None,
+    worker_once_runner: Callable[[NotifierTelegramConfig, Callable[[str], None]], Awaitable[int]] | None = None,
+) -> int:
+    guard_reason = _restricted_live_queued_worker_once_config_guard_reason(config)
+    if guard_reason is not None:
+        emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload(guard_reason, config=config)))
+        return 2
+    if max_lag < 1:
+        emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload("invalid_max_lag", config=config)))
+        return 2
+
+    if redis_client_builder is None:
+        redis_client_builder = _build_send_disabled_proof_redis_client
+    if worker_once_runner is None:
+        worker_once_runner = _run_default_restricted_live_queued_worker_once
+
+    redis_client = None
+    redis_metrics: _RedisGroupMetrics | None = None
+    try:
+        try:
+            redis_client = redis_client_builder(config.redis_url)
+        except Exception:
+            redis_metrics = _RedisGroupMetrics(reason_code="redis_group_metrics_unavailable")
+            emit_json(
+                _to_json(
+                    _restricted_live_queued_worker_once_rejected_payload(
+                        redis_metrics.reason_code,
+                        config=config,
+                        redis_metrics=redis_metrics,
+                    )
+                )
+            )
+            return 2
+
+        redis_metrics = await _load_send_disabled_proof_redis_metrics(
+            redis_client,
+            queue_name=EXPECTED_QUEUE_NAME,
+            consumer_group=config.consumer_group,
+        )
+        if redis_metrics.reason_code is not None:
+            emit_json(
+                _to_json(
+                    _restricted_live_queued_worker_once_rejected_payload(
+                        redis_metrics.reason_code,
+                        config=config,
+                        redis_metrics=redis_metrics,
+                    )
+                )
+            )
+            return 2
+        if (redis_metrics.pending or 0) > 0:
+            emit_json(
+                _to_json(
+                    _restricted_live_queued_worker_once_rejected_payload(
+                        "redis_pending_messages_present",
+                        config=config,
+                        redis_metrics=redis_metrics,
+                    )
+                )
+            )
+            return 2
+        if redis_metrics.lag == 0:
+            emit_json(
+                _to_json(
+                    _restricted_live_queued_worker_once_noop_payload(
+                        "no_queued_message",
+                        config=config,
+                        redis_metrics=redis_metrics,
+                    )
+                )
+            )
+            return 0
+        if (redis_metrics.lag or 0) > max_lag:
+            emit_json(
+                _to_json(
+                    _restricted_live_queued_worker_once_rejected_payload(
+                        "queue_lag_exceeds_restricted_worker_once_limit",
+                        config=config,
+                        redis_metrics=redis_metrics,
+                    )
+                )
+            )
+            return 2
+
+        worker_emitted: list[str] = []
+        try:
+            worker_code = await worker_once_runner(config, worker_emitted.append)
+        except Exception:
+            emit_json(
+                _to_json(
+                    _restricted_live_queued_worker_once_failure_payload(
+                        "worker_once_exception",
+                        config=config,
+                        redis_metrics=redis_metrics,
+                    )
+                )
+            )
+            return 1
+
+        worker_payload = _safe_json_object(worker_emitted[0] if worker_emitted else "")
+        payload = _restricted_live_queued_worker_once_result_payload(
+            config=config,
+            redis_metrics=redis_metrics,
+            worker_code=worker_code,
+            worker_payload=worker_payload,
+        )
+        emit_json(_to_json(payload))
+        if payload["status"] in {"pass", "noop"}:
+            return 0
+        return 1
+    except Exception:
+        emit_json(
+            _to_json(
+                _restricted_live_queued_worker_once_failure_payload(
+                    "restricted_live_queued_worker_once_failed",
+                    config=config,
+                    redis_metrics=redis_metrics,
+                )
+            )
+        )
+        return 1
+    finally:
+        if redis_client is not None:
+            await _close_maybe_async(redis_client)
 
 
 async def create_restricted_live_worker_once_proof_with_repository(
@@ -1165,12 +1336,42 @@ def _restricted_live_proof_config_guard_reason(config: NotifierTelegramConfig) -
     return None
 
 
+def _restricted_live_queued_worker_once_config_guard_reason(config: NotifierTelegramConfig) -> str | None:
+    if config.app_env not in {"prod", "production"}:
+        return "app_env_not_prod"
+    if config.queue_name != EXPECTED_QUEUE_NAME:
+        return "notifier_queue_mismatch"
+    if not config.enable_notification_send:
+        return "notification_send_disabled"
+    if config.dry_run:
+        return "notifier_dry_run_enabled"
+    if config.allow_edits:
+        return "notifier_edits_enabled"
+    if not config.transport_enabled:
+        return "telegram_transport_disabled"
+    if not config.telegram_bot_token:
+        return "telegram_bot_token_missing"
+    if _telegram_api_base_url_is_blackhole(config.telegram_api_base_url):
+        return "telegram_api_base_url_blackhole"
+    if not _telegram_api_base_url_is_official(config.telegram_api_base_url):
+        return "telegram_api_base_url_unofficial"
+    return None
+
+
 def _telegram_api_base_url_is_blackhole(base_url: str) -> bool:
     try:
         hostname = (urlparse(base_url).hostname or "").strip().lower()
     except ValueError:
         return False
     return hostname == "localhost" or hostname == "::1" or hostname.startswith("127.")
+
+
+def _telegram_api_base_url_is_official(base_url: str) -> bool:
+    try:
+        parsed = urlparse(base_url)
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and (parsed.hostname or "").strip().lower() == "api.telegram.org"
 
 
 async def _run_default_send_disabled_proof_worker_once(
@@ -1187,6 +1388,19 @@ async def _run_default_send_disabled_proof_worker_once(
 
 
 async def _run_default_restricted_live_proof_worker_once(
+    config: NotifierTelegramConfig,
+    emit_json: Callable[[str], None],
+) -> int:
+    return await run_worker_once_invocation(
+        queue=EXPECTED_QUEUE_NAME,
+        confirm_worker_once=True,
+        output_format="json",
+        emit_json=emit_json,
+        config_loader=lambda: config,
+    )
+
+
+async def _run_default_restricted_live_queued_worker_once(
     config: NotifierTelegramConfig,
     emit_json: Callable[[str], None],
 ) -> int:
@@ -1506,6 +1720,204 @@ def _restricted_live_proof_failure_payload(reason_code: str) -> dict:
         "reason_code": reason_code,
         "warnings": [reason_code],
     }
+
+
+def _restricted_live_queued_worker_once_rejected_payload(
+    reason_code: str | None,
+    *,
+    config: NotifierTelegramConfig | None = None,
+    redis_metrics: _RedisGroupMetrics | None = None,
+) -> dict[str, Any]:
+    return _restricted_live_queued_worker_once_base_payload(
+        status="rejected",
+        reason_code=reason_code or "restricted_live_queued_worker_once_rejected",
+        config=config,
+        redis_metrics=redis_metrics,
+    )
+
+
+def _restricted_live_queued_worker_once_noop_payload(
+    reason_code: str,
+    *,
+    config: NotifierTelegramConfig,
+    redis_metrics: _RedisGroupMetrics,
+) -> dict[str, Any]:
+    return _restricted_live_queued_worker_once_base_payload(
+        status="noop",
+        reason_code=reason_code,
+        config=config,
+        redis_metrics=redis_metrics,
+    )
+
+
+def _restricted_live_queued_worker_once_failure_payload(
+    reason_code: str,
+    *,
+    config: NotifierTelegramConfig | None,
+    redis_metrics: _RedisGroupMetrics | None = None,
+) -> dict[str, Any]:
+    return _restricted_live_queued_worker_once_base_payload(
+        status="fail",
+        reason_code=reason_code,
+        config=config,
+        redis_metrics=redis_metrics,
+    )
+
+
+def _restricted_live_queued_worker_once_result_payload(
+    *,
+    config: NotifierTelegramConfig,
+    redis_metrics: _RedisGroupMetrics,
+    worker_code: int,
+    worker_payload: dict[str, Any],
+) -> dict[str, Any]:
+    worker_status = _safe_output_token(worker_payload.get("status"), "unknown")
+    worker_reason = _safe_output_token(worker_payload.get("reason_code"), "unknown")
+    worker_once = {
+        "exit_code": worker_code,
+        "status": worker_status,
+        "reason_code": worker_reason,
+        "acked": worker_payload.get("acked") is True,
+        "handler_called": worker_payload.get("handler_called") is True,
+    }
+    if worker_code == 0 and worker_status == "processed" and worker_once["acked"] and worker_once["handler_called"]:
+        status = "pass"
+        reason_code = "restricted_live_queued_worker_once_processed"
+    elif worker_code == 0 and worker_status == "empty":
+        status = "noop"
+        reason_code = "worker_once_no_message_available"
+    elif worker_status == "rejected" or worker_code == 2:
+        status = "fail"
+        reason_code = "worker_once_rejected"
+    else:
+        status = "fail"
+        reason_code = "worker_once_failed"
+
+    payload = _restricted_live_queued_worker_once_base_payload(
+        status=status,
+        reason_code=reason_code,
+        config=config,
+        redis_metrics=redis_metrics,
+        worker_payload=worker_payload,
+    )
+    payload["worker_once"] = worker_once
+    if status == "pass":
+        delivery_result_summary = _restricted_live_queued_delivery_result_summary(
+            worker_payload.get("delivery_result_summary")
+        )
+        if delivery_result_summary is not None:
+            payload["delivery_result_summary"] = delivery_result_summary
+    return payload
+
+
+def _restricted_live_queued_worker_once_base_payload(
+    *,
+    status: str,
+    reason_code: str,
+    config: NotifierTelegramConfig | None = None,
+    redis_metrics: _RedisGroupMetrics | None = None,
+    worker_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": RESTRICTED_LIVE_QUEUED_WORKER_ONCE_SCHEMA_VERSION,
+        "status": status,
+        "reason_code": reason_code,
+        "redis_precheck": {
+            "pending": redis_metrics.pending if redis_metrics is not None else None,
+            "lag": redis_metrics.lag if redis_metrics is not None else None,
+            "reason_code": redis_metrics.reason_code if redis_metrics is not None else None,
+        },
+        "authority": _restricted_live_queued_worker_once_authority(config, worker_payload=worker_payload),
+    }
+
+
+def _restricted_live_queued_worker_once_authority(
+    config: NotifierTelegramConfig | None,
+    *,
+    worker_payload: dict[str, Any] | None = None,
+) -> dict[str, bool]:
+    worker_authority = worker_payload.get("authority") if isinstance(worker_payload, dict) else None
+    if not isinstance(worker_authority, dict):
+        worker_authority = {}
+    return {
+        "telegram_transport_possible": _worker_authority_bool(
+            worker_authority,
+            "telegram_transport_possible",
+            default=_restricted_live_queued_transport_possible(config),
+        ),
+        "database_session_opened": _worker_authority_bool(worker_authority, "database_session_opened"),
+        "workers_started": _worker_authority_bool(worker_authority, "workers_started"),
+        "run_forever_started": _worker_authority_bool(worker_authority, "run_forever_started"),
+        "openai_called": _worker_authority_bool(worker_authority, "openai_called"),
+        "github_called": _worker_authority_bool(worker_authority, "github_called"),
+        "docker_or_systemd_called": _worker_authority_bool(worker_authority, "docker_or_systemd_called"),
+        "alembic_or_ddl_ran": _worker_authority_bool(worker_authority, "alembic_or_ddl_ran"),
+        "subprocess_started": _worker_authority_bool(worker_authority, "subprocess_started"),
+        "shell_invoked": _worker_authority_bool(worker_authority, "shell_invoked"),
+    }
+
+
+def _worker_authority_bool(authority: Mapping[str, Any], name: str, *, default: bool = False) -> bool:
+    value = authority.get(name)
+    if isinstance(value, bool):
+        return value
+    return default
+
+
+def _restricted_live_queued_transport_possible(config: NotifierTelegramConfig | None) -> bool:
+    return bool(
+        config
+        and config.transport_enabled
+        and config.telegram_bot_token
+        and config.app_env in {"prod", "production"}
+        and config.queue_name == EXPECTED_QUEUE_NAME
+        and not config.allow_edits
+        and _telegram_api_base_url_is_official(config.telegram_api_base_url)
+    )
+
+
+def _restricted_live_queued_delivery_result_summary(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    return {
+        "delivery_status": _safe_output_token(value.get("delivery_status"), "unknown"),
+        "attempt_count": _safe_output_int(value.get("attempt_count")),
+        "transport_error_code": _safe_optional_output_token(value.get("transport_error_code")),
+        "transport_error_class": _safe_optional_output_token(value.get("transport_error_class")),
+        "telegram_chat_id_present": value.get("telegram_chat_id_present") is True,
+        "telegram_message_id_present": value.get("telegram_message_id_present") is True,
+        "retry_after_seconds_present": value.get("retry_after_seconds_present") is True,
+        "edited": value.get("edited") is True,
+    }
+
+
+_SAFE_OUTPUT_TOKEN = re.compile(r"^[A-Za-z0-9_]{1,120}$")
+_SENSITIVE_OUTPUT_MARKERS = ("password", "secret", "token", "credential", "api_key", "database_url", "redis_url")
+
+
+def _safe_output_token(value: object, default: str) -> str:
+    if value is None:
+        return default
+    text = str(value)
+    lowered = text.lower()
+    if not _SAFE_OUTPUT_TOKEN.fullmatch(text):
+        return default
+    if any(marker in lowered for marker in _SENSITIVE_OUTPUT_MARKERS):
+        return default
+    return text
+
+
+def _safe_optional_output_token(value: object) -> str | None:
+    if value is None:
+        return None
+    return _safe_output_token(value, "redacted")
+
+
+def _safe_output_int(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 async def _existing_canary_plan_result(
@@ -1878,6 +2290,8 @@ async def _run(argv: list[str] | None = None) -> int:
         return await _run_send_disabled_worker_once_proof_command(args)
     if command == "restricted-live-worker-once-proof":
         return await _run_restricted_live_worker_once_proof_command(args)
+    if command == "restricted-live-queued-worker-once":
+        return await _run_restricted_live_queued_worker_once_command(args)
     if command == "send-canary":
         return await _run_send_canary_command(args)
     if command == "worker":

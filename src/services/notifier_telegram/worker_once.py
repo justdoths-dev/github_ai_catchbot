@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
@@ -199,6 +200,7 @@ async def run_worker_once_invocation(
                     config=config,
                     message=messages[0],
                     handler_called=tracked_service.handler_called,
+                    delivery_result_summary=tracked_service.delivery_result_summary,
                 )
             )
         )
@@ -280,12 +282,14 @@ class _TrackedTriggerService:
     def __init__(self, wrapped: TriggerServiceProtocol) -> None:
         self._wrapped = wrapped
         self.handler_called = False
+        self.delivery_result_summary: dict[str, Any] | None = None
 
     async def handle_trigger_event(self, trigger_event_id: str):
         self.handler_called = True
         result = await self._wrapped.handle_trigger_event(trigger_event_id)
         if result is None:
             raise _HandlerReturnedNoResult()
+        self.delivery_result_summary = _delivery_result_summary(result)
         return result
 
 
@@ -443,9 +447,10 @@ def _payload(
     config: NotifierTelegramConfig | None = None,
     message: StreamMessage | None = None,
     handler_called: bool = False,
+    delivery_result_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     trigger_event_id = str((message.fields if message else {}).get("trigger_event_id") or "").strip()
-    return {
+    payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": status,
         "reason_code": reason_code,
@@ -471,6 +476,45 @@ def _payload(
             "alembic_or_ddl_ran": False,
         },
     }
+    if delivery_result_summary is not None:
+        payload["delivery_result_summary"] = delivery_result_summary
+    return payload
+
+
+_SAFE_SUMMARY_TOKEN = re.compile(r"^[A-Za-z0-9_]{1,120}$")
+_SENSITIVE_SUMMARY_MARKERS = ("password", "secret", "token", "credential", "api_key", "database_url", "redis_url")
+
+
+def _delivery_result_summary(result: object) -> dict[str, Any]:
+    return {
+        "delivery_status": _safe_summary_token(getattr(result, "delivery_status", None)),
+        "attempt_count": _safe_int(getattr(result, "attempt_count", None)),
+        "transport_error_code": _safe_summary_token(getattr(result, "transport_error_code", None)),
+        "transport_error_class": _safe_summary_token(getattr(result, "transport_error_class", None)),
+        "telegram_chat_id_present": getattr(result, "telegram_chat_id", None) is not None,
+        "telegram_message_id_present": getattr(result, "telegram_message_id", None) is not None,
+        "retry_after_seconds_present": getattr(result, "retry_after_seconds", None) is not None,
+        "edited": bool(getattr(result, "edited", False)),
+    }
+
+
+def _safe_summary_token(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    lowered = text.lower()
+    if not _SAFE_SUMMARY_TOKEN.fullmatch(text):
+        return "redacted"
+    if any(marker in lowered for marker in _SENSITIVE_SUMMARY_MARKERS):
+        return "redacted"
+    return text
+
+
+def _safe_int(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 def _uuid_or_none(value: object) -> UUID | None:
