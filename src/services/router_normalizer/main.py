@@ -34,27 +34,30 @@ async def _run() -> int:
         batch_size=config.batch_size,
     )
 
-    async def process_message(message) -> None:
-        async with session_factory() as session:
-            async with session.begin():
-                repository = RouterNormalizerRepository(session)
-                service = RouterNormalizerService(config, repository=repository, logger=logger)
-                result = await service.process_stream_message(message)
-                logger.info(
-                    "router_normalizer_message_processed",
-                    extra={
-                        "service": "router-normalizer",
-                        "event": "router_normalizer_message_processed",
-                        "trigger_event_id": message.trigger_event_id,
-                        "candidate_eligible": result.candidate_eligible,
-                        "artifact_count": result.artifact_count,
-                        "candidate_group_count": result.candidate_group_count,
-                    },
-                )
+    class SessionBackedService:
+        async def process_stream_message(self, message):
+            async with session_factory() as session:
+                async with session.begin():
+                    repository = RouterNormalizerRepository(session)
+                    service = RouterNormalizerService(config, repository=repository, logger=logger)
+                    result = await service.process_stream_message(message)
+                    logger.info(
+                        "router_normalizer_message_processed",
+                        extra={
+                            "service": "router-normalizer",
+                            "event": "router_normalizer_message_processed",
+                            "trigger_event_id": message.trigger_event_id,
+                            "candidate_eligible": result.candidate_eligible,
+                            "artifact_count": result.artifact_count,
+                            "candidate_group_count": result.candidate_group_count,
+                        },
+                    )
+                    return result
 
     worker = RouterNormalizerWorker(
+        config,
         consumer=consumer,
-        process_message=process_message,
+        service=SessionBackedService(),
         logger=logger,
     )
 

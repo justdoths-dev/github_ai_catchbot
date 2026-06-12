@@ -35,6 +35,7 @@ from services.router_normalizer.config import RouterNormalizerConfig
 from services.router_normalizer.models import RedisNormalizeMessage
 from services.router_normalizer.repositories import RouterNormalizerRepository
 from services.router_normalizer.service import RouterNormalizerService
+from services.router_normalizer.worker import RouterNormalizerWorker
 from tests.component.services.upstream.test_db_backed_artifact_snapshot_updated_to_notification_queue_e2e import (
     THIN_REDIS_FIELDS,
     RecordingOpenAIClient,
@@ -86,6 +87,23 @@ class SeedIds:
     repo_full_name: str
     canonical_id: str
     canonical_url: str
+
+
+class RecordingNormalizeConsumer:
+    def __init__(self, message_id: str, fields: dict[str, str]) -> None:
+        self._messages = [(message_id, RedisNormalizeMessage.from_stream_fields(fields))]
+        self.acked: list[str] = []
+
+    async def ensure_group(self) -> None:
+        pass
+
+    async def read_batch(self) -> list[tuple[str, RedisNormalizeMessage]]:
+        messages = self._messages
+        self._messages = []
+        return messages
+
+    async def ack(self, message_id: str) -> None:
+        self.acked.append(message_id)
 
 
 @pytest.mark.asyncio
@@ -143,16 +161,20 @@ async def test_db_backed_source_message_created_routes_to_github_notification_qu
                 _normalizer_config(database_url),
                 repository=RouterNormalizerRepository(session),
             )
-            normalization = await normalizer.process_stream_message(
-                RedisNormalizeMessage.from_stream_fields(source_fields)
+            normalize_consumer = RecordingNormalizeConsumer("1-0", source_fields)
+            normalize_worker = RouterNormalizerWorker(
+                _normalizer_config(database_url),
+                consumer=normalize_consumer,
+                service=normalizer,
             )
+            normalize_result = await normalize_worker.run_once()
             await session.commit()
 
-            assert normalization.signal_detected is True
-            assert normalization.candidate_eligible is True
-            assert normalization.trigger_strength == "strong"
-            assert normalization.artifact_count == 1
-            assert normalization.candidate_group_count == 1
+            assert normalize_result.processed == 1
+            assert normalize_result.acked == 1
+            assert normalize_result.failed == 0
+            assert normalize_result.skipped == 0
+            assert normalize_consumer.acked == ["1-0"]
 
             normalization_runs = await _normalization_runs_for_source(session, ids.source_message_id)
             assert len(normalization_runs) == 1
