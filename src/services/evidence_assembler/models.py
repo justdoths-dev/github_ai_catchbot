@@ -54,6 +54,8 @@ class CandidateMemberRecord:
     artifact_type: str
     member_role: str
     member_order: int | None
+    canonical_id: str | None = None
+    canonical_url: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

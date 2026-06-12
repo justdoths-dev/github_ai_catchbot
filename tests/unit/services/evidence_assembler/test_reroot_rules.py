@@ -6,7 +6,7 @@ from services.evidence_assembler.models import CandidateMemberRecord, SnapshotRe
 from services.evidence_assembler.reroot_rules import RerootRules
 
 
-def _snapshot(artifact_id, snapshot_type="github_repo", status="ready"):
+def _snapshot(artifact_id, snapshot_type="github_repo", status="ready", normalized_projection=None):
     return SnapshotRecord(
         snapshot_id=uuid4(),
         artifact_id=artifact_id,
@@ -15,6 +15,7 @@ def _snapshot(artifact_id, snapshot_type="github_repo", status="ready"):
         status=status,
         fetched_at=None,
         content_anchor="anchor",
+        normalized_projection=normalized_projection,
     )
 
 
@@ -32,6 +33,43 @@ def test_reroot_to_supporting_repo_when_primary_snapshot_missing() -> None:
 
     assert decision.changed is True
     assert decision.to_artifact_id == repo
+
+
+def test_reroot_x_primary_to_supporting_repo_when_x_snapshot_discovers_repo_url() -> None:
+    x_post = uuid4()
+    repo = uuid4()
+    repo_url = "https://github.com/example/reroot-target"
+    decision = RerootRules().decide(
+        current_primary_artifact_id=x_post,
+        members=[
+            CandidateMemberRecord(x_post, "x_post", "primary", 0),
+            CandidateMemberRecord(repo, "github_repo", "supporting", 1, canonical_url=repo_url),
+        ],
+        current_snapshots={
+            x_post: _snapshot(
+                x_post,
+                snapshot_type="x_post",
+                status="ready",
+                normalized_projection={
+                    "root_post": {
+                        "entities": {
+                            "urls": [
+                                {
+                                    "url": "https://t.co/repo",
+                                    "expanded_url": f"{repo_url}/",
+                                }
+                            ]
+                        }
+                    }
+                },
+            ),
+            repo: _snapshot(repo),
+        },
+    )
+
+    assert decision.changed is True
+    assert decision.to_artifact_id == repo
+    assert decision.reason_code == "x_post_discovered_github_repo_supporting_reroot"
 
 
 def test_keep_existing_github_repo_primary() -> None:

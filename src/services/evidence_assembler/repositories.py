@@ -136,7 +136,8 @@ class EvidenceAssemblerRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT cgm.artifact_id, ar.artifact_type, cgm.member_role, cgm.member_order
+                SELECT cgm.artifact_id, ar.artifact_type, ar.canonical_id, ar.canonical_url,
+                       cgm.member_role, cgm.member_order
                 FROM candidate_group_members cgm
                 JOIN artifact_registry ar ON ar.artifact_id = cgm.artifact_id
                 WHERE cgm.candidate_group_id = CAST(:candidate_group_id AS uuid)
@@ -159,6 +160,8 @@ class EvidenceAssemblerRepository:
                 artifact_type=str(row["artifact_type"]),
                 member_role=str(row["member_role"]),
                 member_order=int(row["member_order"]) if row["member_order"] is not None else None,
+                canonical_id=str(row["canonical_id"]) if row["canonical_id"] else None,
+                canonical_url=str(row["canonical_url"]) if row["canonical_url"] else None,
             )
             for row in result.mappings().all()
         ]
