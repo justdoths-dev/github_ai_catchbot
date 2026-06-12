@@ -8,7 +8,10 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
+from services.router_normalizer.models import CanonicalArtifact
+
 from .models import (
+    ArtifactRecord,
     BundleRefreshTarget,
     CandidateGroupRecord,
     CandidateMemberRecord,
@@ -355,7 +358,7 @@ class EvidenceAssemblerRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT observed_url, context_path, discovery_reason,
+                SELECT observed_url, context_path, discovery_reason, depth_remaining,
                        parent_artifact_id, parent_snapshot_id, created_at
                 FROM discovered_url_observations
                 WHERE parent_candidate_group_id = CAST(:candidate_group_id AS uuid)
@@ -373,10 +376,141 @@ class EvidenceAssemblerRepository:
                     discovery_reason=str(row["discovery_reason"]),
                     parent_artifact_id=UUID(str(row["parent_artifact_id"])),
                     parent_snapshot_id=UUID(str(row["parent_snapshot_id"])),
+                    depth_remaining=int(row["depth_remaining"] or 0),
                 )
                 for row in result.mappings().all()
             ],
             parent_artifact_ids={UUID(value) for value in ids},
+        )
+
+    async def upsert_artifact_registry(self, artifact: CanonicalArtifact) -> ArtifactRecord:
+        result = await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO artifact_registry (
+                    artifact_type,
+                    canonical_id,
+                    canonical_url,
+                    normalized_host,
+                    artifact_key_json,
+                    current_status,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    CAST(:artifact_type AS artifact_type_enum),
+                    :canonical_id,
+                    :canonical_url,
+                    :normalized_host,
+                    CAST(:artifact_key_json AS jsonb),
+                    NULL,
+                    now(),
+                    now()
+                )
+                ON CONFLICT (canonical_id)
+                DO UPDATE SET
+                    canonical_url = EXCLUDED.canonical_url,
+                    normalized_host = EXCLUDED.normalized_host,
+                    artifact_key_json = EXCLUDED.artifact_key_json,
+                    updated_at = now()
+                RETURNING artifact_id, artifact_type, canonical_id, canonical_url,
+                          normalized_host, artifact_key_json, current_snapshot_id,
+                          current_status
+                """
+            ),
+            {
+                "artifact_type": artifact.artifact_type,
+                "canonical_id": artifact.canonical_id,
+                "canonical_url": artifact.canonical_url,
+                "normalized_host": artifact.normalized_host,
+                "artifact_key_json": _jsonb_dumps(artifact.artifact_key_json),
+            },
+        )
+        row = result.mappings().one()
+        return ArtifactRecord(
+            artifact_id=UUID(str(row["artifact_id"])),
+            artifact_type=str(row["artifact_type"]),
+            canonical_id=str(row["canonical_id"]),
+            canonical_url=str(row["canonical_url"]) if row["canonical_url"] else None,
+            normalized_host=str(row["normalized_host"]) if row["normalized_host"] else None,
+            artifact_key_json=_json_loads(row["artifact_key_json"]),
+            current_snapshot_id=_uuid_or_none(row["current_snapshot_id"]),
+            current_status=str(row["current_status"]) if row["current_status"] else None,
+        )
+
+    async def insert_supporting_member_if_absent(self, *, candidate_group_id: UUID, artifact_id: UUID) -> None:
+        await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO candidate_group_members (
+                    candidate_group_id,
+                    artifact_id,
+                    member_role,
+                    member_order
+                )
+                SELECT
+                    CAST(:candidate_group_id AS uuid),
+                    CAST(:artifact_id AS uuid),
+                    'supporting',
+                    COALESCE(MAX(member_order), 0) + 1
+                FROM candidate_group_members
+                WHERE candidate_group_id = CAST(:candidate_group_id AS uuid)
+                ON CONFLICT (candidate_group_id, artifact_id, member_role) DO NOTHING
+                """
+            ),
+            {"candidate_group_id": str(candidate_group_id), "artifact_id": str(artifact_id)},
+        )
+
+    async def insert_github_enrich_requested_outbox(
+        self,
+        *,
+        candidate: CandidateGroupRecord,
+        artifact: ArtifactRecord,
+        depth_budget: int,
+    ) -> None:
+        payload = {
+            "candidate_group_id": str(candidate.candidate_group_id),
+            "artifact_id": str(artifact.artifact_id),
+            "artifact_type": artifact.artifact_type,
+            "canonical_id": artifact.canonical_id,
+            "provider_route": "github",
+            "refresh_mode": "standard",
+            "depth_budget": depth_budget,
+            "source_message_id": str(candidate.source_message_id),
+            "source_version_no": candidate.source_version_no,
+        }
+        await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO event_outbox (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    dedupe_key,
+                    payload_json,
+                    status,
+                    created_at
+                )
+                VALUES (
+                    'artifact.enrich.requested.v1',
+                    'artifact',
+                    CAST(:artifact_id AS uuid),
+                    :dedupe_key,
+                    CAST(:payload_json AS jsonb),
+                    'pending'::outbox_status_enum,
+                    now()
+                )
+                ON CONFLICT (dedupe_key) DO NOTHING
+                """
+            ),
+            {
+                "artifact_id": str(artifact.artifact_id),
+                "dedupe_key": (
+                    f"artifact:enrich:{candidate.candidate_group_id}:"
+                    f"{artifact.canonical_id}:{candidate.source_message_id}:{candidate.source_version_no}"
+                ),
+                "payload_json": _jsonb_dumps(payload),
+            },
         )
 
     async def count_reroot_events(self, candidate_group_id: UUID) -> int:

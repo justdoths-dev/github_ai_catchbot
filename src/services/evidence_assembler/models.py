@@ -59,6 +59,18 @@ class CandidateMemberRecord:
 
 
 @dataclass(slots=True, frozen=True)
+class ArtifactRecord:
+    artifact_id: UUID
+    artifact_type: str
+    canonical_id: str
+    canonical_url: str | None
+    normalized_host: str | None
+    artifact_key_json: dict[str, Any] | None
+    current_snapshot_id: UUID | None
+    current_status: str | None
+
+
+@dataclass(slots=True, frozen=True)
 class SnapshotRecord:
     snapshot_id: UUID
     artifact_id: UUID
@@ -89,6 +101,7 @@ class DiscoveredLinkSummary:
     discovery_reason: str
     parent_artifact_id: UUID
     parent_snapshot_id: UUID
+    depth_remaining: int = 0
 
 
 @dataclass(slots=True, frozen=True)

@@ -6,6 +6,9 @@ import logging
 from typing import Any
 from uuid import UUID
 
+from services.router_normalizer.canonicalizer import canonicalize_url
+from services.router_normalizer.models import ResolvedUrl
+
 from .config import EvidenceAssemblerConfig
 from .models import (
     AssemblyResult,
@@ -65,6 +68,27 @@ class EvidenceAssemblerService:
         member_artifact_ids = [member.artifact_id for member in members]
         snapshots = await self._repository.load_current_snapshots(member_artifact_ids)
         artifact_types = {member.artifact_id: member.artifact_type for member in members}
+
+        promoted_github_artifact_ids = await self._promote_discovered_github_repos(
+            candidate=candidate,
+            members=members,
+        )
+        if promoted_github_artifact_ids:
+            members = await self._repository.load_candidate_members(candidate.candidate_group_id)
+            member_artifact_ids = [member.artifact_id for member in members]
+            snapshots = await self._repository.load_current_snapshots(member_artifact_ids)
+            artifact_types = {member.artifact_id: member.artifact_type for member in members}
+            if self._has_unready_promoted_github_repo(
+                promoted_artifact_ids=promoted_github_artifact_ids,
+                snapshots=snapshots,
+            ):
+                return AssemblyResult(
+                    candidate_group_id=candidate.candidate_group_id,
+                    bundle_id=None,
+                    reused_existing_bundle=False,
+                    ready_for_analysis=False,
+                    emitted_analysis_requested=False,
+                )
 
         if self._config.enable_text_idea:
             await self._materialize_existing_text_idea(candidate=candidate, members=members, snapshots=snapshots)
@@ -191,6 +215,73 @@ class EvidenceAssemblerService:
             ready_for_analysis=bundle_draft.ready_for_analysis,
             emitted_analysis_requested=emitted_analysis_requested,
         )
+
+    async def _promote_discovered_github_repos(
+        self,
+        *,
+        candidate: CandidateGroupRecord,
+        members: list[CandidateMemberRecord],
+    ) -> set[UUID]:
+        if candidate.proposal_status != "ready_for_enrich":
+            return set()
+
+        parent_artifact_types = {member.artifact_id: member.artifact_type for member in members}
+        x_parent_artifact_ids = [
+            member.artifact_id
+            for member in members
+            if member.artifact_type == "x_post"
+        ]
+        if not x_parent_artifact_ids:
+            return set()
+
+        discovered_links = await self._repository.load_discovered_links(
+            candidate_group_id=candidate.candidate_group_id,
+            parent_artifact_ids=x_parent_artifact_ids,
+        )
+        promoted_artifact_ids: set[UUID] = set()
+        for link in discovered_links:
+            if parent_artifact_types.get(link.parent_artifact_id) != "x_post":
+                continue
+            artifact = canonicalize_url(
+                link.observed_url,
+                observed=ResolvedUrl(
+                    observed_url=link.observed_url,
+                    normalized_url=link.observed_url,
+                    resolved_url=link.observed_url,
+                    source_kind="discovered_url_observation",
+                    context_path=link.context_path,
+                ),
+            )
+            if artifact.artifact_type != "github_repo":
+                continue
+
+            depth_budget = max(0, min(int(link.depth_remaining or 0), 1))
+            async with self._repository.transaction():
+                promoted = await self._repository.upsert_artifact_registry(artifact)
+                await self._repository.insert_supporting_member_if_absent(
+                    candidate_group_id=candidate.candidate_group_id,
+                    artifact_id=promoted.artifact_id,
+                )
+                if promoted.current_status not in RerootRules.READY_REPO_STATES:
+                    await self._repository.insert_github_enrich_requested_outbox(
+                        candidate=candidate,
+                        artifact=promoted,
+                        depth_budget=depth_budget,
+                    )
+            promoted_artifact_ids.add(promoted.artifact_id)
+        return promoted_artifact_ids
+
+    @staticmethod
+    def _has_unready_promoted_github_repo(
+        *,
+        promoted_artifact_ids: set[UUID],
+        snapshots: dict[UUID, SnapshotRecord],
+    ) -> bool:
+        for artifact_id in promoted_artifact_ids:
+            snapshot = snapshots.get(artifact_id)
+            if snapshot is None or snapshot.status not in RerootRules.READY_REPO_STATES:
+                return True
+        return False
 
     async def _materialize_existing_text_idea(
         self,
