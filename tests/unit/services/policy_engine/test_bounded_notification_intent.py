@@ -11,6 +11,7 @@ import pytest
 from src.services.policy_engine.bounded_notification_intent import (
     BoundedPolicyNotificationIntentConfig,
     BoundedPolicyNotificationIntentRuntimeHandle,
+    PolicyApplyBacklogCounts,
     PolicyApplyEventRow,
     PolicyInvocationSummary,
     run_bounded_policy_notification_intent,
@@ -26,31 +27,64 @@ TELEGRAM_TOKEN = "123456:sentinel_telegram_token"
 RAW_PAYLOAD_VALUE = "sentinel raw policy payload"
 RENDERED_TEXT = "sentinel rendered message text"
 EXCEPTION_DETAIL = "sentinel private policy failure detail"
+REQUIRED_FIELDS = (
+    "judge_run_id",
+    "judge_output_id",
+    "candidate_group_id",
+    "bundle_id",
+)
 
 
 class FakeRepository:
     def __init__(
         self,
         *,
-        pending_count: int = 1,
-        row: PolicyApplyEventRow | None = None,
+        rows: list[PolicyApplyEventRow] | None = None,
+        existing_analysis_judge_output_ids: set[UUID] | None = None,
+        counts: PolicyApplyBacklogCounts | None = None,
         operation_log: list[str] | None = None,
     ) -> None:
-        self.pending_count = pending_count
-        self.row = row
+        self.rows = rows if rows is not None else []
+        self.existing_analysis_judge_output_ids = existing_analysis_judge_output_ids or set()
+        self.counts = counts
         self.operation_log = operation_log if operation_log is not None else []
         self.count_calls = 0
         self.fetch_calls = 0
 
-    async def count_pending_policy_apply_events(self) -> int:
+    async def load_pending_policy_apply_event_counts(self) -> PolicyApplyBacklogCounts:
         self.operation_log.append("count")
         self.count_calls += 1
-        return self.pending_count
+        if self.counts is not None:
+            return self.counts
+        malformed = 0
+        stale = 0
+        eligible = 0
+        for row in self.rows:
+            if not _payload_valid(row.payload_json):
+                malformed += 1
+                continue
+            judge_output_id = UUID(str(row.payload_json["judge_output_id"]))
+            if judge_output_id in self.existing_analysis_judge_output_ids:
+                stale += 1
+            else:
+                eligible += 1
+        return PolicyApplyBacklogCounts(
+            raw_pending=len(self.rows),
+            eligible_pending=eligible,
+            stale_already_analyzed=stale,
+            malformed_pending=malformed,
+        )
 
-    async def fetch_oldest_pending_policy_apply_event(self) -> PolicyApplyEventRow | None:
-        self.operation_log.append("fetch")
+    async def fetch_oldest_eligible_pending_policy_apply_event(self) -> PolicyApplyEventRow | None:
+        self.operation_log.append("fetch_eligible")
         self.fetch_calls += 1
-        return self.row
+        eligible_rows = [
+            row
+            for row in self.rows
+            if _payload_valid(row.payload_json)
+            and UUID(str(row.payload_json["judge_output_id"])) not in self.existing_analysis_judge_output_ids
+        ]
+        return sorted(eligible_rows, key=lambda row: (row.created_at, row.event_id))[0] if eligible_rows else None
 
 
 class FakePolicyInvoker:
@@ -145,7 +179,20 @@ def _payload(**overrides) -> dict[str, object]:
     return payload
 
 
-def _row(*, payload_json: dict[str, object] | None = None) -> PolicyApplyEventRow:
+def _payload_valid(payload: dict[str, object]) -> bool:
+    for field_name in REQUIRED_FIELDS:
+        try:
+            UUID(str(payload.get(field_name)))
+        except (TypeError, ValueError, AttributeError):
+            return False
+    return True
+
+
+def _row(
+    *,
+    payload_json: dict[str, object] | None = None,
+    created_at: datetime | None = None,
+) -> PolicyApplyEventRow:
     return PolicyApplyEventRow(
         event_id=uuid4(),
         event_type="analysis.policy.apply.v1",
@@ -153,7 +200,7 @@ def _row(*, payload_json: dict[str, object] | None = None) -> PolicyApplyEventRo
         aggregate_id=uuid4(),
         payload_json=payload_json if payload_json is not None else _payload(),
         status="pending",
-        created_at=datetime.now(timezone.utc),
+        created_at=created_at if created_at is not None else datetime.now(timezone.utc),
     )
 
 
@@ -170,7 +217,7 @@ def _approved_config(**overrides) -> BoundedPolicyNotificationIntentConfig:
 
 @pytest.mark.asyncio
 async def test_no_flags_fail_closed_before_db() -> None:
-    runtime_builder = FakeRuntimeBuilder(FakeRepository(row=_row()), FakePolicyInvoker())
+    runtime_builder = FakeRuntimeBuilder(FakeRepository(rows=[_row()]), FakePolicyInvoker())
 
     result = await run_bounded_policy_notification_intent(
         BoundedPolicyNotificationIntentConfig(),
@@ -193,7 +240,7 @@ async def test_no_flags_fail_closed_before_db() -> None:
 
 @pytest.mark.asyncio
 async def test_missing_database_read_gate_blocks_before_db_session() -> None:
-    runtime_builder = FakeRuntimeBuilder(FakeRepository(row=_row()), FakePolicyInvoker())
+    runtime_builder = FakeRuntimeBuilder(FakeRepository(rows=[_row()]), FakePolicyInvoker())
 
     result = await run_bounded_policy_notification_intent(
         BoundedPolicyNotificationIntentConfig(operator_approved=True),
@@ -209,8 +256,16 @@ async def test_missing_database_read_gate_blocks_before_db_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pending_count_zero_blocks_before_policy_invocation() -> None:
-    repository = FakeRepository(pending_count=0)
+async def test_two_stale_already_analyzed_rows_and_zero_eligible_blocks_before_policy_invocation() -> None:
+    stale_judge_output_1 = uuid4()
+    stale_judge_output_2 = uuid4()
+    repository = FakeRepository(
+        rows=[
+            _row(payload_json=_payload(judge_output_id=str(stale_judge_output_1))),
+            _row(payload_json=_payload(judge_output_id=str(stale_judge_output_2))),
+        ],
+        existing_analysis_judge_output_ids={stale_judge_output_1, stale_judge_output_2},
+    )
     invoker = FakePolicyInvoker()
     runtime_builder = FakeRuntimeBuilder(repository, invoker)
 
@@ -221,8 +276,12 @@ async def test_pending_count_zero_blocks_before_policy_invocation() -> None:
     )
 
     assert result.status == "blocked"
-    assert result.error_code == "pending_count_mismatch"
-    assert result.pending_policy_apply_count_observed == 0
+    assert result.error_code == "eligible_pending_count_mismatch"
+    assert result.pending_policy_apply_count_observed == 2
+    assert result.raw_pending_policy_apply_count_observed == 2
+    assert result.eligible_pending_policy_apply_count_observed == 0
+    assert result.stale_already_analyzed_policy_apply_count_observed == 2
+    assert result.malformed_pending_policy_apply_count_observed == 0
     assert result.state.database_read_attempted is True
     assert result.state.policy_invocation_attempted is False
     assert repository.count_calls == 1
@@ -232,21 +291,63 @@ async def test_pending_count_zero_blocks_before_policy_invocation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pending_count_greater_than_expected_blocks_before_policy_invocation() -> None:
-    repository = FakeRepository(pending_count=2, row=_row())
+async def test_eligible_count_greater_than_expected_blocks_before_policy_invocation() -> None:
+    repository = FakeRepository(rows=[_row(), _row()])
     invoker = FakePolicyInvoker()
 
     result = await run_bounded_policy_notification_intent(
-        _approved_config(expected_pending_count=1),
+        _approved_config(expected_eligible_pending_count=1),
         runtime_config_loader=_runtime_config,
         runtime_builder=FakeRuntimeBuilder(repository, invoker),
     )
 
-    assert result.error_code == "pending_count_mismatch"
+    assert result.error_code == "eligible_pending_count_mismatch"
     assert result.pending_policy_apply_count_observed == 2
+    assert result.raw_pending_policy_apply_count_observed == 2
+    assert result.eligible_pending_policy_apply_count_observed == 2
+    assert result.stale_already_analyzed_policy_apply_count_observed == 0
     assert result.state.policy_invocation_attempted is False
     assert repository.fetch_calls == 0
     assert invoker.calls == []
+
+
+@pytest.mark.asyncio
+async def test_two_stale_rows_plus_one_fresh_eligible_selects_only_fresh_event() -> None:
+    operation_log: list[str] = []
+    stale_judge_output_1 = uuid4()
+    stale_judge_output_2 = uuid4()
+    stale_row_1 = _row(
+        payload_json=_payload(judge_output_id=str(stale_judge_output_1)),
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    stale_row_2 = _row(
+        payload_json=_payload(judge_output_id=str(stale_judge_output_2)),
+        created_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    fresh_row = _row(created_at=datetime(2026, 1, 3, tzinfo=timezone.utc))
+    repository = FakeRepository(
+        rows=[stale_row_1, stale_row_2, fresh_row],
+        existing_analysis_judge_output_ids={stale_judge_output_1, stale_judge_output_2},
+        operation_log=operation_log,
+    )
+    invoker = FakePolicyInvoker(operation_log=operation_log)
+
+    result = await run_bounded_policy_notification_intent(
+        _approved_config(),
+        runtime_config_loader=_runtime_config,
+        runtime_builder=FakeRuntimeBuilder(repository, invoker),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "pass"
+    assert report["pending_policy_apply_count_observed"] == 3
+    assert report["raw_pending_policy_apply_count_observed"] == 3
+    assert report["eligible_pending_policy_apply_count_observed"] == 1
+    assert report["stale_already_analyzed_policy_apply_count_observed"] == 2
+    assert report["malformed_pending_policy_apply_count_observed"] == 0
+    assert report["selected_event_id_suffix"] == str(fresh_row.event_id)[-8:]
+    assert invoker.calls == [fresh_row.event_id]
+    assert operation_log == ["count", "fetch_eligible", "policy"]
 
 
 @pytest.mark.asyncio
@@ -254,7 +355,7 @@ async def test_malformed_payload_blocks_before_policy_invocation_without_printin
     payload = _payload()
     raw_payload = str(payload.pop("bundle_id"))
     row = _row(payload_json=payload)
-    repository = FakeRepository(row=row)
+    repository = FakeRepository(rows=[row])
     invoker = FakePolicyInvoker()
 
     result = await run_bounded_policy_notification_intent(
@@ -264,10 +365,13 @@ async def test_malformed_payload_blocks_before_policy_invocation_without_printin
     )
     rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
 
-    assert result.error_code == "malformed_event_payload"
-    assert result.payload_has_judge_run_id is True
-    assert result.payload_has_bundle_id is False
+    assert result.error_code == "malformed_policy_apply_payload"
+    assert result.raw_pending_policy_apply_count_observed == 1
+    assert result.eligible_pending_policy_apply_count_observed == 0
+    assert result.malformed_pending_policy_apply_count_observed == 1
+    assert result.selected_event_present is False
     assert result.state.policy_invocation_attempted is False
+    assert repository.fetch_calls == 0
     assert invoker.calls == []
     assert raw_payload not in rendered
     assert RAW_PAYLOAD_VALUE not in rendered
@@ -276,7 +380,7 @@ async def test_malformed_payload_blocks_before_policy_invocation_without_printin
 
 @pytest.mark.asyncio
 async def test_missing_policy_write_gate_blocks_before_policy_invocation() -> None:
-    repository = FakeRepository(row=_row())
+    repository = FakeRepository(rows=[_row()])
     invoker = FakePolicyInvoker()
 
     result = await run_bounded_policy_notification_intent(
@@ -297,7 +401,7 @@ async def test_successful_fake_non_suppress_invokes_policy_once_and_reports_inte
     operation_log: list[str] = []
     row = _row()
     notification_event_id = uuid4()
-    repository = FakeRepository(row=row, operation_log=operation_log)
+    repository = FakeRepository(rows=[row], operation_log=operation_log)
     invoker = FakePolicyInvoker(
         summary=PolicyInvocationSummary(
             processed_event_count=1,
@@ -346,7 +450,11 @@ async def test_successful_fake_non_suppress_invokes_policy_once_and_reports_inte
     assert report["side_effects"]["notification_delivery_record_write"] is False
     assert report["side_effects"]["telegram_send_called"] is False
     assert report["side_effects"]["telegram_edit_called"] is False
-    assert operation_log == ["count", "fetch", "policy"]
+    assert report["raw_pending_policy_apply_count_observed"] == 1
+    assert report["eligible_pending_policy_apply_count_observed"] == 1
+    assert report["stale_already_analyzed_policy_apply_count_observed"] == 0
+    assert report["malformed_pending_policy_apply_count_observed"] == 0
+    assert operation_log == ["count", "fetch_eligible", "policy"]
     assert invoker.calls == [row.event_id]
     assert runtime_builder.close_commits == [True]
 
@@ -368,7 +476,7 @@ async def test_successful_fake_suppress_invokes_policy_once_without_notification
     result = await run_bounded_policy_notification_intent(
         _approved_config(),
         runtime_config_loader=_runtime_config,
-        runtime_builder=FakeRuntimeBuilder(FakeRepository(row=row), invoker),
+        runtime_builder=FakeRuntimeBuilder(FakeRepository(rows=[row]), invoker),
     )
     report = result.to_sanitized_dict()
 
@@ -392,7 +500,7 @@ async def test_policy_invocation_failure_is_sanitized_and_does_not_call_notifier
     result = await run_bounded_policy_notification_intent(
         _approved_config(),
         runtime_config_loader=_runtime_config,
-        runtime_builder=FakeRuntimeBuilder(FakeRepository(row=row), invoker),
+        runtime_builder=FakeRuntimeBuilder(FakeRepository(rows=[row]), invoker),
     )
     rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
 
@@ -414,7 +522,7 @@ async def test_sanitized_output_omits_full_ids_payload_urls_tokens_rendered_text
     result = await run_bounded_policy_notification_intent(
         _approved_config(),
         runtime_config_loader=_runtime_config,
-        runtime_builder=FakeRuntimeBuilder(FakeRepository(row=row), FakePolicyInvoker()),
+        runtime_builder=FakeRuntimeBuilder(FakeRepository(rows=[row]), FakePolicyInvoker()),
     )
     rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
 
@@ -435,7 +543,7 @@ async def test_sanitized_output_omits_full_ids_payload_urls_tokens_rendered_text
         _approved_config(),
         runtime_config_loader=_runtime_config,
         runtime_builder=FakeRuntimeBuilder(
-            FakeRepository(row=_row()),
+            FakeRepository(rows=[_row()]),
             FakePolicyInvoker(failure=RuntimeError(EXCEPTION_DETAIL)),
         ),
     )

@@ -32,6 +32,7 @@ REQUIRED_PAYLOAD_FIELDS = (
     "candidate_group_id",
     "bundle_id",
 )
+UUID_TEXT_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +41,13 @@ class BoundedPolicyNotificationIntentConfig:
     allow_database_read: bool = False
     allow_policy_write: bool = False
     expected_pending_count: int = 1
+    expected_eligible_pending_count: int | None = None
+
+    @property
+    def resolved_expected_eligible_pending_count(self) -> int:
+        if self.expected_eligible_pending_count is not None:
+            return self.expected_eligible_pending_count
+        return self.expected_pending_count
 
 
 @dataclass(slots=True)
@@ -69,6 +77,14 @@ class PolicyApplyEventRow:
 
 
 @dataclass(frozen=True, slots=True)
+class PolicyApplyBacklogCounts:
+    raw_pending: int = 0
+    eligible_pending: int = 0
+    stale_already_analyzed: int = 0
+    malformed_pending: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class PolicyInvocationSummary:
     processed_event_count: int = 0
     analysis_created: bool = False
@@ -88,8 +104,8 @@ class PolicyInvocationSummary:
 
 
 class BoundedPolicyNotificationIntentRepository(Protocol):
-    async def count_pending_policy_apply_events(self) -> int: ...
-    async def fetch_oldest_pending_policy_apply_event(self) -> PolicyApplyEventRow | None: ...
+    async def load_pending_policy_apply_event_counts(self) -> PolicyApplyBacklogCounts: ...
+    async def fetch_oldest_eligible_pending_policy_apply_event(self) -> PolicyApplyEventRow | None: ...
 
 
 class BoundedPolicyInvoker(Protocol):
@@ -121,6 +137,10 @@ class BoundedPolicyNotificationIntentResult:
     database_read_allowed: bool
     policy_write_allowed: bool
     pending_policy_apply_count_observed: int | None = None
+    raw_pending_policy_apply_count_observed: int | None = None
+    eligible_pending_policy_apply_count_observed: int | None = None
+    stale_already_analyzed_policy_apply_count_observed: int | None = None
+    malformed_pending_policy_apply_count_observed: int | None = None
     selected_event_present: bool = False
     selected_event_status: str | None = None
     selected_event_id_suffix: str | None = None
@@ -150,6 +170,12 @@ class BoundedPolicyNotificationIntentResult:
             "policy_write_allowed": self.policy_write_allowed,
             "database_read_attempted": self.state.database_read_attempted,
             "pending_policy_apply_count_observed": self.pending_policy_apply_count_observed,
+            "raw_pending_policy_apply_count_observed": self.raw_pending_policy_apply_count_observed,
+            "eligible_pending_policy_apply_count_observed": self.eligible_pending_policy_apply_count_observed,
+            "stale_already_analyzed_policy_apply_count_observed": (
+                self.stale_already_analyzed_policy_apply_count_observed
+            ),
+            "malformed_pending_policy_apply_count_observed": self.malformed_pending_policy_apply_count_observed,
             "selected_event_present": self.selected_event_present,
             "selected_event_status": self.selected_event_status,
             "selected_event_id_suffix": self.selected_event_id_suffix,
@@ -207,33 +233,146 @@ class SqlAlchemyBoundedPolicyNotificationIntentRepository:
     def __init__(self, session: Any) -> None:
         self._session = session
 
-    async def count_pending_policy_apply_events(self) -> int:
+    async def load_pending_policy_apply_event_counts(self) -> PolicyApplyBacklogCounts:
         result = await self._session.execute(
             _sql(
                 """
-                SELECT count(*)
-                FROM event_outbox
-                WHERE event_type = :event_type
-                  AND status = 'pending'::outbox_status_enum
+                WITH pending AS (
+                    SELECT event_id, payload_json
+                    FROM event_outbox
+                    WHERE event_type = :event_type
+                      AND status = 'pending'::outbox_status_enum
+                ),
+                payload_checked AS (
+                    SELECT
+                        event_id,
+                        payload_json,
+                        COALESCE((payload_json ->> 'judge_run_id') ~* :uuid_pattern, false) AS has_judge_run_id,
+                        COALESCE((payload_json ->> 'judge_output_id') ~* :uuid_pattern, false) AS has_judge_output_id,
+                        COALESCE((payload_json ->> 'candidate_group_id') ~* :uuid_pattern, false)
+                            AS has_candidate_group_id,
+                        COALESCE((payload_json ->> 'bundle_id') ~* :uuid_pattern, false) AS has_bundle_id
+                    FROM pending
+                ),
+                classified AS (
+                    SELECT
+                        event_id,
+                        payload_json,
+                        (
+                            has_judge_run_id
+                            AND has_judge_output_id
+                            AND has_candidate_group_id
+                            AND has_bundle_id
+                        ) AS payload_valid,
+                        CASE
+                            WHEN (
+                                has_judge_run_id
+                                AND has_judge_output_id
+                                AND has_candidate_group_id
+                                AND has_bundle_id
+                            )
+                            THEN CAST(payload_json ->> 'judge_output_id' AS uuid)
+                            ELSE NULL::uuid
+                        END AS judge_output_uuid
+                    FROM payload_checked
+                ),
+                classified_with_analysis AS (
+                    SELECT
+                        classified.event_id,
+                        classified.payload_valid,
+                        EXISTS (
+                            SELECT 1
+                            FROM analyses
+                            WHERE analyses.judge_output_id = classified.judge_output_uuid
+                        ) AS already_analyzed
+                    FROM classified
+                )
+                SELECT
+                    (SELECT count(*) FROM pending) AS raw_pending_count,
+                    count(*) FILTER (WHERE payload_valid AND already_analyzed)
+                        AS stale_already_analyzed_count,
+                    count(*) FILTER (WHERE payload_valid AND NOT already_analyzed)
+                        AS eligible_pending_count,
+                    count(*) FILTER (WHERE NOT payload_valid) AS malformed_pending_count
+                FROM classified_with_analysis
                 """
             ),
-            {"event_type": EVENT_TYPE},
+            {"event_type": EVENT_TYPE, "uuid_pattern": UUID_TEXT_PATTERN},
         )
-        return int(result.scalar_one())
+        row = result.mappings().one()
+        return PolicyApplyBacklogCounts(
+            raw_pending=int(row["raw_pending_count"]),
+            eligible_pending=int(row["eligible_pending_count"]),
+            stale_already_analyzed=int(row["stale_already_analyzed_count"]),
+            malformed_pending=int(row["malformed_pending_count"]),
+        )
 
-    async def fetch_oldest_pending_policy_apply_event(self) -> PolicyApplyEventRow | None:
+    async def fetch_oldest_eligible_pending_policy_apply_event(self) -> PolicyApplyEventRow | None:
         result = await self._session.execute(
             _sql(
                 """
+                WITH pending AS (
+                    SELECT event_id, event_type, aggregate_type, aggregate_id, payload_json, status, created_at
+                    FROM event_outbox
+                    WHERE event_type = :event_type
+                      AND status = 'pending'::outbox_status_enum
+                ),
+                payload_checked AS (
+                    SELECT
+                        event_id,
+                        event_type,
+                        aggregate_type,
+                        aggregate_id,
+                        payload_json,
+                        status,
+                        created_at,
+                        COALESCE((payload_json ->> 'judge_run_id') ~* :uuid_pattern, false) AS has_judge_run_id,
+                        COALESCE((payload_json ->> 'judge_output_id') ~* :uuid_pattern, false) AS has_judge_output_id,
+                        COALESCE((payload_json ->> 'candidate_group_id') ~* :uuid_pattern, false)
+                            AS has_candidate_group_id,
+                        COALESCE((payload_json ->> 'bundle_id') ~* :uuid_pattern, false) AS has_bundle_id
+                    FROM pending
+                ),
+                classified AS (
+                    SELECT
+                        event_id,
+                        event_type,
+                        aggregate_type,
+                        aggregate_id,
+                        payload_json,
+                        status,
+                        created_at,
+                        (
+                            has_judge_run_id
+                            AND has_judge_output_id
+                            AND has_candidate_group_id
+                            AND has_bundle_id
+                        ) AS payload_valid,
+                        CASE
+                            WHEN (
+                                has_judge_run_id
+                                AND has_judge_output_id
+                                AND has_candidate_group_id
+                                AND has_bundle_id
+                            )
+                            THEN CAST(payload_json ->> 'judge_output_id' AS uuid)
+                            ELSE NULL::uuid
+                        END AS judge_output_uuid
+                    FROM payload_checked
+                )
                 SELECT event_id, event_type, aggregate_type, aggregate_id, payload_json, status, created_at
-                FROM event_outbox
-                WHERE event_type = :event_type
-                  AND status = 'pending'::outbox_status_enum
+                FROM classified
+                WHERE payload_valid
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM analyses
+                      WHERE analyses.judge_output_id = classified.judge_output_uuid
+                  )
                 ORDER BY created_at ASC, event_id ASC
                 LIMIT 1
                 """
             ),
-            {"event_type": EVENT_TYPE},
+            {"event_type": EVENT_TYPE, "uuid_pattern": UUID_TEXT_PATTERN},
         )
         row = result.mappings().first()
         if row is None:
@@ -462,32 +601,41 @@ async def run_bounded_policy_notification_intent(
         )
         repository = runtime_handle.repository
         state.database_read_attempted = True
-        pending_count = await repository.count_pending_policy_apply_events()
-        if pending_count != config.expected_pending_count:
+        policy_apply_counts = await repository.load_pending_policy_apply_event_counts()
+        if policy_apply_counts.malformed_pending:
             return _result(
                 "blocked",
-                "pending_count_mismatch",
+                "malformed_policy_apply_payload",
                 config=config,
                 state=state,
-                pending_count_observed=pending_count,
+                policy_apply_counts=policy_apply_counts,
             )
-        if pending_count != 1:
+        expected_eligible_count = config.resolved_expected_eligible_pending_count
+        if policy_apply_counts.eligible_pending != expected_eligible_count:
             return _result(
                 "blocked",
-                "pending_count_not_one",
+                "eligible_pending_count_mismatch",
                 config=config,
                 state=state,
-                pending_count_observed=pending_count,
+                policy_apply_counts=policy_apply_counts,
+            )
+        if policy_apply_counts.eligible_pending != 1:
+            return _result(
+                "blocked",
+                "eligible_pending_count_not_one",
+                config=config,
+                state=state,
+                policy_apply_counts=policy_apply_counts,
             )
 
-        row = await repository.fetch_oldest_pending_policy_apply_event()
+        row = await repository.fetch_oldest_eligible_pending_policy_apply_event()
         if row is None:
             return _result(
                 "blocked",
-                "selected_event_missing",
+                "eligible_policy_apply_missing",
                 config=config,
                 state=state,
-                pending_count_observed=pending_count,
+                policy_apply_counts=policy_apply_counts,
             )
         payload_flags = _payload_presence_flags(row.payload_json)
         if not all(payload_flags.values()):
@@ -496,7 +644,7 @@ async def run_bounded_policy_notification_intent(
                 "malformed_event_payload",
                 config=config,
                 state=state,
-                pending_count_observed=pending_count,
+                policy_apply_counts=policy_apply_counts,
                 selected_event=row,
                 payload_flags=payload_flags,
             )
@@ -506,7 +654,7 @@ async def run_bounded_policy_notification_intent(
                 "policy_write_not_allowed",
                 config=config,
                 state=state,
-                pending_count_observed=pending_count,
+                policy_apply_counts=policy_apply_counts,
                 selected_event=row,
                 payload_flags=payload_flags,
             )
@@ -520,7 +668,7 @@ async def run_bounded_policy_notification_intent(
                 "policy_invocation_failed",
                 config=config,
                 state=state,
-                pending_count_observed=pending_count,
+                policy_apply_counts=policy_apply_counts,
                 selected_event=row,
                 payload_flags=payload_flags,
             )
@@ -533,7 +681,7 @@ async def run_bounded_policy_notification_intent(
             None,
             config=config,
             state=state,
-            pending_count_observed=pending_count,
+            policy_apply_counts=policy_apply_counts,
             selected_event=row,
             payload_flags=payload_flags,
             invocation=invocation,
@@ -584,6 +732,7 @@ def _result(
     *,
     config: BoundedPolicyNotificationIntentConfig,
     state: BoundedPolicyNotificationIntentState,
+    policy_apply_counts: PolicyApplyBacklogCounts | None = None,
     pending_count_observed: int | None = None,
     selected_event: PolicyApplyEventRow | None = None,
     payload_flags: Mapping[str, bool] | None = None,
@@ -595,6 +744,7 @@ def _result(
     recommended_next_action = None
     if invocation is not None and invocation.delivery_decision == "suppress":
         recommended_next_action = "no_notification_intent_emitted_by_policy"
+    raw_pending_count = policy_apply_counts.raw_pending if policy_apply_counts is not None else pending_count_observed
     return BoundedPolicyNotificationIntentResult(
         status=status,
         ok=status == "pass" and error_code is None,
@@ -602,7 +752,17 @@ def _result(
         operator_approved=config.operator_approved,
         database_read_allowed=config.allow_database_read,
         policy_write_allowed=config.allow_policy_write,
-        pending_policy_apply_count_observed=pending_count_observed,
+        pending_policy_apply_count_observed=raw_pending_count,
+        raw_pending_policy_apply_count_observed=raw_pending_count,
+        eligible_pending_policy_apply_count_observed=(
+            policy_apply_counts.eligible_pending if policy_apply_counts is not None else None
+        ),
+        stale_already_analyzed_policy_apply_count_observed=(
+            policy_apply_counts.stale_already_analyzed if policy_apply_counts is not None else None
+        ),
+        malformed_pending_policy_apply_count_observed=(
+            policy_apply_counts.malformed_pending if policy_apply_counts is not None else None
+        ),
         selected_event_present=selected["present"],
         selected_event_status=selected["status"],
         selected_event_id_suffix=selected["event_id_suffix"],
@@ -698,6 +858,7 @@ __all__ = [
     "BoundedPolicyNotificationIntentState",
     "EVENT_TYPE",
     "MODE",
+    "PolicyApplyBacklogCounts",
     "PolicyApplyEventRow",
     "PolicyEngineTriggerInvoker",
     "PolicyInvocationSummary",

@@ -46,7 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--operator-approved", action="store_true")
     parser.add_argument("--allow-database-read", action="store_true")
     parser.add_argument("--allow-policy-write", action="store_true")
-    parser.add_argument("--expected-pending-count", type=int, default=1)
+    parser.add_argument("--expected-pending-count", type=int, default=None)
+    parser.add_argument("--expected-eligible-pending-count", type=int, default=None)
     return parser
 
 
@@ -56,6 +57,10 @@ def run(
     runtime_config_loader=None,
     runtime_builder: BoundedPolicyNotificationIntentRuntimeBuilder | None = None,
 ) -> RunnerResult:
+    try:
+        expected_eligible_pending_count = _resolve_expected_eligible_pending_count(args)
+    except CliArgumentError as exc:
+        return RunnerResult(exit_code=1, report=argument_error_report(str(exc)))
     runner_kwargs: dict[str, Any] = {
         "runtime_builder": runtime_builder,
     }
@@ -66,7 +71,7 @@ def run(
             operator_approved=bool(args.operator_approved),
             allow_database_read=bool(args.allow_database_read),
             allow_policy_write=bool(args.allow_policy_write),
-            expected_pending_count=int(args.expected_pending_count),
+            expected_eligible_pending_count=expected_eligible_pending_count,
         ),
         **runner_kwargs,
     )
@@ -92,6 +97,18 @@ def main(
     )
     sys.stdout.write(render_sanitized_json(result.report))
     return result.exit_code
+
+
+def _resolve_expected_eligible_pending_count(args: argparse.Namespace) -> int:
+    legacy = args.expected_pending_count
+    explicit = args.expected_eligible_pending_count
+    if legacy is not None and explicit is not None and int(legacy) != int(explicit):
+        raise CliArgumentError("expected_count_conflict")
+    if explicit is not None:
+        return int(explicit)
+    if legacy is not None:
+        return int(legacy)
+    return 1
 
 
 __all__ = [

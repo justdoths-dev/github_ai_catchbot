@@ -9,6 +9,7 @@ from uuid import uuid4
 from src.services.policy_engine import bounded_notification_intent
 from src.services.policy_engine.bounded_notification_intent import (
     BoundedPolicyNotificationIntentRuntimeHandle,
+    PolicyApplyBacklogCounts,
     PolicyApplyEventRow,
     PolicyEngineConfig,
     PolicyInvocationSummary,
@@ -29,10 +30,10 @@ class FakeRepository:
     def __init__(self, row: PolicyApplyEventRow) -> None:
         self.row = row
 
-    async def count_pending_policy_apply_events(self) -> int:
-        return 1
+    async def load_pending_policy_apply_event_counts(self) -> PolicyApplyBacklogCounts:
+        return PolicyApplyBacklogCounts(raw_pending=1, eligible_pending=1)
 
-    async def fetch_oldest_pending_policy_apply_event(self) -> PolicyApplyEventRow | None:
+    async def fetch_oldest_eligible_pending_policy_apply_event(self) -> PolicyApplyEventRow | None:
         return self.row
 
 
@@ -166,6 +167,7 @@ def test_parser_exposes_only_approved_bounded_flags() -> None:
         "--allow-database-read",
         "--allow-policy-write",
         "--expected-pending-count",
+        "--expected-eligible-pending-count",
     }
 
 
@@ -201,6 +203,8 @@ def test_valid_cli_run_prints_sanitized_json_and_delegates_to_source(capsys) -> 
             "--allow-database-read",
             "--allow-policy-write",
             "--expected-pending-count",
+            "1",
+            "--expected-eligible-pending-count",
             "1",
         ],
         runtime_config_loader=_runtime_config,
@@ -249,8 +253,36 @@ def test_run_with_explicit_args_uses_expected_pending_count() -> None:
 
     assert result.exit_code == 0
     assert result.report["pending_policy_apply_count_observed"] == 1
+    assert result.report["raw_pending_policy_apply_count_observed"] == 1
+    assert result.report["eligible_pending_policy_apply_count_observed"] == 1
     assert result.report["processed_event_count"] == 1
     assert invoker.calls == [row.event_id]
+
+
+def test_run_with_expected_count_conflict_fails_before_runtime() -> None:
+    row = _row()
+    repository = FakeRepository(row)
+    invoker = FakePolicyInvoker()
+
+    result = runner.run(
+        _parse_args(
+            "--operator-approved",
+            "--allow-database-read",
+            "--allow-policy-write",
+            "--expected-pending-count",
+            "1",
+            "--expected-eligible-pending-count",
+            "2",
+        ),
+        runtime_config_loader=_runtime_config,
+        runtime_builder=FakeRuntimeBuilder(repository, invoker),
+    )
+
+    assert result.exit_code == 1
+    assert result.report["error_code"] == "expected_count_conflict"
+    assert result.report["database_read_attempted"] is False
+    assert result.report["policy_invocation_attempted"] is False
+    assert invoker.calls == []
 
 
 def test_tool_source_imports_no_db_redis_or_external_clients_and_has_no_business_logic() -> None:
