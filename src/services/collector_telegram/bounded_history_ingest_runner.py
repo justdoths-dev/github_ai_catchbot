@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -652,17 +652,25 @@ def _valid_max_messages(value: int) -> bool:
 def _coerce_source_message_id(row: Mapping[str, Any] | None) -> str | None:
     if row is None:
         return None
-    value = row.get("source_message_id")
-    if isinstance(value, str) and value:
-        return value
+    source_message_id = _coerce_uuid_string(row.get("source_message_id"))
+    if source_message_id is not None:
+        return source_message_id
     raise BoundedHistoryIngestError("source_message_id_invalid")
 
 
 def _require_source_message_id(row: Mapping[str, Any]) -> str:
-    value = row.get("source_message_id")
+    source_message_id = _coerce_uuid_string(row.get("source_message_id"))
+    if source_message_id is not None:
+        return source_message_id
+    raise BoundedHistoryIngestError("source_message_id_invalid")
+
+
+def _coerce_uuid_string(value: object) -> str | None:
     if isinstance(value, str) and value:
         return value
-    raise BoundedHistoryIngestError("source_message_id_invalid")
+    if isinstance(value, UUID):
+        return str(value)
+    return None
 
 
 def _require_version_no(row: Mapping[str, Any]) -> int:

@@ -5,7 +5,7 @@ import json
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
@@ -31,6 +31,7 @@ RAW_MESSAGE_ID = 444555666
 RAW_MESSAGE_TEXT = "sentinel bounded history ingest raw message text"
 RAW_SECRET = "sentinel_telegram_api_hash_history_ingest"
 EXCEPTION_DETAIL = "private exception detail with sentinel bounded history ingest raw message text"
+_DEFAULT_SOURCE_MESSAGE_ID = object()
 
 
 class FakeTransaction:
@@ -60,9 +61,15 @@ class FakeRepository:
         *,
         tracked: TrackedChat | None = None,
         fail_upsert: Exception | None = None,
+        return_uuid_source_message_id: bool = False,
+        upsert_source_message_id: object = _DEFAULT_SOURCE_MESSAGE_ID,
+        omit_upsert_source_message_id: bool = False,
     ) -> None:
         self.tracked = tracked
         self.fail_upsert = fail_upsert
+        self.return_uuid_source_message_id = return_uuid_source_message_id
+        self.upsert_source_message_id = upsert_source_message_id
+        self.omit_upsert_source_message_id = omit_upsert_source_message_id
         self.messages: dict[tuple[int, int], dict[str, Any]] = {}
         self.versions: dict[str, list[dict[str, Any]]] = {}
         self.outbox: list[Any] = []
@@ -112,14 +119,19 @@ class FakeRepository:
         key = (projection.chat_id, projection.message_id)
         row = self.messages.get(key)
         if row is None:
-            source_message_id = str(uuid5(NAMESPACE_URL, f"telegram:{projection.chat_id}:{projection.message_id}"))
+            source_message_uuid = uuid5(NAMESPACE_URL, f"telegram:{projection.chat_id}:{projection.message_id}")
+            source_message_id = str(source_message_uuid)
+            row_source_message_id = self.upsert_source_message_id
+            if row_source_message_id is _DEFAULT_SOURCE_MESSAGE_ID:
+                row_source_message_id = source_message_uuid if self.return_uuid_source_message_id else source_message_id
             row = {
-                "source_message_id": source_message_id,
                 "chat_id": projection.chat_id,
                 "message_id": projection.message_id,
                 "logical_post_key": projection.logical_post_key,
                 "current_version_no": 0,
             }
+            if not self.omit_upsert_source_message_id:
+                row["source_message_id"] = row_source_message_id
             self.messages[key] = row
             self.versions[source_message_id] = []
         row["logical_post_key"] = projection.logical_post_key
@@ -437,6 +449,115 @@ async def test_one_fake_message_flows_through_projection_repository_and_outbox()
     assert RAW_MESSAGE_TEXT not in rendered
     assert DB_URL not in rendered
     assert RAW_SECRET not in rendered
+
+
+@pytest.mark.asyncio
+async def test_new_source_message_accepts_uuid_source_message_id_from_upsert_row() -> None:
+    repository = FakeRepository(return_uuid_source_message_id=True)
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(),
+        repository=repository,
+        history=FakeHistoryClient([_message()]),
+    )
+    report = result.to_sanitized_dict()
+
+    row = repository.messages[(RAW_CHAT_ID, RAW_MESSAGE_ID)]
+    source_message_id = row["source_message_id"]
+
+    assert result.ok is True
+    assert report["source_messages_created_count"] == 1
+    assert report["source_versions_appended_count"] == 1
+    assert report["outbox_events_inserted_count"] == 1
+    assert isinstance(source_message_id, UUID)
+    assert repository.outbox[0].aggregate_id == str(source_message_id)
+    assert repository.outbox[0].payload_json["source_message_id"] == str(source_message_id)
+    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
+    assert builder.close_commits == [True]
+
+
+@pytest.mark.asyncio
+async def test_existing_source_message_accepts_uuid_source_message_id_from_existing_row() -> None:
+    repository = FakeRepository(return_uuid_source_message_id=True)
+    first_result, _loader, _builder, repository, _history = await _run(
+        _approved_config(),
+        repository=repository,
+        history=FakeHistoryClient([_message()]),
+    )
+    row = repository.messages[(RAW_CHAT_ID, RAW_MESSAGE_ID)]
+    assert isinstance(row["source_message_id"], UUID)
+
+    second_result, _loader, second_builder, repository, _history = await _run(
+        _approved_config(),
+        repository=repository,
+        history=FakeHistoryClient([_message()]),
+    )
+    second = second_result.to_sanitized_dict()
+
+    assert first_result.ok is True
+    assert second_result.ok is True
+    assert second["source_messages_created_count"] == 0
+    assert second["source_versions_appended_count"] == 0
+    assert second["outbox_events_inserted_count"] == 0
+    assert second["idempotent_noop_count"] == 1
+    assert second["database_write_attempted"] is False
+    assert second["outbox_write_attempted"] is False
+    assert second_builder.close_commits == [True]
+    assert repository.upsert_calls == 1
+    assert len(repository.outbox) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "repository",
+    [
+        FakeRepository(upsert_source_message_id=123),
+        FakeRepository(omit_upsert_source_message_id=True),
+    ],
+)
+async def test_invalid_or_missing_upsert_source_message_id_fails_closed_without_outbox(
+    repository: FakeRepository,
+) -> None:
+    result, _loader, builder, repository, _history = await _run(
+        _approved_config(),
+        repository=repository,
+        history=FakeHistoryClient([_message()]),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["error_code"] == "source_message_id_invalid"
+    assert report["database_write_attempted"] is True
+    assert report["outbox_write_attempted"] is False
+    assert report["outbox_events_inserted_count"] == 0
+    assert repository.messages == {}
+    assert repository.outbox == []
+    assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+async def test_invalid_existing_source_message_id_fails_closed_before_database_write() -> None:
+    repository = FakeRepository()
+    repository.messages[(RAW_CHAT_ID, RAW_MESSAGE_ID)] = {
+        "source_message_id": {"unexpected": "shape"},
+        "chat_id": RAW_CHAT_ID,
+        "message_id": RAW_MESSAGE_ID,
+        "logical_post_key": f"telegram:{RAW_CHAT_ID}:{RAW_MESSAGE_ID}",
+        "current_version_no": 0,
+    }
+    result, _loader, builder, repository, _history = await _run(
+        _approved_config(),
+        repository=repository,
+        history=FakeHistoryClient([_message()]),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["error_code"] == "source_message_id_invalid"
+    assert report["database_write_attempted"] is False
+    assert report["outbox_write_attempted"] is False
+    assert repository.upsert_calls == 0
+    assert repository.outbox == []
+    assert builder.close_commits == [False]
 
 
 @pytest.mark.asyncio

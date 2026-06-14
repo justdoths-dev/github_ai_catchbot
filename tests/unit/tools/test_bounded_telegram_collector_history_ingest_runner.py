@@ -4,7 +4,7 @@ import ast
 import json
 from pathlib import Path
 from typing import Any
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from src.services.collector_telegram.bounded_history_ingest_runner import (
     BoundedTelegramCollectorHistoryIngestRuntimeHandle,
@@ -56,9 +56,10 @@ class FakeRepository:
 
     async def upsert_source_message(self, projection: Any, *, platform: str = "telegram"):
         assert platform == "telegram"
-        source_message_id = str(uuid5(NAMESPACE_URL, f"telegram:{projection.chat_id}:{projection.message_id}"))
+        source_message_uuid = uuid5(NAMESPACE_URL, f"telegram:{projection.chat_id}:{projection.message_id}")
+        source_message_id = str(source_message_uuid)
         row = {
-            "source_message_id": source_message_id,
+            "source_message_id": source_message_uuid,
             "chat_id": projection.chat_id,
             "message_id": projection.message_id,
         }
@@ -243,6 +244,9 @@ def test_valid_cli_run_prints_sanitized_json_and_delegates_to_source(capsys) -> 
     assert parsed["source_messages_created_count"] == 1
     assert parsed["source_versions_appended_count"] == 1
     assert parsed["outbox_events_inserted_count"] == 1
+    row = runtime_builder.repository.messages[(RAW_CHAT_ID, 123456)]
+    assert isinstance(row["source_message_id"], UUID)
+    assert runtime_builder.repository.outbox[0].aggregate_id == str(row["source_message_id"])
     assert runtime_builder.history_client.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
     for raw in (
         str(RAW_CHAT_ID),
