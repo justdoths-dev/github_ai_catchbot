@@ -434,8 +434,8 @@ class CollectorRepository:
         )
         return result.mappings().first()
 
-    async def insert_outbox_event(self, event: OutboxEventDraft) -> None:
-        await self._session.execute(
+    async def insert_outbox_event(self, event: OutboxEventDraft) -> bool:
+        result = await self._session.execute(
             sa.text(
                 """
                 INSERT INTO event_outbox (
@@ -455,6 +455,7 @@ class CollectorRepository:
                     'pending'::outbox_status_enum
                 )
                 ON CONFLICT (dedupe_key) DO NOTHING
+                RETURNING event_id
                 """
             ),
             {
@@ -465,6 +466,39 @@ class CollectorRepository:
                 'payload_json': _jsonb_dumps(event.payload_json),
             },
         )
+        return result.scalar_one_or_none() is not None
+
+    async def get_active_joined_tracked_chat_by_registry_id(
+        self,
+        registry_id: str,
+    ) -> TrackedChat | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT
+                    registry_id,
+                    chat_id,
+                    desired_state,
+                    access_state,
+                    source_kind,
+                    source_value,
+                    priority_weight,
+                    last_seen_message_id,
+                    last_seen_message_date
+                FROM telegram_channel_registry
+                WHERE registry_id = CAST(:registry_id AS uuid)
+                  AND desired_state = 'active'
+                  AND access_state = 'joined'
+                  AND chat_id IS NOT NULL
+                LIMIT 2
+                """
+            ),
+            {"registry_id": registry_id},
+        )
+        rows = result.mappings().all()
+        if len(rows) != 1:
+            return None
+        return self._tracked_chat_from_row(rows[0])
 
     async def list_active_tracked_chats(self) -> list[TrackedChat]:
         result = await self._session.execute(
