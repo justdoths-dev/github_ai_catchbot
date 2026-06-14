@@ -9,6 +9,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 
+from src.services.collector_telegram import bounded_history_ingest_runner as runner_module
 from src.services.collector_telegram.bounded_history_ingest_runner import (
     BoundedHistoryIngestError,
     BoundedTelegramCollectorHistoryIngestConfig,
@@ -251,6 +252,218 @@ class FakeRuntimeBuilder:
         )
 
 
+class FakeDefaultSession:
+    def __init__(self, *, commit_error: Exception | None = None) -> None:
+        self.commit_error = commit_error
+        self.commit_calls = 0
+        self.rollback_calls = 0
+        self.close_calls = 0
+
+    async def commit(self) -> None:
+        self.commit_calls += 1
+        if self.commit_error is not None:
+            raise self.commit_error
+
+    async def rollback(self) -> None:
+        self.rollback_calls += 1
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class FakeDefaultEngine:
+    def __init__(self) -> None:
+        self.dispose_calls = 0
+
+    async def dispose(self) -> None:
+        self.dispose_calls += 1
+
+
+class FakeDefaultTDLib:
+    def __init__(self, runtime_config: CollectorTelegramConfig, *, transport: object, logger: Any) -> None:
+        self.runtime_config = runtime_config
+        self.transport = transport
+        self.logger = logger
+
+
+class FakeDefaultHistoryClient:
+    def __init__(self, tdlib: FakeDefaultTDLib, *, state: BoundedTelegramCollectorHistoryIngestState) -> None:
+        self.tdlib = tdlib
+        self.state = state
+        self.close_calls = 0
+
+    async def fetch_newest_history_messages(self, *, chat_id: int, limit: int):
+        del chat_id, limit
+        raise AssertionError("default runtime close tests do not fetch history")
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class ImplicitTransaction:
+    def __init__(self, repository: "ImplicitTransactionRepository") -> None:
+        self.repository = repository
+
+    async def __aenter__(self) -> "ImplicitTransactionRepository":
+        self.repository.ensure_pending()
+        self.repository.transaction_enters += 1
+        return self.repository
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.repository.transaction_exits.append(exc_type)
+        if self.repository.implicit_transaction_open:
+            return None
+        if exc_type is None:
+            self.repository.finalize(commit=True)
+        else:
+            self.repository.finalize(commit=False)
+        return None
+
+
+class ImplicitTransactionRepository:
+    def __init__(self, *, tracked: TrackedChat, fail_after_upsert: Exception | None = None) -> None:
+        self.tracked = tracked
+        self.fail_after_upsert = fail_after_upsert
+        self.implicit_transaction_open = False
+        self.committed_messages: dict[tuple[int, int], dict[str, Any]] = {}
+        self.committed_versions: dict[str, list[dict[str, Any]]] = {}
+        self.committed_outbox: list[Any] = []
+        self.pending_messages: dict[tuple[int, int], dict[str, Any]] | None = None
+        self.pending_versions: dict[str, list[dict[str, Any]]] | None = None
+        self.pending_outbox: list[Any] | None = None
+        self.registry_lookups: list[str] = []
+        self.transaction_enters = 0
+        self.transaction_exits: list[Any] = []
+        self.upsert_calls = 0
+
+    def ensure_pending(self) -> None:
+        if self.pending_messages is None:
+            self.pending_messages = deepcopy(self.committed_messages)
+            self.pending_versions = deepcopy(self.committed_versions)
+            self.pending_outbox = list(self.committed_outbox)
+
+    def finalize(self, *, commit: bool) -> None:
+        if commit and self.pending_messages is not None:
+            self.committed_messages = deepcopy(self.pending_messages)
+            self.committed_versions = deepcopy(self.pending_versions or {})
+            self.committed_outbox = list(self.pending_outbox or [])
+        self.pending_messages = None
+        self.pending_versions = None
+        self.pending_outbox = None
+        self.implicit_transaction_open = False
+
+    def pending_counts(self) -> tuple[int, int, int]:
+        return (
+            len(self.pending_messages or {}),
+            sum(len(versions) for versions in (self.pending_versions or {}).values()),
+            len(self.pending_outbox or []),
+        )
+
+    def committed_counts(self) -> tuple[int, int, int]:
+        return (
+            len(self.committed_messages),
+            sum(len(versions) for versions in self.committed_versions.values()),
+            len(self.committed_outbox),
+        )
+
+    def transaction(self) -> ImplicitTransaction:
+        return ImplicitTransaction(self)
+
+    async def get_active_joined_tracked_chat_by_registry_id(self, registry_id: str) -> TrackedChat | None:
+        self.registry_lookups.append(registry_id)
+        self.implicit_transaction_open = True
+        self.ensure_pending()
+        if self.tracked.registry_id != registry_id:
+            return None
+        if self.tracked.desired_state != "active" or self.tracked.access_state != "joined":
+            return None
+        return self.tracked
+
+    async def get_source_message(self, *, platform: str, chat_id: int, message_id: int) -> dict[str, Any] | None:
+        assert platform == "telegram"
+        self.ensure_pending()
+        return (self.pending_messages or {}).get((chat_id, message_id))
+
+    async def get_latest_version(self, source_message_id: str) -> dict[str, Any] | None:
+        self.ensure_pending()
+        versions = (self.pending_versions or {}).get(source_message_id, [])
+        return versions[-1] if versions else None
+
+    async def upsert_source_message(self, projection: Any, *, platform: str = "telegram") -> dict[str, Any]:
+        assert platform == "telegram"
+        self.ensure_pending()
+        self.upsert_calls += 1
+        source_message_uuid = uuid5(NAMESPACE_URL, f"telegram:{projection.chat_id}:{projection.message_id}")
+        source_message_id = str(source_message_uuid)
+        row = {
+            "source_message_id": source_message_id,
+            "chat_id": projection.chat_id,
+            "message_id": projection.message_id,
+            "logical_post_key": projection.logical_post_key,
+            "current_version_no": 0,
+        }
+        assert self.pending_messages is not None
+        assert self.pending_versions is not None
+        self.pending_messages[(projection.chat_id, projection.message_id)] = row
+        self.pending_versions.setdefault(source_message_id, [])
+        return row
+
+    async def append_source_message_version_if_changed(
+        self,
+        *,
+        source_message_id: str,
+        projection: Any,
+        version_reason: str,
+        observed_at: Any = None,
+        telegram_edit_date: Any = None,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        del observed_at, telegram_edit_date
+        if self.fail_after_upsert is not None:
+            raise self.fail_after_upsert
+        self.ensure_pending()
+        assert self.pending_versions is not None
+        versions = self.pending_versions.setdefault(source_message_id, [])
+        row = {
+            "source_message_id": source_message_id,
+            "version_no": len(versions) + 1,
+            "version_reason": version_reason,
+            "content_hash": projection.content_hash,
+        }
+        versions.append(row)
+        return True, row
+
+    async def insert_outbox_event(self, event: Any) -> bool:
+        self.ensure_pending()
+        assert self.pending_outbox is not None
+        self.pending_outbox.append(event)
+        return True
+
+
+class ImplicitTransactionRuntimeBuilder:
+    def __init__(self, repository: ImplicitTransactionRepository, history_client: FakeHistoryClient) -> None:
+        self.repository = repository
+        self.history_client = history_client
+        self.close_commits: list[bool] = []
+        self.pre_close_committed_counts: list[tuple[int, int, int]] = []
+        self.pre_close_pending_counts: list[tuple[int, int, int]] = []
+
+    async def __call__(self, runtime_config, state, logger):
+        del runtime_config, state, logger
+
+        async def close(commit: bool) -> None:
+            self.close_commits.append(commit)
+            self.pre_close_committed_counts.append(self.repository.committed_counts())
+            self.pre_close_pending_counts.append(self.repository.pending_counts())
+            self.repository.finalize(commit=commit)
+            await self.history_client.close()
+
+        return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
+            repository=self.repository,
+            history_client=self.history_client,
+            close=close,
+        )
+
+
 class Loader:
     def __init__(self) -> None:
         self.calls = 0
@@ -309,6 +522,40 @@ def _approved_config(**overrides: Any) -> BoundedTelegramCollectorHistoryIngestC
     return BoundedTelegramCollectorHistoryIngestConfig(**values)
 
 
+def _tracked_chat(registry_id: str = "11111111-1111-1111-1111-111111111111") -> TrackedChat:
+    return TrackedChat(
+        registry_id=registry_id,
+        chat_id=RAW_CHAT_ID,
+        desired_state="active",
+        access_state="joined",
+        source_kind="username",
+        source_value="goodvibeai",
+        priority_weight=100,
+    )
+
+
+def _install_default_runtime_fakes(monkeypatch: pytest.MonkeyPatch, session: FakeDefaultSession):
+    engine = FakeDefaultEngine()
+    history_clients: list[FakeDefaultHistoryClient] = []
+
+    def fake_async_sessionmaker(received_engine: FakeDefaultEngine, *, expire_on_commit: bool):
+        assert received_engine is engine
+        assert expire_on_commit is False
+        return lambda: session
+
+    def fake_history_client(tdlib: FakeDefaultTDLib, *, state: BoundedTelegramCollectorHistoryIngestState):
+        client = FakeDefaultHistoryClient(tdlib, state=state)
+        history_clients.append(client)
+        return client
+
+    monkeypatch.setattr(runner_module, "create_async_engine", lambda database_url: engine)
+    monkeypatch.setattr(runner_module, "async_sessionmaker", fake_async_sessionmaker)
+    monkeypatch.setattr(runner_module, "TDJsonTransport", lambda: object())
+    monkeypatch.setattr(runner_module, "TDLibClient", FakeDefaultTDLib)
+    monkeypatch.setattr(runner_module, "_TDLibBoundedHistoryClient", fake_history_client)
+    return engine, history_clients
+
+
 async def _run(
     config: BoundedTelegramCollectorHistoryIngestConfig,
     *,
@@ -326,6 +573,120 @@ async def _run(
         runtime_builder=builder,
     )
     return result, fake_loader, builder, fake_repository, fake_history
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("commit", "expected_commit_calls", "expected_rollback_calls"),
+    [
+        (True, 1, 0),
+        (False, 0, 1),
+    ],
+)
+async def test_default_runtime_close_finalizes_session_from_commit_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    commit: bool,
+    expected_commit_calls: int,
+    expected_rollback_calls: int,
+) -> None:
+    session = FakeDefaultSession()
+    engine, history_clients = _install_default_runtime_fakes(monkeypatch, session)
+    handle = await runner_module.build_default_bounded_history_ingest_runtime(
+        _runtime_config(),
+        BoundedTelegramCollectorHistoryIngestState(),
+        runner_module.logging.getLogger(__name__),
+    )
+
+    await handle.close(commit)
+
+    assert session.commit_calls == expected_commit_calls
+    assert session.rollback_calls == expected_rollback_calls
+    assert session.close_calls == 1
+    assert engine.dispose_calls == 1
+    assert len(history_clients) == 1
+    assert history_clients[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_default_runtime_close_commit_failure_is_visible_and_still_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = FakeDefaultSession(commit_error=RuntimeError("sentinel_commit_failed"))
+    engine, history_clients = _install_default_runtime_fakes(monkeypatch, session)
+    handle = await runner_module.build_default_bounded_history_ingest_runtime(
+        _runtime_config(),
+        BoundedTelegramCollectorHistoryIngestState(),
+        runner_module.logging.getLogger(__name__),
+    )
+
+    with pytest.raises(RuntimeError, match="sentinel_commit_failed"):
+        await handle.close(True)
+
+    assert session.commit_calls == 1
+    assert session.rollback_calls == 0
+    assert session.close_calls == 1
+    assert engine.dispose_calls == 1
+    assert len(history_clients) == 1
+    assert history_clients[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_run_with_implicit_transaction_persists_on_close_commit_true() -> None:
+    tracked = _tracked_chat()
+    repository = ImplicitTransactionRepository(tracked=tracked)
+    history = FakeHistoryClient([_message()])
+    builder = ImplicitTransactionRuntimeBuilder(repository, history)
+
+    result = await run_bounded_telegram_collector_history_ingest(
+        _approved_config(chat_id=None, registry_id=tracked.registry_id),
+        runtime_config_loader=Loader(),
+        runtime_builder=builder,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is True
+    assert report["source_messages_created_count"] == 1
+    assert report["source_versions_appended_count"] == 1
+    assert report["outbox_events_inserted_count"] == 1
+    assert repository.registry_lookups == [tracked.registry_id]
+    assert repository.transaction_enters == 1
+    assert builder.close_commits == [True]
+    assert builder.pre_close_committed_counts == [(0, 0, 0)]
+    assert builder.pre_close_pending_counts == [(1, 1, 1)]
+    assert repository.committed_counts() == (1, 1, 1)
+    assert repository.pending_counts() == (0, 0, 0)
+    assert len(repository.committed_outbox) == 1
+    assert repository.committed_outbox[0].event_type == "source_message.created.v1"
+
+
+@pytest.mark.asyncio
+async def test_failure_after_write_with_implicit_transaction_rolls_back_pending_state() -> None:
+    tracked = _tracked_chat()
+    repository = ImplicitTransactionRepository(
+        tracked=tracked,
+        fail_after_upsert=RuntimeError(EXCEPTION_DETAIL),
+    )
+    history = FakeHistoryClient([_message()])
+    builder = ImplicitTransactionRuntimeBuilder(repository, history)
+
+    result = await run_bounded_telegram_collector_history_ingest(
+        _approved_config(chat_id=None, registry_id=tracked.registry_id),
+        runtime_config_loader=Loader(),
+        runtime_builder=builder,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["error_code"] == "unexpected_failure"
+    assert report["database_write_attempted"] is True
+    assert report["outbox_write_attempted"] is False
+    assert repository.transaction_enters == 1
+    assert builder.close_commits == [False]
+    assert builder.pre_close_committed_counts == [(0, 0, 0)]
+    assert builder.pre_close_pending_counts == [(1, 0, 0)]
+    assert repository.committed_counts() == (0, 0, 0)
+    assert repository.pending_counts() == (0, 0, 0)
+    assert repository.committed_outbox == []
 
 
 @pytest.mark.asyncio

@@ -452,11 +452,18 @@ async def build_default_bounded_history_ingest_runtime(
     history_client = _TDLibBoundedHistoryClient(tdlib, state=state)
 
     async def close(commit: bool) -> None:
-        del commit
-        with contextlib.suppress(Exception):
-            await history_client.close()
-        await session.close()
-        await engine.dispose()
+        try:
+            if commit:
+                await session.commit()
+            else:
+                await session.rollback()
+        finally:
+            with contextlib.suppress(Exception):
+                await history_client.close()
+            with contextlib.suppress(Exception):
+                await session.close()
+            with contextlib.suppress(Exception):
+                await engine.dispose()
 
     return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
         repository=repository,
