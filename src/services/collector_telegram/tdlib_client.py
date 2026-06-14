@@ -124,13 +124,22 @@ class TDLibTransportProtocol(Protocol):
 class TDJsonTransport:
     """Async-shaped adapter around the official TDLib tdjson C interface."""
 
-    def __init__(self, *, library_path: str | None = None) -> None:
+    def __init__(self, *, library_path: str | None = None, suppress_native_logs: bool = True) -> None:
         self._library_path = library_path
+        self._suppress_native_logs = suppress_native_logs
+        self._native_log_suppression_attempted = False
+        self._native_log_suppression_confirmed = False
         self._tdjson: ctypes.CDLL | None = None
         self._client: ctypes.c_void_p | None = None
 
     def assert_available(self) -> None:
         self._load_tdjson()
+
+    def native_log_suppression_attempted(self) -> bool:
+        return self._native_log_suppression_attempted
+
+    def native_log_suppression_confirmed(self) -> bool:
+        return self._native_log_suppression_confirmed
 
     async def initialize(self) -> None:
         if self._client is not None:
@@ -186,6 +195,8 @@ class TDJsonTransport:
         except OSError as exc:
             raise TDLibTransportError("tdjson library could not be loaded") from exc
 
+        self._suppress_native_tdlib_logs(tdjson)
+
         try:
             tdjson.td_json_client_create.restype = ctypes.c_void_p
             tdjson.td_json_client_send.argtypes = (ctypes.c_void_p, ctypes.c_char_p)
@@ -195,6 +206,23 @@ class TDJsonTransport:
         except AttributeError as exc:
             raise TDLibTransportError("tdjson library is missing required client symbols") from exc
         return tdjson
+
+    def _suppress_native_tdlib_logs(self, tdjson: ctypes.CDLL) -> None:
+        if not self._suppress_native_logs:
+            return
+        self._native_log_suppression_attempted = True
+        setter = getattr(tdjson, "td_set_log_verbosity_level", None)
+        if setter is None:
+            self._native_log_suppression_confirmed = False
+            raise TDLibTransportError("tdjson native log suppression unavailable")
+        try:
+            setter.argtypes = (ctypes.c_int,)
+            setter.restype = None
+            setter(0)
+        except Exception as exc:
+            self._native_log_suppression_confirmed = False
+            raise TDLibTransportError("tdjson native log suppression failed") from exc
+        self._native_log_suppression_confirmed = True
 
     @staticmethod
     def _default_library_path_candidate() -> str | None:
@@ -239,6 +267,8 @@ class TDLibClient:
             return
         try:
             await self._transport.initialize()
+        except TDLibTransportError:
+            raise
         except Exception as exc:  # pragma: no cover
             raise TDLibTransportError("Failed to initialize TDLib transport") from exc
         self._initialized = True
@@ -248,6 +278,8 @@ class TDLibClient:
         self._ensure_open()
         try:
             await self._transport.send(request)
+        except TDLibTransportError:
+            raise
         except Exception as exc:  # pragma: no cover
             raise TDLibTransportError("Failed to send TDLib request") from exc
 
@@ -255,6 +287,8 @@ class TDLibClient:
         self._ensure_open()
         try:
             payload = await self._transport.receive(timeout)
+        except TDLibTransportError:
+            raise
         except Exception as exc:  # pragma: no cover
             raise TDLibTransportError("Failed to receive TDLib payload") from exc
 
@@ -288,6 +322,18 @@ class TDLibClient:
         raw = state.get("@type")
         return raw if isinstance(raw, str) else None
 
+    def native_log_suppression_attempted(self) -> bool:
+        getter = getattr(self._transport, "native_log_suppression_attempted", None)
+        if getter is None:
+            return False
+        return bool(getter())
+
+    def native_log_suppression_confirmed(self) -> bool:
+        getter = getattr(self._transport, "native_log_suppression_confirmed", None)
+        if getter is None:
+            return False
+        return bool(getter())
+
     def _ensure_open(self) -> None:
         if not self._initialized:
             raise TDLibTransportError("TDLib client is not initialized")
@@ -304,6 +350,9 @@ class TDLibClient:
                 "encryption_key": tdlib_json_bytes(self._config.tdlib_db_encryption_key),
             }
         )
+
+    def build_get_authorization_state_request(self) -> TDLibRequest:
+        return TDLibRequest({"@type": "getAuthorizationState"})
 
     def build_set_authentication_phone_number_request(self) -> TDLibRequest:
         return TDLibRequest(

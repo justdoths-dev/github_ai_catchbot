@@ -15,6 +15,7 @@ from uuid import uuid4
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from .config import CollectorTelegramConfig
+from .exceptions import TDLibTransportError
 from .idempotency import IdempotencyPolicy
 from .message_projection import MessageProjectionBuilder
 from .models import SourceMessageProjection, TrackedChat
@@ -29,6 +30,24 @@ DEFAULT_MAX_MESSAGES = 1
 MAX_MESSAGES_HARD_LIMIT = 3
 HISTORY_READ_TIMEOUT_SEC = 30.0
 HISTORY_RECEIVE_TIMEOUT_SEC = 1.0
+AUTH_READY_TIMEOUT_SEC = 30.0
+AUTH_RECEIVE_TIMEOUT_SEC = 1.0
+
+_INTERACTIVE_AUTHORIZATION_STATES = frozenset(
+    {
+        "authorizationStateWaitPhoneNumber",
+        "authorizationStateWaitCode",
+        "authorizationStateWaitOtherDeviceConfirmation",
+        "authorizationStateWaitPassword",
+    }
+)
+_TERMINAL_NOT_READY_AUTHORIZATION_STATES = frozenset(
+    {
+        "authorizationStateLoggingOut",
+        "authorizationStateClosing",
+        "authorizationStateClosed",
+    }
+)
 
 JsonDict = dict[str, Any]
 RuntimeConfigLoader = Callable[[], CollectorTelegramConfig]
@@ -97,6 +116,11 @@ class BoundedTelegramCollectorHistoryIngestState:
     runtime_config_attempted: bool = False
     runtime_builder_attempted: bool = False
     registry_lookup_attempted: bool = False
+    tdlib_auth_ready_checked: bool = False
+    tdlib_auth_ready: bool = False
+    tdlib_parameters_submitted: bool = False
+    tdlib_log_suppression_attempted: bool = False
+    tdlib_log_suppression_confirmed: bool = False
     telegram_read_attempted: bool = False
     telegram_read_called: bool = False
     database_write_attempted: bool = False
@@ -188,6 +212,11 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "target_chat_id_suffix": self.target_chat_id_suffix,
             "target_chat_id_sha256_12": self.target_chat_id_sha256_12,
             "target_registry_id_suffix": self.target_registry_id_suffix,
+            "tdlib_auth_ready_checked": self.state.tdlib_auth_ready_checked,
+            "tdlib_auth_ready": self.state.tdlib_auth_ready,
+            "tdlib_parameters_submitted": self.state.tdlib_parameters_submitted,
+            "tdlib_log_suppression_attempted": self.state.tdlib_log_suppression_attempted,
+            "tdlib_log_suppression_confirmed": self.state.tdlib_log_suppression_confirmed,
             "telegram_read_attempted": self.state.telegram_read_attempted,
             "database_write_attempted": self.state.database_write_attempted,
             "outbox_write_attempted": self.state.outbox_write_attempted,
@@ -223,12 +252,23 @@ class _ResolvedTarget:
 
 
 class _TDLibBoundedHistoryClient:
-    def __init__(self, tdlib: TDLibClient, *, timeout_sec: float = HISTORY_READ_TIMEOUT_SEC) -> None:
+    def __init__(
+        self,
+        tdlib: TDLibClient,
+        *,
+        state: BoundedTelegramCollectorHistoryIngestState,
+        timeout_sec: float = HISTORY_READ_TIMEOUT_SEC,
+        auth_ready_timeout_sec: float = AUTH_READY_TIMEOUT_SEC,
+        require_native_log_suppression: bool = True,
+    ) -> None:
         self._tdlib = tdlib
+        self._state = state
         self._timeout_sec = timeout_sec
+        self._auth_ready_timeout_sec = auth_ready_timeout_sec
+        self._require_native_log_suppression = require_native_log_suppression
 
     async def fetch_newest_history_messages(self, *, chat_id: int, limit: int) -> Sequence[Mapping[str, Any]]:
-        await self._tdlib.initialize()
+        await self._ensure_ready_for_history_read()
         request = self._tdlib.build_get_chat_history_request(
             chat_id=chat_id,
             from_message_id=0,
@@ -239,6 +279,7 @@ class _TDLibBoundedHistoryClient:
         payload = dict(request.payload)
         extra = f"{RUNNER_NAME}:{uuid4()}"
         payload["@extra"] = extra
+        self._state.telegram_read_called = True
         await self._tdlib.send(payload)
 
         deadline = time.monotonic() + self._timeout_sec
@@ -259,6 +300,72 @@ class _TDLibBoundedHistoryClient:
 
     async def close(self) -> None:
         await self._tdlib.close()
+
+    async def _ensure_ready_for_history_read(self) -> None:
+        try:
+            await self._tdlib.initialize()
+        except TDLibTransportError as exc:
+            self._copy_log_suppression_state()
+            if self._state.tdlib_log_suppression_attempted and not self._state.tdlib_log_suppression_confirmed:
+                raise BoundedHistoryIngestError("tdlib_log_suppression_unconfirmed") from exc
+            raise BoundedHistoryIngestError("tdlib_initialize_failed") from exc
+
+        self._copy_log_suppression_state()
+        if self._require_native_log_suppression and not self._state.tdlib_log_suppression_confirmed:
+            raise BoundedHistoryIngestError("tdlib_log_suppression_unconfirmed")
+
+        self._state.tdlib_auth_ready_checked = True
+        await self._request_authorization_state()
+
+        deadline = time.monotonic() + self._auth_ready_timeout_sec
+        while time.monotonic() < deadline:
+            receive_timeout = min(AUTH_RECEIVE_TIMEOUT_SEC, max(0.0, deadline - time.monotonic()))
+            response = await self._tdlib.receive(receive_timeout)
+            if response is None:
+                continue
+            authorization_state = _authorization_state_from_tdlib_payload(response)
+            if authorization_state is None:
+                if response.get("@type") == "error" and _is_bounded_auth_extra(response.get("@extra")):
+                    raise BoundedHistoryIngestError("tdlib_parameters_required")
+                continue
+
+            state_type = authorization_state.get("@type")
+            if state_type == "authorizationStateReady":
+                self._state.tdlib_auth_ready = True
+                return
+            if state_type == "authorizationStateWaitTdlibParameters":
+                await self._submit_tdlib_parameters()
+                continue
+            if state_type == "authorizationStateWaitEncryptionKey":
+                await self._submit_database_encryption_key()
+                continue
+            if state_type in _INTERACTIVE_AUTHORIZATION_STATES:
+                raise BoundedHistoryIngestError("tdlib_not_authorized")
+            if state_type in _TERMINAL_NOT_READY_AUTHORIZATION_STATES:
+                raise BoundedHistoryIngestError("tdlib_not_authorized")
+            raise BoundedHistoryIngestError("tdlib_auth_state_invalid")
+
+        raise BoundedHistoryIngestError("tdlib_auth_ready_timeout")
+
+    async def _request_authorization_state(self) -> None:
+        payload = dict(self._tdlib.build_get_authorization_state_request().payload)
+        payload["@extra"] = f"{RUNNER_NAME}:auth_state:{uuid4()}"
+        await self._tdlib.send(payload)
+
+    async def _submit_tdlib_parameters(self) -> None:
+        payload = dict(self._tdlib.build_set_tdlib_parameters_request().payload)
+        payload["@extra"] = f"{RUNNER_NAME}:tdlib_parameters:{uuid4()}"
+        self._state.tdlib_parameters_submitted = True
+        await self._tdlib.send(payload)
+
+    async def _submit_database_encryption_key(self) -> None:
+        payload = dict(self._tdlib.build_check_database_encryption_key_request().payload)
+        payload["@extra"] = f"{RUNNER_NAME}:database_encryption_key:{uuid4()}"
+        await self._tdlib.send(payload)
+
+    def _copy_log_suppression_state(self) -> None:
+        self._state.tdlib_log_suppression_attempted = self._tdlib.native_log_suppression_attempted()
+        self._state.tdlib_log_suppression_confirmed = self._tdlib.native_log_suppression_confirmed()
 
 
 class HistoryMessageIngestProcessor:
@@ -336,14 +443,13 @@ async def build_default_bounded_history_ingest_runtime(
     state: BoundedTelegramCollectorHistoryIngestState,
     logger: logging.Logger,
 ) -> BoundedTelegramCollectorHistoryIngestRuntimeHandle:
-    del state
     runtime_config.ensure_runtime_dirs()
     engine = create_async_engine(runtime_config.database_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     session = session_factory()
     repository = CollectorRepository(session, logger=logger)
     tdlib = TDLibClient(runtime_config, transport=TDJsonTransport(), logger=logger)
-    history_client = _TDLibBoundedHistoryClient(tdlib)
+    history_client = _TDLibBoundedHistoryClient(tdlib, state=state)
 
     async def close(commit: bool) -> None:
         del commit
@@ -417,11 +523,11 @@ async def run_bounded_telegram_collector_history_ingest(
         target = await _resolve_target(config, runtime.repository, state)
 
         state.telegram_read_attempted = True
-        state.telegram_read_called = True
         messages = await runtime.history_client.fetch_newest_history_messages(
             chat_id=target.chat_id,
             limit=config.max_messages,
         )
+        state.telegram_read_called = True
         selected_messages = [dict(message) for message in messages if isinstance(message, Mapping)][: config.max_messages]
 
         processor = HistoryMessageIngestProcessor(
@@ -523,6 +629,20 @@ def _target_selection_mode(config: BoundedTelegramCollectorHistoryIngestConfig) 
     if config.registry_id is not None:
         return "registry_id"
     return "none"
+
+
+def _authorization_state_from_tdlib_payload(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    if payload.get("@type") == "updateAuthorizationState":
+        authorization_state = payload.get("authorization_state")
+        return authorization_state if isinstance(authorization_state, Mapping) else None
+    payload_type = payload.get("@type")
+    if isinstance(payload_type, str) and payload_type.startswith("authorizationState"):
+        return payload
+    return None
+
+
+def _is_bounded_auth_extra(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(f"{RUNNER_NAME}:")
 
 
 def _valid_max_messages(value: int) -> bool:

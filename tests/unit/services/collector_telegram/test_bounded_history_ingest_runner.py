@@ -10,12 +10,16 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 
 from src.services.collector_telegram.bounded_history_ingest_runner import (
+    BoundedHistoryIngestError,
     BoundedTelegramCollectorHistoryIngestConfig,
     BoundedTelegramCollectorHistoryIngestRuntimeHandle,
+    BoundedTelegramCollectorHistoryIngestState,
+    _TDLibBoundedHistoryClient,
     run_bounded_telegram_collector_history_ingest,
 )
 from src.services.collector_telegram.config import CollectorTelegramConfig
 from src.services.collector_telegram.models import CollectorEnvironment, CollectorMode, TrackedChat
+from src.services.collector_telegram.tdlib_client import TDLibClient
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -163,6 +167,54 @@ class FakeHistoryClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class FakeTDLibTransport:
+    def __init__(
+        self,
+        *,
+        auth_payloads: list[dict[str, Any]] | None = None,
+        history_messages: list[dict[str, Any]] | None = None,
+        log_suppression_attempted: bool = True,
+        log_suppression_confirmed: bool = True,
+    ) -> None:
+        self.auth_payloads = list(auth_payloads or [])
+        self.history_messages = list(history_messages or [_message()])
+        self.log_suppression_attempted = log_suppression_attempted
+        self.log_suppression_confirmed = log_suppression_confirmed
+        self.initialized = False
+        self.closed = False
+        self.sent_requests: list[dict[str, Any]] = []
+
+    async def initialize(self) -> None:
+        self.initialized = True
+
+    async def send(self, request: dict[str, Any]) -> None:
+        self.sent_requests.append(dict(request))
+        if request.get("@type") == "getChatHistory":
+            extra = request.get("@extra")
+            self.auth_payloads.append(
+                {
+                    "@type": "messages",
+                    "@extra": extra,
+                    "messages": deepcopy(self.history_messages),
+                }
+            )
+
+    async def receive(self, timeout: float) -> dict[str, Any] | None:
+        del timeout
+        if self.auth_payloads:
+            return self.auth_payloads.pop(0)
+        return None
+
+    async def close(self) -> None:
+        self.closed = True
+
+    def native_log_suppression_attempted(self) -> bool:
+        return self.log_suppression_attempted
+
+    def native_log_suppression_confirmed(self) -> bool:
+        return self.log_suppression_confirmed
 
 
 class FakeRuntimeBuilder:
@@ -385,6 +437,108 @@ async def test_one_fake_message_flows_through_projection_repository_and_outbox()
     assert RAW_MESSAGE_TEXT not in rendered
     assert DB_URL not in rendered
     assert RAW_SECRET not in rendered
+
+
+@pytest.mark.asyncio
+async def test_tdlib_history_client_submits_parameters_before_history_request() -> None:
+    state = BoundedTelegramCollectorHistoryIngestState()
+    transport = FakeTDLibTransport(
+        auth_payloads=[
+            {"@type": "authorizationStateWaitTdlibParameters"},
+            {"@type": "authorizationStateWaitEncryptionKey"},
+            {
+                "@type": "updateAuthorizationState",
+                "authorization_state": {"@type": "authorizationStateReady"},
+            },
+        ]
+    )
+    tdlib = TDLibClient(_runtime_config(), transport=transport)
+    client = _TDLibBoundedHistoryClient(tdlib, state=state, auth_ready_timeout_sec=0.1)
+
+    messages = await client.fetch_newest_history_messages(chat_id=RAW_CHAT_ID, limit=1)
+
+    request_types = [request["@type"] for request in transport.sent_requests]
+    assert request_types == [
+        "getAuthorizationState",
+        "setTdlibParameters",
+        "checkDatabaseEncryptionKey",
+        "getChatHistory",
+    ]
+    assert messages[0]["id"] == RAW_MESSAGE_ID
+    assert state.tdlib_log_suppression_attempted is True
+    assert state.tdlib_log_suppression_confirmed is True
+    assert state.tdlib_auth_ready_checked is True
+    assert state.tdlib_auth_ready is True
+    assert state.tdlib_parameters_submitted is True
+    assert state.telegram_read_called is True
+    assert transport.sent_requests[1]["api_hash"] == RAW_SECRET
+    assert transport.sent_requests[2]["encryption_key"]
+    assert transport.sent_requests[3]["chat_id"] == RAW_CHAT_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state_type",
+    [
+        "authorizationStateWaitPhoneNumber",
+        "authorizationStateWaitCode",
+        "authorizationStateWaitOtherDeviceConfirmation",
+        "authorizationStateWaitPassword",
+    ],
+)
+async def test_tdlib_history_client_blocks_interactive_auth_before_history_request(state_type: str) -> None:
+    state = BoundedTelegramCollectorHistoryIngestState()
+    transport = FakeTDLibTransport(auth_payloads=[{"@type": state_type}])
+    tdlib = TDLibClient(_runtime_config(), transport=transport)
+    client = _TDLibBoundedHistoryClient(tdlib, state=state, auth_ready_timeout_sec=0.1)
+
+    with pytest.raises(BoundedHistoryIngestError) as exc_info:
+        await client.fetch_newest_history_messages(chat_id=RAW_CHAT_ID, limit=1)
+
+    assert exc_info.value.error_code == "tdlib_not_authorized"
+    assert [request["@type"] for request in transport.sent_requests] == ["getAuthorizationState"]
+    assert state.tdlib_auth_ready_checked is True
+    assert state.tdlib_auth_ready is False
+    assert state.telegram_read_called is False
+
+
+@pytest.mark.asyncio
+async def test_tdlib_history_client_times_out_before_history_request_when_ready_never_seen() -> None:
+    state = BoundedTelegramCollectorHistoryIngestState()
+    transport = FakeTDLibTransport(auth_payloads=[])
+    tdlib = TDLibClient(_runtime_config(), transport=transport)
+    client = _TDLibBoundedHistoryClient(tdlib, state=state, auth_ready_timeout_sec=0.01)
+
+    with pytest.raises(BoundedHistoryIngestError) as exc_info:
+        await client.fetch_newest_history_messages(chat_id=RAW_CHAT_ID, limit=1)
+
+    assert exc_info.value.error_code == "tdlib_auth_ready_timeout"
+    assert [request["@type"] for request in transport.sent_requests] == ["getAuthorizationState"]
+    assert state.tdlib_auth_ready_checked is True
+    assert state.tdlib_auth_ready is False
+    assert state.telegram_read_called is False
+
+
+@pytest.mark.asyncio
+async def test_tdlib_history_client_requires_log_suppression_before_auth_or_history_request() -> None:
+    state = BoundedTelegramCollectorHistoryIngestState()
+    transport = FakeTDLibTransport(
+        auth_payloads=[{"@type": "authorizationStateReady"}],
+        log_suppression_attempted=True,
+        log_suppression_confirmed=False,
+    )
+    tdlib = TDLibClient(_runtime_config(), transport=transport)
+    client = _TDLibBoundedHistoryClient(tdlib, state=state, auth_ready_timeout_sec=0.1)
+
+    with pytest.raises(BoundedHistoryIngestError) as exc_info:
+        await client.fetch_newest_history_messages(chat_id=RAW_CHAT_ID, limit=1)
+
+    assert exc_info.value.error_code == "tdlib_log_suppression_unconfirmed"
+    assert transport.sent_requests == []
+    assert state.tdlib_log_suppression_attempted is True
+    assert state.tdlib_log_suppression_confirmed is False
+    assert state.tdlib_auth_ready_checked is False
+    assert state.telegram_read_called is False
 
 
 @pytest.mark.asyncio

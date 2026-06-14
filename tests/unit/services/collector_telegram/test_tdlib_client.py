@@ -24,12 +24,24 @@ from services.collector_telegram.tdlib_client import (
 )
 
 
+class FakeCFunction:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return None
+
+
 def _fake_tdjson_cdll() -> SimpleNamespace:
     return SimpleNamespace(
-        td_json_client_create=SimpleNamespace(),
-        td_json_client_send=SimpleNamespace(),
-        td_json_client_receive=SimpleNamespace(),
-        td_json_client_destroy=SimpleNamespace(),
+        td_set_log_verbosity_level=FakeCFunction(),
+        td_json_client_create=FakeCFunction(),
+        td_json_client_send=FakeCFunction(),
+        td_json_client_receive=FakeCFunction(),
+        td_json_client_destroy=FakeCFunction(),
     )
 
 
@@ -155,6 +167,7 @@ class TDLibClientTests(unittest.IsolatedAsyncioTestCase):
 
         find_library.assert_not_called()
         cdll.assert_called_once_with(explicit_path)
+        self.assertEqual(fake_cdll.td_set_log_verbosity_level.calls, [(0,)])
 
     def test_real_tdjson_transport_preserves_env_var_path_behavior(self) -> None:
         env_path = "/safe/env/libtdjson.so"
@@ -173,6 +186,7 @@ class TDLibClientTests(unittest.IsolatedAsyncioTestCase):
 
         find_library.assert_not_called()
         cdll.assert_called_once_with(env_path)
+        self.assertEqual(fake_cdll.td_set_log_verbosity_level.calls, [(0,)])
 
     def test_real_tdjson_transport_uses_vps_default_path_candidate(self) -> None:
         fake_cdll = _fake_tdjson_cdll()
@@ -188,6 +202,24 @@ class TDLibClientTests(unittest.IsolatedAsyncioTestCase):
                         TDJsonTransport().assert_available()
 
         cdll.assert_called_once_with(default_path)
+        self.assertEqual(fake_cdll.td_set_log_verbosity_level.calls, [(0,)])
+
+    def test_real_tdjson_transport_blocks_when_native_log_suppression_is_unavailable(self) -> None:
+        explicit_path = "/safe/test/libtdjson.so"
+        fake_cdll = SimpleNamespace(
+            td_json_client_create=FakeCFunction(),
+            td_json_client_send=FakeCFunction(),
+            td_json_client_receive=FakeCFunction(),
+            td_json_client_destroy=FakeCFunction(),
+        )
+        transport = TDJsonTransport(library_path=explicit_path)
+
+        with patch("services.collector_telegram.tdlib_client.ctypes.CDLL", return_value=fake_cdll):
+            with self.assertRaises(TDLibTransportError):
+                transport.assert_available()
+
+        self.assertTrue(transport.native_log_suppression_attempted())
+        self.assertFalse(transport.native_log_suppression_confirmed())
 
     def test_tdlib_parameter_shape_guard_rejects_default_like_payload(self) -> None:
         invalid_payload = {

@@ -149,13 +149,20 @@ def _runtime_config() -> CollectorTelegramConfig:
 
 def test_main_with_no_flags_returns_fail_closed_json(capsys) -> None:
     exit_code = runner.main([])
-    parsed = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
 
     assert exit_code == 1
+    assert captured.err == ""
     assert parsed["schema_version"] == "bounded_telegram_collector_history_ingest_v1"
     assert parsed["runner_name"] == "bounded_telegram_collector_history_ingest_runner"
     assert parsed["operator_approved"] is False
     assert parsed["runtime_config_attempted"] is False
+    assert parsed["tdlib_auth_ready_checked"] is False
+    assert parsed["tdlib_auth_ready"] is False
+    assert parsed["tdlib_parameters_submitted"] is False
+    assert parsed["tdlib_log_suppression_attempted"] is False
+    assert parsed["tdlib_log_suppression_confirmed"] is False
     assert parsed["telegram_read_attempted"] is False
     assert parsed["database_write_attempted"] is False
     assert parsed["outbox_write_attempted"] is False
@@ -224,10 +231,12 @@ def test_valid_cli_run_prints_sanitized_json_and_delegates_to_source(capsys) -> 
         runtime_config_loader=_runtime_config,
         runtime_builder=runtime_builder,
     )
-    output = capsys.readouterr().out
+    captured = capsys.readouterr()
+    output = captured.out
     parsed = json.loads(output)
 
     assert exit_code == 0
+    assert captured.err == ""
     assert parsed["ok"] is True
     assert parsed["messages_requested"] == 1
     assert parsed["messages_seen"] == 1
@@ -235,5 +244,14 @@ def test_valid_cli_run_prints_sanitized_json_and_delegates_to_source(capsys) -> 
     assert parsed["source_versions_appended_count"] == 1
     assert parsed["outbox_events_inserted_count"] == 1
     assert runtime_builder.history_client.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
-    for raw in (str(RAW_CHAT_ID), RAW_MESSAGE_TEXT, DB_URL, RAW_SECRET):
+    for raw in (
+        str(RAW_CHAT_ID),
+        "getChatHistory",
+        RAW_MESSAGE_TEXT,
+        DB_URL,
+        RAW_SECRET,
+        "+15555550123",
+        "/tmp/sentinel-cli-history-ingest-tdlib-state",
+        "/tmp/sentinel-cli-history-ingest-tdlib-files",
+    ):
         assert raw not in output
