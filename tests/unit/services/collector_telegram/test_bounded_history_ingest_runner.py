@@ -32,6 +32,7 @@ RAW_MESSAGE_ID = 444555666
 RAW_MESSAGE_TEXT = "sentinel bounded history ingest raw message text"
 RAW_SECRET = "sentinel_telegram_api_hash_history_ingest"
 EXCEPTION_DETAIL = "private exception detail with sentinel bounded history ingest raw message text"
+CLOSE_EXCEPTION_DETAIL = "private close failure detail with sentinel bounded history ingest raw message text"
 _DEFAULT_SOURCE_MESSAGE_ID = object()
 
 
@@ -231,9 +232,16 @@ class FakeTDLibTransport:
 
 
 class FakeRuntimeBuilder:
-    def __init__(self, repository: FakeRepository, history_client: FakeHistoryClient) -> None:
+    def __init__(
+        self,
+        repository: FakeRepository,
+        history_client: FakeHistoryClient,
+        *,
+        close_error: Exception | None = None,
+    ) -> None:
         self.repository = repository
         self.history_client = history_client
+        self.close_error = close_error
         self.calls = 0
         self.close_commits: list[bool] = []
 
@@ -244,6 +252,8 @@ class FakeRuntimeBuilder:
         async def close(commit: bool) -> None:
             self.close_commits.append(commit)
             await self.history_client.close()
+            if self.close_error is not None:
+                raise self.close_error
 
         return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
             repository=self.repository,
@@ -562,11 +572,12 @@ async def _run(
     repository: FakeRepository | None = None,
     history: FakeHistoryClient | None = None,
     loader: Loader | None = None,
+    close_error: Exception | None = None,
 ):
     fake_repository = repository or FakeRepository()
     fake_history = history or FakeHistoryClient([_message()])
     fake_loader = loader or Loader()
-    builder = FakeRuntimeBuilder(fake_repository, fake_history)
+    builder = FakeRuntimeBuilder(fake_repository, fake_history, close_error=close_error)
     result = await run_bounded_telegram_collector_history_ingest(
         config,
         runtime_config_loader=fake_loader,
@@ -687,6 +698,65 @@ async def test_failure_after_write_with_implicit_transaction_rolls_back_pending_
     assert repository.committed_counts() == (0, 0, 0)
     assert repository.pending_counts() == (0, 0, 0)
     assert repository.committed_outbox == []
+
+
+@pytest.mark.asyncio
+async def test_successful_processing_close_commit_failure_returns_sanitized_blocked_result() -> None:
+    close_error = RuntimeError(CLOSE_EXCEPTION_DETAIL)
+    result, _loader, builder, _repository, history = await _run(
+        _approved_config(),
+        close_error=close_error,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "runtime_commit_failed"
+    assert report["error_class"] == "RuntimeError"
+    assert builder.close_commits == [True]
+    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
+    for raw_value in (
+        str(RAW_CHAT_ID),
+        str(RAW_MESSAGE_ID),
+        RAW_MESSAGE_TEXT,
+        DB_URL,
+        RAW_SECRET,
+        CLOSE_EXCEPTION_DETAIL,
+    ):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_failed_processing_close_rollback_failure_returns_sanitized_blocked_result() -> None:
+    repository = FakeRepository(fail_upsert=RuntimeError(EXCEPTION_DETAIL))
+    result, _loader, builder, _repository, history = await _run(
+        _approved_config(),
+        repository=repository,
+        history=FakeHistoryClient([_message()]),
+        close_error=ValueError(CLOSE_EXCEPTION_DETAIL),
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "runtime_rollback_failed"
+    assert report["error_class"] == "ValueError"
+    assert report["database_write_attempted"] is True
+    assert report["outbox_write_attempted"] is False
+    assert builder.close_commits == [False]
+    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
+    for raw_value in (
+        str(RAW_CHAT_ID),
+        str(RAW_MESSAGE_ID),
+        RAW_MESSAGE_TEXT,
+        DB_URL,
+        RAW_SECRET,
+        EXCEPTION_DETAIL,
+        CLOSE_EXCEPTION_DETAIL,
+    ):
+        assert raw_value not in rendered
 
 
 @pytest.mark.asyncio

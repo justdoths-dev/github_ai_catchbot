@@ -20,6 +20,7 @@ DB_URL = "postgresql+psycopg://sentinel_user:sentinel_db_password@127.0.0.1/db"
 RAW_CHAT_ID = 9876543210123
 RAW_MESSAGE_TEXT = "sentinel cli history ingest message text"
 RAW_SECRET = "sentinel_cli_history_ingest_secret"
+CLOSE_EXCEPTION_DETAIL = "private cli close failure with sentinel cli history ingest message text"
 
 
 class FakeTransaction:
@@ -111,15 +112,19 @@ class FakeHistoryClient:
 
 
 class FakeRuntimeBuilder:
-    def __init__(self) -> None:
+    def __init__(self, *, close_error: Exception | None = None) -> None:
         self.repository = FakeRepository()
         self.history_client = FakeHistoryClient()
+        self.close_error = close_error
+        self.close_commits: list[bool] = []
 
     async def __call__(self, runtime_config, state, logger):
         del runtime_config, state, logger
 
         async def close(commit: bool) -> None:
-            del commit
+            self.close_commits.append(commit)
+            if self.close_error is not None:
+                raise self.close_error
 
         return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
             repository=self.repository,
@@ -254,6 +259,49 @@ def test_valid_cli_run_prints_sanitized_json_and_delegates_to_source(capsys) -> 
         RAW_MESSAGE_TEXT,
         DB_URL,
         RAW_SECRET,
+        "+15555550123",
+        "/tmp/sentinel-cli-history-ingest-tdlib-state",
+        "/tmp/sentinel-cli-history-ingest-tdlib-files",
+    ):
+        assert raw not in output
+
+
+def test_main_close_failure_returns_sanitized_json_without_stderr(capsys) -> None:
+    runtime_builder = FakeRuntimeBuilder(close_error=RuntimeError(CLOSE_EXCEPTION_DETAIL))
+    exit_code = runner.main(
+        [
+            "--operator-approved",
+            "--allow-runtime-config",
+            "--allow-telegram-read",
+            "--allow-database-write",
+            "--allow-outbox-write",
+            "--max-messages",
+            "1",
+            "--chat-id",
+            str(RAW_CHAT_ID),
+        ],
+        runtime_config_loader=_runtime_config,
+        runtime_builder=runtime_builder,
+    )
+    captured = capsys.readouterr()
+    output = captured.out
+    parsed = json.loads(output)
+
+    assert exit_code == 1
+    assert captured.err == ""
+    assert parsed["ok"] is False
+    assert parsed["status"] == "blocked"
+    assert parsed["error_code"] == "runtime_commit_failed"
+    assert parsed["error_class"] == "RuntimeError"
+    assert runtime_builder.close_commits == [True]
+    assert runtime_builder.history_client.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
+    for raw in (
+        str(RAW_CHAT_ID),
+        "getChatHistory",
+        RAW_MESSAGE_TEXT,
+        DB_URL,
+        RAW_SECRET,
+        CLOSE_EXCEPTION_DETAIL,
         "+15555550123",
         "/tmp/sentinel-cli-history-ingest-tdlib-state",
         "/tmp/sentinel-cli-history-ingest-tdlib-files",

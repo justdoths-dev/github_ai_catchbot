@@ -525,6 +525,7 @@ async def run_bounded_telegram_collector_history_ingest(
     state.runtime_builder_attempted = True
     runtime: BoundedTelegramCollectorHistoryIngestRuntimeHandle | None = None
     commit = False
+    result: BoundedTelegramCollectorHistoryIngestResult | None = None
     try:
         runtime = await builder(runtime_config, state, effective_logger)
         target = await _resolve_target(config, runtime.repository, state)
@@ -556,7 +557,7 @@ async def run_bounded_telegram_collector_history_ingest(
             noop_count += int(applied.idempotent_noop)
 
         commit = True
-        return BoundedTelegramCollectorHistoryIngestResult(
+        result = BoundedTelegramCollectorHistoryIngestResult(
             status="completed",
             ok=True,
             error_code=None,
@@ -574,12 +575,18 @@ async def run_bounded_telegram_collector_history_ingest(
             idempotent_noop_count=noop_count,
         )
     except BoundedHistoryIngestError as exc:
-        return blocked(exc.error_code)
+        result = blocked(exc.error_code)
     except Exception as exc:
-        return blocked("unexpected_failure", error_class=_safe_exception_class(exc))
+        result = blocked("unexpected_failure", error_class=_safe_exception_class(exc))
     finally:
         if runtime is not None:
-            await runtime.close(commit)
+            try:
+                await runtime.close(commit)
+            except Exception as exc:
+                result = blocked(_runtime_close_error_code(commit), error_class=_safe_exception_class(exc))
+
+    assert result is not None
+    return result
 
 
 def run_bounded_telegram_collector_history_ingest_sync(
@@ -700,6 +707,10 @@ def _safe_hash12(value: object | None) -> str | None:
     if value is None:
         return None
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _runtime_close_error_code(commit: bool) -> str:
+    return "runtime_commit_failed" if commit else "runtime_rollback_failed"
 
 
 def _safe_exception_class(exc: BaseException) -> str:
