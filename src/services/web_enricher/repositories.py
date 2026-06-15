@@ -39,7 +39,8 @@ class WebEnricherRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT event_id, event_type, payload_json, created_at
+                SELECT event_id, event_type, aggregate_type, aggregate_id,
+                       status, payload_json, created_at
                 FROM event_outbox
                 WHERE event_id = CAST(:event_id AS uuid)
                 """
@@ -49,6 +50,10 @@ class WebEnricherRepository:
         row = result.mappings().first()
         if row is None or row["event_type"] != "artifact.enrich.requested.v1":
             return None
+        if row["status"] != "published":
+            raise ValueError("artifact.enrich.requested.v1 must be published")
+        if row["aggregate_type"] != "artifact":
+            raise ValueError("artifact.enrich.requested.v1 aggregate_type must be artifact")
         payload = _json_loads(row["payload_json"]) or {}
         required = ["candidate_group_id", "artifact_id", "artifact_type", "provider_route", "refresh_mode", "depth_budget"]
         missing = [key for key in required if key not in payload]
@@ -56,6 +61,10 @@ class WebEnricherRepository:
             raise ValueError(f"artifact.enrich.requested.v1 missing required fields: {', '.join(missing)}")
         if payload["provider_route"] != "web":
             return None
+        if payload["artifact_type"] != "web_article":
+            raise ValueError("artifact.enrich.requested.v1 artifact_type must be web_article")
+        if str(payload["artifact_id"]) != str(row["aggregate_id"]):
+            raise ValueError("artifact.enrich.requested.v1 artifact_id must match aggregate_id")
         return ArtifactEnrichmentJob(
             trigger_event_id=UUID(str(row["event_id"])),
             event_type=str(row["event_type"]),
@@ -301,7 +310,7 @@ class WebEnricherRepository:
         snapshot_id: UUID,
         status: str,
         content_anchor: str,
-    ) -> None:
+    ) -> int:
         payload = {
             "artifact_id": str(artifact_id),
             "candidate_group_id": str(candidate_group_id),
@@ -312,7 +321,7 @@ class WebEnricherRepository:
             "status": status,
             "content_anchor": content_anchor,
         }
-        await self._session.execute(
+        result = await self._session.execute(
             sa.text(
                 """
                 INSERT INTO event_outbox (
@@ -333,6 +342,7 @@ class WebEnricherRepository:
                 "payload_json": _jsonb_dumps(payload),
             },
         )
+        return int(getattr(result, "rowcount", 1) or 0)
 
 
 def _parse_requested_at(raw_value: Any, fallback: Any) -> datetime:

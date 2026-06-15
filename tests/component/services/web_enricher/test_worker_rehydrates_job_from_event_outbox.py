@@ -133,6 +133,9 @@ async def test_repository_rehydrates_web_job_from_event_outbox() -> None:
             {
                 "event_id": trigger_event_id,
                 "event_type": "artifact.enrich.requested.v1",
+                "aggregate_type": "artifact",
+                "aggregate_id": artifact_id,
+                "status": "published",
                 "created_at": created_at,
                 "payload_json": {
                     "candidate_group_id": str(candidate_group_id),
