@@ -4,7 +4,7 @@ from .models import BundleMemberDraft, SnapshotRecord
 
 
 _UNUSABLE_STATES = {"failed_transient", "failed_permanent", "rate_limited", "access_denied", "unsupported"}
-_READY_STATES = {"ready", "partial_ready"}
+_READY_STATES = {"ready", "partial_ready", "low_evidence"}
 
 
 class ReadinessEvaluator:
@@ -23,8 +23,4 @@ class ReadinessEvaluator:
             return False
         if primary_snapshot.status in _UNUSABLE_STATES:
             return False
-        if primary_snapshot.status in _READY_STATES:
-            return True
-        if primary_snapshot.status == "low_evidence":
-            return primary_snapshot.snapshot_type == "text_idea"
-        return False
+        return primary_snapshot.status in _READY_STATES

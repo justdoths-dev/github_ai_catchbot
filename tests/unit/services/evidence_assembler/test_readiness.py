@@ -40,22 +40,22 @@ def test_low_evidence_text_idea_can_be_ready_when_formed() -> None:
     ) is True
 
 
-def test_low_evidence_web_article_is_not_ready() -> None:
+def test_low_evidence_web_article_can_be_ready_when_bundle_is_formed() -> None:
     snapshot = _snapshot("low_evidence", "web_article")
     assert ReadinessEvaluator().is_ready_for_analysis(
         primary_snapshot=snapshot,
         bundle_members=[_member(snapshot)],
         token_budget_profile="small",
-    ) is False
+    ) is True
 
 
-def test_low_evidence_x_post_is_not_ready() -> None:
+def test_low_evidence_x_post_can_be_ready_when_bundle_is_formed() -> None:
     snapshot = _snapshot("low_evidence", "x_post")
     assert ReadinessEvaluator().is_ready_for_analysis(
         primary_snapshot=snapshot,
         bundle_members=[_member(snapshot)],
         token_budget_profile="small",
-    ) is False
+    ) is True
 
 
 def test_ready_and_partial_ready_non_text_primary_remain_ready() -> None:

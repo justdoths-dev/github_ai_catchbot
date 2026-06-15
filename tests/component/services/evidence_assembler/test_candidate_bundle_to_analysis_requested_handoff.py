@@ -66,7 +66,7 @@ async def test_duplicate_bundle_input_hash_reuses_bundle_without_reemitting_anal
 
 
 @pytest.mark.asyncio
-async def test_low_evidence_non_text_primary_does_not_become_ready_handoff() -> None:
+async def test_low_evidence_non_text_primary_keeps_limitation_and_can_handoff() -> None:
     repository = FakeRepository()
     trigger_event_id = uuid4()
     artifact_id = uuid4()
@@ -78,11 +78,12 @@ async def test_low_evidence_non_text_primary_does_not_become_ready_handoff() -> 
     results = await EvidenceAssemblerService(config(), repository=repository).handle_trigger_event(trigger_event_id)  # type: ignore[arg-type]
 
     assert len(results) == 1
-    assert results[0].ready_for_analysis is False
-    assert results[0].emitted_analysis_requested is False
-    assert repository.bundles[0][1].ready_for_analysis is False
+    assert results[0].ready_for_analysis is True
+    assert results[0].emitted_analysis_requested is True
+    assert repository.bundles[0][1].ready_for_analysis is True
     assert repository.bundles[0][1].judge_profile == "x_primary"
-    assert repository.outbox == []
+    assert "low_evidence" in repository.bundles[0][1].evidence_limitations
+    assert len(repository.outbox) == 1
 
 
 @pytest.mark.asyncio
