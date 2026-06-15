@@ -20,6 +20,7 @@ from .models import (
 class AsyncSessionLike(Protocol):
     def in_transaction(self) -> bool: ...
     def begin(self) -> Any: ...
+    async def rollback(self) -> None: ...
     async def execute(self, statement: Any, params: dict[str, Any] | None = None) -> Any: ...
 
 
@@ -30,8 +31,7 @@ class WebEnricherRepository:
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[AsyncSessionLike]:
         if self._session.in_transaction():
-            yield self._session
-            return
+            await self._session.rollback()
         async with self._session.begin():
             yield self._session
 

@@ -8,17 +8,22 @@ from uuid import uuid4
 
 import pytest
 
+from src.services.web_enricher.article_parser import ArticleParser
 from src.services.web_enricher.bounded_web_enrich_runner import (
     BoundedWebEnrichConfig,
     BoundedWebEnrichCounters,
     BoundedWebEnrichDatabaseHandle,
     BoundedWebEnrichRedisHandle,
     BoundedWebEnrichRuntimeConfig,
+    CountingWebEnricherRepository,
     TemporaryGroupRedisTargetConsumer,
     run_bounded_web_enrich,
 )
 from src.services.web_enricher.config import WebEnricherConfig
-from src.services.web_enricher.models import ArtifactEnrichmentJob, EnrichmentResult
+from src.services.web_enricher.models import ArtifactEnrichmentJob, EnrichmentResult, FetchedDocument
+from src.services.web_enricher.repositories import WebEnricherRepository
+from src.services.web_enricher.service import WebEnricherService
+from src.services.web_enricher.url_discovery import WebUrlDiscovery
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -201,6 +206,208 @@ class FakeDatabaseBuilder:
 
         return BoundedWebEnrichDatabaseHandle(
             service=self.service,
+            counters=self.counters,
+            close=close,
+        )
+
+
+class FakeSessionResult:
+    def __init__(self, *, row=None, scalar=None, rowcount: int = 1) -> None:
+        self._row = row
+        self._scalar = scalar
+        self.rowcount = rowcount
+
+    def mappings(self):
+        return self
+
+    def first(self):
+        return self._row
+
+    def scalar_one_or_none(self):
+        return self._scalar
+
+    def scalar_one(self):
+        return self._scalar
+
+
+class FakeImplicitReadTransactionSession:
+    def __init__(
+        self,
+        *,
+        trigger_event_id,
+        candidate_group_id,
+        artifact_id,
+        order: list[str],
+        fail_commit: bool = False,
+    ) -> None:
+        self.trigger_event_id = trigger_event_id
+        self.candidate_group_id = candidate_group_id
+        self.artifact_id = artifact_id
+        self.order = order
+        self.fail_commit = fail_commit
+        self.run_id = uuid4()
+        self.snapshot_id = uuid4()
+        self.rollback_count = 0
+        self.commit_count = 0
+        self._in_transaction = False
+
+    def in_transaction(self) -> bool:
+        return self._in_transaction
+
+    def begin(self):
+        return FakeWriteTransaction(self)
+
+    async def rollback(self) -> None:
+        self.rollback_count += 1
+        self.order.append("db:rollback_implicit_read")
+        self._in_transaction = False
+
+    async def execute(self, statement, params=None):
+        del params
+        if not self._in_transaction:
+            self._in_transaction = True
+            self.order.append("db:implicit_read_tx")
+
+        sql = str(statement)
+        if "SELECT event_id, event_type, aggregate_type, aggregate_id" in sql:
+            return FakeSessionResult(
+                row={
+                    "event_id": self.trigger_event_id,
+                    "event_type": "artifact.enrich.requested.v1",
+                    "aggregate_type": "artifact",
+                    "aggregate_id": self.artifact_id,
+                    "status": "published",
+                    "created_at": datetime.now(timezone.utc),
+                    "payload_json": {
+                        "candidate_group_id": str(self.candidate_group_id),
+                        "artifact_id": str(self.artifact_id),
+                        "artifact_type": "web_article",
+                        "provider_route": "web",
+                        "refresh_mode": "standard",
+                        "depth_budget": 1,
+                    },
+                }
+            )
+        if "FROM artifact_registry" in sql and "SELECT artifact_id" in sql:
+            return FakeSessionResult(
+                row={
+                    "artifact_id": self.artifact_id,
+                    "artifact_type": "web_article",
+                    "canonical_id": "web:https://example.test/article",
+                    "canonical_url": "https://example.test/article",
+                    "normalized_host": "example.test",
+                    "artifact_key_json": {"url": "https://example.test/article"},
+                    "current_snapshot_id": None,
+                    "current_status": None,
+                }
+            )
+        if "INSERT INTO artifact_enrichment_runs" in sql:
+            return FakeSessionResult(scalar=self.run_id)
+        if "INSERT INTO artifact_snapshots" in sql:
+            return FakeSessionResult(scalar=self.snapshot_id)
+        if "INSERT INTO event_outbox" in sql:
+            return FakeSessionResult(rowcount=1)
+        return FakeSessionResult(rowcount=1)
+
+
+class FakeWriteTransaction:
+    def __init__(self, session: FakeImplicitReadTransactionSession) -> None:
+        self._session = session
+
+    async def __aenter__(self):
+        self._session.order.append("db:begin_write")
+        self._session._in_transaction = True
+        return self._session
+
+    async def __aexit__(self, exc_type, exc, traceback) -> bool:
+        del exc, traceback
+        if exc_type is not None:
+            self._session.order.append("db:rollback_write")
+            self._session._in_transaction = False
+            return False
+        if self._session.fail_commit:
+            self._session.order.append("db:commit_failed")
+            self._session._in_transaction = False
+            raise RuntimeError(RAW_EXCEPTION_DETAIL)
+        self._session.commit_count += 1
+        self._session.order.append("db:commit")
+        self._session._in_transaction = False
+        return False
+
+
+class FakeWebFetchClient:
+    def __init__(self, state) -> None:
+        self.state = state
+
+    async def fetch(self, url: str) -> FetchedDocument:
+        self.state.web_fetch_attempted = True
+        body_text = (
+            "<html><head><title>Example Article</title>"
+            "<meta name=\"description\" content=\"Example description\"></head>"
+            "<body><article>Example article body "
+            "<a href=\"https://example.org/project\">project</a></article></body></html>"
+        )
+        return FetchedDocument(
+            requested_url=url,
+            final_url=url,
+            status_code=200,
+            content_type="text/html",
+            body_bytes=body_text.encode("utf-8"),
+            body_text=body_text,
+            response_headers_subset={"content-type": "text/html"},
+            content_hash="f" * 64,
+            fetch_anomalies=[],
+        )
+
+    async def close(self) -> None:
+        pass
+
+
+class RealServiceFakeDatabaseBuilder:
+    def __init__(
+        self,
+        *,
+        trigger_event_id,
+        candidate_group_id,
+        artifact_id,
+        order: list[str],
+        fail_commit: bool = False,
+    ) -> None:
+        self.trigger_event_id = trigger_event_id
+        self.candidate_group_id = candidate_group_id
+        self.artifact_id = artifact_id
+        self.order = order
+        self.fail_commit = fail_commit
+        self.counters = BoundedWebEnrichCounters()
+        self.session: FakeImplicitReadTransactionSession | None = None
+
+    async def __call__(self, runtime_config, state, logger):
+        state.database_session_opened = True
+        self.session = FakeImplicitReadTransactionSession(
+            trigger_event_id=self.trigger_event_id,
+            candidate_group_id=self.candidate_group_id,
+            artifact_id=self.artifact_id,
+            order=self.order,
+            fail_commit=self.fail_commit,
+        )
+        repository = CountingWebEnricherRepository(WebEnricherRepository(self.session), self.counters)
+        service = WebEnricherService(
+            runtime_config.web_config,
+            repository=repository,  # type: ignore[arg-type]
+            fetch_client=FakeWebFetchClient(state),  # type: ignore[arg-type]
+            article_parser=ArticleParser(
+                excerpt_chars=runtime_config.web_config.excerpt_chars,
+                max_outbound_links=runtime_config.web_config.max_outbound_links,
+            ),
+            url_discovery=WebUrlDiscovery(),
+            logger=logger,
+        )
+
+        async def close() -> None:
+            pass
+
+        return BoundedWebEnrichDatabaseHandle(
+            service=service,
             counters=self.counters,
             close=close,
         )
@@ -489,6 +696,83 @@ async def test_matching_job_rehydrates_handles_and_acks_after_service_commit() -
     assert STREAM_ID not in rendered
     assert DB_URL not in rendered
     assert REDIS_URL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_rehydrate_select_implicit_transaction_commits_writes_before_ack() -> None:
+    order: list[str] = []
+    trigger_event_id = uuid4()
+    candidate_group_id = uuid4()
+    artifact_id = uuid4()
+    redis = FakeRedisClient([(STREAM_ID, _thin_fields(trigger_event_id, artifact_id))], order=order)
+    database_builder = RealServiceFakeDatabaseBuilder(
+        trigger_event_id=trigger_event_id,
+        candidate_group_id=candidate_group_id,
+        artifact_id=artifact_id,
+        order=order,
+    )
+
+    result = await run_bounded_web_enrich(
+        _approved_config(trigger_event_id=trigger_event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+
+    assert result.ok is True
+    assert result.status == "processed"
+    assert result.state.database_write_attempted is True
+    assert result.state.redis_ack_attempted is True
+    assert result.redis_acked_count == 1
+    assert result.counters.artifact_enrichment_runs_inserted_count == 1
+    assert result.counters.artifact_snapshots_written_count == 1
+    assert result.counters.artifact_snapshot_web_article_written_count == 1
+    assert result.counters.artifact_registry_updates_count == 1
+    assert result.counters.artifact_snapshot_updated_outbox_count == 1
+    assert database_builder.session is not None
+    assert database_builder.session.rollback_count == 1
+    assert database_builder.session.commit_count == 2
+    assert "db:rollback_implicit_read" in order
+    assert order[-1] == "redis:ack"
+    assert max(index for index, item in enumerate(order) if item == "db:commit") < order.index("redis:ack")
+    assert redis.acked == [STREAM_ID]
+
+
+@pytest.mark.asyncio
+async def test_db_commit_failure_after_write_counters_does_not_ack() -> None:
+    order: list[str] = []
+    trigger_event_id = uuid4()
+    candidate_group_id = uuid4()
+    artifact_id = uuid4()
+    redis = FakeRedisClient([(STREAM_ID, _thin_fields(trigger_event_id, artifact_id))], order=order)
+    database_builder = RealServiceFakeDatabaseBuilder(
+        trigger_event_id=trigger_event_id,
+        candidate_group_id=candidate_group_id,
+        artifact_id=artifact_id,
+        order=order,
+        fail_commit=True,
+    )
+
+    result = await run_bounded_web_enrich(
+        _approved_config(trigger_event_id=trigger_event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+    rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
+
+    assert result.ok is False
+    assert result.error_code == "database_write_failed"
+    assert result.error_class == "RuntimeError"
+    assert result.state.database_write_attempted is True
+    assert result.state.redis_ack_attempted is False
+    assert result.redis_acked_count == 0
+    assert result.counters.artifact_enrichment_runs_inserted_count == 1
+    assert result.counters.artifact_snapshots_written_count == 0
+    assert "db:commit_failed" in order
+    assert "redis:ack" not in order
+    assert redis.acked == []
+    assert RAW_EXCEPTION_DETAIL not in rendered
 
 
 @pytest.mark.asyncio
