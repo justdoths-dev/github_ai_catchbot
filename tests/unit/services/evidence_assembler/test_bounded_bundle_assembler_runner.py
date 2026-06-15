@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from uuid import UUID, uuid4
 
 import pytest
@@ -197,6 +198,7 @@ class FakeRedisClient:
         self.offset = 0
         self.acked: list[str] = []
         self.destroyed_groups: list[str] = []
+        self.xreadgroup_calls: list[dict[str, object]] = []
 
     async def xlen(self, name: str) -> int:
         assert name == "q.candidate.bundle"
@@ -209,10 +211,13 @@ class FakeRedisClient:
         return True
 
     async def xreadgroup(self, groupname, consumername, streams, count=None, block=None):
-        del groupname, consumername, block
+        del groupname, consumername
         assert streams == {"q.candidate.bundle": ">"}
+        self.xreadgroup_calls.append({"count": count, "block": block})
         batch = self.entries[self.offset : self.offset + int(count or 1)]
         self.offset += len(batch)
+        if not batch and block == 0:
+            await asyncio.Event().wait()
         return [("q.candidate.bundle", batch)] if batch else []
 
     async def xack(self, name: str, groupname: str, *ids: str):
@@ -225,6 +230,22 @@ class FakeRedisClient:
         assert name == "q.candidate.bundle"
         self.destroyed_groups.append(groupname)
         return True
+
+
+class FakeTemporaryGroupRedisBuilder:
+    def __init__(self, client: FakeRedisClient) -> None:
+        self.client = client
+        self.consumer: TemporaryGroupRedisTargetConsumer | None = None
+
+    async def __call__(self, runtime_config, state, logger):
+        del runtime_config, logger
+        self.consumer = TemporaryGroupRedisTargetConsumer(self.client, queue_name="q.candidate.bundle")
+
+        async def close() -> None:
+            assert self.consumer is not None
+            await self.consumer.cleanup(state)
+
+        return BoundedBundleAssemblerRedisHandle(consumer=self.consumer, close=close)
 
 
 def _selected(event_id: UUID, artifact_id: UUID, fields: dict[str, str] | None = None) -> TargetedRedisBundleMessage:
@@ -570,6 +591,98 @@ async def test_candidate_fanout_cap_blocks_before_assembly_or_ack() -> None:
     assert report["error_code"] == "candidate_fanout_limit_exceeded"
     assert database.assembled is False
     assert report["redis_ack_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_temporary_group_scan_finds_target_without_waiting_for_future_messages() -> None:
+    target_event_id = uuid4()
+    target_artifact_id = uuid4()
+    other_event_id = uuid4()
+    other_artifact_id = uuid4()
+    redis_client = FakeRedisClient(
+        [
+            ("1710000000001-0", _message_fields(other_event_id, other_artifact_id)),
+            (STREAM_ID, _message_fields(target_event_id, target_artifact_id)),
+        ]
+    )
+    consumer = TemporaryGroupRedisTargetConsumer(redis_client, queue_name="q.candidate.bundle")
+
+    selected, seen, matched = await asyncio.wait_for(
+        consumer.find_target(
+            _approved_config(event_id=target_event_id, scan_limit=25),
+            state=type("State", (), {"redis_consume_attempted": False, "redis_group_created": False})(),
+        ),
+        timeout=0.25,
+    )
+
+    assert selected is not None
+    assert selected.redis_message_id == STREAM_ID
+    assert seen == 2
+    assert matched == 1
+    assert redis_client.xreadgroup_calls == [{"count": 2, "block": None}]
+
+
+@pytest.mark.asyncio
+async def test_temporary_group_scan_no_target_returns_not_found_without_waiting_for_future_messages() -> None:
+    target_event_id = uuid4()
+    first_event_id = uuid4()
+    first_artifact_id = uuid4()
+    second_event_id = uuid4()
+    second_artifact_id = uuid4()
+    redis_client = FakeRedisClient(
+        [
+            ("1710000000001-0", _message_fields(first_event_id, first_artifact_id)),
+            ("1710000000002-0", _message_fields(second_event_id, second_artifact_id)),
+        ]
+    )
+
+    result = await asyncio.wait_for(
+        run_bounded_bundle_assembler(
+            _approved_config(event_id=target_event_id, scan_limit=25),
+            runtime_config_loader=_runtime_config,
+            redis_builder=FakeTemporaryGroupRedisBuilder(redis_client),
+        ),
+        timeout=0.25,
+    )
+
+    report = result.to_sanitized_dict()
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "target_message_not_found"
+    assert report["messages_seen"] == 2
+    assert report["messages_matched"] == 0
+    assert report["redis_ack_attempted"] is False
+    assert redis_client.acked == []
+    assert redis_client.xreadgroup_calls == [{"count": 2, "block": None}]
+
+
+@pytest.mark.asyncio
+async def test_temporary_group_scan_duplicate_target_blocks_without_waiting_for_future_messages() -> None:
+    target_event_id = uuid4()
+    target_artifact_id = uuid4()
+    redis_client = FakeRedisClient(
+        [
+            ("1710000000001-0", _message_fields(target_event_id, target_artifact_id)),
+            ("1710000000002-0", _message_fields(target_event_id, target_artifact_id)),
+        ]
+    )
+
+    result = await asyncio.wait_for(
+        run_bounded_bundle_assembler(
+            _approved_config(event_id=target_event_id, scan_limit=25),
+            runtime_config_loader=_runtime_config,
+            redis_builder=FakeTemporaryGroupRedisBuilder(redis_client),
+        ),
+        timeout=0.25,
+    )
+
+    report = result.to_sanitized_dict()
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "target_message_count_exceeded"
+    assert report["messages_seen"] == 2
+    assert report["messages_matched"] == 2
+    assert report["redis_ack_attempted"] is False
+    assert redis_client.acked == []
+    assert redis_client.xreadgroup_calls == [{"count": 2, "block": None}]
 
 
 @pytest.mark.asyncio

@@ -402,7 +402,8 @@ class TemporaryGroupRedisTargetConsumer:
         state: BoundedBundleAssemblerState,
     ) -> tuple[TargetedRedisBundleMessage | None, int, int]:
         state.redis_consume_attempted = True
-        if await self._client.xlen(self._queue_name) <= 0:
+        available_messages = await self._client.xlen(self._queue_name)
+        if available_messages <= 0:
             return None, 0, 0
         await self._client.xgroup_create(self._queue_name, self._group_name, id="0", mkstream=False)
         self._group_created = True
@@ -411,14 +412,15 @@ class TemporaryGroupRedisTargetConsumer:
         messages_seen = 0
         messages_matched = 0
         selected: TargetedRedisBundleMessage | None = None
-        while messages_seen < config.scan_limit:
-            count = max(1, min(config.scan_limit - messages_seen, config.scan_limit))
+        scan_limit = min(config.scan_limit, available_messages)
+        while messages_seen < scan_limit:
+            count = max(1, min(scan_limit - messages_seen, scan_limit))
             raw = await self._client.xreadgroup(
                 self._group_name,
                 self._consumer_name,
                 {self._queue_name: ">"},
                 count=count,
-                block=0,
+                block=None,
             )
             entries = _flatten_stream_entries(raw)
             if not entries:
@@ -434,7 +436,7 @@ class TemporaryGroupRedisTargetConsumer:
                             fields=decoded_fields,
                             message=RedisBundleMessage.from_stream_fields(decoded_fields),
                         )
-                if messages_seen >= config.scan_limit:
+                if messages_seen >= scan_limit:
                     break
         return selected, messages_seen, messages_matched
 
