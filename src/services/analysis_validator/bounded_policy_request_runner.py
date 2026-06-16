@@ -550,6 +550,11 @@ class SqlAlchemyBoundedAnalysisValidatorPolicyRequestRepository:
         candidate_group_id: UUID,
         bundle_id: UUID,
     ) -> list[OutboxEventRow]:
+        del candidate_group_id, bundle_id
+        dedupe_key = _policy_apply_dedupe_key(
+            judge_run_id=judge_run_id,
+            judge_output_id=judge_output_id,
+        )
         result = await self._session.execute(
             _sql(
                 """
@@ -559,19 +564,14 @@ class SqlAlchemyBoundedAnalysisValidatorPolicyRequestRepository:
                 WHERE event_type = 'analysis.policy.apply.v1'
                   AND aggregate_type = 'judge_run'
                   AND aggregate_id = CAST(:judge_run_id AS uuid)
-                  AND payload_json->>'judge_run_id' = :judge_run_id
-                  AND payload_json->>'judge_output_id' = :judge_output_id
-                  AND payload_json->>'candidate_group_id' = :candidate_group_id
-                  AND payload_json->>'bundle_id' = :bundle_id
+                  AND dedupe_key = :dedupe_key
                 ORDER BY created_at ASC, event_id ASC
                 LIMIT 2
                 """
             ),
             {
                 "judge_run_id": str(judge_run_id),
-                "judge_output_id": str(judge_output_id),
-                "candidate_group_id": str(candidate_group_id),
-                "bundle_id": str(bundle_id),
+                "dedupe_key": dedupe_key,
             },
         )
         return [_outbox_row_from_mapping(row) for row in result.mappings().all()]
@@ -892,6 +892,22 @@ async def run_bounded_analysis_validator_policy_request(
     repository_handle: BoundedAnalysisValidatorRepositoryHandle | None = None
     publisher_handle: BoundedAnalysisValidatorRedisPublisherHandle | None = None
     result: BoundedAnalysisValidatorPolicyRequestResult | None = None
+    redis_message: RedisStreamMessage | None = None
+    event: OutboxEventRow | None = None
+    judge_run: JudgeRunValidationRecord | None = None
+    judge_output: JudgeOutputValidationRecord | None = None
+    bundle: BundleValidationRecord | None = None
+    payload_judge_output_id: UUID | None = None
+    policy_apply_outbox: OutboxEventRow | None = None
+    policy_apply_written = False
+    policy_apply_published = False
+    state_transition_written = False
+    redis_output_message_id: str | None = None
+    validation_status: str | None = None
+    validation_error_count = 0
+    redis_message_count = 0
+    queue_name: str | None = None
+    stage_name: str | None = None
     try:
         redis_handle = await (
             redis_reader_builder or build_default_bounded_analysis_validator_redis_reader
@@ -922,6 +938,7 @@ async def run_bounded_analysis_validator_policy_request(
             raise _BoundedResultReady
 
         redis_message = matches[0]
+        redis_message_count = 1
         redis_error = _validate_redis_message(redis_message)
         if redis_error is not None:
             result = _result(
@@ -930,7 +947,7 @@ async def run_bounded_analysis_validator_policy_request(
                 config=config,
                 state=state,
                 redis_message=redis_message,
-                redis_message_count=1,
+                redis_message_count=redis_message_count,
             )
             raise _BoundedResultReady
 
@@ -957,7 +974,7 @@ async def run_bounded_analysis_validator_policy_request(
                 state=state,
                 redis_message=redis_message,
                 event=event,
-                redis_message_count=1,
+                redis_message_count=redis_message_count,
             )
             raise _BoundedResultReady
 
@@ -975,7 +992,7 @@ async def run_bounded_analysis_validator_policy_request(
                 redis_message=redis_message,
                 event=event,
                 judge_output_id=payload_judge_output_id,
-                redis_message_count=1,
+                redis_message_count=redis_message_count,
             )
             raise _BoundedResultReady
 
@@ -991,7 +1008,7 @@ async def run_bounded_analysis_validator_policy_request(
                 event=event,
                 judge_run=judge_run,
                 judge_output_id=payload_judge_output_id,
-                redis_message_count=1,
+                redis_message_count=redis_message_count,
             )
             raise _BoundedResultReady
 
@@ -1016,7 +1033,7 @@ async def run_bounded_analysis_validator_policy_request(
                 judge_run=judge_run,
                 judge_output=judge_output,
                 judge_output_id=payload_judge_output_id,
-                redis_message_count=1,
+                redis_message_count=redis_message_count,
             )
             raise _BoundedResultReady
 
@@ -1042,7 +1059,7 @@ async def run_bounded_analysis_validator_policy_request(
                 judge_run=judge_run,
                 judge_output=judge_output,
                 bundle=bundle,
-                redis_message_count=1,
+                redis_message_count=redis_message_count,
             )
             raise _BoundedResultReady
 
@@ -1063,7 +1080,7 @@ async def run_bounded_analysis_validator_policy_request(
                 judge_run=judge_run,
                 judge_output=judge_output,
                 bundle=bundle,
-                redis_message_count=1,
+                redis_message_count=redis_message_count,
             )
             raise _BoundedResultReady
 
@@ -1088,10 +1105,12 @@ async def run_bounded_analysis_validator_policy_request(
                 judge_run=judge_run,
                 judge_output=judge_output,
                 bundle=bundle,
-                redis_message_count=1,
+                redis_message_count=redis_message_count,
             )
             raise _BoundedResultReady
 
+        validation_status = "passed"
+        validation_error_count = 0
         policy_rows = await repository.load_policy_apply_outboxes(
             judge_run_id=judge_run.judge_run_id,
             judge_output_id=judge_output.judge_output_id,
@@ -1109,14 +1128,12 @@ async def run_bounded_analysis_validator_policy_request(
                 judge_run=judge_run,
                 judge_output=judge_output,
                 bundle=bundle,
-                validation_status="passed",
-                validation_error_count=0,
-                redis_message_count=1,
+                validation_status=validation_status,
+                validation_error_count=validation_error_count,
+                redis_message_count=redis_message_count,
             )
             raise _BoundedResultReady
 
-        state_transition_written = False
-        policy_apply_written = False
         if policy_rows:
             policy_apply_outbox = policy_rows[0]
         else:
@@ -1156,9 +1173,9 @@ async def run_bounded_analysis_validator_policy_request(
                     policy_apply_outbox=policy_apply_outbox,
                     policy_apply_written=policy_apply_written,
                     state_transition_written=state_transition_written,
-                    validation_status="passed",
-                    validation_error_count=0,
-                    redis_message_count=1,
+                    validation_status=validation_status,
+                    validation_error_count=validation_error_count,
+                    redis_message_count=redis_message_count,
                 )
                 raise _BoundedResultReady
             try:
@@ -1178,9 +1195,9 @@ async def run_bounded_analysis_validator_policy_request(
                     policy_apply_outbox=policy_apply_outbox,
                     policy_apply_written=policy_apply_written,
                     state_transition_written=state_transition_written,
-                    validation_status="passed",
-                    validation_error_count=0,
-                    redis_message_count=1,
+                    validation_status=validation_status,
+                    validation_error_count=validation_error_count,
+                    redis_message_count=redis_message_count,
                 )
                 raise _BoundedResultReady
 
@@ -1205,13 +1222,16 @@ async def run_bounded_analysis_validator_policy_request(
                 policy_apply_outbox=policy_apply_outbox,
                 policy_apply_written=policy_apply_written,
                 state_transition_written=state_transition_written,
-                validation_status="passed",
-                validation_error_count=0,
-                redis_message_count=1,
+                validation_status=validation_status,
+                validation_error_count=validation_error_count,
+                redis_message_count=redis_message_count,
             )
             raise _BoundedResultReady
 
         if policy_apply_outbox.status == "published":
+            queue_name = OUTPUT_QUEUE_NAME
+            stage_name = OUTPUT_STAGE_NAME
+            policy_apply_published = True
             result = _result(
                 "noop",
                 None,
@@ -1224,13 +1244,13 @@ async def run_bounded_analysis_validator_policy_request(
                 bundle=bundle,
                 policy_apply_outbox=policy_apply_outbox,
                 policy_apply_written=policy_apply_written,
-                policy_apply_published=True,
+                policy_apply_published=policy_apply_published,
                 state_transition_written=state_transition_written,
-                validation_status="passed",
-                validation_error_count=0,
-                redis_message_count=1,
-                queue_name=OUTPUT_QUEUE_NAME,
-                stage_name=OUTPUT_STAGE_NAME,
+                validation_status=validation_status,
+                validation_error_count=validation_error_count,
+                redis_message_count=redis_message_count,
+                queue_name=queue_name,
+                stage_name=stage_name,
             )
             raise _BoundedResultReady
         if policy_apply_outbox.status != "pending":
@@ -1247,13 +1267,15 @@ async def run_bounded_analysis_validator_policy_request(
                 policy_apply_outbox=policy_apply_outbox,
                 policy_apply_written=policy_apply_written,
                 state_transition_written=state_transition_written,
-                validation_status="passed",
-                validation_error_count=0,
-                redis_message_count=1,
+                validation_status=validation_status,
+                validation_error_count=validation_error_count,
+                redis_message_count=redis_message_count,
             )
             raise _BoundedResultReady
 
         route = _resolve_policy_apply_route(policy_apply_outbox, route_resolver=route_resolver)
+        queue_name = route.queue_name
+        stage_name = route.stage_name
         publisher_handle = await (
             redis_publisher_builder or build_default_bounded_analysis_validator_redis_publisher
         )(runtime_config, state, effective_logger)
@@ -1292,14 +1314,15 @@ async def run_bounded_analysis_validator_policy_request(
                 policy_apply_written=policy_apply_written,
                 state_transition_written=state_transition_written,
                 redis_output_message_id=redis_output_message_id,
-                validation_status="passed",
-                validation_error_count=0,
-                redis_message_count=1,
-                queue_name=route.queue_name,
-                stage_name=route.stage_name,
+                validation_status=validation_status,
+                validation_error_count=validation_error_count,
+                redis_message_count=redis_message_count,
+                queue_name=queue_name,
+                stage_name=stage_name,
             )
             raise _BoundedResultReady
 
+        policy_apply_published = True
         result = _result(
             "published",
             None,
@@ -1312,14 +1335,14 @@ async def run_bounded_analysis_validator_policy_request(
             bundle=bundle,
             policy_apply_outbox=replace(policy_apply_outbox, status="published"),
             policy_apply_written=policy_apply_written,
-            policy_apply_published=True,
+            policy_apply_published=policy_apply_published,
             state_transition_written=state_transition_written,
             redis_output_message_id=redis_output_message_id,
-            validation_status="passed",
-            validation_error_count=0,
-            redis_message_count=1,
-            queue_name=route.queue_name,
-            stage_name=route.stage_name,
+            validation_status=validation_status,
+            validation_error_count=validation_error_count,
+            redis_message_count=redis_message_count,
+            queue_name=queue_name,
+            stage_name=stage_name,
         )
     except _BoundedResultReady:
         pass
@@ -1330,6 +1353,22 @@ async def run_bounded_analysis_validator_policy_request(
             error_class=_safe_exception_class(exc),
             config=config,
             state=state,
+            redis_message=redis_message,
+            event=event,
+            judge_run=judge_run,
+            judge_output=judge_output,
+            judge_output_id=payload_judge_output_id,
+            bundle=bundle,
+            policy_apply_outbox=policy_apply_outbox,
+            policy_apply_written=policy_apply_written,
+            policy_apply_published=policy_apply_published,
+            state_transition_written=state_transition_written,
+            redis_output_message_id=redis_output_message_id,
+            validation_status=validation_status,
+            validation_error_count=validation_error_count,
+            redis_message_count=redis_message_count,
+            queue_name=queue_name,
+            stage_name=stage_name,
         )
     except Exception as exc:
         error_code = "redis_xadd_failed" if state.redis_publish_attempted else "bounded_policy_request_failed"
@@ -1339,6 +1378,22 @@ async def run_bounded_analysis_validator_policy_request(
             error_class=_safe_exception_class(exc),
             config=config,
             state=state,
+            redis_message=redis_message,
+            event=event,
+            judge_run=judge_run,
+            judge_output=judge_output,
+            judge_output_id=payload_judge_output_id,
+            bundle=bundle,
+            policy_apply_outbox=policy_apply_outbox,
+            policy_apply_written=policy_apply_written,
+            policy_apply_published=policy_apply_published,
+            state_transition_written=state_transition_written,
+            redis_output_message_id=redis_output_message_id,
+            validation_status=validation_status,
+            validation_error_count=validation_error_count,
+            redis_message_count=redis_message_count,
+            queue_name=queue_name,
+            stage_name=stage_name,
         )
     finally:
         if publisher_handle is not None:

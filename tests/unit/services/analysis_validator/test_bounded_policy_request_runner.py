@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import json
 from dataclasses import replace
@@ -21,6 +22,7 @@ from src.services.analysis_validator.bounded_policy_request_runner import (
     JudgeOutputValidationRecord,
     JudgeRunValidationRecord,
     RedisStreamMessage,
+    SqlAlchemyBoundedAnalysisValidatorPolicyRequestRepository,
     run_bounded_analysis_validator_policy_request_sync,
 )
 from src.services.outbox_relay.models import OutboxEventRow, QueueRoute
@@ -142,19 +144,15 @@ class FakeRepository:
         candidate_group_id,
         bundle_id,
     ):
-        expected = _policy_payload(
-            judge_run_id=judge_run_id,
-            judge_output_id=judge_output_id,
-            candidate_group_id=candidate_group_id,
-            bundle_id=bundle_id,
-        )
+        del candidate_group_id, bundle_id
+        dedupe_key = f"analysis-policy-apply:{judge_run_id}:{judge_output_id}"
         return [
             row
             for row in self.policy_rows
             if row.event_type == "analysis.policy.apply.v1"
             and row.aggregate_type == "judge_run"
             and row.aggregate_id == judge_run_id
-            and row.payload_json == expected
+            and row.dedupe_key == dedupe_key
         ][:2]
 
     async def insert_state_transition(self, **kwargs):
@@ -184,6 +182,40 @@ class FakeRepository:
 
     async def rollback(self) -> None:
         self.rollbacks += 1
+
+
+class RaisingPolicyLookupRepository(FakeRepository):
+    async def load_policy_apply_outboxes(
+        self,
+        *,
+        judge_run_id,
+        judge_output_id,
+        candidate_group_id,
+        bundle_id,
+    ):
+        del judge_run_id, judge_output_id, candidate_group_id, bundle_id
+        raise RuntimeError(f"private sql detail {RAW_PAYLOAD_SENTINEL}")
+
+
+class CapturingSqlResult:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self.rows
+
+
+class CapturingSqlSession:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def execute(self, statement, params):
+        self.calls.append((str(statement), dict(params)))
+        return CapturingSqlResult(self.rows)
 
 
 class FakeRepositoryBuilder:
@@ -389,6 +421,7 @@ def _run(
     *,
     config: BoundedAnalysisValidatorPolicyRequestConfig | None = None,
     messages: list[RedisStreamMessage] | None = None,
+    repository: FakeRepository | None = None,
     event: OutboxEventRow | None = None,
     judge_run: JudgeRunValidationRecord | None = None,
     judge_output: JudgeOutputValidationRecord | None = None,
@@ -398,15 +431,14 @@ def _run(
     route_resolver=None,
 ):
     reader_builder = FakeRedisReaderBuilder(FakeRedisReader(messages if messages is not None else [_redis_message()]))
-    repository_builder = FakeRepositoryBuilder(
-        FakeRepository(
-            event=_event() if event is None else event,
-            judge_run=_judge_run() if judge_run is None else judge_run,
-            judge_output=_judge_output() if judge_output is None else judge_output,
-            bundle=_bundle() if bundle is None else bundle,
-            policy_rows=policy_rows,
-        )
+    fake_repository = repository or FakeRepository(
+        event=_event() if event is None else event,
+        judge_run=_judge_run() if judge_run is None else judge_run,
+        judge_output=_judge_output() if judge_output is None else judge_output,
+        bundle=_bundle() if bundle is None else bundle,
+        policy_rows=policy_rows,
     )
+    repository_builder = FakeRepositoryBuilder(fake_repository)
     publisher_builder = FakeRedisPublisherBuilder(FakeRedisPublisher())
     result = run_bounded_analysis_validator_policy_request_sync(
         config or _approved_config(),
@@ -497,6 +529,46 @@ def test_success_validates_writes_policy_apply_publishes_and_records_attempt() -
     assert reader_builder.closed is True
     assert repository_builder.closed is True
     assert publisher_builder.closed is True
+
+
+def test_repository_policy_apply_lookup_uses_dedupe_key_without_json_payload_operators() -> None:
+    row = {
+        "event_id": POLICY_APPLY_EVENT_ID,
+        "event_type": "analysis.policy.apply.v1",
+        "aggregate_type": "judge_run",
+        "aggregate_id": JUDGE_RUN_ID,
+        "dedupe_key": f"analysis-policy-apply:{JUDGE_RUN_ID}:{JUDGE_OUTPUT_ID}",
+        "payload_json": _policy_payload(
+            judge_run_id=JUDGE_RUN_ID,
+            judge_output_id=JUDGE_OUTPUT_ID,
+            candidate_group_id=CANDIDATE_GROUP_ID,
+            bundle_id=BUNDLE_ID,
+        ),
+        "status": "pending",
+        "fail_count": 0,
+        "created_at": datetime.now(timezone.utc),
+    }
+    session = CapturingSqlSession([row])
+    repository = SqlAlchemyBoundedAnalysisValidatorPolicyRequestRepository(session)
+
+    rows = asyncio.run(
+        repository.load_policy_apply_outboxes(
+            judge_run_id=JUDGE_RUN_ID,
+            judge_output_id=JUDGE_OUTPUT_ID,
+            candidate_group_id=CANDIDATE_GROUP_ID,
+            bundle_id=BUNDLE_ID,
+        )
+    )
+
+    sql, params = session.calls[0]
+    assert rows[0].event_id == POLICY_APPLY_EVENT_ID
+    assert "dedupe_key = :dedupe_key" in " ".join(sql.split())
+    assert "payload_json->" not in sql
+    assert "->>" not in sql
+    assert params == {
+        "judge_run_id": str(JUDGE_RUN_ID),
+        "dedupe_key": f"analysis-policy-apply:{JUDGE_RUN_ID}:{JUDGE_OUTPUT_ID}",
+    }
 
 
 @pytest.mark.parametrize(
@@ -693,14 +765,72 @@ def test_existing_published_policy_apply_outbox_returns_noop_without_duplicate_p
     assert repository_builder.repository.policy_rows == [existing]
 
 
+def test_existing_policy_apply_lookup_is_dedupe_based_and_payload_validation_stays_strict() -> None:
+    existing = replace(
+        _policy_outbox(status="pending"),
+        payload_json={
+            "judge_run_id": str(JUDGE_RUN_ID),
+            "judge_output_id": str(JUDGE_OUTPUT_ID),
+            "candidate_group_id": str(CANDIDATE_GROUP_ID),
+            "bundle_id": str(UUID("00000000-0000-4000-8000-0000bad0bad0")),
+        },
+    )
+    result, _, repository_builder, publisher_builder = _run(policy_rows=[existing])
+    report = result.to_sanitized_dict()
+
+    assert report["error_code"] == "policy_apply_outbox_payload_mismatch"
+    assert report["event_outbox_found"] is True
+    assert report["judge_run_found"] is True
+    assert report["judge_output_found"] is True
+    assert report["bundle_found"] is True
+    assert report["redis_publish_attempted"] is False
+    assert repository_builder.repository.state_transitions == []
+    assert publisher_builder.calls == 0
+
+
 def test_duplicate_policy_apply_outbox_rows_fail_closed() -> None:
     first = _policy_outbox(status="pending")
-    second = replace(first, event_id=UUID("00000000-0000-4000-8000-0000bb66bb66"), dedupe_key="duplicate-dedupe")
+    second = replace(first, event_id=UUID("00000000-0000-4000-8000-0000bb66bb66"))
     result, _, repository_builder, publisher_builder = _run(policy_rows=[first, second])
     report = result.to_sanitized_dict()
 
     assert report["error_code"] == "policy_apply_outbox_count_exceeded"
     assert report["redis_publish_attempted"] is False
+    assert repository_builder.repository.state_transitions == []
+    assert publisher_builder.calls == 0
+
+
+def test_unexpected_policy_lookup_exception_preserves_known_context_without_details() -> None:
+    repository = RaisingPolicyLookupRepository(
+        event=_event(),
+        judge_run=_judge_run(),
+        judge_output=_judge_output(),
+        bundle=_bundle(),
+    )
+    result, _, repository_builder, publisher_builder = _run(repository=repository)
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, ensure_ascii=False, sort_keys=True)
+
+    assert report["status"] == "failed"
+    assert report["error_code"] == "bounded_policy_request_failed"
+    assert report["error_class"] == "RuntimeError"
+    assert report["target_redis_message_id_suffix"] == "508480-0"
+    assert report["target_trigger_event_id_suffix"] == "3e3b11b3"
+    assert report["target_judge_run_id_suffix"] == "7a111d13"
+    assert report["target_judge_output_id_suffix"] == "c7d7ef5e"
+    assert report["target_bundle_id_suffix"] == "c51bd89e"
+    assert report["target_candidate_group_suffix"] == "42c0d691"
+    assert report["event_outbox_found"] is True
+    assert report["judge_run_found"] is True
+    assert report["judge_output_found"] is True
+    assert report["bundle_found"] is True
+    assert report["analysis_validator_called"] is True
+    assert report["database_write_attempted"] is False
+    assert report["redis_publish_attempted"] is False
+    assert report["state_transition_written"] is False
+    assert report["policy_apply_outbox_written"] is False
+    assert RAW_PAYLOAD_SENTINEL not in rendered
+    assert "private sql detail" not in rendered
     assert repository_builder.repository.state_transitions == []
     assert publisher_builder.calls == 0
 
