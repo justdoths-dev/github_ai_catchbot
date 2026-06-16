@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .request_shape import validate_responses_request_shape
+from .request_shape import build_responses_request, validate_responses_request_shape
 
 
 class OpenAIClientConfigurationError(RuntimeError):
@@ -77,35 +77,19 @@ class OpenAIJudgeClient:
         max_output_tokens: int | None,
         prompt_cache_key: str | None,
     ) -> dict[str, Any]:
-        request: dict[str, Any] = {
-            "model": model,
-            "reasoning": {"effort": reasoning_effort},
-            "input": [
-                {
-                    "role": "developer",
-                    "content": [{"type": "input_text", "text": developer_prompt}],
-                },
-                {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": user_context}],
-                },
-            ],
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "judge_output_v1",
-                    "strict": True,
-                    "schema": json_schema,
-                }
-            },
-            "tools": [],
-        }
-        if max_output_tokens is not None:
-            request["max_output_tokens"] = max_output_tokens
         # OpenAI transport compatibility guard after a live 400 on
         # prompt_cache_key: keep the internal audit/cache-intent argument but
         # omit it from Responses API request kwargs.
-        return request
+        return build_responses_request(
+            model=model,
+            reasoning_effort=reasoning_effort,
+            developer_prompt=developer_prompt,
+            user_context=user_context,
+            json_schema=json_schema,
+            max_output_tokens=max_output_tokens,
+            prompt_cache_key=prompt_cache_key,
+            include_prompt_cache_key=False,
+        )
 
     @staticmethod
     def _build_client(*, api_key: str, project: str | None, timeout_sec: float) -> Any:

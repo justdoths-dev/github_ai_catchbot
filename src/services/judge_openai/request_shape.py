@@ -5,6 +5,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from .context_builder import JudgeContextBuilder
+from .models import BundleJudgeContext, JudgeRunRecord
+from .preflight import NoopModelContextPreflight
+from .prompt_library import PromptLibrary
+
 
 LOCKED_HOT_PATH_MODEL = "gpt-5.4-mini"
 LOCKED_ESCALATION_MODEL = "gpt-5.4"
@@ -47,6 +52,221 @@ class RequestShapeDiagnostic:
     @property
     def valid(self) -> bool:
         return not self.issue_codes
+
+
+class JudgeOpenAIRequestEnvelopeError(ValueError):
+    def __init__(self, issue_codes: tuple[str, ...]) -> None:
+        super().__init__("judge_openai_request_envelope_invalid")
+        self.issue_codes = issue_codes
+
+
+@dataclass(slots=True, frozen=True)
+class JudgeOpenAIRequestEnvelope:
+    model: str
+    reasoning_effort: str
+    prompt_version: str
+    schema_version: str
+    policy_version: str
+    judge_profile: str
+    prompt_cache_key: str | None
+    developer_prompt_text: str
+    user_context: str
+    structured_output_schema_id: str
+    structured_output_schema: dict[str, Any]
+    max_output_tokens: int | None
+    request_timeout_sec: float | None
+    preflight_notes: tuple[str, ...] = ()
+    preflight_flags: Mapping[str, Any] | None = None
+
+    @property
+    def context_character_count(self) -> int:
+        return len(self.user_context)
+
+    def to_responses_request(self, *, include_prompt_cache_key: bool = True) -> dict[str, Any]:
+        return build_responses_request(
+            model=self.model,
+            reasoning_effort=self.reasoning_effort,
+            developer_prompt=self.developer_prompt_text,
+            user_context=self.user_context,
+            json_schema=self.structured_output_schema,
+            max_output_tokens=self.max_output_tokens,
+            prompt_cache_key=self.prompt_cache_key,
+            schema_name=self.structured_output_schema_id,
+            include_prompt_cache_key=include_prompt_cache_key,
+        )
+
+
+class JudgeOpenAIRequestEnvelopeBuilder:
+    def __init__(
+        self,
+        *,
+        prompt_library: PromptLibrary | None = None,
+        context_builder: JudgeContextBuilder | None = None,
+        structured_output_schema: Mapping[str, Any] | None = None,
+        structured_output_schema_id: str = "judge_output_v1",
+        max_output_tokens: int | None = None,
+        request_timeout_sec: float | None = None,
+    ) -> None:
+        self._prompt_library = prompt_library or PromptLibrary()
+        self._context_builder = context_builder or JudgeContextBuilder(
+            preflight=NoopModelContextPreflight()
+        )
+        self._structured_output_schema = dict(structured_output_schema or build_judge_output_schema())
+        self._structured_output_schema_id = structured_output_schema_id
+        self._max_output_tokens = max_output_tokens
+        self._request_timeout_sec = request_timeout_sec
+
+    def build(
+        self,
+        *,
+        judge_run: JudgeRunRecord,
+        bundle: BundleJudgeContext,
+    ) -> JudgeOpenAIRequestEnvelope:
+        developer_prompt = self._prompt_library.render(
+            judge_profile=judge_run.judge_profile,
+            prompt_version=judge_run.prompt_version,
+        )
+        prepared = self._context_builder.build(
+            developer_prompt=developer_prompt,
+            bundle=bundle,
+        )
+        envelope = JudgeOpenAIRequestEnvelope(
+            model=judge_run.model,
+            reasoning_effort=judge_run.reasoning_effort,
+            prompt_version=judge_run.prompt_version,
+            schema_version=judge_run.schema_version,
+            policy_version=judge_run.policy_version,
+            judge_profile=judge_run.judge_profile,
+            prompt_cache_key=judge_run.prompt_cache_key,
+            developer_prompt_text=prepared.developer_prompt,
+            user_context=prepared.user_context,
+            structured_output_schema_id=self._structured_output_schema_id,
+            structured_output_schema=dict(self._structured_output_schema),
+            max_output_tokens=self._max_output_tokens,
+            request_timeout_sec=self._request_timeout_sec,
+            preflight_notes=tuple(prepared.preflight_notes),
+            preflight_flags=dict(prepared.preflight_flags),
+        )
+        diagnostic = validate_responses_request_shape(envelope.to_responses_request())
+        if not diagnostic.valid:
+            raise JudgeOpenAIRequestEnvelopeError(diagnostic.issue_codes)
+        return envelope
+
+
+def build_responses_request(
+    *,
+    model: str,
+    reasoning_effort: str,
+    developer_prompt: str,
+    user_context: str,
+    json_schema: Mapping[str, Any],
+    max_output_tokens: int | None,
+    prompt_cache_key: str | None,
+    schema_name: str = "judge_output_v1",
+    include_prompt_cache_key: bool = False,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "model": model,
+        "reasoning": {"effort": reasoning_effort},
+        "input": [
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": developer_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_context}],
+            },
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": schema_name,
+                "strict": True,
+                "schema": dict(json_schema),
+            }
+        },
+        "tools": [],
+    }
+    if max_output_tokens is not None:
+        request["max_output_tokens"] = max_output_tokens
+    if include_prompt_cache_key and prompt_cache_key:
+        request["prompt_cache_key"] = prompt_cache_key
+    return request
+
+
+def build_judge_output_schema() -> dict[str, Any]:
+    score_0_to_100 = {"type": "integer", "minimum": 0, "maximum": 100}
+    nullable_score_0_to_100 = {"type": ["integer", "null"], "minimum": 0, "maximum": 100}
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "judge_schema_version",
+            "candidate_group_id",
+            "headline",
+            "summary_one_line_ko",
+            "skeptical_take_ko",
+            "why_it_might_matter_ko",
+            "comparables",
+            "scores",
+            "reason_codes",
+            "red_flags_ko",
+            "evidence_limitations_ko",
+            "recommended_action_ko",
+            "freshness_note_ko",
+            "model_proposed_verdict",
+            "model_confidence_band",
+        ],
+        "properties": {
+            "judge_schema_version": {"type": "string"},
+            "candidate_group_id": {"type": "string"},
+            "headline": {"type": "string"},
+            "summary_one_line_ko": {"type": "string"},
+            "skeptical_take_ko": {"type": "string"},
+            "why_it_might_matter_ko": {"type": "string"},
+            "comparables": {"type": "array", "items": {"type": "string"}},
+            "scores": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "novelty",
+                    "practical_usefulness",
+                    "evidence_strength",
+                    "hype_penalty",
+                    "confidence",
+                    "code_quality",
+                    "maintenance_signal",
+                    "specificity",
+                    "reproducibility_signal",
+                ],
+                "properties": {
+                    "novelty": score_0_to_100,
+                    "practical_usefulness": score_0_to_100,
+                    "evidence_strength": score_0_to_100,
+                    "hype_penalty": score_0_to_100,
+                    "confidence": score_0_to_100,
+                    "code_quality": nullable_score_0_to_100,
+                    "maintenance_signal": nullable_score_0_to_100,
+                    "specificity": nullable_score_0_to_100,
+                    "reproducibility_signal": nullable_score_0_to_100,
+                },
+            },
+            "reason_codes": {"type": "array", "items": {"type": "string"}},
+            "red_flags_ko": {"type": "array", "items": {"type": "string"}},
+            "evidence_limitations_ko": {"type": "array", "items": {"type": "string"}},
+            "recommended_action_ko": {"type": "string"},
+            "freshness_note_ko": {"type": "string"},
+            "model_proposed_verdict": {
+                "type": ["string", "null"],
+                "enum": ["inspect_now", "later", "skip", None],
+            },
+            "model_confidence_band": {
+                "type": ["string", "null"],
+                "enum": ["low", "medium", "high", None],
+            },
+        },
+    }
 
 
 def validate_responses_request_shape(request: Mapping[str, Any]) -> RequestShapeDiagnostic:

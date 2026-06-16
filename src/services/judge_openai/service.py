@@ -13,6 +13,12 @@ from .openai_client import OpenAIPermanentError, OpenAIRequestShapeError, OpenAI
 from .preflight import HeuristicSanitizingPreflight, NoopModelContextPreflight
 from .prompt_library import PromptLibrary, UnsupportedJudgeProfileError, UnsupportedPromptVersionError
 from .repositories import JudgeOpenAIRepository
+from .request_shape import (
+    JudgeOpenAIRequestEnvelope,
+    JudgeOpenAIRequestEnvelopeBuilder,
+    JudgeOpenAIRequestEnvelopeError,
+    build_judge_output_schema,
+)
 from .response_mapper import OpenAIResponseMapper
 
 
@@ -48,7 +54,12 @@ class JudgeOpenAIService:
             if config.enable_prompt_guard_preflight
             else NoopModelContextPreflight()
         )
-        self._context_builder = JudgeContextBuilder(preflight=preflight)
+        self._request_envelope_builder = JudgeOpenAIRequestEnvelopeBuilder(
+            prompt_library=self._prompt_library,
+            context_builder=JudgeContextBuilder(preflight=preflight),
+            max_output_tokens=config.max_output_tokens,
+            request_timeout_sec=config.request_timeout_sec,
+        )
 
     async def handle_trigger_event(self, trigger_event_id: str | UUID) -> None:
         try:
@@ -107,10 +118,7 @@ class JudgeOpenAIService:
             return
 
         try:
-            developer_prompt = self._prompt_library.render(
-                judge_profile=judge_run.judge_profile,
-                prompt_version=judge_run.prompt_version,
-            )
+            envelope = self._request_envelope_builder.build(judge_run=judge_run, bundle=bundle)
         except UnsupportedPromptVersionError:
             await self._finish_without_output(
                 judge_run=judge_run,
@@ -125,14 +133,19 @@ class JudgeOpenAIService:
                 finish_reason="unsupported_judge_profile",
             )
             return
-
-        prepared = self._context_builder.build(developer_prompt=developer_prompt, bundle=bundle)
+        except JudgeOpenAIRequestEnvelopeError:
+            await self._finish_without_output(
+                judge_run=judge_run,
+                status="failed_terminal",
+                finish_reason="openai_request_shape_invalid",
+            )
+            return
 
         async with self._repository.transaction():
             await self._repository.mark_judge_run_running(judge_run.judge_run_id)
 
         try:
-            outcome = await self._call_with_single_schema_retry(judge_run=judge_run, prepared=prepared)
+            outcome = await self._call_with_single_schema_retry(judge_run=judge_run, envelope=envelope)
         except OpenAIRequestShapeError:
             await self._finish_without_output(
                 judge_run=judge_run,
@@ -200,29 +213,39 @@ class JudgeOpenAIService:
                 refusal_detected=result.refusal_detected,
             )
 
-    async def _call_with_single_schema_retry(self, *, judge_run: JudgeRunRecord, prepared) -> _CallOutcome:
-        first = await self._call_once(judge_run=judge_run, prepared=prepared)
+    async def _call_with_single_schema_retry(
+        self,
+        *,
+        judge_run: JudgeRunRecord,
+        envelope: JudgeOpenAIRequestEnvelope,
+    ) -> _CallOutcome:
+        first = await self._call_once(judge_run=judge_run, envelope=envelope)
         if first.has_structured_payload or first.refusal_detected:
             return _CallOutcome(result=first)
 
         async with self._repository.transaction():
             await self._repository.increment_schema_retry_count(judge_run.judge_run_id)
 
-        second = await self._call_once(judge_run=judge_run, prepared=prepared)
+        second = await self._call_once(judge_run=judge_run, envelope=envelope)
         if second.has_structured_payload or second.refusal_detected:
             return _CallOutcome(result=second)
         return _CallOutcome(result=second, terminal_schema_failure=True)
 
-    async def _call_once(self, *, judge_run: JudgeRunRecord, prepared) -> OpenAIJudgeResult:
+    async def _call_once(
+        self,
+        *,
+        judge_run: JudgeRunRecord,
+        envelope: JudgeOpenAIRequestEnvelope,
+    ) -> OpenAIJudgeResult:
         started = time.monotonic()
         response = await self._openai_client.create_structured_response(
-            model=judge_run.model,
-            reasoning_effort=judge_run.reasoning_effort,
-            developer_prompt=prepared.developer_prompt,
-            user_context=prepared.user_context,
-            json_schema=self.judge_output_schema(),
-            max_output_tokens=self._config.max_output_tokens,
-            prompt_cache_key=judge_run.prompt_cache_key,
+            model=envelope.model,
+            reasoning_effort=envelope.reasoning_effort,
+            developer_prompt=envelope.developer_prompt_text,
+            user_context=envelope.user_context,
+            json_schema=envelope.structured_output_schema,
+            max_output_tokens=envelope.max_output_tokens,
+            prompt_cache_key=envelope.prompt_cache_key,
         )
         return self._response_mapper.parse(response, started_monotonic=started)
 
@@ -280,74 +303,4 @@ class JudgeOpenAIService:
 
     @staticmethod
     def judge_output_schema() -> dict:
-        score_0_to_100 = {"type": "integer", "minimum": 0, "maximum": 100}
-        nullable_score_0_to_100 = {"type": ["integer", "null"], "minimum": 0, "maximum": 100}
-        return {
-            "type": "object",
-            "additionalProperties": False,
-            "required": [
-                "judge_schema_version",
-                "candidate_group_id",
-                "headline",
-                "summary_one_line_ko",
-                "skeptical_take_ko",
-                "why_it_might_matter_ko",
-                "comparables",
-                "scores",
-                "reason_codes",
-                "red_flags_ko",
-                "evidence_limitations_ko",
-                "recommended_action_ko",
-                "freshness_note_ko",
-                "model_proposed_verdict",
-                "model_confidence_band",
-            ],
-            "properties": {
-                "judge_schema_version": {"type": "string"},
-                "candidate_group_id": {"type": "string"},
-                "headline": {"type": "string"},
-                "summary_one_line_ko": {"type": "string"},
-                "skeptical_take_ko": {"type": "string"},
-                "why_it_might_matter_ko": {"type": "string"},
-                "comparables": {"type": "array", "items": {"type": "string"}},
-                "scores": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": [
-                        "novelty",
-                        "practical_usefulness",
-                        "evidence_strength",
-                        "hype_penalty",
-                        "confidence",
-                        "code_quality",
-                        "maintenance_signal",
-                        "specificity",
-                        "reproducibility_signal",
-                    ],
-                    "properties": {
-                        "novelty": score_0_to_100,
-                        "practical_usefulness": score_0_to_100,
-                        "evidence_strength": score_0_to_100,
-                        "hype_penalty": score_0_to_100,
-                        "confidence": score_0_to_100,
-                        "code_quality": nullable_score_0_to_100,
-                        "maintenance_signal": nullable_score_0_to_100,
-                        "specificity": nullable_score_0_to_100,
-                        "reproducibility_signal": nullable_score_0_to_100,
-                    },
-                },
-                "reason_codes": {"type": "array", "items": {"type": "string"}},
-                "red_flags_ko": {"type": "array", "items": {"type": "string"}},
-                "evidence_limitations_ko": {"type": "array", "items": {"type": "string"}},
-                "recommended_action_ko": {"type": "string"},
-                "freshness_note_ko": {"type": "string"},
-                "model_proposed_verdict": {
-                    "type": ["string", "null"],
-                    "enum": ["inspect_now", "later", "skip", None],
-                },
-                "model_confidence_band": {
-                    "type": ["string", "null"],
-                    "enum": ["low", "medium", "high", None],
-                },
-            },
-        }
+        return build_judge_output_schema()
