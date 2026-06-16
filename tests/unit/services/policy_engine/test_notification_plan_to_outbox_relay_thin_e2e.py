@@ -339,7 +339,7 @@ async def test_policy_suppressed_delivery_does_not_emit_notification_event() -> 
     analysis = policy_repo.analyses[0]
     assert analysis.verdict == "skip"
     assert analysis.delivery_decision == "suppress"
-    assert "verdict_skip" in analysis.reason_codes_json
+    assert "policy_verdict_skip" in analysis.reason_codes_json
     assert policy_repo.state_transitions == [
         {
             "object_type": "analysis",

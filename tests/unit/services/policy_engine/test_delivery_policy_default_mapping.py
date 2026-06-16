@@ -32,4 +32,4 @@ def test_skip_maps_to_suppress_suppressed() -> None:
 
     assert decision.delivery_decision == "suppress"
     assert decision.urgency_profile == "suppressed"
-    assert decision.suppress_reason_code == "verdict_skip"
+    assert decision.suppress_reason_code == "policy_verdict_skip"

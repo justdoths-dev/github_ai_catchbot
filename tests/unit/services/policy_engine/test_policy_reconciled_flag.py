@@ -25,12 +25,12 @@ def test_different_model_and_policy_verdict_is_not_reconciled_and_appends_reason
     assert reason_codes == ["policy_threshold_later", "policy_overrode_model_verdict"]
 
 
-def test_missing_model_verdict_is_not_reconciled_and_appends_reason() -> None:
+def test_missing_model_verdict_is_reconciled_by_policy_contract() -> None:
     reconciled, reason_codes = reconcile_model_verdict(
         model_proposed_verdict=None,
         final_verdict="later",
         reason_codes=["policy_threshold_later"],
     )
 
-    assert reconciled is False
-    assert reason_codes == ["policy_threshold_later", "policy_no_model_verdict"]
+    assert reconciled is True
+    assert reason_codes == ["policy_threshold_later"]

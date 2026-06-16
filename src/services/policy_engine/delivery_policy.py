@@ -32,5 +32,5 @@ class DeliveryPolicy:
         return DeliveryDecisionResult(
             delivery_decision="suppress",
             urgency_profile="suppressed",
-            suppress_reason_code="verdict_skip",
+            suppress_reason_code="policy_verdict_skip",
         )

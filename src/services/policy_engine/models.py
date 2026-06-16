@@ -46,6 +46,7 @@ class JudgeOutputPolicyContext:
     model_proposed_verdict: str | None
     model_confidence_band: str | None
     created_at: datetime | None = None
+    judge_schema_version: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

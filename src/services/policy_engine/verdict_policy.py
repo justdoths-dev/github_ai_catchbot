@@ -83,7 +83,7 @@ def reconcile_model_verdict(
     reason_codes: list[str],
 ) -> tuple[bool, list[str]]:
     if not model_proposed_verdict:
-        return False, [*reason_codes, "policy_no_model_verdict"]
+        return True, reason_codes
     if model_proposed_verdict == final_verdict:
         return True, reason_codes
     return False, [*reason_codes, "policy_overrode_model_verdict"]

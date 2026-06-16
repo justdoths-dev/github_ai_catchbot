@@ -118,6 +118,7 @@ class PolicyEngineRepository:
             sa.text(
                 """
                 SELECT judge_output_id, judge_run_id, candidate_group_id,
+                       judge_schema_version,
                        payload_json, model_proposed_verdict, model_confidence_band, created_at
                 FROM judge_outputs
                 WHERE judge_output_id = CAST(:judge_output_id AS uuid)
@@ -136,6 +137,7 @@ class PolicyEngineRepository:
             model_proposed_verdict=_string_or_none(row["model_proposed_verdict"]),
             model_confidence_band=_string_or_none(row["model_confidence_band"]),
             created_at=row["created_at"],
+            judge_schema_version=_string_or_none(row["judge_schema_version"]),
         )
 
     async def load_bundle_context(self, bundle_id: UUID) -> BundlePolicyContext | None:

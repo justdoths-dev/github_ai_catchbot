@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+import argparse
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Sequence
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.services.policy_engine.bounded_analysis_runner import (
+    BoundedPolicyEngineAnalysisConfig,
+    BoundedPolicyEngineAnalysisResult,
+    BoundedPolicyEngineAnalysisRuntimeConfig,
+    BoundedPolicyEngineRedisPublisherBuilder,
+    BoundedPolicyEngineRedisReaderBuilder,
+    BoundedPolicyEngineRepositoryBuilder,
+    argument_error_report,
+    render_sanitized_json,
+    run_bounded_policy_engine_analysis_sync,
+)
+
+
+class CliArgumentError(ValueError):
+    pass
+
+
+class JsonOnlyArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        del message
+        raise CliArgumentError("unsupported_cli_argument")
+
+
+@dataclass(frozen=True, slots=True)
+class RunnerResult:
+    exit_code: int
+    report: dict[str, Any]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = JsonOnlyArgumentParser(
+        description=(
+            "Apply deterministic policy for one exact q.analysis.policy analysis.policy.apply.v1 handoff "
+            "and publish one notification.plan.created.v1 intent when delivery is non-suppress."
+        ),
+        add_help=False,
+    )
+    parser.add_argument("--operator-approved", action="store_true")
+    parser.add_argument("--allow-runtime-config", action="store_true")
+    parser.add_argument("--allow-redis-read", action="store_true")
+    parser.add_argument("--allow-redis-publish", action="store_true")
+    parser.add_argument("--allow-database-read", action="store_true")
+    parser.add_argument("--allow-database-write", action="store_true")
+    parser.add_argument("--allow-policy-engine", action="store_true")
+    parser.add_argument("--redis-message-suffix")
+    parser.add_argument("--trigger-event-suffix")
+    parser.add_argument("--judge-run-suffix")
+    parser.add_argument("--judge-output-suffix")
+    parser.add_argument("--bundle-suffix")
+    parser.add_argument("--candidate-group-suffix")
+    parser.add_argument("--scan-limit", type=int, default=25)
+    return parser
+
+
+def run(
+    args: argparse.Namespace,
+    *,
+    runtime_config_loader=None,
+    redis_reader_builder: BoundedPolicyEngineRedisReaderBuilder | None = None,
+    repository_builder: BoundedPolicyEngineRepositoryBuilder | None = None,
+    redis_publisher_builder: BoundedPolicyEngineRedisPublisherBuilder | None = None,
+) -> RunnerResult:
+    parsed_values = {
+        "redis_message_suffix": _parse_optional_redis_message_suffix(args.redis_message_suffix),
+        "trigger_event_suffix": _parse_optional_uuid_suffix(args.trigger_event_suffix, "invalid_trigger_event_suffix"),
+        "judge_run_suffix": _parse_optional_uuid_suffix(args.judge_run_suffix, "invalid_judge_run_suffix"),
+        "judge_output_suffix": _parse_optional_uuid_suffix(args.judge_output_suffix, "invalid_judge_output_suffix"),
+        "bundle_suffix": _parse_optional_uuid_suffix(args.bundle_suffix, "invalid_bundle_suffix"),
+        "candidate_group_suffix": _parse_optional_uuid_suffix(
+            args.candidate_group_suffix,
+            "invalid_candidate_group_suffix",
+        ),
+    }
+    for parsed in parsed_values.values():
+        if isinstance(parsed, dict):
+            return RunnerResult(exit_code=1, report=parsed)
+
+    runner_kwargs: dict[str, Any] = {
+        "redis_reader_builder": redis_reader_builder,
+        "repository_builder": repository_builder,
+        "redis_publisher_builder": redis_publisher_builder,
+    }
+    if runtime_config_loader is not None:
+        runner_kwargs["runtime_config_loader"] = runtime_config_loader
+
+    result = run_bounded_policy_engine_analysis_sync(
+        BoundedPolicyEngineAnalysisConfig(
+            operator_approved=bool(args.operator_approved),
+            allow_runtime_config=bool(args.allow_runtime_config),
+            allow_redis_read=bool(args.allow_redis_read),
+            allow_redis_publish=bool(args.allow_redis_publish),
+            allow_database_read=bool(args.allow_database_read),
+            allow_database_write=bool(args.allow_database_write),
+            allow_policy_engine=bool(args.allow_policy_engine),
+            redis_message_suffix=parsed_values["redis_message_suffix"],
+            trigger_event_suffix=parsed_values["trigger_event_suffix"],
+            judge_run_suffix=parsed_values["judge_run_suffix"],
+            judge_output_suffix=parsed_values["judge_output_suffix"],
+            bundle_suffix=parsed_values["bundle_suffix"],
+            candidate_group_suffix=parsed_values["candidate_group_suffix"],
+            scan_limit=int(args.scan_limit),
+        ),
+        **runner_kwargs,
+    )
+    report = result.to_sanitized_dict()
+    return RunnerResult(exit_code=0 if result.ok else 1, report=report)
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    runtime_config_loader=None,
+    redis_reader_builder: BoundedPolicyEngineRedisReaderBuilder | None = None,
+    repository_builder: BoundedPolicyEngineRepositoryBuilder | None = None,
+    redis_publisher_builder: BoundedPolicyEngineRedisPublisherBuilder | None = None,
+) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+    except CliArgumentError as exc:
+        sys.stdout.write(render_sanitized_json(argument_error_report(str(exc))))
+        return 1
+    result = run(
+        args,
+        runtime_config_loader=runtime_config_loader,
+        redis_reader_builder=redis_reader_builder,
+        repository_builder=repository_builder,
+        redis_publisher_builder=redis_publisher_builder,
+    )
+    sys.stdout.write(render_sanitized_json(result.report))
+    return result.exit_code
+
+
+def _parse_optional_uuid_suffix(value: str | None, error_code: str) -> str | None | dict[str, Any]:
+    if value is None:
+        return None
+    stripped = value.strip().lower()
+    if 4 <= len(stripped) <= 36 and all(char in "0123456789abcdef-" for char in stripped):
+        return stripped
+    return argument_error_report(error_code)
+
+
+def _parse_optional_redis_message_suffix(value: str | None) -> str | None | dict[str, Any]:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if 3 <= len(stripped) <= 64 and all(char in "0123456789-" for char in stripped):
+        return stripped
+    return argument_error_report("invalid_redis_message_suffix")
+
+
+__all__ = [
+    "BoundedPolicyEngineAnalysisConfig",
+    "BoundedPolicyEngineAnalysisResult",
+    "BoundedPolicyEngineAnalysisRuntimeConfig",
+    "BoundedPolicyEngineRedisPublisherBuilder",
+    "BoundedPolicyEngineRedisReaderBuilder",
+    "BoundedPolicyEngineRepositoryBuilder",
+    "CliArgumentError",
+    "RunnerResult",
+    "build_parser",
+    "main",
+    "run",
+]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
