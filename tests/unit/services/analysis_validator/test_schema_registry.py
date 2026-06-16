@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+import pytest
+
 from services.analysis_validator.schema_registry import JudgeOutputSchemaRegistry
 
 
@@ -45,6 +47,38 @@ def test_schema_registry_accepts_corrected_locked_score_contract() -> None:
     assert decision.action == "forward_policy"
 
 
+@pytest.mark.parametrize(
+    "required_score_field",
+    [
+        "novelty",
+        "practical_usefulness",
+        "evidence_strength",
+        "hype_penalty",
+        "confidence",
+    ],
+)
+def test_schema_registry_rejects_null_required_common_scores(required_score_field: str) -> None:
+    payload = valid_payload()
+    payload["scores"][required_score_field] = None
+
+    decision = _registry().validate(payload)
+
+    assert decision.action == "failed_terminal"
+    assert decision.reason_code == "validator_score_range_invalid"
+
+
+def test_schema_registry_accepts_null_conditional_artifact_scores() -> None:
+    payload = valid_payload()
+    payload["scores"]["code_quality"] = None
+    payload["scores"]["maintenance_signal"] = None
+    payload["scores"]["specificity"] = None
+    payload["scores"]["reproducibility_signal"] = None
+
+    decision = _registry().validate(payload)
+
+    assert decision.action == "forward_policy"
+
+
 def test_schema_registry_rejects_missing_required_locked_score_fields() -> None:
     payload = valid_payload()
     del payload["scores"]["maintenance_signal"]
@@ -72,9 +106,10 @@ def test_schema_registry_rejects_old_score_only_payload() -> None:
     assert decision.reason_code == "validator_schema_invalid"
 
 
-def test_schema_registry_enforces_score_range() -> None:
+@pytest.mark.parametrize("bad_score", [True, "80", -1, 101])
+def test_schema_registry_enforces_score_type_and_range(bad_score) -> None:
     payload = valid_payload()
-    payload["scores"]["novelty"] = 101
+    payload["scores"]["novelty"] = bad_score
 
     decision = _registry().validate(payload)
 
