@@ -6,6 +6,9 @@ import pytest
 
 from services.maintenance.models import StreamMessage
 from services.maintenance.retry_policy import (
+    DELIVERY_RESULT_NOOP_STAGE_NAME,
+    DELIVERY_RESULT_SEND_DISABLED_NOOP_ERROR_CODE,
+    DELIVERY_RESULT_SUPPRESSED_NOOP_ERROR_CODE,
     DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE,
     DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME,
 )
@@ -67,6 +70,42 @@ async def test_sent_delivery_result_worker_writes_exactly_one_maintenance_marker
     assert marker["root_object_id"] == latest.notification_delivery_record_id
     assert marker["attempt_status"] == "succeeded"
     assert marker["error_code"] == DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE
+
+
+@pytest.mark.asyncio
+async def test_edited_delivery_result_records_success_without_retry_or_replay() -> None:
+    repository = FakeRepository()
+    notification_plan = plan(status="edited", send_after=None)
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    latest = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        delivery_status="edited",
+        attempt_count=2,
+    )
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest
+    event = outbox_event(
+        "notification.delivery.result.v1",
+        aggregate_id=notification_plan.notification_plan_id,
+        payload_json={
+            "notification_plan_id": str(notification_plan.notification_plan_id),
+            "notification_delivery_record_id": str(latest.notification_delivery_record_id),
+            "delivery_status": "edited",
+        },
+    )
+    repository.events[event.event_id] = event
+    service = MaintenanceService(config(), repository=repository)
+
+    result = await service.handle_maintenance_trigger_event(event.event_id)
+
+    assert result is not None
+    assert result.classification == "terminal_success"
+    assert result.action == "mark_terminal_success"
+    assert result.retry_intent_written is False
+    assert result.dead_letter_written is False
+    assert repository.plan_created_outbox == []
+    assert repository.dead_letters == []
+    assert len(repository.job_attempts) == 1
+    assert repository.job_attempts[0]["root_object_id"] == latest.notification_delivery_record_id
 
 
 @pytest.mark.asyncio
@@ -148,6 +187,162 @@ async def test_failed_retryable_result_consumer_records_candidate_without_retry_
 
 
 @pytest.mark.asyncio
+async def test_suppressed_dry_run_result_records_logical_noop_without_retry() -> None:
+    repository = FakeRepository()
+    notification_plan = plan(status="suppressed", send_after=None, suppress_reason_code="dry_run_skip_transport")
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    latest = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        delivery_status="suppressed",
+        attempt_count=0,
+        transport_error_code="dry_run_skip_transport",
+        transport_error_class=None,
+    )
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest
+    event = outbox_event(
+        "notification.delivery.result.v1",
+        aggregate_id=notification_plan.notification_plan_id,
+        payload_json={
+            "notification_plan_id": str(notification_plan.notification_plan_id),
+            "delivery_status": "suppressed",
+        },
+    )
+    repository.events[event.event_id] = event
+    service = MaintenanceService(config(), repository=repository)
+
+    result = await service.handle_maintenance_trigger_event(event.event_id)
+
+    assert result is not None
+    assert result.classification == "logical_noop_success"
+    assert result.action == "mark_logical_noop_success"
+    assert result.reason_code == "delivery_result_suppressed_dry_run_noop"
+    assert result.retry_intent_written is False
+    assert result.dead_letter_written is False
+    assert repository.plan_created_outbox == []
+    assert repository.dead_letters == []
+    assert len(repository.job_attempts) == 1
+    assert repository.job_attempts[0]["stage_name"] == DELIVERY_RESULT_NOOP_STAGE_NAME
+    assert repository.job_attempts[0]["error_code"] == "delivery_result_suppressed_dry_run_noop"
+
+
+@pytest.mark.asyncio
+async def test_suppressed_send_disabled_result_records_distinct_noop_without_retry() -> None:
+    repository = FakeRepository()
+    notification_plan = plan(
+        status="suppressed",
+        send_after=None,
+        suppress_reason_code="notification_send_flag_disabled",
+    )
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    latest = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        delivery_status="suppressed",
+        attempt_count=0,
+        transport_error_code="notification_send_flag_disabled",
+        transport_error_class=None,
+    )
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest
+    event = outbox_event(
+        "notification.delivery.result.v1",
+        aggregate_id=notification_plan.notification_plan_id,
+        payload_json={
+            "notification_plan_id": str(notification_plan.notification_plan_id),
+            "delivery_status": "suppressed",
+        },
+    )
+    repository.events[event.event_id] = event
+    service = MaintenanceService(config(), repository=repository)
+
+    result = await service.handle_maintenance_trigger_event(event.event_id)
+
+    assert result is not None
+    assert result.classification == "logical_noop_success"
+    assert result.action == "mark_logical_noop_success"
+    assert result.reason_code == DELIVERY_RESULT_SEND_DISABLED_NOOP_ERROR_CODE
+    assert result.retry_intent_written is False
+    assert result.dead_letter_written is False
+    assert repository.plan_created_outbox == []
+    assert repository.dead_letters == []
+    assert len(repository.job_attempts) == 1
+    assert repository.job_attempts[0]["error_code"] == DELIVERY_RESULT_SEND_DISABLED_NOOP_ERROR_CODE
+
+
+@pytest.mark.asyncio
+async def test_suppressed_unknown_reason_records_generic_noop_without_retry() -> None:
+    repository = FakeRepository()
+    notification_plan = plan(status="suppressed", send_after=None, suppress_reason_code="policy_suppressed")
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    latest = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        delivery_status="suppressed",
+        attempt_count=0,
+        transport_error_code="policy_suppressed",
+        transport_error_class=None,
+    )
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest
+    event = outbox_event(
+        "notification.delivery.result.v1",
+        aggregate_id=notification_plan.notification_plan_id,
+        payload_json={
+            "notification_plan_id": str(notification_plan.notification_plan_id),
+            "delivery_status": "suppressed",
+        },
+    )
+    repository.events[event.event_id] = event
+    service = MaintenanceService(config(), repository=repository)
+
+    result = await service.handle_maintenance_trigger_event(event.event_id)
+
+    assert result is not None
+    assert result.classification == "logical_noop_success"
+    assert result.reason_code == DELIVERY_RESULT_SUPPRESSED_NOOP_ERROR_CODE
+    assert repository.plan_created_outbox == []
+    assert repository.dead_letters == []
+    assert len(repository.job_attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_terminal_result_creates_delivery_dlq_without_retry_intent() -> None:
+    repository = FakeRepository()
+    notification_plan = plan(status="failed_terminal", send_after=None)
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    latest = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        delivery_status="failed_terminal",
+        attempt_count=3,
+        transport_error_code="notify_transport_terminal_chat_access",
+        transport_error_class="terminal",
+    )
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest
+    event = outbox_event(
+        "notification.delivery.result.v1",
+        aggregate_id=notification_plan.notification_plan_id,
+        payload_json={
+            "notification_plan_id": str(notification_plan.notification_plan_id),
+            "delivery_status": "failed_terminal",
+        },
+    )
+    repository.events[event.event_id] = event
+    service = MaintenanceService(config(), repository=repository)
+
+    result = await service.handle_maintenance_trigger_event(event.event_id)
+
+    assert result is not None
+    assert result.classification == "terminal_failure"
+    assert result.action == "record_terminal_failure"
+    assert result.retry_intent_written is False
+    assert result.dead_letter_written is True
+    assert repository.plan_created_outbox == []
+    assert len(repository.job_attempts) == 1
+    assert repository.job_attempts[0]["attempt_status"] == "failed_terminal"
+    assert len(repository.dead_letters) == 1
+    assert repository.dead_letters[0]["stage_name"] == "maintenance_delivery_result"
+    assert repository.dead_letters[0]["last_error_code"] == "notify_transport_terminal_chat_access"
+    assert repository.dead_letters[0]["next_manual_action"] == "request_delivery_replay_after_operator_fix"
+    assert repository.dead_letters[0]["replay_hint"] == "delivery_replay_from_notification_plan"
+
+
+@pytest.mark.asyncio
 async def test_unsupported_event_type_is_ignored_without_db_write() -> None:
     repository = FakeRepository()
     notification_plan = plan()
@@ -166,6 +361,57 @@ async def test_unsupported_event_type_is_ignored_without_db_write() -> None:
     assert result.processed is False
     assert result.classification == "unsupported"
     assert result.action == "unsupported"
+    assert repository.job_attempts == []
+    assert repository.plan_created_outbox == []
+    assert repository.dead_letters == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_delivery_event_missing_payload_plan_id_fails_closed_without_db_write() -> None:
+    repository = FakeRepository()
+    notification_plan = plan()
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    event = outbox_event(
+        "notification.delivery.result.v1",
+        aggregate_id=notification_plan.notification_plan_id,
+        payload_json={"delivery_status": "failed_retryable"},
+    )
+    repository.events[event.event_id] = event
+    service = MaintenanceService(config(), repository=repository)
+
+    result = await service.handle_maintenance_trigger_event(event.event_id)
+
+    assert result is not None
+    assert result.processed is False
+    assert result.classification == "unsupported"
+    assert result.action == "unsupported"
+    assert result.reason_code == "invalid_delivery_result_payload"
+    assert repository.job_attempts == []
+    assert repository.plan_created_outbox == []
+    assert repository.dead_letters == []
+
+
+@pytest.mark.asyncio
+async def test_wrong_aggregate_type_delivery_event_fails_closed_without_db_write() -> None:
+    repository = FakeRepository()
+    notification_plan = plan()
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    event = outbox_event(
+        "notification.delivery.result.v1",
+        aggregate_id=notification_plan.notification_plan_id,
+        aggregate_type="analysis",
+        payload_json={"notification_plan_id": str(notification_plan.notification_plan_id)},
+    )
+    repository.events[event.event_id] = event
+    service = MaintenanceService(config(), repository=repository)
+
+    result = await service.handle_maintenance_trigger_event(event.event_id)
+
+    assert result is not None
+    assert result.processed is False
+    assert result.classification == "unsupported"
+    assert result.action == "unsupported"
+    assert result.reason_code == "unsupported_aggregate_type"
     assert repository.job_attempts == []
     assert repository.plan_created_outbox == []
     assert repository.dead_letters == []

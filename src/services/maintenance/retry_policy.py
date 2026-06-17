@@ -6,6 +6,8 @@ from typing import Literal
 
 DELIVERY_RESULT_NOOP_STAGE_NAME = "maintenance_delivery_result"
 DELIVERY_RESULT_NOOP_ERROR_CODE = "delivery_result_suppressed_dry_run_noop"
+DELIVERY_RESULT_SEND_DISABLED_NOOP_ERROR_CODE = "delivery_result_suppressed_send_disabled_noop"
+DELIVERY_RESULT_SUPPRESSED_NOOP_ERROR_CODE = "delivery_result_suppressed_logical_noop"
 DELIVERY_RESULT_NOOP_CLASSIFICATION = "logical_noop_success"
 DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME = "maintenance_delivery_result"
 DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE = "delivery_result_sent_terminal_success"
@@ -109,7 +111,7 @@ def classify_delivery_result_send_disabled_noop(
         return DeliveryResultSendDisabledNoopDecision(
             action="mark_logical_noop_success",
             maintenance_classification=DELIVERY_RESULT_NOOP_CLASSIFICATION,
-            reason_code="delivery_result_suppressed_send_disabled_noop",
+            reason_code=DELIVERY_RESULT_SEND_DISABLED_NOOP_ERROR_CODE,
             auto_retry_allowed=False,
             dead_letter_allowed=False,
             replay_dispatch_allowed=False,

@@ -32,6 +32,7 @@ ALLOWED_DELIVERY_DLQ_LAST_ERROR_CODES = frozenset(
 ALLOWED_DELIVERY_DLQ_NEXT_MANUAL_ACTIONS = frozenset(
     {
         "request_explicit_delivery_replay",
+        "request_delivery_replay_after_operator_fix",
         "fix_chat_access_then_delivery_replay",
         "disable_edits_then_delivery_replay",
         "fix_template_then_delivery_replay",

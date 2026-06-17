@@ -235,7 +235,7 @@ class MaintenanceRepository:
                     :retry_count,
                     now(),
                     now(),
-                    'request_explicit_delivery_replay',
+                    'request_delivery_replay_after_operator_fix',
                     'delivery_replay_from_notification_plan'
                 )
                 """
@@ -243,6 +243,67 @@ class MaintenanceRepository:
             {
                 "queue_name": MAINTENANCE_QUEUE_NAME,
                 "notification_plan_id": str(notification_plan_id),
+                "retry_count": retry_count,
+            },
+        )
+        return True
+
+    async def insert_delivery_terminal_dead_letter(
+        self,
+        *,
+        notification_plan_id: UUID,
+        retry_count: int,
+        last_error_code: str | None,
+    ) -> bool:
+        error_code = last_error_code or "delivery_result_failed_terminal"
+        existing = await self._session.execute(
+            sa.text(
+                """
+                SELECT dead_letter_entry_id
+                FROM dead_letter_entries
+                WHERE stage_name = 'maintenance_delivery_result'
+                  AND queue_name = :queue_name
+                  AND root_object_type = 'notification_plan'
+                  AND root_object_id = CAST(:notification_plan_id AS uuid)
+                  AND last_error_code = :last_error_code
+                  AND replay_hint = 'delivery_replay_from_notification_plan'
+                LIMIT 1
+                """
+            ),
+            {
+                "queue_name": MAINTENANCE_QUEUE_NAME,
+                "notification_plan_id": str(notification_plan_id),
+                "last_error_code": error_code,
+            },
+        )
+        if existing.scalar_one_or_none() is not None:
+            return False
+        await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO dead_letter_entries (
+                    stage_name, queue_name, root_object_type, root_object_id,
+                    last_error_code, last_error_snippet, retry_count,
+                    first_failed_at, last_failed_at, next_manual_action, replay_hint
+                ) VALUES (
+                    'maintenance_delivery_result',
+                    :queue_name,
+                    'notification_plan',
+                    CAST(:notification_plan_id AS uuid),
+                    :last_error_code,
+                    'delivery terminal failure requires explicit replay review',
+                    :retry_count,
+                    now(),
+                    now(),
+                    'request_delivery_replay_after_operator_fix',
+                    'delivery_replay_from_notification_plan'
+                )
+                """
+            ),
+            {
+                "queue_name": MAINTENANCE_QUEUE_NAME,
+                "notification_plan_id": str(notification_plan_id),
+                "last_error_code": error_code,
                 "retry_count": retry_count,
             },
         )
@@ -326,6 +387,17 @@ class MaintenanceRepository:
         )
 
     async def count_delivery_result_noop_job_attempts(self, notification_plan_id: UUID) -> int:
+        return await self.count_delivery_result_logical_noop_job_attempts(
+            notification_plan_id,
+            error_code=DELIVERY_RESULT_NOOP_ERROR_CODE,
+        )
+
+    async def count_delivery_result_logical_noop_job_attempts(
+        self,
+        notification_plan_id: UUID,
+        *,
+        error_code: str,
+    ) -> int:
         result = await self._session.execute(
             sa.text(
                 """
@@ -343,12 +415,23 @@ class MaintenanceRepository:
                 "stage_name": DELIVERY_RESULT_NOOP_STAGE_NAME,
                 "queue_name": MAINTENANCE_QUEUE_NAME,
                 "notification_plan_id": str(notification_plan_id),
-                "error_code": DELIVERY_RESULT_NOOP_ERROR_CODE,
+                "error_code": error_code,
             },
         )
         return int(result.scalar_one())
 
     async def insert_delivery_result_noop_job_attempt(self, notification_plan_id: UUID) -> bool:
+        return await self.insert_delivery_result_logical_noop_job_attempt(
+            notification_plan_id,
+            error_code=DELIVERY_RESULT_NOOP_ERROR_CODE,
+        )
+
+    async def insert_delivery_result_logical_noop_job_attempt(
+        self,
+        notification_plan_id: UUID,
+        *,
+        error_code: str,
+    ) -> bool:
         result = await self._session.execute(
             sa.text(
                 """
@@ -387,7 +470,7 @@ class MaintenanceRepository:
                 "root_object_id": str(notification_plan_id),
                 "notification_plan_id": str(notification_plan_id),
                 "attempt_status": "succeeded",
-                "error_code": DELIVERY_RESULT_NOOP_ERROR_CODE,
+                "error_code": error_code,
             },
         )
         return result.scalar_one_or_none() is not None
@@ -758,8 +841,12 @@ class MaintenanceRepository:
 
 
 def delivery_result_from_outbox(event: OutboxEvent) -> DeliveryResultEvent | None:
+    if event.event_type != "notification.delivery.result.v1":
+        return None
+    if event.aggregate_type != "notification_plan":
+        return None
     payload = event.payload_json
-    notification_plan_id = _uuid_or_none(payload.get("notification_plan_id") or event.aggregate_id)
+    notification_plan_id = _uuid_or_none(payload.get("notification_plan_id"))
     if notification_plan_id is None:
         return None
     return DeliveryResultEvent(

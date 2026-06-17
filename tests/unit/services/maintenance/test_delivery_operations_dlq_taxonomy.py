@@ -19,6 +19,7 @@ def test_delivery_dlq_taxonomy_is_exact() -> None:
     }
     assert ALLOWED_DELIVERY_DLQ_NEXT_MANUAL_ACTIONS == {
         "request_explicit_delivery_replay",
+        "request_delivery_replay_after_operator_fix",
         "fix_chat_access_then_delivery_replay",
         "disable_edits_then_delivery_replay",
         "fix_template_then_delivery_replay",

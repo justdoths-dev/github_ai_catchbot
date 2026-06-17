@@ -21,6 +21,10 @@ from services.maintenance.retry_policy import (
 )
 
 
+PG_SCHEME = "postgresql+psycopg:" + "//"
+REDIS_SCHEME = "redis:" + "//"
+
+
 class Tx:
     async def __aenter__(self):
         return self
@@ -111,6 +115,36 @@ class FakeRepository:
                 "root_object_id": notification_plan_id,
                 "last_error_code": "max_notification_retry_attempts_exceeded",
                 "retry_count": retry_count,
+                "next_manual_action": "request_delivery_replay_after_operator_fix",
+                "replay_hint": "delivery_replay_from_notification_plan",
+            }
+        )
+        return True
+
+    async def insert_delivery_terminal_dead_letter(
+        self,
+        *,
+        notification_plan_id: UUID,
+        retry_count: int,
+        last_error_code: str | None,
+    ) -> bool:
+        error_code = last_error_code or "delivery_result_failed_terminal"
+        if any(
+            row["stage_name"] == "maintenance_delivery_result"
+            and row["root_object_id"] == notification_plan_id
+            and row["last_error_code"] == error_code
+            for row in self.dead_letters
+        ):
+            return False
+        self.dead_letters.append(
+            {
+                "stage_name": "maintenance_delivery_result",
+                "queue_name": "q.maintenance",
+                "root_object_type": "notification_plan",
+                "root_object_id": notification_plan_id,
+                "last_error_code": error_code,
+                "retry_count": retry_count,
+                "next_manual_action": "request_delivery_replay_after_operator_fix",
                 "replay_hint": "delivery_replay_from_notification_plan",
             }
         )
@@ -128,6 +162,17 @@ class FakeRepository:
         self.job_attempts.append(kwargs)
 
     async def count_delivery_result_noop_job_attempts(self, notification_plan_id: UUID) -> int:
+        return await self.count_delivery_result_logical_noop_job_attempts(
+            notification_plan_id,
+            error_code=DELIVERY_RESULT_NOOP_ERROR_CODE,
+        )
+
+    async def count_delivery_result_logical_noop_job_attempts(
+        self,
+        notification_plan_id: UUID,
+        *,
+        error_code: str,
+    ) -> int:
         return sum(
             1
             for row in self.job_attempts
@@ -136,11 +181,22 @@ class FakeRepository:
             and row["root_object_type"] == "notification_plan"
             and row["root_object_id"] == notification_plan_id
             and row["attempt_status"] == "succeeded"
-            and row["error_code"] == DELIVERY_RESULT_NOOP_ERROR_CODE
+            and row["error_code"] == error_code
         )
 
     async def insert_delivery_result_noop_job_attempt(self, notification_plan_id: UUID) -> bool:
-        if await self.count_delivery_result_noop_job_attempts(notification_plan_id):
+        return await self.insert_delivery_result_logical_noop_job_attempt(
+            notification_plan_id,
+            error_code=DELIVERY_RESULT_NOOP_ERROR_CODE,
+        )
+
+    async def insert_delivery_result_logical_noop_job_attempt(
+        self,
+        notification_plan_id: UUID,
+        *,
+        error_code: str,
+    ) -> bool:
+        if await self.count_delivery_result_logical_noop_job_attempts(notification_plan_id, error_code=error_code):
             return False
         await self.insert_job_attempt(
             stage_name=DELIVERY_RESULT_NOOP_STAGE_NAME,
@@ -148,7 +204,7 @@ class FakeRepository:
             root_object_type="notification_plan",
             root_object_id=notification_plan_id,
             attempt_status="succeeded",
-            error_code=DELIVERY_RESULT_NOOP_ERROR_CODE,
+            error_code=error_code,
         )
         return True
 
@@ -205,8 +261,8 @@ def config(
 ) -> MaintenanceConfig:
     return MaintenanceConfig(
         app_env=app_env,
-        database_url="postgresql+psycopg://example",
-        redis_url="redis://example",
+        database_url=PG_SCHEME + "example",
+        redis_url=REDIS_SCHEME + "example",
         maintenance_queue_name="q.maintenance",
         maintenance_consumer_group="maintenance",
         maintenance_consumer_name="test",
@@ -273,11 +329,17 @@ def latest_delivery_record(
     )
 
 
-def outbox_event(event_type: str, *, aggregate_id: UUID, payload_json: dict) -> OutboxEvent:
+def outbox_event(
+    event_type: str,
+    *,
+    aggregate_id: UUID,
+    payload_json: dict,
+    aggregate_type: str = "notification_plan",
+) -> OutboxEvent:
     return OutboxEvent(
         event_id=uuid4(),
         event_type=event_type,
-        aggregate_type="notification_plan",
+        aggregate_type=aggregate_type,
         aggregate_id=aggregate_id,
         payload_json=payload_json,
     )

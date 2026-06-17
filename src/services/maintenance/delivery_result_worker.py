@@ -14,10 +14,11 @@ from .models import (
 from .repositories import delivery_result_from_outbox
 from .retry_policy import (
     DELIVERY_RESULT_NOOP_CLASSIFICATION,
-    DELIVERY_RESULT_NOOP_ERROR_CODE,
+    DELIVERY_RESULT_SUPPRESSED_NOOP_ERROR_CODE,
     DELIVERY_RESULT_SENT_SUCCESS_CLASSIFICATION,
     DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE,
     classify_delivery_result_dry_run_noop,
+    classify_delivery_result_send_disabled_noop,
     classify_delivery_result_sent_success,
 )
 
@@ -29,8 +30,27 @@ class DeliveryResultRepositoryProtocol(Protocol):
     async def load_latest_delivery_record(self, notification_plan_id: UUID) -> LatestDeliveryRecord | None: ...
     async def count_delivery_result_noop_job_attempts(self, notification_plan_id: UUID) -> int: ...
     async def insert_delivery_result_noop_job_attempt(self, notification_plan_id: UUID) -> bool: ...
+    async def count_delivery_result_logical_noop_job_attempts(
+        self,
+        notification_plan_id: UUID,
+        *,
+        error_code: str,
+    ) -> int: ...
+    async def insert_delivery_result_logical_noop_job_attempt(
+        self,
+        notification_plan_id: UUID,
+        *,
+        error_code: str,
+    ) -> bool: ...
     async def count_delivery_result_sent_success_job_attempts(self, notification_delivery_record_id: UUID) -> int: ...
     async def insert_delivery_result_sent_success_job_attempt(self, notification_delivery_record_id: UUID) -> bool: ...
+    async def insert_delivery_terminal_dead_letter(
+        self,
+        *,
+        notification_plan_id: UUID,
+        retry_count: int,
+        last_error_code: str | None,
+    ) -> bool: ...
     async def insert_job_attempt(
         self,
         *,
@@ -64,6 +84,13 @@ class DeliveryResultWorker:
                 action="unsupported",
                 reason_code="unsupported_event_type",
             )
+        if event.aggregate_type != "notification_plan":
+            return DeliveryResultWorkerResult(
+                processed=False,
+                classification="unsupported",
+                action="unsupported",
+                reason_code="unsupported_aggregate_type",
+            )
 
         delivery_result = delivery_result_from_outbox(event)
         if delivery_result is None:
@@ -94,12 +121,22 @@ class DeliveryResultWorker:
             delivery_reason=delivery_reason,
         )
         if dry_run_noop.action == "mark_logical_noop_success":
-            return await self._mark_dry_run_noop(plan)
+            return await self._mark_logical_noop(plan, error_code=dry_run_noop.reason_code)
+
+        send_disabled_noop = classify_delivery_result_send_disabled_noop(
+            delivery_status=delivery_status,
+            delivery_reason=delivery_reason,
+        )
+        if send_disabled_noop.action == "mark_logical_noop_success":
+            return await self._mark_logical_noop(plan, error_code=send_disabled_noop.reason_code)
+
+        if delivery_status == "suppressed":
+            return await self._mark_logical_noop(plan, error_code=DELIVERY_RESULT_SUPPRESSED_NOOP_ERROR_CODE)
 
         if delivery_status == "failed_retryable":
             return await self._record_retryable_candidate(plan)
         if delivery_status == "failed_terminal":
-            return await self._record_terminal_failure(plan)
+            return await self._record_terminal_failure(plan, latest)
 
         return DeliveryResultWorkerResult(
             processed=True,
@@ -134,24 +171,35 @@ class DeliveryResultWorker:
             already_marked=not inserted,
         )
 
-    async def _mark_dry_run_noop(self, plan: NotificationPlanRecord) -> DeliveryResultWorkerResult:
-        existing = await self._repository.count_delivery_result_noop_job_attempts(plan.notification_plan_id)
+    async def _mark_logical_noop(
+        self,
+        plan: NotificationPlanRecord,
+        *,
+        error_code: str,
+    ) -> DeliveryResultWorkerResult:
+        existing = await self._repository.count_delivery_result_logical_noop_job_attempts(
+            plan.notification_plan_id,
+            error_code=error_code,
+        )
         if existing:
             return DeliveryResultWorkerResult(
                 processed=True,
                 classification=DELIVERY_RESULT_NOOP_CLASSIFICATION,
                 action="already_marked",
-                reason_code=DELIVERY_RESULT_NOOP_ERROR_CODE,
+                reason_code=error_code,
                 already_marked=True,
             )
 
         async with self._repository.transaction():
-            inserted = await self._repository.insert_delivery_result_noop_job_attempt(plan.notification_plan_id)
+            inserted = await self._repository.insert_delivery_result_logical_noop_job_attempt(
+                plan.notification_plan_id,
+                error_code=error_code,
+            )
         return DeliveryResultWorkerResult(
             processed=True,
             classification=DELIVERY_RESULT_NOOP_CLASSIFICATION,
             action="mark_logical_noop_success" if inserted else "already_marked",
-            reason_code=DELIVERY_RESULT_NOOP_ERROR_CODE,
+            reason_code=error_code,
             marker_written=inserted,
             already_marked=not inserted,
         )
@@ -173,7 +221,11 @@ class DeliveryResultWorker:
             reason_code="failed_retryable_deferred_to_due_scan",
         )
 
-    async def _record_terminal_failure(self, plan: NotificationPlanRecord) -> DeliveryResultWorkerResult:
+    async def _record_terminal_failure(
+        self,
+        plan: NotificationPlanRecord,
+        latest: LatestDeliveryRecord,
+    ) -> DeliveryResultWorkerResult:
         async with self._repository.transaction():
             await self._repository.insert_job_attempt(
                 stage_name="maintenance_delivery_result",
@@ -183,11 +235,17 @@ class DeliveryResultWorker:
                 attempt_status="failed_terminal",
                 error_code="delivery_result_failed_terminal_dlq_candidate",
             )
+            dead_letter_written = await self._repository.insert_delivery_terminal_dead_letter(
+                notification_plan_id=plan.notification_plan_id,
+                retry_count=latest.attempt_count,
+                last_error_code=latest.transport_error_code,
+            )
         return DeliveryResultWorkerResult(
             processed=True,
             classification="terminal_failure",
             action="record_terminal_failure",
             reason_code="failed_terminal_dlq_candidate",
+            dead_letter_written=dead_letter_written,
         )
 
 
