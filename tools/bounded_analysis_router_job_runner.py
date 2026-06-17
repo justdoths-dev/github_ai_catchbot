@@ -42,16 +42,20 @@ class RunnerResult:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = JsonOnlyArgumentParser(
-        description="Process exactly one target q.analysis.route analysis-router job.",
+        description="Preview or execute exactly one target q.analysis.route analysis-router job.",
         add_help=False,
     )
+    parser.add_argument("--mode", choices=("preview", "execute"), default="preview")
     parser.add_argument("--operator-approved", action="store_true")
     parser.add_argument("--allow-runtime-config", action="store_true")
+    parser.add_argument("--allow-redis-read", action="store_true")
+    parser.add_argument("--allow-database-read", action="store_true")
     parser.add_argument("--allow-redis-consume", action="store_true")
     parser.add_argument("--allow-database-write", action="store_true")
     parser.add_argument("--allow-redis-ack", action="store_true")
     parser.add_argument("--trigger-event-id")
     parser.add_argument("--trigger-event-suffix")
+    parser.add_argument("--candidate-group-suffix", "--aggregate-suffix", dest="candidate_group_suffix")
     parser.add_argument("--redis-message-id")
     parser.add_argument("--max-messages", type=int, default=1)
     parser.add_argument("--scan-limit", type=int, default=25)
@@ -65,12 +69,29 @@ def run(
     redis_builder: BoundedAnalysisRouterRedisBuilder | None = None,
     database_builder: BoundedAnalysisRouterDatabaseBuilder | None = None,
 ) -> RunnerResult:
+    if args.trigger_event_id is not None:
+        return RunnerResult(
+            exit_code=1,
+            report=argument_error_report("full_trigger_event_id_selector_not_allowed"),
+        )
+    if args.redis_message_id is not None:
+        return RunnerResult(
+            exit_code=1,
+            report=argument_error_report("full_redis_message_id_selector_not_allowed"),
+        )
+
     trigger_event_id = _parse_optional_uuid(args.trigger_event_id, "invalid_trigger_event_id")
-    trigger_event_suffix = _parse_optional_event_suffix(args.trigger_event_suffix)
+    trigger_event_suffix = _parse_optional_event_suffix(args.trigger_event_suffix, "invalid_trigger_event_suffix")
+    candidate_group_suffix = _parse_optional_event_suffix(
+        args.candidate_group_suffix,
+        "invalid_candidate_group_suffix",
+    )
     if isinstance(trigger_event_id, dict):
         return RunnerResult(exit_code=1, report=trigger_event_id)
     if isinstance(trigger_event_suffix, dict):
         return RunnerResult(exit_code=1, report=trigger_event_suffix)
+    if isinstance(candidate_group_suffix, dict):
+        return RunnerResult(exit_code=1, report=candidate_group_suffix)
 
     runner_kwargs: dict[str, Any] = {
         "redis_builder": redis_builder,
@@ -80,13 +101,17 @@ def run(
         runner_kwargs["runtime_config_loader"] = runtime_config_loader
     result = run_bounded_analysis_router_sync(
         BoundedAnalysisRouterConfig(
+            mode=str(args.mode),
             operator_approved=bool(args.operator_approved),
             allow_runtime_config=bool(args.allow_runtime_config),
+            allow_redis_read=bool(args.allow_redis_read),
+            allow_database_read=bool(args.allow_database_read),
             allow_redis_consume=bool(args.allow_redis_consume),
             allow_database_write=bool(args.allow_database_write),
             allow_redis_ack=bool(args.allow_redis_ack),
             trigger_event_id=trigger_event_id,
             trigger_event_suffix=trigger_event_suffix,
+            candidate_group_suffix=candidate_group_suffix,
             redis_message_id=args.redis_message_id,
             max_messages=int(args.max_messages),
             scan_limit=int(args.scan_limit),
@@ -128,13 +153,13 @@ def _parse_optional_uuid(value: str | None, error_code: str) -> UUID | None | di
         return argument_error_report(error_code)
 
 
-def _parse_optional_event_suffix(value: str | None) -> str | None | dict[str, Any]:
+def _parse_optional_event_suffix(value: str | None, error_code: str) -> str | None | dict[str, Any]:
     if value is None:
         return None
     stripped = value.strip().lower()
     if 4 <= len(stripped) <= 36 and all(char in "0123456789abcdef-" for char in stripped):
         return stripped
-    return argument_error_report("invalid_trigger_event_suffix")
+    return argument_error_report(error_code)
 
 
 __all__ = [

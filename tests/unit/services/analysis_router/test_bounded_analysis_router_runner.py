@@ -41,15 +41,25 @@ class FakeRedisClient:
         ack_error: BaseException | None = None,
         ack_count: int | None = None,
         order: list[str] | None = None,
+        group_exists: bool = True,
+        group_pending: int = 0,
+        group_lag: int | None = None,
+        group_last_delivered_id: str = "0-0",
     ) -> None:
         self.entries = entries or []
         self.ack_error = ack_error
         self.ack_count = ack_count
         self.order = order
+        self.group_exists = group_exists
+        self.group_pending = group_pending
+        self.group_lag = len(self.entries) if group_lag is None else group_lag
+        self.group_last_delivered_id = group_last_delivered_id
         self.group_created = False
         self.group_start_id: str | None = None
         self.acked: list[str] = []
         self.cursor = 0
+        self.range_calls = 0
+        self.xinfo_calls = 0
         self.read_calls = 0
         self.xreadgroup_blocks: list[int | None] = []
 
@@ -70,6 +80,42 @@ class FakeRedisClient:
         assert mkstream is False
         self.group_created = True
         self.group_start_id = id
+
+    async def xrange(
+        self,
+        name: str,
+        min: str = "-",
+        max: str = "+",
+        count: int | None = None,
+    ) -> list[tuple[str, dict[str, object]]]:
+        assert name == "q.analysis.route"
+        assert max == "+"
+        self.range_calls += 1
+        if min == "-":
+            entries = self.entries
+        elif min.startswith("("):
+            entries = [
+                entry
+                for entry in self.entries
+                if _redis_stream_id_greater(entry[0], min[1:])
+            ]
+        else:
+            raise AssertionError(f"unexpected xrange min: {min}")
+        return entries[: count or len(entries)]
+
+    async def xinfo_groups(self, name: str) -> list[dict[str, object]]:
+        assert name == "q.analysis.route"
+        self.xinfo_calls += 1
+        if not self.group_exists:
+            return []
+        return [
+            {
+                "name": "analysis-router",
+                "pending": self.group_pending,
+                "lag": self.group_lag,
+                "last-delivered-id": self.group_last_delivered_id,
+            }
+        ]
 
     async def xreadgroup(
         self,
@@ -169,6 +215,9 @@ class FakeRepository:
         self.shape_calls.append(bundle_id)
         return self.shape
 
+    async def load_existing_judge_run(self, **kwargs):
+        return self.existing_judge_run_id
+
     async def get_or_create_judge_run(self, **kwargs):
         if self.order is not None:
             self.order.append("db:get_or_create")
@@ -263,8 +312,11 @@ def _router_config(*, escalation: bool = False) -> AnalysisRouterConfig:
 
 def _approved_config(**overrides) -> BoundedAnalysisRouterConfig:
     values = {
+        "mode": "execute",
         "operator_approved": True,
         "allow_runtime_config": True,
+        "allow_redis_read": True,
+        "allow_database_read": True,
         "allow_redis_consume": True,
         "allow_database_write": True,
         "allow_redis_ack": True,
@@ -345,6 +397,12 @@ def _thin_fields(event_id: UUID, candidate_group_id: UUID, **overrides: object) 
     return fields
 
 
+def _redis_stream_id_greater(left: str, right: str) -> bool:
+    left_key = tuple(int(part) for part in left.split("-", 1))
+    right_key = tuple(int(part) for part in right.split("-", 1))
+    return left_key > right_key
+
+
 def _success_parts(*, existing_judge_run_id: UUID | None = None, order: list[str] | None = None):
     event_id = uuid4()
     candidate_group_id = uuid4()
@@ -401,6 +459,437 @@ async def test_missing_runtime_config_blocks_before_redis_db_or_ack() -> None:
 
 
 @pytest.mark.asyncio
+async def test_missing_read_gates_block_before_runtime_config_redis_db_or_ack() -> None:
+    for overrides, expected_error in (
+        ({"allow_redis_read": False}, "redis_read_not_allowed"),
+        ({"allow_database_read": False}, "database_read_not_allowed"),
+    ):
+        redis_builder = FakeRedisBuilder(FakeRedisClient())
+        database_builder = RaisingDatabaseBuilder()
+
+        result = await run_bounded_analysis_router(
+            _approved_config(**overrides),
+            runtime_config_loader=_raising_runtime_config,
+            redis_builder=redis_builder,
+            database_builder=database_builder,
+        )
+
+        assert result.error_code == expected_error
+        assert result.state.runtime_config_loaded is False
+        assert result.state.redis_read_attempted is False
+        assert result.state.redis_consume_attempted is False
+        assert result.state.database_read_attempted is False
+        assert result.state.database_write_attempted is False
+        assert result.state.redis_ack_attempted is False
+        assert redis_builder.calls == 0
+        assert database_builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_preview_reports_create_without_db_write_consume_or_ack() -> None:
+    event_id, _candidate_group_id, _bundle_id, repository, redis, _config = _success_parts()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(
+            mode="preview",
+            trigger_event_id=event_id,
+            allow_redis_consume=False,
+            allow_database_write=False,
+            allow_redis_ack=False,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=FakeDatabaseBuilder(repository),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is True
+    assert result.status == "preview"
+    assert report["target_message_found"] is True
+    assert report["analysis_request_event_found"] is True
+    assert report["request_current"] is True
+    assert report["bundle_ready"] is True
+    assert report["existing_judge_run_found"] is False
+    assert report["planned_action"] == "create_judge_run"
+    assert result.state.redis_read_attempted is True
+    assert result.state.redis_consume_attempted is False
+    assert result.state.database_read_attempted is True
+    assert result.state.database_write_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert repository.get_or_create_calls == []
+    assert repository.outbox_calls == []
+    assert redis.range_calls == 2
+    assert redis.read_calls == 0
+    assert redis.acked == []
+
+
+@pytest.mark.asyncio
+async def test_preview_reports_existing_judge_run_reuse_without_duplicate_outbox() -> None:
+    existing_judge_run_id = uuid4()
+    event_id, _candidate_group_id, _bundle_id, repository, redis, _config = _success_parts(
+        existing_judge_run_id=existing_judge_run_id
+    )
+
+    result = await run_bounded_analysis_router(
+        _approved_config(
+            mode="preview",
+            trigger_event_id=event_id,
+            allow_redis_consume=False,
+            allow_database_write=False,
+            allow_redis_ack=False,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=FakeDatabaseBuilder(repository),
+    )
+
+    assert result.ok is True
+    assert result.status == "preview"
+    assert result.existing_judge_run_found is True
+    assert result.planned_action == "reuse_existing_judge_run"
+    assert repository.get_or_create_calls == []
+    assert repository.outbox_calls == []
+    assert redis.acked == []
+
+
+@pytest.mark.asyncio
+async def test_preview_reports_stale_request_as_noop_without_ack() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    bundle_id = uuid4()
+    repository = FakeRepository(
+        event=_event(event_id, candidate_group_id, bundle_id),
+        candidate_state=_candidate_state(candidate_group_id, uuid4()),
+        bundle=_bundle(bundle_id, candidate_group_id),
+    )
+    redis = FakeRedisClient([(STREAM_ID, _thin_fields(event_id, candidate_group_id))])
+
+    result = await run_bounded_analysis_router(
+        _approved_config(
+            mode="preview",
+            trigger_event_id=event_id,
+            allow_redis_consume=False,
+            allow_database_write=False,
+            allow_redis_ack=False,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=FakeDatabaseBuilder(repository),
+    )
+
+    assert result.ok is True
+    assert result.status == "preview"
+    assert result.request_current is False
+    assert result.bundle_ready is True
+    assert result.planned_action == "noop"
+    assert result.state.database_write_attempted is False
+    assert result.state.redis_consume_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert repository.get_or_create_calls == []
+    assert redis.acked == []
+
+
+@pytest.mark.asyncio
+async def test_candidate_group_suffix_refines_target_selection_before_db() -> None:
+    event_id = uuid4()
+    wrong_candidate_group_id = uuid4()
+    candidate_group_id = uuid4()
+    bundle_id = uuid4()
+    repository = FakeRepository(
+        event=_event(event_id, candidate_group_id, bundle_id),
+        candidate_state=_candidate_state(candidate_group_id, bundle_id),
+        bundle=_bundle(bundle_id, candidate_group_id),
+    )
+    redis = FakeRedisClient(
+        [
+            ("100-0", _thin_fields(event_id, wrong_candidate_group_id)),
+            (STREAM_ID, _thin_fields(event_id, candidate_group_id)),
+        ]
+    )
+
+    result = await run_bounded_analysis_router(
+        _approved_config(
+            mode="preview",
+            trigger_event_suffix=str(event_id)[-8:],
+            trigger_event_id=None,
+            candidate_group_suffix=str(candidate_group_id)[-8:],
+            allow_redis_consume=False,
+            allow_database_write=False,
+            allow_redis_ack=False,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=FakeDatabaseBuilder(repository),
+    )
+
+    assert result.ok is True
+    assert result.messages_seen == 2
+    assert result.messages_matched == 1
+    assert result.target_candidate_group_suffix == str(candidate_group_id)[-8:]
+    assert result.planned_action == "create_judge_run"
+    assert redis.acked == []
+
+
+def test_cli_full_selectors_fail_closed_without_echoing_raw_values() -> None:
+    from tools import bounded_analysis_router_job_runner as cli
+
+    full_trigger_event_id = str(uuid4())
+    full_redis_message_id = "1710000000000-0"
+    cases = (
+        (
+            ["--trigger-event-id", full_trigger_event_id],
+            "full_trigger_event_id_selector_not_allowed",
+            full_trigger_event_id,
+        ),
+        (
+            ["--redis-message-id", full_redis_message_id],
+            "full_redis_message_id_selector_not_allowed",
+            full_redis_message_id,
+        ),
+    )
+
+    for argv, expected_error, forbidden_value in cases:
+        result = cli.run(cli.build_parser().parse_args(argv))
+        rendered = json.dumps(result.report, sort_keys=True)
+
+        assert result.exit_code == 1
+        assert result.report["error_code"] == expected_error
+        assert forbidden_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_preview_reports_group_preflight_fields_without_consume_or_ack() -> None:
+    event_id, _candidate_group_id, _bundle_id, repository, redis, _config = _success_parts()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(
+            mode="preview",
+            trigger_event_suffix=str(event_id)[-8:],
+            trigger_event_id=None,
+            allow_redis_consume=False,
+            allow_database_write=False,
+            allow_redis_ack=False,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=FakeDatabaseBuilder(repository),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["group_name"] == "analysis-router"
+    assert report["group_exists"] is True
+    assert report["group_pending"] == 0
+    assert report["group_lag"] == 1
+    assert report["group_last_delivered_id_suffix"] == "0-0"
+    assert report["target_after_group_last_delivered"] is True
+    assert report["target_is_next_deliverable"] is True
+    assert redis.xinfo_calls == 1
+    assert redis.read_calls == 0
+    assert redis.acked == []
+
+
+@pytest.mark.asyncio
+async def test_target_behind_non_target_unread_blocks_before_xreadgroup_db_write_or_ack() -> None:
+    target_event_id = uuid4()
+    target_candidate_group_id = uuid4()
+    redis = FakeRedisClient(
+        [
+            ("100-0", _thin_fields(uuid4(), uuid4())),
+            ("101-0", _thin_fields(target_event_id, target_candidate_group_id)),
+        ]
+    )
+    database_builder = RaisingDatabaseBuilder()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(trigger_event_id=target_event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.error_code == "target_not_next_deliverable"
+    assert report["target_after_group_last_delivered"] is True
+    assert report["target_is_next_deliverable"] is False
+    assert result.state.redis_consume_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert result.state.database_write_attempted is False
+    assert redis.read_calls == 0
+    assert redis.acked == []
+    assert database_builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_group_missing_blocks_before_xreadgroup_db_write_or_ack() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    redis = FakeRedisClient(
+        [("100-0", _thin_fields(event_id, candidate_group_id))],
+        group_exists=False,
+    )
+    database_builder = RaisingDatabaseBuilder()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(trigger_event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+
+    assert result.error_code == "redis_consumer_group_missing"
+    assert result.to_sanitized_dict()["group_exists"] is False
+    assert result.state.redis_consume_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert result.state.database_write_attempted is False
+    assert redis.read_calls == 0
+    assert redis.acked == []
+    assert database_builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_group_pending_nonzero_blocks_before_xreadgroup_db_write_or_ack() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    redis = FakeRedisClient(
+        [("100-0", _thin_fields(event_id, candidate_group_id))],
+        group_pending=1,
+    )
+    database_builder = RaisingDatabaseBuilder()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(trigger_event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.error_code == "redis_consumer_group_pending_nonzero"
+    assert report["group_pending"] == 1
+    assert report["target_is_next_deliverable"] is False
+    assert result.state.redis_consume_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert result.state.database_write_attempted is False
+    assert redis.read_calls == 0
+    assert redis.acked == []
+    assert database_builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_target_not_after_last_delivered_blocks_before_xreadgroup_db_write_or_ack() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    redis = FakeRedisClient(
+        [("100-0", _thin_fields(event_id, candidate_group_id))],
+        group_last_delivered_id="100-0",
+    )
+    database_builder = RaisingDatabaseBuilder()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(trigger_event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.error_code == "target_not_after_group_last_delivered"
+    assert report["target_after_group_last_delivered"] is False
+    assert report["target_is_next_deliverable"] is False
+    assert result.state.redis_consume_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert result.state.database_write_attempted is False
+    assert redis.read_calls == 0
+    assert redis.acked == []
+    assert database_builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_target_not_next_deliverable_blocks_before_xreadgroup_db_write_or_ack() -> None:
+    target_event_id = uuid4()
+    target_candidate_group_id = uuid4()
+    redis = FakeRedisClient(
+        [
+            ("100-0", _thin_fields(uuid4(), uuid4())),
+            ("101-0", _thin_fields(uuid4(), uuid4())),
+            ("102-0", _thin_fields(target_event_id, target_candidate_group_id)),
+        ],
+        group_last_delivered_id="100-0",
+    )
+    database_builder = RaisingDatabaseBuilder()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(trigger_event_id=target_event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.error_code == "target_not_next_deliverable"
+    assert report["target_after_group_last_delivered"] is True
+    assert report["target_is_next_deliverable"] is False
+    assert result.state.redis_consume_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert result.state.database_write_attempted is False
+    assert redis.read_calls == 0
+    assert redis.acked == []
+    assert database_builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_job_id_must_equal_trigger_event_id_blocks_before_db_or_ack() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    redis = FakeRedisClient(
+        [("100-0", _thin_fields(event_id, candidate_group_id, job_id=str(uuid4())))]
+    )
+    database_builder = RaisingDatabaseBuilder()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(trigger_event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+
+    assert result.error_code == "job_id_trigger_event_id_mismatch"
+    assert result.state.redis_consume_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert result.state.database_write_attempted is False
+    assert redis.xinfo_calls == 0
+    assert redis.read_calls == 0
+    assert redis.acked == []
+    assert database_builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_job_id_must_be_valid_uuid_blocks_before_db_or_ack() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    redis = FakeRedisClient(
+        [("100-0", _thin_fields(event_id, candidate_group_id, job_id="not-a-uuid"))]
+    )
+    database_builder = RaisingDatabaseBuilder()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(trigger_event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+
+    assert result.error_code == "job_id_invalid"
+    assert result.state.redis_consume_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert result.state.database_write_attempted is False
+    assert redis.xinfo_calls == 0
+    assert redis.read_calls == 0
+    assert redis.acked == []
+    assert database_builder.calls == 0
+
+
+@pytest.mark.asyncio
 async def test_redis_scan_with_fewer_entries_than_scan_limit_returns_without_hanging() -> None:
     target_event_id = uuid4()
     redis = FakeRedisClient([("100-0", _thin_fields(uuid4(), uuid4()))])
@@ -415,8 +904,9 @@ async def test_redis_scan_with_fewer_entries_than_scan_limit_returns_without_han
 
     assert result.error_code == "target_message_not_found"
     assert result.messages_seen == 1
-    assert redis.read_calls == 2
-    assert redis.xreadgroup_blocks == [None, None]
+    assert redis.range_calls == 1
+    assert redis.read_calls == 0
+    assert redis.xreadgroup_blocks == []
     assert redis.acked == []
     assert database_builder.calls == 0
 
@@ -679,6 +1169,12 @@ async def test_successful_fake_backed_run_creates_one_judge_run_one_outbox_and_a
     assert redis.acked == [STREAM_ID]
     assert result.redis_ack_status == "acked"
     assert result.redis_acked_count == 1
+    assert report["group_exists"] is True
+    assert report["group_pending"] == 0
+    assert report["target_after_group_last_delivered"] is True
+    assert report["target_is_next_deliverable"] is True
+    assert redis.xinfo_calls == 1
+    assert redis.read_calls == 1
 
 
 @pytest.mark.asyncio
@@ -822,7 +1318,7 @@ def test_source_ast_guard_no_forbidden_authority_or_broad_worker_calls() -> None
     imported_roots = set()
     imported_modules = set()
     forbidden_call_names = {"system", "popen", "call", "check_call", "check_output", "run_forever"}
-    forbidden_call_attrs = forbidden_call_names | {"xread", "xrange", "sleep"}
+    forbidden_call_attrs = forbidden_call_names | {"xread", "xgroup_create", "sleep"}
     xreadgroup_calls = []
 
     for node in ast.walk(tree):
@@ -851,6 +1347,7 @@ def test_source_ast_guard_no_forbidden_authority_or_broad_worker_calls() -> None
     assert not any(".web_enricher" in module for module in imported_modules)
     assert not any(".worker" in module for module in imported_modules)
     assert "run_forever(" not in source
+    assert "xgroup_create(" not in source
     assert "docker" not in imported_roots
     assert "alembic" not in imported_roots
     for call in xreadgroup_calls:

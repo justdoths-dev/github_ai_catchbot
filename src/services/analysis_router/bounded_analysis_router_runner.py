@@ -21,9 +21,10 @@ from .repositories import AnalysisRouterRepository, AsyncSessionLike
 from .routing_policy import ALLOWED_JUDGE_PROFILES, AnalysisRoutingPolicy
 
 
-SCHEMA_VERSION = "bounded_analysis_router_runner_v1"
+SCHEMA_VERSION = "bounded_analysis_router_runner_v2"
 RUNNER_NAME = "bounded_analysis_router_job_runner"
-MODE = "analysis_route_one_shot_consume"
+MODE_PREVIEW = "preview"
+MODE_EXECUTE = "execute"
 QUEUE_NAME = "q.analysis.route"
 STAGE_NAME = "analysis_route"
 ROOT_OBJECT_TYPE = "candidate_group"
@@ -71,13 +72,17 @@ REQUIRED_EVENT_PAYLOAD_FIELDS = (
 
 @dataclass(frozen=True, slots=True)
 class BoundedAnalysisRouterConfig:
+    mode: str = MODE_PREVIEW
     operator_approved: bool = False
     allow_runtime_config: bool = False
+    allow_redis_read: bool = False
+    allow_database_read: bool = False
     allow_redis_consume: bool = False
     allow_database_write: bool = False
     allow_redis_ack: bool = False
     trigger_event_id: UUID | None = None
     trigger_event_suffix: str | None = None
+    candidate_group_suffix: str | None = None
     redis_message_id: str | None = None
     max_messages: int = DEFAULT_MAX_MESSAGES
     scan_limit: int = DEFAULT_SCAN_LIMIT
@@ -99,6 +104,7 @@ class BoundedAnalysisRouterRuntimeConfig:
 @dataclass(slots=True)
 class BoundedAnalysisRouterState:
     runtime_config_loaded: bool = False
+    redis_read_attempted: bool = False
     redis_consume_attempted: bool = False
     redis_group_created: bool = False
     redis_ack_attempted: bool = False
@@ -106,6 +112,13 @@ class BoundedAnalysisRouterState:
     database_read_attempted: bool = False
     database_write_attempted: bool = False
     database_commit_attempted: bool = False
+    group_name: str | None = None
+    group_exists: bool | None = None
+    group_pending: int | None = None
+    group_lag: int | None = None
+    group_last_delivered_id_suffix: str | None = None
+    target_after_group_last_delivered: bool | None = None
+    target_is_next_deliverable: bool | None = None
 
 
 @dataclass(slots=True)
@@ -161,12 +174,19 @@ class BoundedAnalysisRouterResult:
     messages_processed_count: int = 0
     redis_ack_status: str = "not_attempted"
     redis_acked_count: int = 0
+    target_message_found: bool = False
+    analysis_request_event_found: bool = False
+    request_current: bool | None = None
+    bundle_ready: bool | None = None
+    existing_judge_run_found: bool | None = None
+    planned_action: str | None = None
+    would_fail_closed: bool = False
 
     def to_sanitized_dict(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
             "runner_name": RUNNER_NAME,
-            "mode": MODE,
+            "mode": self.config.mode,
             "ok": self.ok,
             "status": self.status,
             "error_code": self.error_code,
@@ -187,16 +207,34 @@ class BoundedAnalysisRouterResult:
             "redis_ack_attempted": self.state.redis_ack_attempted,
             "redis_ack_status": self.redis_ack_status,
             "redis_acked_count": self.redis_acked_count,
+            "group_name": self.state.group_name,
+            "group_exists": self.state.group_exists,
+            "group_pending": self.state.group_pending,
+            "group_lag": self.state.group_lag,
+            "group_last_delivered_id_suffix": self.state.group_last_delivered_id_suffix,
+            "target_after_group_last_delivered": self.state.target_after_group_last_delivered,
+            "target_is_next_deliverable": self.state.target_is_next_deliverable,
+            "target_message_found": self.target_message_found,
+            "analysis_request_event_found": self.analysis_request_event_found,
+            "request_current": self.request_current,
+            "bundle_ready": self.bundle_ready,
+            "existing_judge_run_found": self.existing_judge_run_found,
+            "planned_action": self.planned_action,
+            "would_fail_closed": self.would_fail_closed,
             "gates": {
                 "operator_approved": self.config.operator_approved,
                 "runtime_config_allowed": self.config.allow_runtime_config,
+                "redis_read_allowed": self.config.allow_redis_read,
+                "database_read_allowed": self.config.allow_database_read,
                 "redis_consume_allowed": self.config.allow_redis_consume,
                 "database_write_allowed": self.config.allow_database_write,
                 "redis_ack_allowed": self.config.allow_redis_ack,
+                "candidate_group_suffix": self.config.candidate_group_suffix,
                 "max_messages": self.config.max_messages,
                 "scan_limit": self.config.scan_limit,
             },
             "side_effects": {
+                "redis_read_called": self.state.redis_read_attempted,
                 "redis_consume_called": self.state.redis_consume_attempted,
                 "redis_group_created": self.state.redis_group_created,
                 "redis_ack_called": self.state.redis_ack_attempted,
@@ -263,19 +301,33 @@ class RedisTargetConsumer(Protocol):
         state: BoundedAnalysisRouterState,
     ) -> tuple[TargetedAnalysisRouteMessage | None, int, int]: ...
 
+    async def consume_target(
+        self,
+        config: BoundedAnalysisRouterConfig,
+        state: BoundedAnalysisRouterState,
+    ) -> tuple[TargetedAnalysisRouteMessage | None, int, int]: ...
+
+    async def preflight_group(
+        self,
+        selected: TargetedAnalysisRouteMessage,
+        state: BoundedAnalysisRouterState,
+    ) -> None: ...
+
     async def ack(self, message_id: str, state: BoundedAnalysisRouterState) -> int: ...
 
 
 class RedisTargetConsumerClient(Protocol):
     async def xlen(self, name: str) -> int: ...
 
-    async def xgroup_create(
+    async def xrange(
         self,
         name: str,
-        groupname: str,
-        id: str = "$",
-        mkstream: bool = False,
+        min: str = "-",
+        max: str = "+",
+        count: int | None = None,
     ) -> Any: ...
+
+    async def xinfo_groups(self, name: str) -> Any: ...
 
     async def xreadgroup(
         self,
@@ -304,6 +356,14 @@ class AnalysisRouteRepository(Protocol):
     async def load_candidate_route_state(self, candidate_group_id: str) -> CandidateRouteState | None: ...
     async def load_bundle(self, bundle_id: str) -> BundleRouteRecord | None: ...
     async def load_bundle_shape_stats(self, bundle_id: str) -> BundleShapeStats: ...
+    async def load_existing_judge_run(
+        self,
+        *,
+        bundle_id: str,
+        prompt_version: str,
+        model: str,
+        reasoning_effort: str,
+    ) -> UUID | None: ...
 
     async def get_or_create_judge_run(
         self,
@@ -375,47 +435,89 @@ class BoundedAnalysisRouteRedisConsumer:
         config: BoundedAnalysisRouterConfig,
         state: BoundedAnalysisRouterState,
     ) -> tuple[TargetedAnalysisRouteMessage | None, int, int]:
-        state.redis_consume_attempted = True
+        state.redis_read_attempted = True
         if await self._client.xlen(self._queue_name) <= 0:
             return None, 0, 0
-        try:
-            await self._client.xgroup_create(
-                self._queue_name,
-                self._consumer_group,
-                id="0",
-                mkstream=False,
-            )
-            state.redis_group_created = True
-        except Exception as exc:
-            if "BUSYGROUP" not in str(exc):
-                raise
 
+        raw = await self._client.xrange(
+            self._queue_name,
+            min="-",
+            max="+",
+            count=config.scan_limit,
+        )
+        return _select_target_from_entries(_flatten_direct_stream_entries(raw), config, config.scan_limit)
+
+    async def preflight_group(
+        self,
+        selected: TargetedAnalysisRouteMessage,
+        state: BoundedAnalysisRouterState,
+    ) -> None:
+        state.redis_read_attempted = True
+        state.group_name = self._consumer_group
+        state.group_exists = False
+        state.group_pending = None
+        state.group_lag = None
+        state.group_last_delivered_id_suffix = None
+        state.target_after_group_last_delivered = False
+        state.target_is_next_deliverable = False
+
+        raw_groups = await self._client.xinfo_groups(self._queue_name)
+        group = _find_consumer_group(raw_groups, self._consumer_group)
+        if group is None:
+            return
+
+        state.group_exists = True
+        state.group_pending = _int_or_none(group.get("pending"))
+        state.group_lag = _int_or_none(group.get("lag"))
+        last_delivered_id = _string_or_none(group.get("last-delivered-id"))
+        state.group_last_delivered_id_suffix = _optional_id_suffix(last_delivered_id)
+        if not last_delivered_id:
+            return
+
+        target_after_last = _redis_stream_id_greater(selected.redis_message_id, last_delivered_id)
+        state.target_after_group_last_delivered = target_after_last
+        if state.group_pending != 0 or not target_after_last:
+            return
+
+        normalized_last_delivered_id = _normalize_redis_stream_id(last_delivered_id)
+        if normalized_last_delivered_id is None:
+            return
+        raw_next = await self._client.xrange(
+            self._queue_name,
+            min=f"({normalized_last_delivered_id}",
+            max="+",
+            count=1,
+        )
+        next_entries = _flatten_direct_stream_entries(raw_next)
+        state.target_is_next_deliverable = bool(
+            next_entries and next_entries[0][0] == selected.redis_message_id
+        )
+
+    async def consume_target(
+        self,
+        config: BoundedAnalysisRouterConfig,
+        state: BoundedAnalysisRouterState,
+    ) -> tuple[TargetedAnalysisRouteMessage | None, int, int]:
+        state.redis_consume_attempted = True
         selected: TargetedAnalysisRouteMessage | None = None
         messages_seen = 0
         messages_matched = 0
-        while messages_seen < config.scan_limit:
-            count = max(1, min(config.scan_limit - messages_seen, config.scan_limit))
-            raw = await self._client.xreadgroup(
-                self._consumer_group,
-                self._consumer_name,
-                {self._queue_name: ">"},
-                count=count,
-            )
-            entries = _flatten_stream_entries(raw)
-            if not entries:
-                break
-            for message_id, fields in entries:
-                messages_seen += 1
-                decoded_fields = _decode_fields(fields)
-                if _matches_target(message_id, decoded_fields, config):
-                    messages_matched += 1
-                    if selected is None:
-                        selected = TargetedAnalysisRouteMessage(
-                            redis_message_id=message_id,
-                            fields=decoded_fields,
-                        )
-                if messages_seen >= config.scan_limit:
-                    break
+        raw = await self._client.xreadgroup(
+            self._consumer_group,
+            self._consumer_name,
+            {self._queue_name: ">"},
+            count=1,
+        )
+        entries = _flatten_group_stream_entries(raw)
+        for message_id, fields in entries[:1]:
+            messages_seen += 1
+            decoded_fields = _decode_fields(fields)
+            if _matches_target(message_id, decoded_fields, config):
+                messages_matched += 1
+                selected = TargetedAnalysisRouteMessage(
+                    redis_message_id=message_id,
+                    fields=decoded_fields,
+                )
         return selected, messages_seen, messages_matched
 
     async def ack(self, message_id: str, state: BoundedAnalysisRouterState) -> int:
@@ -460,6 +562,21 @@ class SqlAlchemyBoundedAnalysisRouteRepository:
 
     async def load_bundle_shape_stats(self, bundle_id: str) -> BundleShapeStats:
         return await self._router_repository.load_bundle_shape_stats(bundle_id)
+
+    async def load_existing_judge_run(
+        self,
+        *,
+        bundle_id: str,
+        prompt_version: str,
+        model: str,
+        reasoning_effort: str,
+    ) -> UUID | None:
+        return await self._router_repository.load_existing_judge_run(
+            bundle_id=UUID(str(bundle_id)),
+            prompt_version=prompt_version,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
 
     async def get_or_create_judge_run(self, **kwargs: Any) -> tuple[UUID, bool]:
         return await self._router_repository.get_or_create_judge_run(**kwargs)
@@ -583,19 +700,9 @@ async def run_bounded_analysis_router(
     logger: logging.Logger | None = None,
 ) -> BoundedAnalysisRouterResult:
     state = BoundedAnalysisRouterState()
-    target_error = _target_error(config)
-    if not config.operator_approved:
-        return _result("blocked", "operator_approval_missing", config=config, state=state)
-    if target_error is not None:
-        return _result("blocked", target_error, config=config, state=state)
-    if config.trigger_event_suffix is not None and not _is_valid_event_suffix(config.trigger_event_suffix):
-        return _result("blocked", "invalid_trigger_event_suffix", config=config, state=state)
-    if config.max_messages != HARD_MAX_MESSAGES:
-        return _result("blocked", "max_messages_must_be_one", config=config, state=state)
-    if config.scan_limit <= 0 or config.scan_limit > HARD_SCAN_LIMIT:
-        return _result("blocked", "scan_limit_out_of_range", config=config, state=state)
-    if not config.allow_runtime_config:
-        return _result("blocked", "runtime_config_not_allowed", config=config, state=state)
+    gate_error = _gate_error(config)
+    if gate_error is not None:
+        return _result("blocked", gate_error, config=config, state=state)
 
     effective_logger = logger or logging.getLogger(__name__)
     try:
@@ -608,12 +715,6 @@ async def run_bounded_analysis_router(
 
     if runtime_config.router_config.queue_name != QUEUE_NAME:
         return _result("blocked", "queue_not_allowed", config=config, state=state)
-    if not config.allow_redis_consume:
-        return _result("blocked", "redis_consume_not_allowed", config=config, state=state)
-    if not config.allow_database_write:
-        return _result("blocked", "database_write_not_allowed", config=config, state=state)
-    if not config.allow_redis_ack:
-        return _result("blocked", "redis_ack_not_allowed", config=config, state=state)
 
     redis_handle: BoundedAnalysisRouterRedisHandle | None = None
     database_handle: BoundedAnalysisRouterDatabaseHandle | None = None
@@ -624,6 +725,11 @@ async def run_bounded_analysis_router(
     counters = BoundedAnalysisRouterCounters()
     messages_seen = 0
     messages_matched = 0
+    request_current: bool | None = None
+    bundle_ready: bool | None = None
+    existing_judge_run_found: bool | None = None
+    planned_action: str | None = None
+    would_fail_closed = False
 
     try:
         redis_handle = await (redis_builder or build_default_bounded_analysis_router_redis_consumer)(
@@ -667,6 +773,24 @@ async def run_bounded_analysis_router(
             )
             raise _AnalysisRouterResultReady
 
+        await redis_handle.consumer.preflight_group(selected, state)
+        group_preflight_error = _group_preflight_error(state)
+        if group_preflight_error is not None:
+            would_fail_closed = True
+            if config.mode == MODE_EXECUTE:
+                result = _result(
+                    "blocked",
+                    group_preflight_error,
+                    config=config,
+                    state=state,
+                    selected=selected,
+                    messages_seen=messages_seen,
+                    messages_matched=messages_matched,
+                    planned_action="noop",
+                    would_fail_closed=would_fail_closed,
+                )
+                raise _AnalysisRouterResultReady
+
         database_handle = await (database_builder or build_default_bounded_analysis_router_database)(
             runtime_config,
             state,
@@ -679,6 +803,7 @@ async def run_bounded_analysis_router(
             assert trigger_event_id is not None
             event = await repository.fetch_analysis_request_event(str(trigger_event_id))
             if event is None:
+                would_fail_closed = True
                 result = _result(
                     "blocked",
                     "event_outbox_missing",
@@ -687,10 +812,12 @@ async def run_bounded_analysis_router(
                     selected=selected,
                     messages_seen=messages_seen,
                     messages_matched=messages_matched,
+                    would_fail_closed=would_fail_closed,
                 )
                 raise _AnalysisRouterResultReady
             event_error, job = _validate_event_outbox(event, selected)
             if event_error is not None or job is None:
+                would_fail_closed = True
                 result = _result(
                     "blocked",
                     event_error or "analysis_requested_event_contract_mismatch",
@@ -701,11 +828,13 @@ async def run_bounded_analysis_router(
                     job=job,
                     messages_seen=messages_seen,
                     messages_matched=messages_matched,
+                    would_fail_closed=would_fail_closed,
                 )
                 raise _AnalysisRouterResultReady
 
             candidate_state = await repository.load_candidate_route_state(job.candidate_group_id)
             if candidate_state is None:
+                would_fail_closed = True
                 result = _result(
                     "blocked",
                     "candidate_group_missing",
@@ -716,11 +845,31 @@ async def run_bounded_analysis_router(
                     job=job,
                     messages_seen=messages_seen,
                     messages_matched=messages_matched,
+                    would_fail_closed=would_fail_closed,
                 )
                 raise _AnalysisRouterResultReady
 
             bundle = await repository.load_bundle(job.bundle_id)
             if bundle is None:
+                bundle_ready = False
+                planned_action = "noop"
+                would_fail_closed = True
+                if config.mode == MODE_PREVIEW:
+                    result = _result(
+                        "preview",
+                        None,
+                        config=config,
+                        state=state,
+                        selected=selected,
+                        event=event,
+                        job=job,
+                        messages_seen=messages_seen,
+                        messages_matched=messages_matched,
+                        bundle_ready=bundle_ready,
+                        planned_action=planned_action,
+                        would_fail_closed=would_fail_closed,
+                    )
+                    raise _AnalysisRouterResultReady
                 result = _result(
                     "blocked",
                     "bundle_missing",
@@ -731,9 +880,15 @@ async def run_bounded_analysis_router(
                     job=job,
                     messages_seen=messages_seen,
                     messages_matched=messages_matched,
+                    bundle_ready=bundle_ready,
+                    planned_action=planned_action,
+                    would_fail_closed=would_fail_closed,
                 )
                 raise _AnalysisRouterResultReady
             if _id_text(bundle.candidate_group_id) != _id_text(job.candidate_group_id):
+                bundle_ready = bool(bundle.ready_for_analysis)
+                planned_action = "noop"
+                would_fail_closed = True
                 result = _result(
                     "blocked",
                     "bundle_candidate_group_mismatch",
@@ -744,9 +899,32 @@ async def run_bounded_analysis_router(
                     job=job,
                     messages_seen=messages_seen,
                     messages_matched=messages_matched,
+                    bundle_ready=bundle_ready,
+                    planned_action=planned_action,
+                    would_fail_closed=would_fail_closed,
                 )
                 raise _AnalysisRouterResultReady
             if _id_text(candidate_state.current_bundle_id) != _id_text(job.bundle_id):
+                request_current = False
+                bundle_ready = bool(bundle.ready_for_analysis)
+                planned_action = "noop"
+                if config.mode == MODE_PREVIEW:
+                    result = _result(
+                        "preview",
+                        None,
+                        config=config,
+                        state=state,
+                        selected=selected,
+                        event=event,
+                        job=job,
+                        messages_seen=messages_seen,
+                        messages_matched=messages_matched,
+                        request_current=request_current,
+                        bundle_ready=bundle_ready,
+                        planned_action=planned_action,
+                        would_fail_closed=would_fail_closed,
+                    )
+                    raise _AnalysisRouterResultReady
                 result = _result(
                     "blocked",
                     "stale_bundle_request",
@@ -757,9 +935,34 @@ async def run_bounded_analysis_router(
                     job=job,
                     messages_seen=messages_seen,
                     messages_matched=messages_matched,
+                    request_current=request_current,
+                    bundle_ready=bundle_ready,
+                    planned_action=planned_action,
+                    would_fail_closed=True,
                 )
                 raise _AnalysisRouterResultReady
+            request_current = True
             if not bundle.ready_for_analysis:
+                bundle_ready = False
+                planned_action = "noop"
+                would_fail_closed = True
+                if config.mode == MODE_PREVIEW:
+                    result = _result(
+                        "preview",
+                        None,
+                        config=config,
+                        state=state,
+                        selected=selected,
+                        event=event,
+                        job=job,
+                        messages_seen=messages_seen,
+                        messages_matched=messages_matched,
+                        request_current=request_current,
+                        bundle_ready=bundle_ready,
+                        planned_action=planned_action,
+                        would_fail_closed=would_fail_closed,
+                    )
+                    raise _AnalysisRouterResultReady
                 result = _result(
                     "blocked",
                     "bundle_not_ready",
@@ -770,11 +973,35 @@ async def run_bounded_analysis_router(
                     job=job,
                     messages_seen=messages_seen,
                     messages_matched=messages_matched,
+                    request_current=request_current,
+                    bundle_ready=bundle_ready,
+                    planned_action=planned_action,
+                    would_fail_closed=would_fail_closed,
                 )
                 raise _AnalysisRouterResultReady
+            bundle_ready = True
 
             shape = await repository.load_bundle_shape_stats(job.bundle_id)
             if shape.member_count <= 0:
+                planned_action = "noop"
+                would_fail_closed = True
+                if config.mode == MODE_PREVIEW:
+                    result = _result(
+                        "preview",
+                        None,
+                        config=config,
+                        state=state,
+                        selected=selected,
+                        event=event,
+                        job=job,
+                        messages_seen=messages_seen,
+                        messages_matched=messages_matched,
+                        request_current=request_current,
+                        bundle_ready=bundle_ready,
+                        planned_action=planned_action,
+                        would_fail_closed=would_fail_closed,
+                    )
+                    raise _AnalysisRouterResultReady
                 result = _result(
                     "blocked",
                     "bundle_members_missing",
@@ -785,6 +1012,10 @@ async def run_bounded_analysis_router(
                     job=job,
                     messages_seen=messages_seen,
                     messages_matched=messages_matched,
+                    request_current=request_current,
+                    bundle_ready=bundle_ready,
+                    planned_action=planned_action,
+                    would_fail_closed=would_fail_closed,
                 )
                 raise _AnalysisRouterResultReady
 
@@ -795,6 +1026,24 @@ async def run_bounded_analysis_router(
                 shape=shape,
             )
             if decision.action != "judge":
+                planned_action = "noop"
+                if config.mode == MODE_PREVIEW:
+                    result = _result(
+                        "preview",
+                        None,
+                        config=config,
+                        state=state,
+                        selected=selected,
+                        event=event,
+                        job=job,
+                        messages_seen=messages_seen,
+                        messages_matched=messages_matched,
+                        request_current=request_current,
+                        bundle_ready=bundle_ready,
+                        planned_action=planned_action,
+                        would_fail_closed=would_fail_closed,
+                    )
+                    raise _AnalysisRouterResultReady
                 result = _result(
                     "blocked",
                     decision.refresh_reason or "analysis_route_noop",
@@ -805,6 +1054,62 @@ async def run_bounded_analysis_router(
                     job=job,
                     messages_seen=messages_seen,
                     messages_matched=messages_matched,
+                    request_current=request_current,
+                    bundle_ready=bundle_ready,
+                    planned_action=planned_action,
+                    would_fail_closed=True,
+                )
+                raise _AnalysisRouterResultReady
+
+            existing_judge_run_id = await repository.load_existing_judge_run(
+                bundle_id=job.bundle_id,
+                prompt_version=decision.prompt_version or "",
+                model=decision.model or "",
+                reasoning_effort=decision.reasoning_effort or "",
+            )
+            existing_judge_run_found = existing_judge_run_id is not None
+            planned_action = "reuse_existing_judge_run" if existing_judge_run_found else "create_judge_run"
+            if config.mode == MODE_PREVIEW:
+                result = _result(
+                    "preview",
+                    None,
+                    config=config,
+                    state=state,
+                    selected=selected,
+                    event=event,
+                    job=job,
+                    messages_seen=messages_seen,
+                    messages_matched=messages_matched,
+                    request_current=request_current,
+                    bundle_ready=bundle_ready,
+                    existing_judge_run_found=existing_judge_run_found,
+                    planned_action=planned_action,
+                    would_fail_closed=would_fail_closed,
+                )
+                raise _AnalysisRouterResultReady
+
+            consumed, consume_seen, consume_matched = await redis_handle.consumer.consume_target(config, state)
+            if (
+                consumed is None
+                or consume_seen != HARD_MAX_MESSAGES
+                or consume_matched != HARD_MAX_MESSAGES
+                or consumed.redis_message_id != selected.redis_message_id
+            ):
+                result = _result(
+                    "blocked",
+                    "target_message_not_consumable_exactly",
+                    config=config,
+                    state=state,
+                    selected=selected,
+                    event=event,
+                    job=job,
+                    messages_seen=messages_seen,
+                    messages_matched=messages_matched,
+                    request_current=request_current,
+                    bundle_ready=bundle_ready,
+                    existing_judge_run_found=existing_judge_run_found,
+                    planned_action="noop",
+                    would_fail_closed=True,
                 )
                 raise _AnalysisRouterResultReady
 
@@ -849,6 +1154,11 @@ async def run_bounded_analysis_router(
                 counters=counters,
                 messages_seen=messages_seen,
                 messages_matched=messages_matched,
+                request_current=request_current,
+                bundle_ready=bundle_ready,
+                existing_judge_run_found=existing_judge_run_found,
+                planned_action=planned_action,
+                would_fail_closed=would_fail_closed,
             )
             raise _AnalysisRouterResultReady
 
@@ -868,6 +1178,11 @@ async def run_bounded_analysis_router(
                 counters=counters,
                 messages_seen=messages_seen,
                 messages_matched=messages_matched,
+                request_current=request_current,
+                bundle_ready=bundle_ready,
+                existing_judge_run_found=existing_judge_run_found,
+                planned_action=planned_action,
+                would_fail_closed=would_fail_closed,
             )
             raise _AnalysisRouterResultReady
         database_handle = None
@@ -889,6 +1204,11 @@ async def run_bounded_analysis_router(
                 messages_matched=messages_matched,
                 messages_processed_count=1,
                 redis_ack_status="failed",
+                request_current=request_current,
+                bundle_ready=bundle_ready,
+                existing_judge_run_found=existing_judge_run_found,
+                planned_action=planned_action,
+                would_fail_closed=would_fail_closed,
             )
             raise _AnalysisRouterResultReady
         if acked_count != 1:
@@ -906,6 +1226,11 @@ async def run_bounded_analysis_router(
                 messages_processed_count=1,
                 redis_ack_status="failed",
                 redis_acked_count=acked_count,
+                request_current=request_current,
+                bundle_ready=bundle_ready,
+                existing_judge_run_found=existing_judge_run_found,
+                planned_action=planned_action,
+                would_fail_closed=would_fail_closed,
             )
             raise _AnalysisRouterResultReady
 
@@ -923,6 +1248,11 @@ async def run_bounded_analysis_router(
             messages_processed_count=1,
             redis_ack_status="acked",
             redis_acked_count=acked_count,
+            request_current=request_current,
+            bundle_ready=bundle_ready,
+            existing_judge_run_found=existing_judge_run_found,
+            planned_action=planned_action,
+            would_fail_closed=would_fail_closed,
         )
     except _AnalysisRouterResultReady:
         pass
@@ -1017,9 +1347,14 @@ def _result(
     messages_processed_count: int = 0,
     redis_ack_status: str = "not_attempted",
     redis_acked_count: int = 0,
+    request_current: bool | None = None,
+    bundle_ready: bool | None = None,
+    existing_judge_run_found: bool | None = None,
+    planned_action: str | None = None,
+    would_fail_closed: bool = False,
 ) -> BoundedAnalysisRouterResult:
     trigger_event_id: UUID | str | None = config.trigger_event_id or config.trigger_event_suffix
-    candidate_group_id: UUID | str | None = None
+    candidate_group_id: UUID | str | None = config.candidate_group_suffix
     bundle_id: UUID | str | None = None
     redis_message_id = config.redis_message_id
     if selected is not None:
@@ -1035,7 +1370,7 @@ def _result(
         bundle_id = job.bundle_id
     return BoundedAnalysisRouterResult(
         status=status,
-        ok=status in {"routed", "reused"} and error_code is None,
+        ok=status in {"preview", "routed", "reused"} and error_code is None,
         error_code=error_code,
         error_class=error_class,
         config=config,
@@ -1050,6 +1385,13 @@ def _result(
         messages_processed_count=messages_processed_count,
         redis_ack_status=redis_ack_status,
         redis_acked_count=redis_acked_count,
+        target_message_found=selected is not None,
+        analysis_request_event_found=event is not None,
+        request_current=request_current,
+        bundle_ready=bundle_ready,
+        existing_judge_run_found=existing_judge_run_found,
+        planned_action=planned_action,
+        would_fail_closed=would_fail_closed,
     )
 
 
@@ -1103,15 +1445,66 @@ def _target_error(config: BoundedAnalysisRouterConfig) -> str | None:
     return None
 
 
+def _gate_error(config: BoundedAnalysisRouterConfig) -> str | None:
+    if config.mode not in {MODE_PREVIEW, MODE_EXECUTE}:
+        return "invalid_mode"
+    if not config.operator_approved:
+        return "operator_approval_missing"
+    target_error = _target_error(config)
+    if target_error is not None:
+        return target_error
+    if config.trigger_event_suffix is not None and not _is_valid_event_suffix(config.trigger_event_suffix):
+        return "invalid_trigger_event_suffix"
+    if config.candidate_group_suffix is not None and not _is_valid_event_suffix(config.candidate_group_suffix):
+        return "invalid_candidate_group_suffix"
+    if config.max_messages != HARD_MAX_MESSAGES:
+        return "max_messages_must_be_one"
+    if config.scan_limit <= 0 or config.scan_limit > HARD_SCAN_LIMIT:
+        return "scan_limit_out_of_range"
+    if not config.allow_runtime_config:
+        return "runtime_config_not_allowed"
+    if not config.allow_redis_read:
+        return "redis_read_not_allowed"
+    if not config.allow_database_read:
+        return "database_read_not_allowed"
+    if config.mode == MODE_EXECUTE and not config.allow_redis_consume:
+        return "redis_consume_not_allowed"
+    if config.mode == MODE_EXECUTE and not config.allow_database_write:
+        return "database_write_not_allowed"
+    if config.mode == MODE_EXECUTE and not config.allow_redis_ack:
+        return "redis_ack_not_allowed"
+    return None
+
+
+def _group_preflight_error(state: BoundedAnalysisRouterState) -> str | None:
+    if state.group_exists is not True:
+        return "redis_consumer_group_missing"
+    if state.group_pending != 0:
+        return "redis_consumer_group_pending_nonzero"
+    if state.target_after_group_last_delivered is not True:
+        return "target_not_after_group_last_delivered"
+    if state.target_is_next_deliverable is not True:
+        return "target_not_next_deliverable"
+    return None
+
+
 def _matches_target(message_id: str, fields: Mapping[str, Any], config: BoundedAnalysisRouterConfig) -> bool:
     if config.redis_message_id:
-        return message_id == config.redis_message_id
-    trigger_event_id = str(fields.get("trigger_event_id", "")).strip().lower()
-    if config.trigger_event_id is not None:
-        return trigger_event_id == str(config.trigger_event_id)
-    if config.trigger_event_suffix is not None:
-        return trigger_event_id.endswith(config.trigger_event_suffix.lower())
-    return False
+        target_matches = message_id == config.redis_message_id
+    else:
+        trigger_event_id = str(fields.get("trigger_event_id", "")).strip().lower()
+        if config.trigger_event_id is not None:
+            target_matches = trigger_event_id == str(config.trigger_event_id)
+        elif config.trigger_event_suffix is not None:
+            target_matches = trigger_event_id.endswith(config.trigger_event_suffix.lower())
+        else:
+            target_matches = False
+    if not target_matches:
+        return False
+    if config.candidate_group_suffix is None:
+        return True
+    root_object_id = str(fields.get("root_object_id", "")).strip().lower()
+    return root_object_id.endswith(config.candidate_group_suffix.lower())
 
 
 def _selected_message_contract_error(selected: TargetedAnalysisRouteMessage) -> str | None:
@@ -1124,12 +1517,16 @@ def _selected_message_contract_error(selected: TargetedAnalysisRouteMessage) -> 
         return "stage_not_allowed"
     if str(selected.fields.get("root_object_type", "")) != ROOT_OBJECT_TYPE:
         return "root_object_type_not_allowed"
-    if _uuid_or_none(selected.fields.get("trigger_event_id")) is None:
+    trigger_event_id = _uuid_or_none(selected.fields.get("trigger_event_id"))
+    if trigger_event_id is None:
         return "trigger_event_id_invalid"
     if _uuid_or_none(selected.fields.get("root_object_id")) is None:
         return "root_object_id_invalid"
-    if not str(selected.fields.get("job_id", "")).strip():
-        return "redis_message_contract_invalid"
+    job_id = _uuid_or_none(selected.fields.get("job_id"))
+    if job_id is None:
+        return "job_id_invalid"
+    if str(job_id) != str(trigger_event_id):
+        return "job_id_trigger_event_id_mismatch"
     if not str(selected.fields.get("idempotency_key", "")).strip():
         return "redis_message_contract_invalid"
     return None
@@ -1181,12 +1578,57 @@ def _validate_event_outbox(
     )
 
 
-def _flatten_stream_entries(raw: Any) -> list[tuple[str, Mapping[str, Any]]]:
+def _select_target_from_entries(
+    entries: list[tuple[str, Mapping[str, Any]]],
+    config: BoundedAnalysisRouterConfig,
+    scan_limit: int,
+) -> tuple[TargetedAnalysisRouteMessage | None, int, int]:
+    selected: TargetedAnalysisRouteMessage | None = None
+    messages_seen = 0
+    messages_matched = 0
+    for message_id, fields in entries[:scan_limit]:
+        messages_seen += 1
+        decoded_fields = _decode_fields(fields)
+        if _matches_target(message_id, decoded_fields, config):
+            messages_matched += 1
+            if selected is None:
+                selected = TargetedAnalysisRouteMessage(
+                    redis_message_id=message_id,
+                    fields=decoded_fields,
+                )
+    return selected, messages_seen, messages_matched
+
+
+def _flatten_direct_stream_entries(raw: Any) -> list[tuple[str, Mapping[str, Any]]]:
+    return [(str(_decode_value(message_id)), fields) for message_id, fields in raw or []]
+
+
+def _flatten_group_stream_entries(raw: Any) -> list[tuple[str, Mapping[str, Any]]]:
     messages: list[tuple[str, Mapping[str, Any]]] = []
     for _stream_name, entries in raw or []:
         for message_id, fields in entries:
             messages.append((str(_decode_value(message_id)), fields))
     return messages
+
+
+def _find_consumer_group(raw: Any, group_name: str) -> dict[str, Any] | None:
+    for item in raw or []:
+        group = _decode_group_info(item)
+        if str(group.get("name", "")) == group_name:
+            return group
+    return None
+
+
+def _decode_group_info(item: Any) -> dict[str, Any]:
+    if isinstance(item, Mapping):
+        return {str(_decode_value(key)): _decode_value(value) for key, value in item.items()}
+    if isinstance(item, (list, tuple)):
+        decoded = [_decode_value(value) for value in item]
+        return {
+            str(decoded[index]): decoded[index + 1]
+            for index in range(0, len(decoded) - 1, 2)
+        }
+    return {}
 
 
 def _decode_fields(fields: Mapping[Any, Any]) -> dict[str, Any]:
@@ -1236,6 +1678,22 @@ def _optional_id_suffix(value: UUID | str | None) -> str | None:
     return text[-8:] if text else None
 
 
+def _string_or_none(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(_decode_value(value)).strip()
+    return text or None
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _id_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -1246,6 +1704,32 @@ def _id_text(value: Any) -> str | None:
 def _is_valid_event_suffix(value: str) -> bool:
     stripped = value.strip().lower()
     return 4 <= len(stripped) <= 36 and all(char in "0123456789abcdef-" for char in stripped)
+
+
+def _redis_stream_id_greater(left: str, right: str) -> bool:
+    left_key = _redis_stream_id_key(left)
+    right_key = _redis_stream_id_key(right)
+    return left_key is not None and right_key is not None and left_key > right_key
+
+
+def _normalize_redis_stream_id(value: str) -> str | None:
+    key = _redis_stream_id_key(value)
+    if key is None:
+        return None
+    return f"{key[0]}-{key[1]}"
+
+
+def _redis_stream_id_key(value: str) -> tuple[int, int] | None:
+    text = str(value).strip()
+    if text == "0":
+        return (0, 0)
+    parts = text.split("-", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
 
 
 def _safe_exception_class(exc: BaseException) -> str:
@@ -1286,7 +1770,8 @@ __all__ = [
     "EXPECTED_STREAM_FIELDS",
     "HARD_MAX_MESSAGES",
     "HARD_SCAN_LIMIT",
-    "MODE",
+    "MODE_EXECUTE",
+    "MODE_PREVIEW",
     "QUEUE_NAME",
     "ROOT_OBJECT_TYPE",
     "RUNNER_NAME",
