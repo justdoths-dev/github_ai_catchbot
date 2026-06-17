@@ -13,9 +13,9 @@ from src.services.evidence_assembler.bounded_bundle_assembler_runner import (
     BoundedBundleAssemblerError,
     BoundedBundleAssemblerRedisHandle,
     BoundedBundleAssemblerRuntimeConfig,
+    ExistingGroupRedisTargetConsumer,
     RedisBundleMessage,
     TargetedRedisBundleMessage,
-    TemporaryGroupRedisTargetConsumer,
     TriggerEventContract,
     run_bounded_bundle_assembler,
 )
@@ -84,8 +84,6 @@ class FakeConsumer:
         state.redis_read_attempted = True
         if config.run_mode == "execute":
             state.redis_consume_attempted = True
-            state.redis_group_create_attempted = True
-            state.redis_group_created = True
         return self.selected, self.messages_seen, self.messages_matched
 
     async def ack(self, message_id: str, state) -> int:
@@ -105,10 +103,7 @@ class FakeRedisBuilder:
         del runtime_config, logger
 
         async def close() -> None:
-            if state.redis_group_created:
-                state.redis_group_destroy_attempted = True
-                state.redis_cleanup_attempted = True
-                state.redis_group_destroy_succeeded = True
+            pass
 
         return BoundedBundleAssemblerRedisHandle(consumer=self.consumer, close=close)
 
@@ -214,15 +209,25 @@ class FakeRedisClient:
         self,
         entries: list[tuple[str, dict[str, str]]],
         *,
-        destroy_error: BaseException | None = None,
+        group_name: str = "evidence-assembler",
+        group_pending: int = 0,
+        group_lag: int | None = 1,
+        group_last_delivered_id: str = "0-0",
+        group_exists: bool = True,
+        xinfo_error: BaseException | None = None,
     ) -> None:
         self.entries = entries
-        self.destroy_error = destroy_error
+        self.group_name = group_name
+        self.group_pending = group_pending
+        self.group_lag = group_lag
+        self.group_last_delivered_id = group_last_delivered_id
+        self.group_exists = group_exists
+        self.xinfo_error = xinfo_error
         self.offset = 0
         self.acked: list[str] = []
-        self.created_groups: list[str] = []
-        self.destroyed_groups: list[str] = []
         self.xreadgroup_calls: list[dict[str, object]] = []
+        self.xinfo_groups_calls: list[str] = []
+        self.xrange_calls: list[dict[str, object]] = []
 
     async def xlen(self, name: str) -> int:
         assert name == "q.candidate.bundle"
@@ -231,19 +236,38 @@ class FakeRedisClient:
     async def xrange(self, name: str, min: str = "-", max: str = "+", count: int | None = None):
         del min, max
         assert name == "q.candidate.bundle"
+        self.xrange_calls.append({"count": count})
         return self.entries[: int(count or len(self.entries))]
 
-    async def xgroup_create(self, name: str, groupname: str, id: str = "$", mkstream: bool = False):
+    async def xinfo_groups(self, name: str):
         assert name == "q.candidate.bundle"
-        assert id == "0"
-        assert mkstream is False
-        self.created_groups.append(groupname)
-        return True
+        self.xinfo_groups_calls.append(name)
+        if self.xinfo_error is not None:
+            raise self.xinfo_error
+        if not self.group_exists:
+            return []
+        return [
+            {
+                "name": self.group_name,
+                "pending": self.group_pending,
+                "lag": self.group_lag,
+                "last-delivered-id": self.group_last_delivered_id,
+            }
+        ]
 
     async def xreadgroup(self, groupname, consumername, streams, count=None, block=None):
-        del groupname, consumername
+        self.xreadgroup_calls.append(
+            {
+                "groupname": groupname,
+                "consumername": consumername,
+                "streams": streams,
+                "count": count,
+                "block": block,
+            }
+        )
+        assert groupname == "evidence-assembler"
+        assert consumername == "bounded-test"
         assert streams == {"q.candidate.bundle": ">"}
-        self.xreadgroup_calls.append({"count": count, "block": block})
         batch = self.entries[self.offset : self.offset + int(count or 1)]
         self.offset += len(batch)
         if not batch and block == 0:
@@ -256,26 +280,23 @@ class FakeRedisClient:
         self.acked.extend(ids)
         return len(ids)
 
-    async def xgroup_destroy(self, name: str, groupname: str):
-        assert name == "q.candidate.bundle"
-        self.destroyed_groups.append(groupname)
-        if self.destroy_error is not None:
-            raise self.destroy_error
-        return True
 
-
-class FakeTemporaryGroupRedisBuilder:
+class FakeExistingGroupRedisBuilder:
     def __init__(self, client: FakeRedisClient) -> None:
         self.client = client
-        self.consumer: TemporaryGroupRedisTargetConsumer | None = None
+        self.consumer: ExistingGroupRedisTargetConsumer | None = None
 
     async def __call__(self, runtime_config, state, logger):
         del runtime_config, logger
-        self.consumer = TemporaryGroupRedisTargetConsumer(self.client, queue_name="q.candidate.bundle")
+        self.consumer = ExistingGroupRedisTargetConsumer(
+            self.client,
+            queue_name="q.candidate.bundle",
+            group_name="evidence-assembler",
+            consumer_name="bounded-test",
+        )
 
         async def close() -> None:
-            assert self.consumer is not None
-            await self.consumer.cleanup(state)
+            pass
 
         return BoundedBundleAssemblerRedisHandle(consumer=self.consumer, close=close)
 
@@ -337,8 +358,8 @@ def _approved_config(event_id: UUID | None = None, artifact_id: UUID | None = No
         "allow_database_write_for_evidence_bundle_only": True,
         "allow_redis_read": True,
         "allow_redis_consume": True,
-        "allow_redis_group_create": True,
-        "allow_redis_group_destroy": True,
+        "allow_redis_group_create": False,
+        "allow_redis_group_destroy": False,
         "allow_redis_ack": True,
         "queue_name": "q.candidate.bundle",
         "redis_message_id_suffix": redis_message_id_suffix,
@@ -364,55 +385,33 @@ async def test_no_flags_blocks_before_runtime_redis_or_database() -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_without_redis_group_create_gate_blocks_before_runtime_redis_or_database() -> None:
+async def test_execute_does_not_require_legacy_group_create_or_destroy_gates() -> None:
     event_id = uuid4()
+    artifact_id = uuid4()
+    selected = _selected(event_id, artifact_id)
+    counters = BoundedBundleAssemblerCounters()
+    database = FakeDatabase(event=_event(event_id, artifact_id), counters=counters)
+    consumer = FakeConsumer(selected)
 
     result = await run_bounded_bundle_assembler(
         _approved_config(
             event_id=event_id,
-            allow_redis_group_create=False,
-            allow_redis_group_destroy=True,
-        ),
-        runtime_config_loader=lambda: (_ for _ in ()).throw(AssertionError("runtime config must not load")),
-    )
-
-    report = result.to_sanitized_dict()
-    assert result.ok is False
-    assert report["status"] == "blocked"
-    assert report["error_code"] == "redis_group_create_not_allowed"
-    assert report["redis_group_create_allowed"] is False
-    assert report["redis_group_destroy_allowed"] is True
-    assert report["redis_read_attempted"] is False
-    assert report["redis_group_create_attempted"] is False
-    assert report["redis_group_destroy_attempted"] is False
-    assert report["database_read_attempted"] is False
-    assert report["database_write_attempted"] is False
-
-
-@pytest.mark.asyncio
-async def test_execute_without_redis_group_destroy_gate_blocks_before_runtime_redis_or_database() -> None:
-    event_id = uuid4()
-
-    result = await run_bounded_bundle_assembler(
-        _approved_config(
-            event_id=event_id,
-            allow_redis_group_create=True,
             allow_redis_group_destroy=False,
+            allow_redis_group_create=False,
         ),
-        runtime_config_loader=lambda: (_ for _ in ()).throw(AssertionError("runtime config must not load")),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(consumer),
+        database_builder=FakeDatabaseBuilder(database),
     )
 
     report = result.to_sanitized_dict()
-    assert result.ok is False
-    assert report["status"] == "blocked"
-    assert report["error_code"] == "redis_group_destroy_not_allowed"
-    assert report["redis_group_create_allowed"] is True
+    assert result.ok is True
+    assert report["status"] == "assembled"
+    assert report["redis_group_create_allowed"] is False
     assert report["redis_group_destroy_allowed"] is False
-    assert report["redis_read_attempted"] is False
     assert report["redis_group_create_attempted"] is False
     assert report["redis_group_destroy_attempted"] is False
-    assert report["database_read_attempted"] is False
-    assert report["database_write_attempted"] is False
+    assert report["redis_ack_attempted"] is True
 
 
 @pytest.mark.asyncio
@@ -691,7 +690,7 @@ async def test_candidate_fanout_cap_blocks_before_assembly_or_ack() -> None:
 
 
 @pytest.mark.asyncio
-async def test_temporary_group_scan_finds_target_without_waiting_for_future_messages() -> None:
+async def test_existing_group_scan_finds_target_with_xreadgroup_gt_without_waiting_for_future_messages() -> None:
     target_event_id = uuid4()
     target_artifact_id = uuid4()
     other_event_id = uuid4()
@@ -702,12 +701,17 @@ async def test_temporary_group_scan_finds_target_without_waiting_for_future_mess
             (STREAM_ID, _message_fields(target_event_id, target_artifact_id)),
         ]
     )
-    consumer = TemporaryGroupRedisTargetConsumer(redis_client, queue_name="q.candidate.bundle")
+    consumer = ExistingGroupRedisTargetConsumer(
+        redis_client,
+        queue_name="q.candidate.bundle",
+        group_name="evidence-assembler",
+        consumer_name="bounded-test",
+    )
 
     selected, seen, matched = await asyncio.wait_for(
         consumer.find_target(
             _approved_config(event_id=target_event_id, scan_limit=25),
-            state=type("State", (), {"redis_consume_attempted": False, "redis_group_created": False})(),
+            state=runner_module.BoundedBundleAssemblerState(),
         ),
         timeout=0.25,
     )
@@ -716,7 +720,15 @@ async def test_temporary_group_scan_finds_target_without_waiting_for_future_mess
     assert selected.redis_message_id == STREAM_ID
     assert seen == 2
     assert matched == 1
-    assert redis_client.xreadgroup_calls == [{"count": 2, "block": None}]
+    assert redis_client.xreadgroup_calls == [
+        {
+            "groupname": "evidence-assembler",
+            "consumername": "bounded-test",
+            "streams": {"q.candidate.bundle": ">"},
+            "count": 2,
+            "block": None,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -724,7 +736,12 @@ async def test_preview_does_not_require_group_gates_or_create_destroy_group() ->
     event_id = uuid4()
     artifact_id = uuid4()
     event = _event(event_id, artifact_id)
-    redis_client = FakeRedisClient([(STREAM_ID, _message_fields(event_id, artifact_id))])
+    redis_client = FakeRedisClient(
+        [(STREAM_ID, _message_fields(event_id, artifact_id))],
+        group_pending=0,
+        group_lag=1,
+        group_last_delivered_id="1710000000001-0",
+    )
     database = FakeDatabase(
         event=event,
         counters=BoundedBundleAssemblerCounters(),
@@ -751,7 +768,7 @@ async def test_preview_does_not_require_group_gates_or_create_destroy_group() ->
             allow_redis_ack=False,
         ),
         runtime_config_loader=_runtime_config,
-        redis_builder=FakeTemporaryGroupRedisBuilder(redis_client),
+        redis_builder=FakeExistingGroupRedisBuilder(redis_client),
         database_builder=FakeDatabaseBuilder(database),
     )
 
@@ -766,13 +783,74 @@ async def test_preview_does_not_require_group_gates_or_create_destroy_group() ->
     assert report["redis_group_cleanup_suppressed"] is False
     assert report["redis_consume_attempted"] is False
     assert report["redis_ack_attempted"] is False
-    assert redis_client.created_groups == []
-    assert redis_client.destroyed_groups == []
+    assert report["group_name"] == "evidence-assembler"
+    assert report["group_exists"] is True
+    assert report["group_pending"] == 0
+    assert report["group_lag"] == 1
+    assert report["group_last_delivered_id_suffix"] == "00000001-0"
+    assert report["target_after_group_last_delivered"] is True
     assert redis_client.xreadgroup_calls == []
+    assert redis_client.xrange_calls == [{"count": 1}]
 
 
 @pytest.mark.asyncio
-async def test_temporary_group_scan_no_target_returns_not_found_without_waiting_for_future_messages() -> None:
+async def test_execute_blocks_if_configured_consumer_group_is_missing() -> None:
+    event_id = uuid4()
+    artifact_id = uuid4()
+    redis_client = FakeRedisClient(
+        [(STREAM_ID, _message_fields(event_id, artifact_id))],
+        group_exists=False,
+    )
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeExistingGroupRedisBuilder(redis_client),
+    )
+
+    report = result.to_sanitized_dict()
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "redis_consumer_group_not_found"
+    assert report["group_name"] == "evidence-assembler"
+    assert report["group_exists"] is False
+    assert report["redis_consume_attempted"] is False
+    assert report["database_read_attempted"] is False
+    assert report["redis_ack_attempted"] is False
+    assert redis_client.xreadgroup_calls == []
+    assert redis_client.acked == []
+
+
+@pytest.mark.asyncio
+async def test_execute_blocks_if_configured_consumer_group_has_pending_messages() -> None:
+    event_id = uuid4()
+    artifact_id = uuid4()
+    redis_client = FakeRedisClient(
+        [(STREAM_ID, _message_fields(event_id, artifact_id))],
+        group_pending=1,
+        group_lag=1,
+        group_last_delivered_id="1710000000001-0",
+    )
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeExistingGroupRedisBuilder(redis_client),
+    )
+
+    report = result.to_sanitized_dict()
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "redis_consumer_group_pending_nonzero"
+    assert report["group_exists"] is True
+    assert report["group_pending"] == 1
+    assert report["redis_consume_attempted"] is False
+    assert report["database_read_attempted"] is False
+    assert report["redis_ack_attempted"] is False
+    assert redis_client.xreadgroup_calls == []
+    assert redis_client.acked == []
+
+
+@pytest.mark.asyncio
+async def test_existing_group_scan_no_target_returns_not_found_without_ack() -> None:
     target_event_id = uuid4()
     first_event_id = uuid4()
     first_artifact_id = uuid4()
@@ -789,7 +867,7 @@ async def test_temporary_group_scan_no_target_returns_not_found_without_waiting_
         run_bounded_bundle_assembler(
             _approved_config(event_id=target_event_id, scan_limit=25),
             runtime_config_loader=_runtime_config,
-            redis_builder=FakeTemporaryGroupRedisBuilder(redis_client),
+            redis_builder=FakeExistingGroupRedisBuilder(redis_client),
         ),
         timeout=0.25,
     )
@@ -801,14 +879,27 @@ async def test_temporary_group_scan_no_target_returns_not_found_without_waiting_
     assert report["messages_matched"] == 0
     assert report["redis_ack_attempted"] is False
     assert redis_client.acked == []
-    assert redis_client.xreadgroup_calls == [{"count": 2, "block": None}]
+    assert redis_client.xreadgroup_calls == [
+        {
+            "groupname": "evidence-assembler",
+            "consumername": "bounded-test",
+            "streams": {"q.candidate.bundle": ">"},
+            "count": 2,
+            "block": None,
+        }
+    ]
 
 
 @pytest.mark.asyncio
-async def test_execute_with_group_gates_creates_group_commits_acks_exact_target_and_destroys_group() -> None:
+async def test_execute_uses_existing_group_commits_then_acks_exact_target_without_group_lifecycle() -> None:
     event_id = uuid4()
     artifact_id = uuid4()
-    redis_client = FakeRedisClient([(STREAM_ID, _message_fields(event_id, artifact_id))])
+    redis_client = FakeRedisClient(
+        [(STREAM_ID, _message_fields(event_id, artifact_id))],
+        group_pending=0,
+        group_lag=1,
+        group_last_delivered_id="1710000000001-0",
+    )
     database = FakeDatabase(
         event=_event(event_id, artifact_id),
         counters=BoundedBundleAssemblerCounters(),
@@ -818,65 +909,39 @@ async def test_execute_with_group_gates_creates_group_commits_acks_exact_target_
     result = await run_bounded_bundle_assembler(
         _approved_config(event_id=event_id),
         runtime_config_loader=_runtime_config,
-        redis_builder=FakeTemporaryGroupRedisBuilder(redis_client),
+        redis_builder=FakeExistingGroupRedisBuilder(redis_client),
         database_builder=database_builder,
     )
 
     report = result.to_sanitized_dict()
     assert result.ok is True
     assert report["status"] == "assembled"
-    assert report["redis_group_create_allowed"] is True
-    assert report["redis_group_destroy_allowed"] is True
-    assert report["redis_group_create_attempted"] is True
-    assert report["redis_group_destroy_attempted"] is True
-    assert report["redis_group_destroy_succeeded"] is True
+    assert report["group_name"] == "evidence-assembler"
+    assert report["group_exists"] is True
+    assert report["group_pending"] == 0
+    assert report["group_lag"] == 1
+    assert report["target_after_group_last_delivered"] is True
+    assert report["redis_group_create_allowed"] is False
+    assert report["redis_group_destroy_allowed"] is False
+    assert report["redis_group_create_attempted"] is False
+    assert report["redis_group_destroy_attempted"] is False
+    assert report["redis_group_destroy_succeeded"] is False
     assert report["redis_group_cleanup_suppressed"] is False
     assert database_builder.close_commits == [True]
     assert redis_client.acked == [STREAM_ID]
-    assert len(redis_client.created_groups) == 1
-    assert redis_client.destroyed_groups == redis_client.created_groups
+    assert redis_client.xreadgroup_calls == [
+        {
+            "groupname": "evidence-assembler",
+            "consumername": "bounded-test",
+            "streams": {"q.candidate.bundle": ">"},
+            "count": 1,
+            "block": None,
+        }
+    ]
 
 
 @pytest.mark.asyncio
-async def test_xgroup_destroy_failure_is_surfaced_and_sanitized_after_commit_and_ack() -> None:
-    event_id = uuid4()
-    artifact_id = uuid4()
-    redis_client = FakeRedisClient(
-        [(STREAM_ID, _message_fields(event_id, artifact_id))],
-        destroy_error=RuntimeError(RAW_EXCEPTION_DETAIL),
-    )
-    database = FakeDatabase(
-        event=_event(event_id, artifact_id),
-        counters=BoundedBundleAssemblerCounters(),
-    )
-    database_builder = FakeDatabaseBuilder(database)
-
-    result = await run_bounded_bundle_assembler(
-        _approved_config(event_id=event_id),
-        runtime_config_loader=_runtime_config,
-        redis_builder=FakeTemporaryGroupRedisBuilder(redis_client),
-        database_builder=database_builder,
-    )
-
-    report = result.to_sanitized_dict()
-    rendered = runner_module.render_sanitized_json(report)
-    assert result.ok is False
-    assert report["status"] == "failed"
-    assert report["error_code"] == "redis_group_destroy_failed"
-    assert report["error_class"] == "RuntimeError"
-    assert report["redis_group_create_attempted"] is True
-    assert report["redis_group_destroy_attempted"] is True
-    assert report["redis_group_destroy_succeeded"] is False
-    assert report["redis_group_cleanup_suppressed"] is True
-    assert database_builder.close_commits == [True]
-    assert redis_client.acked == [STREAM_ID]
-    assert len(redis_client.created_groups) == 1
-    assert redis_client.destroyed_groups == redis_client.created_groups
-    assert RAW_EXCEPTION_DETAIL not in rendered
-
-
-@pytest.mark.asyncio
-async def test_temporary_group_scan_duplicate_target_blocks_without_waiting_for_future_messages() -> None:
+async def test_existing_group_scan_duplicate_target_blocks_without_ack() -> None:
     target_event_id = uuid4()
     target_artifact_id = uuid4()
     redis_client = FakeRedisClient(
@@ -890,7 +955,7 @@ async def test_temporary_group_scan_duplicate_target_blocks_without_waiting_for_
         run_bounded_bundle_assembler(
             _approved_config(event_id=target_event_id, scan_limit=25, redis_message_id_suffix="1-0"),
             runtime_config_loader=_runtime_config,
-            redis_builder=FakeTemporaryGroupRedisBuilder(redis_client),
+            redis_builder=FakeExistingGroupRedisBuilder(redis_client),
         ),
         timeout=0.25,
     )
@@ -902,11 +967,19 @@ async def test_temporary_group_scan_duplicate_target_blocks_without_waiting_for_
     assert report["messages_matched"] == 2
     assert report["redis_ack_attempted"] is False
     assert redis_client.acked == []
-    assert redis_client.xreadgroup_calls == [{"count": 2, "block": None}]
+    assert redis_client.xreadgroup_calls == [
+        {
+            "groupname": "evidence-assembler",
+            "consumername": "bounded-test",
+            "streams": {"q.candidate.bundle": ">"},
+            "count": 2,
+            "block": None,
+        }
+    ]
 
 
 @pytest.mark.asyncio
-async def test_temporary_group_scan_does_not_ack_non_target_messages() -> None:
+async def test_existing_group_scan_does_not_ack_non_target_messages() -> None:
     target_event_id = uuid4()
     target_artifact_id = uuid4()
     other_event_id = uuid4()
@@ -917,11 +990,16 @@ async def test_temporary_group_scan_does_not_ack_non_target_messages() -> None:
             (STREAM_ID, _message_fields(target_event_id, target_artifact_id)),
         ]
     )
-    consumer = TemporaryGroupRedisTargetConsumer(redis_client, queue_name="q.candidate.bundle")
+    consumer = ExistingGroupRedisTargetConsumer(
+        redis_client,
+        queue_name="q.candidate.bundle",
+        group_name="evidence-assembler",
+        consumer_name="bounded-test",
+    )
 
     selected, seen, matched = await consumer.find_target(
         _approved_config(event_id=target_event_id, scan_limit=25),
-        state=type("State", (), {"redis_consume_attempted": False, "redis_group_created": False})(),
+        state=runner_module.BoundedBundleAssemblerState(),
     )
     assert selected is not None
     assert selected.redis_message_id == STREAM_ID

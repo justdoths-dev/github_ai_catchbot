@@ -7,7 +7,7 @@ import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from .config import EvidenceAssemblerConfig, EvidenceAssemblerConfigurationError
 from .models import AssemblyResult, BundleRefreshTarget, EvidenceBundleDraft, EvidenceBundlePreview
@@ -117,6 +117,12 @@ class BoundedBundleAssemblerState:
     database_write_attempted: bool = False
     event_outbox_read_attempted: bool = False
     trigger_suffix_lookup_attempted: bool = False
+    group_name: str | None = None
+    group_exists: bool = False
+    group_pending: int | None = None
+    group_lag: int | None = None
+    group_last_delivered_id: str | None = None
+    target_after_group_last_delivered: bool = False
 
 
 @dataclass(slots=True)
@@ -164,6 +170,15 @@ class TargetedRedisBundleMessage:
     redis_message_id: str
     fields: dict[str, Any]
     message: RedisBundleMessage
+
+
+@dataclass(frozen=True, slots=True)
+class RedisGroupMetadata:
+    name: str
+    exists: bool
+    pending: int | None
+    lag: int | None
+    last_delivered_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +278,12 @@ class BoundedBundleAssemblerResult:
             "redis_ack_attempted": self.state.redis_ack_attempted,
             "redis_ack_status": self.redis_ack_status,
             "redis_acked_count": self.redis_acked_count,
+            "group_name": self.state.group_name,
+            "group_exists": self.state.group_exists,
+            "group_pending": self.state.group_pending,
+            "group_lag": self.state.group_lag,
+            "group_last_delivered_id_suffix": _redis_id_suffix(self.state.group_last_delivered_id),
+            "target_after_group_last_delivered": self.state.target_after_group_last_delivered,
             "database_read_attempted": self.state.database_read_attempted,
             "database_write_attempted": self.state.database_write_attempted,
             "event_outbox_read_attempted": self.state.event_outbox_read_attempted,
@@ -361,13 +382,7 @@ class RedisTargetConsumerClient(Protocol):
         count: int | None = None,
     ) -> Any: ...
 
-    async def xgroup_create(
-        self,
-        name: str,
-        groupname: str,
-        id: str = "$",
-        mkstream: bool = False,
-    ) -> Any: ...
+    async def xinfo_groups(self, name: str) -> Any: ...
 
     async def xreadgroup(
         self,
@@ -379,8 +394,6 @@ class RedisTargetConsumerClient(Protocol):
     ) -> Any: ...
 
     async def xack(self, name: str, groupname: str, *ids: str) -> Any: ...
-
-    async def xgroup_destroy(self, name: str, groupname: str) -> Any: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,21 +457,19 @@ class BoundedBundleAssemblerDatabaseBuilder(Protocol):
     ) -> BoundedBundleAssemblerDatabaseHandle: ...
 
 
-class TemporaryGroupRedisTargetConsumer:
+class ExistingGroupRedisTargetConsumer:
     def __init__(
         self,
         client: RedisTargetConsumerClient,
         *,
         queue_name: str,
-        group_name: str | None = None,
-        consumer_name: str | None = None,
+        group_name: str,
+        consumer_name: str,
     ) -> None:
         self._client = client
         self._queue_name = queue_name
-        unique = uuid4().hex
-        self._group_name = group_name or f"bounded-evidence-assembler-{unique}"
-        self._consumer_name = consumer_name or f"bounded-bundle-{unique}"
-        self._group_created = False
+        self._group_name = group_name
+        self._consumer_name = consumer_name
 
     async def find_target(
         self,
@@ -466,6 +477,10 @@ class TemporaryGroupRedisTargetConsumer:
         state: BoundedBundleAssemblerState,
     ) -> tuple[TargetedRedisBundleMessage | None, int, int]:
         state.redis_read_attempted = True
+        group_metadata = await self._load_group_metadata(
+            state,
+            require_existing=config.run_mode == EXECUTE_MODE,
+        )
         available_messages = await self._client.xlen(self._queue_name)
         if available_messages <= 0:
             return None, 0, 0
@@ -487,15 +502,21 @@ class TemporaryGroupRedisTargetConsumer:
                             fields=decoded_fields,
                             message=RedisBundleMessage.from_stream_fields(decoded_fields),
                         )
+                        _set_target_after_group_last_delivered(
+                            state,
+                            decoded_message_id,
+                            group_metadata.last_delivered_id if group_metadata else None,
+                        )
                 if messages_seen >= scan_limit:
                     break
             return selected, messages_seen, messages_matched
 
+        if group_metadata is None or not group_metadata.exists:
+            raise BoundedBundleAssemblerError("redis_consumer_group_not_found")
+        if group_metadata.pending not in {None, 0}:
+            raise BoundedBundleAssemblerError("redis_consumer_group_pending_nonzero")
+
         state.redis_consume_attempted = True
-        state.redis_group_create_attempted = True
-        await self._client.xgroup_create(self._queue_name, self._group_name, id="0", mkstream=False)
-        self._group_created = True
-        state.redis_group_created = True
 
         messages_seen = 0
         messages_matched = 0
@@ -524,6 +545,11 @@ class TemporaryGroupRedisTargetConsumer:
                             fields=decoded_fields,
                             message=RedisBundleMessage.from_stream_fields(decoded_fields),
                         )
+                        _set_target_after_group_last_delivered(
+                            state,
+                            message_id,
+                            group_metadata.last_delivered_id,
+                        )
                 if messages_seen >= scan_limit:
                     break
         return selected, messages_seen, messages_matched
@@ -536,17 +562,30 @@ class TemporaryGroupRedisTargetConsumer:
         except (TypeError, ValueError):
             return 1 if result else 0
 
-    async def cleanup(self, state: BoundedBundleAssemblerState) -> None:
-        if not self._group_created:
-            return
-        state.redis_group_destroy_attempted = True
-        state.redis_cleanup_attempted = True
+    async def _load_group_metadata(
+        self,
+        state: BoundedBundleAssemblerState,
+        *,
+        require_existing: bool,
+    ) -> "RedisGroupMetadata | None":
+        state.group_name = self._group_name
         try:
-            await self._client.xgroup_destroy(self._queue_name, self._group_name)
-            state.redis_group_destroy_succeeded = True
+            raw_groups = await self._client.xinfo_groups(self._queue_name)
         except Exception:
-            state.redis_cleanup_suppressed = True
-            raise
+            if require_existing:
+                raise BoundedBundleAssemblerError("redis_consumer_group_not_found")
+            return None
+        metadata = _find_group_metadata(raw_groups, self._group_name)
+        if metadata is None:
+            if require_existing:
+                raise BoundedBundleAssemblerError("redis_consumer_group_not_found")
+            state.group_exists = False
+            return None
+        state.group_exists = metadata.exists
+        state.group_pending = metadata.pending
+        state.group_lag = metadata.lag
+        state.group_last_delivered_id = metadata.last_delivered_id
+        return metadata
 
 
 class CountingEvidenceAssemblerRepository:
@@ -782,25 +821,19 @@ async def build_default_bounded_bundle_assembler_redis_consumer(
     from redis.asyncio import Redis  # type: ignore[import-not-found]
 
     redis_client = Redis.from_url(runtime_config.redis_url, decode_responses=True)
-    consumer = TemporaryGroupRedisTargetConsumer(
+    consumer = ExistingGroupRedisTargetConsumer(
         redis_client,
         queue_name=runtime_config.assembler_config.queue_name,
+        group_name=runtime_config.assembler_config.consumer_group,
+        consumer_name=runtime_config.assembler_config.consumer_name,
     )
 
     async def close() -> None:
-        cleanup_error: Exception | None = None
-        try:
-            await consumer.cleanup(state)
-        except Exception as exc:
-            cleanup_error = exc
-        finally:
-            close_client = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
-            if close_client is not None:
-                result = close_client()
-                if hasattr(result, "__await__"):
-                    await result
-        if cleanup_error is not None:
-            raise cleanup_error
+        close_client = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
+        if close_client is not None:
+            result = close_client()
+            if hasattr(result, "__await__"):
+                await result
 
     return BoundedBundleAssemblerRedisHandle(consumer=consumer, close=close)
 
@@ -885,10 +918,6 @@ async def run_bounded_bundle_assembler(
         return _result("blocked", "scan_limit_out_of_range", config=config, state=state)
     if config.candidate_fanout_limit <= 0 or config.candidate_fanout_limit > HARD_CANDIDATE_FANOUT_LIMIT:
         return _result("blocked", "candidate_fanout_limit_out_of_range", config=config, state=state)
-    if config.run_mode == EXECUTE_MODE and not config.allow_redis_group_create:
-        return _result("blocked", "redis_group_create_not_allowed", config=config, state=state)
-    if config.run_mode == EXECUTE_MODE and not config.allow_redis_group_destroy:
-        return _result("blocked", "redis_group_destroy_not_allowed", config=config, state=state)
     if not config.allow_runtime_config:
         return _result("blocked", "runtime_config_not_allowed", config=config, state=state)
 
@@ -926,7 +955,11 @@ async def run_bounded_bundle_assembler(
             state,
             effective_logger,
         )
-        selected, messages_seen, messages_matched = await redis_handle.consumer.find_target(config, state)
+        try:
+            selected, messages_seen, messages_matched = await redis_handle.consumer.find_target(config, state)
+        except BoundedBundleAssemblerError as exc:
+            result = _result("blocked", exc.error_code, config=config, state=state)
+            raise _BoundedBundleAssemblerResultReady
         if selected is None:
             result = _result(
                 "blocked",
@@ -1261,7 +1294,7 @@ def _result(
         counters=effective_counters,
         target_trigger_event_id_suffix=_optional_id_suffix(trigger_event_id),
         target_artifact_id_suffix=_optional_id_suffix(artifact_id),
-        redis_message_id_suffix=_optional_id_suffix(redis_message_id),
+        redis_message_id_suffix=_redis_id_suffix(redis_message_id),
         target_candidate_group_suffix=_optional_id_suffix(candidate_group_id),
         target_snapshot_id_suffix=_optional_id_suffix(snapshot_id),
         target_snapshot_type=snapshot_type,
@@ -1499,6 +1532,68 @@ def _flatten_stream_entries(raw: Any) -> list[tuple[str, Mapping[str, Any]]]:
     return messages
 
 
+def _find_group_metadata(raw_groups: Any, group_name: str) -> RedisGroupMetadata | None:
+    for raw_group in raw_groups or []:
+        if not isinstance(raw_group, Mapping):
+            continue
+        normalized = {str(_decode_value(key)): _decode_value(value) for key, value in raw_group.items()}
+        name = str(normalized.get("name", ""))
+        if name != group_name:
+            continue
+        return RedisGroupMetadata(
+            name=name,
+            exists=True,
+            pending=_optional_int(normalized.get("pending")),
+            lag=_optional_int(normalized.get("lag")),
+            last_delivered_id=_optional_string(normalized.get("last-delivered-id")),
+        )
+    return None
+
+
+def _set_target_after_group_last_delivered(
+    state: BoundedBundleAssemblerState,
+    target_message_id: str,
+    last_delivered_id: str | None,
+) -> None:
+    state.target_after_group_last_delivered = _redis_stream_id_after(target_message_id, last_delivered_id)
+
+
+def _redis_stream_id_after(message_id: str, last_delivered_id: str | None) -> bool:
+    message_parts = _parse_redis_stream_id(message_id)
+    last_parts = _parse_redis_stream_id(last_delivered_id)
+    if message_parts is None or last_parts is None:
+        return False
+    return message_parts > last_parts
+
+
+def _parse_redis_stream_id(value: str | None) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    parts = str(value).split("-", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
 def _decode_fields(fields: Mapping[Any, Any]) -> dict[str, Any]:
     decoded: dict[str, Any] = {}
     for key, value in fields.items():
@@ -1557,6 +1652,15 @@ def _optional_id_suffix(value: UUID | str | None) -> str | None:
         return None
     text = str(value)
     return text[-8:] if text else None
+
+
+def _redis_id_suffix(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    if not text:
+        return None
+    return text[-10:] if len(text) > 10 else text
 
 
 def _is_valid_trigger_event_suffix(value: str) -> bool:
@@ -1660,9 +1764,10 @@ __all__ = [
     "RUNNER_NAME",
     "SCHEMA_VERSION",
     "STAGE_NAME",
+    "ExistingGroupRedisTargetConsumer",
+    "RedisGroupMetadata",
     "SqlAlchemyBoundedBundleAssemblerDatabase",
     "TargetedRedisBundleMessage",
-    "TemporaryGroupRedisTargetConsumer",
     "TriggerEventContract",
     "argument_error_report",
     "build_default_bounded_bundle_assembler_database",

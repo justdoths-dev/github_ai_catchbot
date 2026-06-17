@@ -104,8 +104,6 @@ class FakeConsumer:
         state.redis_read_attempted = True
         if config.run_mode == "execute":
             state.redis_consume_attempted = True
-            state.redis_group_create_attempted = True
-            state.redis_group_created = True
         if not self.selected.redis_message_id.endswith(config.redis_message_id_suffix):
             return None, 1, 0
         if not self.selected.message.trigger_event_id.endswith(config.trigger_event_suffix):
@@ -128,10 +126,7 @@ class FakeRedisBuilder:
         del runtime_config, logger
 
         async def close() -> None:
-            if state.redis_group_created:
-                state.redis_group_destroy_attempted = True
-                state.redis_cleanup_attempted = True
-                state.redis_group_destroy_succeeded = True
+            pass
 
         return BoundedBundleAssemblerRedisHandle(consumer=self.consumer, close=close)
 
@@ -247,8 +242,6 @@ def _execute_args(event_id) -> list[str]:
         *_base_args(event_id),
         "--allow-database-write-for-evidence-bundle-only",
         "--allow-redis-consume",
-        "--allow-redis-group-create",
-        "--allow-redis-group-destroy",
         "--allow-redis-ack",
     ]
 
@@ -471,11 +464,11 @@ def test_execute_writes_bundle_and_acks_after_safe_completion(capsys) -> None:
     assert parsed["analysis_requested_outbox_count"] == 1
     assert parsed["redis_read_attempted"] is True
     assert parsed["redis_consume_attempted"] is True
-    assert parsed["redis_group_create_allowed"] is True
-    assert parsed["redis_group_destroy_allowed"] is True
-    assert parsed["redis_group_create_attempted"] is True
-    assert parsed["redis_group_destroy_attempted"] is True
-    assert parsed["redis_group_destroy_succeeded"] is True
+    assert parsed["redis_group_create_allowed"] is False
+    assert parsed["redis_group_destroy_allowed"] is False
+    assert parsed["redis_group_create_attempted"] is False
+    assert parsed["redis_group_destroy_attempted"] is False
+    assert parsed["redis_group_destroy_succeeded"] is False
     assert parsed["redis_group_cleanup_suppressed"] is False
     assert parsed["database_write_attempted"] is True
     assert parsed["redis_ack_attempted"] is True
@@ -494,32 +487,36 @@ def test_execute_writes_bundle_and_acks_after_safe_completion(capsys) -> None:
         assert raw not in captured.out
 
 
-def test_execute_missing_group_gates_blocks_before_runtime_config(capsys) -> None:
+def test_legacy_group_lifecycle_flags_are_optional_and_inert(capsys) -> None:
     event_id = uuid4()
+    artifact_id = uuid4()
+    selected = _selected(event_id, artifact_id)
+    consumer = FakeConsumer(selected)
+    database = FakeDatabase(_event(event_id, artifact_id), BoundedBundleAssemblerCounters())
+    args = [
+        *_execute_args(event_id),
+        "--allow-redis-group-create",
+        "--allow-redis-group-destroy",
+    ]
 
-    for missing_flag, error_code in (
-        ("--allow-redis-group-create", "redis_group_create_not_allowed"),
-        ("--allow-redis-group-destroy", "redis_group_destroy_not_allowed"),
-    ):
-        args = [arg for arg in _execute_args(event_id) if arg != missing_flag]
-        exit_code = runner.main(
-            args,
-            runtime_config_loader=lambda: (_ for _ in ()).throw(
-                AssertionError("runtime config must not load")
-            ),
-        )
-        captured = capsys.readouterr()
-        parsed = json.loads(captured.out)
+    exit_code = runner.main(
+        args,
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(consumer),
+        database_builder=FakeDatabaseBuilder(database),
+    )
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
 
-        assert exit_code == 1
-        assert captured.err == ""
-        assert parsed["status"] == "blocked"
-        assert parsed["error_code"] == error_code
-        assert parsed["redis_read_attempted"] is False
-        assert parsed["redis_group_create_attempted"] is False
-        assert parsed["redis_group_destroy_attempted"] is False
-        assert parsed["database_read_attempted"] is False
-        assert parsed["database_write_attempted"] is False
+    assert exit_code == 0
+    assert captured.err == ""
+    assert parsed["status"] == "assembled"
+    assert parsed["redis_group_create_allowed"] is True
+    assert parsed["redis_group_destroy_allowed"] is True
+    assert parsed["redis_group_create_attempted"] is False
+    assert parsed["redis_group_destroy_attempted"] is False
+    assert parsed["database_write_attempted"] is True
+    assert parsed["redis_ack_attempted"] is True
 
 
 def test_execute_reuses_existing_bundle_without_duplicate_analysis_requested(capsys) -> None:
@@ -694,15 +691,12 @@ def test_source_guard_keeps_live_authority_and_runtime_surfaces_out() -> None:
     assert not any(".web_enricher" in module for module in imported_modules)
     assert "xreadgroup(" in source
     assert "xack(" in source
-    assert "class TemporaryGroupRedisTargetConsumer" in source
-    assert source.count(".xgroup_create(") == 1
-    assert source.count(".xgroup_destroy(") == 1
+    assert "class ExistingGroupRedisTargetConsumer" in source
+    assert "xinfo_groups" in source
+    assert ".xgroup_create(" not in source
+    assert ".xgroup_destroy(" not in source
     assert "allow_redis_group_create" in source
     assert "allow_redis_group_destroy" in source
-    assert "redis_group_create_not_allowed" in source
-    assert "redis_group_destroy_not_allowed" in source
     runtime_loader_index = source.index("runtime_config = runtime_config_loader()")
     redis_builder_index = source.index("redis_handle = await")
-    assert source.index("redis_group_create_not_allowed") < runtime_loader_index
-    assert source.index("redis_group_destroy_not_allowed") < runtime_loader_index
     assert runtime_loader_index < redis_builder_index
