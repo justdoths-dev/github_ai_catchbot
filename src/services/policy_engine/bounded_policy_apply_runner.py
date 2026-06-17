@@ -185,6 +185,23 @@ class TargetPolicyApplyMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class PolicyApplyCommitContext:
+    runtime_config: BoundedPolicyApplyRuntimeConfig
+    selected: TargetPolicyApplyMessage
+    event: OutboxEventRow
+    analysis_id: UUID | None
+    analysis: AnalysisDraft | None
+    evaluation: PolicyEvaluation | None
+    notification_outbox: OutboxEventRow | None
+    notification_outbox_written: bool
+    analysis_written: bool
+    state_transition_written: bool
+
+
+AfterPolicyCommitCallback = Callable[[PolicyApplyCommitContext], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
 class BoundedPolicyApplyResult:
     status: str
     ok: bool
@@ -841,6 +858,7 @@ async def run_bounded_policy_apply(
     runtime_config_loader: Callable[[], BoundedPolicyApplyRuntimeConfig] = load_runtime_config,
     redis_builder: RedisBuilder | None = None,
     repository_builder: RepositoryBuilder | None = None,
+    after_commit_before_ack: AfterPolicyCommitCallback | None = None,
     logger: logging.Logger | None = None,
 ) -> BoundedPolicyApplyResult:
     state = BoundedPolicyApplyState()
@@ -1130,6 +1148,123 @@ async def run_bounded_policy_apply(
         if existing_analysis is not None:
             analysis_id = existing_analysis.analysis_id
             planned_action = "reuse_existing_analysis"
+            if analysis.delivery_decision != "suppress":
+                if runtime_config.operator_chat_id == 0:
+                    result = _result(
+                        "blocked",
+                        "notification_target_missing",
+                        config=config,
+                        state=state,
+                        selected=selected,
+                        event=event,
+                        candidate=candidate,
+                        judge_run=judge_run,
+                        judge_output=judge_output,
+                        bundle=bundle,
+                        existing_analysis=existing_analysis,
+                        analysis_id=analysis_id,
+                        analysis=analysis,
+                        evaluation=evaluation,
+                        messages_seen=messages_seen,
+                        messages_matched=messages_matched,
+                        planned_action="fail_closed",
+                        would_fail_closed=True,
+                    )
+                    raise _ResultReady
+                notification_intent = NotificationIntentBuilder(config=runtime_config.to_policy_config()).build(
+                    analysis_id=analysis_id,
+                    analysis=analysis,
+                    evaluation=evaluation,
+                )
+                if notification_intent is None:
+                    raise BoundedPolicyApplyError("notification_plan_intent_missing")
+                matching_outboxes = await repository.load_notification_plan_intent_outboxes(notification_intent)
+                if len(matching_outboxes) > 1:
+                    result = _result(
+                        "blocked",
+                        "duplicate_notification_plan_intent_outbox",
+                        config=config,
+                        state=state,
+                        selected=selected,
+                        event=event,
+                        candidate=candidate,
+                        judge_run=judge_run,
+                        judge_output=judge_output,
+                        bundle=bundle,
+                        existing_analysis=existing_analysis,
+                        analysis_id=analysis_id,
+                        analysis=analysis,
+                        evaluation=evaluation,
+                        messages_seen=messages_seen,
+                        messages_matched=messages_matched,
+                        planned_action="fail_closed",
+                        would_fail_closed=True,
+                    )
+                    raise _ResultReady
+                if matching_outboxes:
+                    notification_outbox = matching_outboxes[0]
+                    planned_action = "reuse_existing_analysis_and_notification_intent"
+                    outbox_error = _notification_outbox_error(notification_outbox, intent=notification_intent)
+                    if outbox_error is not None:
+                        result = _result(
+                            "blocked",
+                            outbox_error,
+                            config=config,
+                            state=state,
+                            selected=selected,
+                            event=event,
+                            candidate=candidate,
+                            judge_run=judge_run,
+                            judge_output=judge_output,
+                            bundle=bundle,
+                            existing_analysis=existing_analysis,
+                            analysis_id=analysis_id,
+                            analysis=analysis,
+                            evaluation=evaluation,
+                            notification_outbox=notification_outbox,
+                            messages_seen=messages_seen,
+                            messages_matched=messages_matched,
+                            planned_action="fail_closed",
+                            would_fail_closed=True,
+                        )
+                        raise _ResultReady
+                elif config.mode == MODE_PREVIEW:
+                    planned_action = "reuse_existing_analysis_create_notification_intent"
+                else:
+                    state.database_write_attempted = True
+                    notification_outbox, notification_outbox_written = (
+                        await repository.insert_or_load_notification_plan_intent_outbox(notification_intent)
+                    )
+                    planned_action = (
+                        "reuse_existing_analysis_create_notification_intent"
+                        if notification_outbox_written
+                        else "reuse_existing_analysis_and_notification_intent"
+                    )
+                    outbox_error = _notification_outbox_error(notification_outbox, intent=notification_intent)
+                    if outbox_error is not None:
+                        result = _result(
+                            "blocked",
+                            outbox_error,
+                            config=config,
+                            state=state,
+                            selected=selected,
+                            event=event,
+                            candidate=candidate,
+                            judge_run=judge_run,
+                            judge_output=judge_output,
+                            bundle=bundle,
+                            existing_analysis=existing_analysis,
+                            analysis_id=analysis_id,
+                            analysis=analysis,
+                            evaluation=evaluation,
+                            notification_outbox=notification_outbox,
+                            notification_outbox_written=notification_outbox_written,
+                            messages_seen=messages_seen,
+                            messages_matched=messages_matched,
+                            planned_action="fail_closed",
+                            would_fail_closed=True,
+                        )
+                        raise _ResultReady
         elif analysis.delivery_decision == "suppress":
             planned_action = "create_analysis_suppress_only"
         else:
@@ -1315,6 +1450,80 @@ async def run_bounded_policy_apply(
             )
             raise _ResultReady
 
+        if after_commit_before_ack is not None:
+            assert selected is not None
+            assert event is not None
+            try:
+                await after_commit_before_ack(
+                    PolicyApplyCommitContext(
+                        runtime_config=runtime_config,
+                        selected=selected,
+                        event=event,
+                        analysis_id=analysis_id,
+                        analysis=analysis,
+                        evaluation=evaluation,
+                        notification_outbox=notification_outbox,
+                        notification_outbox_written=notification_outbox_written,
+                        analysis_written=analysis_written,
+                        state_transition_written=state_transition_written,
+                    )
+                )
+            except BoundedPolicyApplyError as exc:
+                result = _result(
+                    "failed",
+                    exc.error_code,
+                    config=config,
+                    state=state,
+                    selected=selected,
+                    event=event,
+                    candidate=candidate,
+                    judge_run=judge_run,
+                    judge_output=judge_output,
+                    bundle=bundle,
+                    existing_analysis=existing_analysis,
+                    analysis_id=analysis_id,
+                    analysis=analysis,
+                    evaluation=evaluation,
+                    notification_outbox=notification_outbox,
+                    notification_outbox_written=notification_outbox_written,
+                    analysis_written=analysis_written,
+                    state_transition_written=state_transition_written,
+                    messages_seen=messages_seen,
+                    messages_matched=messages_matched,
+                    messages_processed_count=1,
+                    planned_action=planned_action,
+                    would_fail_closed=True,
+                )
+                raise _ResultReady
+            except Exception as exc:
+                result = _result(
+                    "failed",
+                    "after_policy_commit_callback_failed",
+                    error_class=_safe_exception_class(exc),
+                    config=config,
+                    state=state,
+                    selected=selected,
+                    event=event,
+                    candidate=candidate,
+                    judge_run=judge_run,
+                    judge_output=judge_output,
+                    bundle=bundle,
+                    existing_analysis=existing_analysis,
+                    analysis_id=analysis_id,
+                    analysis=analysis,
+                    evaluation=evaluation,
+                    notification_outbox=notification_outbox,
+                    notification_outbox_written=notification_outbox_written,
+                    analysis_written=analysis_written,
+                    state_transition_written=state_transition_written,
+                    messages_seen=messages_seen,
+                    messages_matched=messages_matched,
+                    messages_processed_count=1,
+                    planned_action=planned_action,
+                    would_fail_closed=True,
+                )
+                raise _ResultReady
+
         try:
             acked_count = await redis_handle.consumer.ack(selected.redis_message_id, state)
         except Exception as exc:
@@ -1490,6 +1699,7 @@ def run_bounded_policy_apply_sync(
     runtime_config_loader: Callable[[], BoundedPolicyApplyRuntimeConfig] = load_runtime_config,
     redis_builder: RedisBuilder | None = None,
     repository_builder: RepositoryBuilder | None = None,
+    after_commit_before_ack: AfterPolicyCommitCallback | None = None,
     logger: logging.Logger | None = None,
 ) -> BoundedPolicyApplyResult:
     return asyncio.run(
@@ -1498,6 +1708,7 @@ def run_bounded_policy_apply_sync(
             runtime_config_loader=runtime_config_loader,
             redis_builder=redis_builder,
             repository_builder=repository_builder,
+            after_commit_before_ack=after_commit_before_ack,
             logger=logger,
         )
     )
@@ -2220,6 +2431,7 @@ def _sql(statement: str) -> Any:
 
 
 __all__ = [
+    "AfterPolicyCommitCallback",
     "BoundedPolicyApplyConfig",
     "BoundedPolicyApplyError",
     "BoundedPolicyApplyRedisHandle",
@@ -2227,6 +2439,7 @@ __all__ = [
     "BoundedPolicyApplyResult",
     "BoundedPolicyApplyRuntimeConfig",
     "BoundedPolicyApplyState",
+    "PolicyApplyCommitContext",
     "RedisPolicyApplyConsumer",
     "SqlAlchemyPolicyApplyRepository",
     "TargetPolicyApplyMessage",
