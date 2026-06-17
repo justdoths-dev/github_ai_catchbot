@@ -250,4 +250,3 @@ def test_service_source_has_no_forbidden_mutation_or_external_authority() -> Non
     assert "UPDATE notification_plans" not in source
     assert "notification_delivery_records (" not in source
     assert "payload_json" not in json.dumps(runner.main.__name__)
-
