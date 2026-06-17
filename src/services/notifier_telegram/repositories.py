@@ -103,7 +103,8 @@ class NotifierTelegramRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT event_id, event_type, aggregate_type, aggregate_id, dedupe_key, payload_json, status
+                SELECT event_id, event_type, aggregate_type, aggregate_id, dedupe_key, payload_json, status,
+                       fail_count, created_at, published_at
                 FROM event_outbox
                 WHERE event_id = CAST(:event_id AS uuid)
                 """
@@ -112,6 +113,19 @@ class NotifierTelegramRepository:
         )
         row = result.mappings().first()
         return dict(row) if row else None
+
+    async def mark_event_outbox_published(self, *, event_id: UUID, published_at: datetime) -> None:
+        await self._session.execute(
+            sa.text(
+                """
+                UPDATE event_outbox
+                SET status = 'published'::outbox_status_enum,
+                    published_at = :published_at
+                WHERE event_id = CAST(:event_id AS uuid)
+                """
+            ),
+            {"event_id": str(event_id), "published_at": published_at},
+        )
 
     async def load_notification_plan_intent(self, notification_plan_id: UUID) -> NotificationIntentJob | None:
         row = await self.load_notification_plan(notification_plan_id)
@@ -611,6 +625,26 @@ class NotifierTelegramRepository:
         inserted = result.scalar_one_or_none()
         return UUID(str(inserted)) if inserted else None
 
+    async def load_notification_render_by_hash(
+        self,
+        *,
+        notification_plan_id: UUID,
+        render_hash: str,
+    ) -> dict[str, Any] | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT notification_render_id, notification_plan_id, render_hash, created_at
+                FROM notification_renders
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                  AND render_hash = :render_hash
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id), "render_hash": render_hash},
+        )
+        row = result.mappings().first()
+        return dict(row) if row else None
+
     async def insert_delivery_record(
         self,
         *,
@@ -761,6 +795,57 @@ class NotifierTelegramRepository:
                 "payload_json": _jsonb_dumps(payload),
             },
         )
+
+    async def insert_delivery_result_outbox_returning(
+        self,
+        *,
+        notification_plan_id: UUID,
+        delivery_status: str,
+        telegram_chat_id: int | None,
+        telegram_message_id: int | None,
+        notification_delivery_record_id: UUID,
+        attempt_count: int,
+        transport_error_code: str | None,
+        transport_error_class: str | None,
+        edited: bool,
+    ) -> UUID | None:
+        payload = {
+            "notification_plan_id": str(notification_plan_id),
+            "notification_delivery_record_id": str(notification_delivery_record_id),
+            "delivery_status": delivery_status,
+            "telegram_chat_id": telegram_chat_id,
+            "telegram_message_id": telegram_message_id,
+            "attempt_count": attempt_count,
+            "transport_error_code": transport_error_code,
+            "transport_error_class": transport_error_class,
+            "edited": edited,
+        }
+        result = await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO event_outbox (
+                    event_type, aggregate_type, aggregate_id, dedupe_key, payload_json, status, created_at
+                ) VALUES (
+                    'notification.delivery.result.v1',
+                    'notification_plan',
+                    CAST(:notification_plan_id AS uuid),
+                    :dedupe_key,
+                    CAST(:payload_json AS jsonb),
+                    'pending'::outbox_status_enum,
+                    now()
+                )
+                ON CONFLICT (dedupe_key) DO NOTHING
+                RETURNING event_id
+                """
+            ),
+            {
+                "notification_plan_id": str(notification_plan_id),
+                "dedupe_key": f"notification-delivery-result:{notification_plan_id}:{notification_delivery_record_id}",
+                "payload_json": _jsonb_dumps(payload),
+            },
+        )
+        inserted = result.scalar_one_or_none()
+        return UUID(str(inserted)) if inserted else None
 
     async def load_send_disabled_worker_once_proof_verification(
         self,
