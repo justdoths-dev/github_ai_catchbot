@@ -11,6 +11,7 @@ import sqlalchemy as sa
 from services.router_normalizer.models import CanonicalArtifact
 
 from .models import (
+    AnalysisRequestedOutboxRecord,
     ArtifactRecord,
     BundleRefreshTarget,
     CandidateGroupRecord,
@@ -609,6 +610,35 @@ class EvidenceAssemblerRepository:
             ready_for_analysis=bool(row["ready_for_analysis"]),
         )
 
+    async def load_analysis_requested_outbox(
+        self,
+        *,
+        candidate_group_id: UUID,
+        bundle_id: UUID,
+    ) -> AnalysisRequestedOutboxRecord | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT event_id
+                FROM event_outbox
+                WHERE event_type = 'analysis.requested.v1'
+                  AND aggregate_type = 'candidate_group'
+                  AND aggregate_id = CAST(:candidate_group_id AS uuid)
+                  AND dedupe_key = :dedupe_key
+                ORDER BY created_at ASC, event_id ASC
+                LIMIT 1
+                """
+            ),
+            {
+                "candidate_group_id": str(candidate_group_id),
+                "dedupe_key": f"analysis-request:{candidate_group_id}:{bundle_id}",
+            },
+        )
+        row = result.mappings().first()
+        if row is None:
+            return None
+        return AnalysisRequestedOutboxRecord(event_id=UUID(str(row["event_id"])), created=False)
+
     async def next_bundle_version(self, candidate_group_id: UUID) -> int:
         result = await self._session.execute(
             sa.text(
@@ -727,36 +757,53 @@ class EvidenceAssemblerRepository:
         bundle_id: UUID,
         judge_profile: str,
         escalation_allowed: bool,
-    ) -> None:
+    ) -> AnalysisRequestedOutboxRecord:
+        dedupe_key = f"analysis-request:{candidate_group_id}:{bundle_id}"
         payload = {
             "candidate_group_id": str(candidate_group_id),
             "bundle_id": str(bundle_id),
             "judge_profile": judge_profile,
             "escalation_allowed": escalation_allowed,
         }
-        await self._session.execute(
+        result = await self._session.execute(
             sa.text(
                 """
-                INSERT INTO event_outbox (
-                    event_type, aggregate_type, aggregate_id, dedupe_key,
-                    payload_json, status, created_at
-                ) VALUES (
-                    'analysis.requested.v1',
-                    'candidate_group',
-                    CAST(:candidate_group_id AS uuid),
-                    :dedupe_key,
-                    CAST(:payload_json AS jsonb),
-                    'pending'::outbox_status_enum,
-                    now()
+                WITH inserted AS (
+                    INSERT INTO event_outbox (
+                        event_type, aggregate_type, aggregate_id, dedupe_key,
+                        payload_json, status, created_at
+                    ) VALUES (
+                        'analysis.requested.v1',
+                        'candidate_group',
+                        CAST(:candidate_group_id AS uuid),
+                        :dedupe_key,
+                        CAST(:payload_json AS jsonb),
+                        'pending'::outbox_status_enum,
+                        now()
+                    )
+                    ON CONFLICT (dedupe_key) DO NOTHING
+                    RETURNING event_id, TRUE AS created
                 )
-                ON CONFLICT (dedupe_key) DO NOTHING
+                SELECT event_id, created FROM inserted
+                UNION ALL
+                SELECT event_id, FALSE AS created
+                FROM event_outbox
+                WHERE dedupe_key = :dedupe_key
+                LIMIT 1
                 """
             ),
             {
                 "candidate_group_id": str(candidate_group_id),
-                "dedupe_key": f"analysis-request:{candidate_group_id}:{bundle_id}",
+                "dedupe_key": dedupe_key,
                 "payload_json": _jsonb_dumps(payload),
             },
+        )
+        row = result.mappings().first()
+        if row is None:
+            raise RuntimeError("analysis.requested outbox insert did not return a row")
+        return AnalysisRequestedOutboxRecord(
+            event_id=UUID(str(row["event_id"])),
+            created=bool(row["created"]),
         )
 
 

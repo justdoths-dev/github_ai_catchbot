@@ -95,6 +95,12 @@ class ExistingBundleRecord:
 
 
 @dataclass(slots=True, frozen=True)
+class AnalysisRequestedOutboxRecord:
+    event_id: UUID
+    created: bool
+
+
+@dataclass(slots=True, frozen=True)
 class DiscoveredLinkSummary:
     observed_url: str
     context_path: str | None
@@ -157,3 +163,14 @@ class AssemblyResult:
     reused_existing_bundle: bool
     ready_for_analysis: bool
     emitted_analysis_requested: bool
+    analysis_requested_event_id: UUID | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class EvidenceBundlePreview:
+    candidate_group_id: UUID
+    current_bundle_present_before: bool
+    bundle_input_existing: bool
+    ready_for_analysis: bool
+    analysis_requested_existing: bool
+    analysis_requested_would_emit: bool

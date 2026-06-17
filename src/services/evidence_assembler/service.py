@@ -17,6 +17,7 @@ from .models import (
     CandidateGroupRecord,
     CandidateMemberRecord,
     DiscoveredLinkSummary,
+    EvidenceBundlePreview,
     EvidenceBundleDraft,
     SnapshotRecord,
 )
@@ -55,6 +56,89 @@ class EvidenceAssemblerService:
             if result is not None:
                 results.append(result)
         return results
+
+    async def preview_trigger_event(self, trigger_event_id: str | UUID) -> list[EvidenceBundlePreview]:
+        targets = await self._repository.resolve_refresh_targets(UUID(str(trigger_event_id)))
+        previews: list[EvidenceBundlePreview] = []
+        for target in targets:
+            preview = await self._preview_one(target)
+            if preview is not None:
+                previews.append(preview)
+        return previews
+
+    async def _preview_one(self, target: BundleRefreshTarget) -> EvidenceBundlePreview | None:
+        candidate = await self._repository.load_candidate_group(target.candidate_group_id)
+        if candidate is None:
+            return None
+
+        members = await self._repository.load_candidate_members(candidate.candidate_group_id)
+        if not members:
+            return None
+
+        member_artifact_ids = [member.artifact_id for member in members]
+        snapshots = await self._repository.load_current_snapshots(member_artifact_ids)
+        artifact_types = {member.artifact_id: member.artifact_type for member in members}
+        current_primary_artifact_id = candidate.current_primary_artifact_id
+        primary_snapshot = snapshots.get(current_primary_artifact_id)
+        discovered_links = await self._repository.load_discovered_links(
+            candidate_group_id=candidate.candidate_group_id,
+            parent_artifact_ids=member_artifact_ids,
+        )
+        bundle_members = self._bundle_members(
+            current_primary_artifact_id=current_primary_artifact_id,
+            members=members,
+            snapshots=snapshots,
+        )
+        supporting_snapshots = [
+            snapshots[member.artifact_id]
+            for member in members
+            if member.artifact_id != current_primary_artifact_id and member.artifact_id in snapshots
+        ]
+        token_budget_profile = self._token_budget.choose(
+            primary_snapshot=primary_snapshot,
+            supporting_snapshot_count=len(supporting_snapshots),
+            discovered_links_count=len(discovered_links),
+        )
+        ready_for_analysis = self._readiness.is_ready_for_analysis(
+            primary_snapshot=primary_snapshot,
+            bundle_members=bundle_members,
+            token_budget_profile=token_budget_profile,
+        )
+        reroot_count = await self._repository.count_reroot_events(candidate.candidate_group_id)
+        bundle_input_hash = self._bundle_input_hash(
+            candidate_group_id=candidate.candidate_group_id,
+            current_primary_artifact_id=current_primary_artifact_id,
+            members=bundle_members,
+            reroot_count=reroot_count,
+            discovered_links=discovered_links,
+            bundle_profile_version=self._config.bundle_profile_version,
+        )
+        existing_bundle = await self._repository.load_existing_bundle(
+            candidate_group_id=candidate.candidate_group_id,
+            bundle_profile_version=self._config.bundle_profile_version,
+            bundle_input_hash=bundle_input_hash,
+        )
+        analysis_requested_existing = False
+        if existing_bundle is not None:
+            existing_analysis = await self._repository.load_analysis_requested_outbox(
+                candidate_group_id=candidate.candidate_group_id,
+                bundle_id=existing_bundle.bundle_id,
+            )
+            analysis_requested_existing = existing_analysis is not None
+        judge_profile = self._judge_profile_for_primary(artifact_types.get(current_primary_artifact_id))
+        analysis_requested_would_emit = (
+            ready_for_analysis
+            and judge_profile is not None
+            and (existing_bundle is None or not analysis_requested_existing)
+        )
+        return EvidenceBundlePreview(
+            candidate_group_id=candidate.candidate_group_id,
+            current_bundle_present_before=candidate.current_bundle_id is not None,
+            bundle_input_existing=existing_bundle is not None,
+            ready_for_analysis=ready_for_analysis,
+            analysis_requested_existing=analysis_requested_existing,
+            analysis_requested_would_emit=analysis_requested_would_emit,
+        )
 
     async def _refresh_one(self, target: BundleRefreshTarget) -> AssemblyResult | None:
         candidate = await self._repository.load_candidate_group(target.candidate_group_id)
@@ -157,18 +241,37 @@ class EvidenceAssemblerService:
             bundle_input_hash=bundle_input_hash,
         )
         if existing_bundle is not None:
-            if candidate.current_bundle_id != existing_bundle.bundle_id:
+            analysis_requested_event_id: UUID | None = None
+            emitted_analysis_requested = False
+            judge_profile = (
+                self._judge_profile_for_primary(artifact_types.get(current_primary_artifact_id))
+                if existing_bundle.ready_for_analysis
+                else None
+            )
+            should_update_current_bundle = candidate.current_bundle_id != existing_bundle.bundle_id
+            if judge_profile or should_update_current_bundle:
                 async with self._repository.transaction():
-                    await self._repository.update_current_bundle(
-                        candidate_group_id=candidate.candidate_group_id,
-                        bundle_id=existing_bundle.bundle_id,
-                    )
+                    if judge_profile:
+                        record = await self._repository.insert_analysis_requested_outbox(
+                            candidate_group_id=candidate.candidate_group_id,
+                            bundle_id=existing_bundle.bundle_id,
+                            judge_profile=judge_profile,
+                            escalation_allowed=True,
+                        )
+                        analysis_requested_event_id = record.event_id
+                        emitted_analysis_requested = record.created
+                    if should_update_current_bundle:
+                        await self._repository.update_current_bundle(
+                            candidate_group_id=candidate.candidate_group_id,
+                            bundle_id=existing_bundle.bundle_id,
+                        )
             return AssemblyResult(
                 candidate_group_id=candidate.candidate_group_id,
                 bundle_id=existing_bundle.bundle_id,
                 reused_existing_bundle=True,
                 ready_for_analysis=existing_bundle.ready_for_analysis,
-                emitted_analysis_requested=False,
+                emitted_analysis_requested=emitted_analysis_requested,
+                analysis_requested_event_id=analysis_requested_event_id,
             )
 
         judge_profile = self._judge_profile_for_primary(artifact_types.get(current_primary_artifact_id))
@@ -192,6 +295,7 @@ class EvidenceAssemblerService:
         )
 
         emitted_analysis_requested = False
+        analysis_requested_event_id: UUID | None = None
         async with self._repository.transaction():
             bundle_version = await self._repository.next_bundle_version(candidate.candidate_group_id)
             bundle_id = await self._repository.append_bundle(draft=bundle_draft, bundle_version=bundle_version)
@@ -200,13 +304,14 @@ class EvidenceAssemblerService:
                 bundle_id=bundle_id,
             )
             if bundle_draft.ready_for_analysis and bundle_draft.judge_profile:
-                await self._repository.insert_analysis_requested_outbox(
+                record = await self._repository.insert_analysis_requested_outbox(
                     candidate_group_id=candidate.candidate_group_id,
                     bundle_id=bundle_id,
                     judge_profile=bundle_draft.judge_profile,
                     escalation_allowed=True,
                 )
-                emitted_analysis_requested = True
+                emitted_analysis_requested = record.created
+                analysis_requested_event_id = record.event_id
 
         return AssemblyResult(
             candidate_group_id=candidate.candidate_group_id,
@@ -214,6 +319,7 @@ class EvidenceAssemblerService:
             reused_existing_bundle=False,
             ready_for_analysis=bundle_draft.ready_for_analysis,
             emitted_analysis_requested=emitted_analysis_requested,
+            analysis_requested_event_id=analysis_requested_event_id,
         )
 
     async def _promote_discovered_github_repos(

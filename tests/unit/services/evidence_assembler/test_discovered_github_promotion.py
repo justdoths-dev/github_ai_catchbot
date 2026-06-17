@@ -6,6 +6,7 @@ import pytest
 
 from services.evidence_assembler.config import EvidenceAssemblerConfig
 from services.evidence_assembler.models import (
+    AnalysisRequestedOutboxRecord,
     ArtifactRecord,
     BundleRefreshTarget,
     CandidateGroupRecord,
@@ -126,6 +127,9 @@ class _PromotionRepository:
     async def load_existing_bundle(self, **kwargs):
         return None
 
+    async def load_analysis_requested_outbox(self, **kwargs):
+        return None
+
     async def next_bundle_version(self, candidate_group_id):
         return 1
 
@@ -138,6 +142,7 @@ class _PromotionRepository:
 
     async def insert_analysis_requested_outbox(self, **kwargs):
         self.analysis_requests.append(kwargs)
+        return AnalysisRequestedOutboxRecord(event_id=uuid4(), created=True)
 
 
 def _config() -> EvidenceAssemblerConfig:

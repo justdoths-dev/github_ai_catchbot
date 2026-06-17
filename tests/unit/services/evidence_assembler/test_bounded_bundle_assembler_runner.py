@@ -20,7 +20,7 @@ from src.services.evidence_assembler.bounded_bundle_assembler_runner import (
     run_bounded_bundle_assembler,
 )
 from src.services.evidence_assembler.config import EvidenceAssemblerConfig
-from src.services.evidence_assembler.models import AssemblyResult
+from src.services.evidence_assembler.models import AssemblyResult, EvidenceBundlePreview
 
 
 DB_URL = "postgresql+psycopg://sentinel_user:sentinel_password@127.0.0.1/db"
@@ -28,6 +28,7 @@ REDIS_URL = "redis://:sentinel_redis_password@127.0.0.1:6379/0"
 RAW_IDEMPOTENCY_KEY = "private-bundle-idempotency-key"
 RAW_EXCEPTION_DETAIL = "sentinel private bundle failure detail"
 STREAM_ID = "1710000000476-0"
+STREAM_ID_SUFFIX = "476-0"
 
 
 def _runtime_config() -> BoundedBundleAssemblerRuntimeConfig:
@@ -80,9 +81,11 @@ class FakeConsumer:
         self.order = order if order is not None else []
 
     async def find_target(self, config, state):
-        del config
-        state.redis_consume_attempted = True
-        state.redis_group_created = True
+        state.redis_read_attempted = True
+        if config.run_mode == "execute":
+            state.redis_consume_attempted = True
+            state.redis_group_create_attempted = True
+            state.redis_group_created = True
         return self.selected, self.messages_seen, self.messages_matched
 
     async def ack(self, message_id: str, state) -> int:
@@ -102,7 +105,10 @@ class FakeRedisBuilder:
         del runtime_config, logger
 
         async def close() -> None:
-            state.redis_cleanup_attempted = True
+            if state.redis_group_created:
+                state.redis_group_destroy_attempted = True
+                state.redis_cleanup_attempted = True
+                state.redis_group_destroy_succeeded = True
 
         return BoundedBundleAssemblerRedisHandle(consumer=self.consumer, close=close)
 
@@ -116,6 +122,7 @@ class FakeDatabase:
         validate_error: BoundedBundleAssemblerError | None = None,
         suffix_error: BoundedBundleAssemblerError | None = None,
         assemble_error: BaseException | None = None,
+        preview_results: list[EvidenceBundlePreview] | None = None,
         run_contract_validation: bool = False,
     ) -> None:
         self.event = event
@@ -123,6 +130,7 @@ class FakeDatabase:
         self.validate_error = validate_error
         self.suffix_error = suffix_error
         self.assemble_error = assemble_error
+        self.preview_results = preview_results
         self.run_contract_validation = run_contract_validation
         self.assembled = False
 
@@ -135,13 +143,21 @@ class FakeDatabase:
 
     async def validate_trigger_event(self, selected, config, state):
         state.event_outbox_read_attempted = True
+        state.database_read_attempted = True
         if self.validate_error is not None:
             raise self.validate_error
         if self.run_contract_validation:
             runner_module._validate_trigger_contract(event=self.event, selected=selected, config=config)
         return self.event
 
-    async def assemble(self, trigger_event_id, state):
+    async def preview(self, trigger_event_id, selected_candidate_group_id, state):
+        del selected_candidate_group_id
+        assert trigger_event_id == self.event.event_id
+        state.database_read_attempted = True
+        return self.preview_results or []
+
+    async def assemble(self, trigger_event_id, selected_candidate_group_id, state):
+        del selected_candidate_group_id
         assert trigger_event_id == self.event.event_id
         state.database_write_attempted = True
         if self.assemble_error is not None:
@@ -158,6 +174,7 @@ class FakeDatabase:
                 reused_existing_bundle=False,
                 ready_for_analysis=True,
                 emitted_analysis_requested=True,
+                analysis_requested_event_id=uuid4(),
             )
         ]
 
@@ -193,10 +210,17 @@ class FakeDatabaseBuilder:
 
 
 class FakeRedisClient:
-    def __init__(self, entries: list[tuple[str, dict[str, str]]]) -> None:
+    def __init__(
+        self,
+        entries: list[tuple[str, dict[str, str]]],
+        *,
+        destroy_error: BaseException | None = None,
+    ) -> None:
         self.entries = entries
+        self.destroy_error = destroy_error
         self.offset = 0
         self.acked: list[str] = []
+        self.created_groups: list[str] = []
         self.destroyed_groups: list[str] = []
         self.xreadgroup_calls: list[dict[str, object]] = []
 
@@ -204,10 +228,16 @@ class FakeRedisClient:
         assert name == "q.candidate.bundle"
         return len(self.entries)
 
+    async def xrange(self, name: str, min: str = "-", max: str = "+", count: int | None = None):
+        del min, max
+        assert name == "q.candidate.bundle"
+        return self.entries[: int(count or len(self.entries))]
+
     async def xgroup_create(self, name: str, groupname: str, id: str = "$", mkstream: bool = False):
         assert name == "q.candidate.bundle"
         assert id == "0"
         assert mkstream is False
+        self.created_groups.append(groupname)
         return True
 
     async def xreadgroup(self, groupname, consumername, streams, count=None, block=None):
@@ -229,6 +259,8 @@ class FakeRedisClient:
     async def xgroup_destroy(self, name: str, groupname: str):
         assert name == "q.candidate.bundle"
         self.destroyed_groups.append(groupname)
+        if self.destroy_error is not None:
+            raise self.destroy_error
         return True
 
 
@@ -289,20 +321,31 @@ def _event(
         snapshot_status="low_evidence",
         content_anchor_present=True,
         impacted_candidate_group_count=impacted_count,
+        selected_candidate_group_id=uuid4(),
     )
 
 
 def _approved_config(event_id: UUID | None = None, artifact_id: UUID | None = None, **kwargs):
-    return BoundedBundleAssemblerConfig(
-        operator_approved=True,
-        allow_runtime_config=True,
-        allow_redis_consume=True,
-        allow_database_write=True,
-        allow_redis_ack=True,
-        trigger_event_id=event_id,
-        artifact_id=artifact_id,
-        **kwargs,
-    )
+    del artifact_id
+    trigger_event_suffix = kwargs.pop("trigger_event_suffix", str(event_id)[-8:] if event_id is not None else None)
+    redis_message_id_suffix = kwargs.pop("redis_message_id_suffix", STREAM_ID_SUFFIX)
+    defaults = {
+        "run_mode": "execute",
+        "operator_approved": True,
+        "allow_runtime_config": True,
+        "allow_database_read": True,
+        "allow_database_write_for_evidence_bundle_only": True,
+        "allow_redis_read": True,
+        "allow_redis_consume": True,
+        "allow_redis_group_create": True,
+        "allow_redis_group_destroy": True,
+        "allow_redis_ack": True,
+        "queue_name": "q.candidate.bundle",
+        "redis_message_id_suffix": redis_message_id_suffix,
+        "trigger_event_suffix": trigger_event_suffix,
+    }
+    defaults.update(kwargs)
+    return BoundedBundleAssemblerConfig(**defaults)
 
 
 @pytest.mark.asyncio
@@ -316,6 +359,60 @@ async def test_no_flags_blocks_before_runtime_redis_or_database() -> None:
     assert report["redis_consume_attempted"] is False
     assert report["database_write_attempted"] is False
     assert report["redis_ack_attempted"] is False
+    assert report["redis_group_create_attempted"] is False
+    assert report["redis_group_destroy_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_without_redis_group_create_gate_blocks_before_runtime_redis_or_database() -> None:
+    event_id = uuid4()
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(
+            event_id=event_id,
+            allow_redis_group_create=False,
+            allow_redis_group_destroy=True,
+        ),
+        runtime_config_loader=lambda: (_ for _ in ()).throw(AssertionError("runtime config must not load")),
+    )
+
+    report = result.to_sanitized_dict()
+    assert result.ok is False
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "redis_group_create_not_allowed"
+    assert report["redis_group_create_allowed"] is False
+    assert report["redis_group_destroy_allowed"] is True
+    assert report["redis_read_attempted"] is False
+    assert report["redis_group_create_attempted"] is False
+    assert report["redis_group_destroy_attempted"] is False
+    assert report["database_read_attempted"] is False
+    assert report["database_write_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_execute_without_redis_group_destroy_gate_blocks_before_runtime_redis_or_database() -> None:
+    event_id = uuid4()
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(
+            event_id=event_id,
+            allow_redis_group_create=True,
+            allow_redis_group_destroy=False,
+        ),
+        runtime_config_loader=lambda: (_ for _ in ()).throw(AssertionError("runtime config must not load")),
+    )
+
+    report = result.to_sanitized_dict()
+    assert result.ok is False
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "redis_group_destroy_not_allowed"
+    assert report["redis_group_create_allowed"] is True
+    assert report["redis_group_destroy_allowed"] is False
+    assert report["redis_read_attempted"] is False
+    assert report["redis_group_create_attempted"] is False
+    assert report["redis_group_destroy_attempted"] is False
+    assert report["database_read_attempted"] is False
+    assert report["database_write_attempted"] is False
 
 
 @pytest.mark.asyncio
@@ -623,6 +720,58 @@ async def test_temporary_group_scan_finds_target_without_waiting_for_future_mess
 
 
 @pytest.mark.asyncio
+async def test_preview_does_not_require_group_gates_or_create_destroy_group() -> None:
+    event_id = uuid4()
+    artifact_id = uuid4()
+    event = _event(event_id, artifact_id)
+    redis_client = FakeRedisClient([(STREAM_ID, _message_fields(event_id, artifact_id))])
+    database = FakeDatabase(
+        event=event,
+        counters=BoundedBundleAssemblerCounters(),
+        preview_results=[
+            EvidenceBundlePreview(
+                candidate_group_id=event.selected_candidate_group_id,
+                current_bundle_present_before=False,
+                bundle_input_existing=False,
+                ready_for_analysis=True,
+                analysis_requested_existing=False,
+                analysis_requested_would_emit=True,
+            )
+        ],
+    )
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(
+            event_id=event_id,
+            run_mode="preview",
+            allow_database_write_for_evidence_bundle_only=False,
+            allow_redis_consume=False,
+            allow_redis_group_create=False,
+            allow_redis_group_destroy=False,
+            allow_redis_ack=False,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeTemporaryGroupRedisBuilder(redis_client),
+        database_builder=FakeDatabaseBuilder(database),
+    )
+
+    report = result.to_sanitized_dict()
+    assert result.ok is True
+    assert report["status"] == "previewed"
+    assert report["redis_group_create_allowed"] is False
+    assert report["redis_group_destroy_allowed"] is False
+    assert report["redis_group_create_attempted"] is False
+    assert report["redis_group_destroy_attempted"] is False
+    assert report["redis_group_destroy_succeeded"] is False
+    assert report["redis_group_cleanup_suppressed"] is False
+    assert report["redis_consume_attempted"] is False
+    assert report["redis_ack_attempted"] is False
+    assert redis_client.created_groups == []
+    assert redis_client.destroyed_groups == []
+    assert redis_client.xreadgroup_calls == []
+
+
+@pytest.mark.asyncio
 async def test_temporary_group_scan_no_target_returns_not_found_without_waiting_for_future_messages() -> None:
     target_event_id = uuid4()
     first_event_id = uuid4()
@@ -656,19 +805,90 @@ async def test_temporary_group_scan_no_target_returns_not_found_without_waiting_
 
 
 @pytest.mark.asyncio
+async def test_execute_with_group_gates_creates_group_commits_acks_exact_target_and_destroys_group() -> None:
+    event_id = uuid4()
+    artifact_id = uuid4()
+    redis_client = FakeRedisClient([(STREAM_ID, _message_fields(event_id, artifact_id))])
+    database = FakeDatabase(
+        event=_event(event_id, artifact_id),
+        counters=BoundedBundleAssemblerCounters(),
+    )
+    database_builder = FakeDatabaseBuilder(database)
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeTemporaryGroupRedisBuilder(redis_client),
+        database_builder=database_builder,
+    )
+
+    report = result.to_sanitized_dict()
+    assert result.ok is True
+    assert report["status"] == "assembled"
+    assert report["redis_group_create_allowed"] is True
+    assert report["redis_group_destroy_allowed"] is True
+    assert report["redis_group_create_attempted"] is True
+    assert report["redis_group_destroy_attempted"] is True
+    assert report["redis_group_destroy_succeeded"] is True
+    assert report["redis_group_cleanup_suppressed"] is False
+    assert database_builder.close_commits == [True]
+    assert redis_client.acked == [STREAM_ID]
+    assert len(redis_client.created_groups) == 1
+    assert redis_client.destroyed_groups == redis_client.created_groups
+
+
+@pytest.mark.asyncio
+async def test_xgroup_destroy_failure_is_surfaced_and_sanitized_after_commit_and_ack() -> None:
+    event_id = uuid4()
+    artifact_id = uuid4()
+    redis_client = FakeRedisClient(
+        [(STREAM_ID, _message_fields(event_id, artifact_id))],
+        destroy_error=RuntimeError(RAW_EXCEPTION_DETAIL),
+    )
+    database = FakeDatabase(
+        event=_event(event_id, artifact_id),
+        counters=BoundedBundleAssemblerCounters(),
+    )
+    database_builder = FakeDatabaseBuilder(database)
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeTemporaryGroupRedisBuilder(redis_client),
+        database_builder=database_builder,
+    )
+
+    report = result.to_sanitized_dict()
+    rendered = runner_module.render_sanitized_json(report)
+    assert result.ok is False
+    assert report["status"] == "failed"
+    assert report["error_code"] == "redis_group_destroy_failed"
+    assert report["error_class"] == "RuntimeError"
+    assert report["redis_group_create_attempted"] is True
+    assert report["redis_group_destroy_attempted"] is True
+    assert report["redis_group_destroy_succeeded"] is False
+    assert report["redis_group_cleanup_suppressed"] is True
+    assert database_builder.close_commits == [True]
+    assert redis_client.acked == [STREAM_ID]
+    assert len(redis_client.created_groups) == 1
+    assert redis_client.destroyed_groups == redis_client.created_groups
+    assert RAW_EXCEPTION_DETAIL not in rendered
+
+
+@pytest.mark.asyncio
 async def test_temporary_group_scan_duplicate_target_blocks_without_waiting_for_future_messages() -> None:
     target_event_id = uuid4()
     target_artifact_id = uuid4()
     redis_client = FakeRedisClient(
         [
             ("1710000000001-0", _message_fields(target_event_id, target_artifact_id)),
-            ("1710000000002-0", _message_fields(target_event_id, target_artifact_id)),
+            ("1710000000011-0", _message_fields(target_event_id, target_artifact_id)),
         ]
     )
 
     result = await asyncio.wait_for(
         run_bounded_bundle_assembler(
-            _approved_config(event_id=target_event_id, scan_limit=25),
+            _approved_config(event_id=target_event_id, scan_limit=25, redis_message_id_suffix="1-0"),
             runtime_config_loader=_runtime_config,
             redis_builder=FakeTemporaryGroupRedisBuilder(redis_client),
         ),

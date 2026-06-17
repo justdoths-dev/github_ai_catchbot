@@ -6,6 +6,7 @@ import pytest
 
 from services.evidence_assembler.config import EvidenceAssemblerConfig
 from services.evidence_assembler.models import (
+    AnalysisRequestedOutboxRecord,
     BundleRefreshTarget,
     CandidateGroupRecord,
     CandidateMemberRecord,
@@ -29,6 +30,7 @@ class FakeRepository:
         self.artifact_id = uuid4()
         self.snapshot_id = uuid4()
         self.existing_bundle_id = uuid4()
+        self.existing_analysis_event_id = uuid4()
         self.current_bundle_updates = []
         self.appended_bundles = []
         self.outbox = []
@@ -82,6 +84,13 @@ class FakeRepository:
             True,
         )
 
+    async def load_analysis_requested_outbox(self, **kwargs):
+        return AnalysisRequestedOutboxRecord(event_id=self.existing_analysis_event_id, created=False)
+
+    async def insert_analysis_requested_outbox(self, **kwargs):
+        self.outbox.append(kwargs)
+        return AnalysisRequestedOutboxRecord(event_id=self.existing_analysis_event_id, created=False)
+
     async def update_current_bundle(self, **kwargs):
         self.current_bundle_updates.append(kwargs)
 
@@ -100,6 +109,7 @@ async def test_existing_bundle_is_reused_without_analysis_reemit() -> None:
     assert result.bundle_id == repository.existing_bundle_id
     assert result.reused_existing_bundle is True
     assert result.emitted_analysis_requested is False
+    assert result.analysis_requested_event_id == repository.existing_analysis_event_id
     assert repository.current_bundle_updates[0]["bundle_id"] == repository.existing_bundle_id
     assert repository.appended_bundles == []
-    assert repository.outbox == []
+    assert len(repository.outbox) == 1

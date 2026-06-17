@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from services.evidence_assembler.config import EvidenceAssemblerConfig
 from services.evidence_assembler.models import (
+    AnalysisRequestedOutboxRecord,
     BundleRefreshTarget,
     CandidateGroupRecord,
     CandidateMemberRecord,
@@ -142,6 +143,15 @@ class FakeRepository:
                 )
         return None
 
+    async def load_analysis_requested_outbox(self, **kwargs):
+        for item in self.outbox:
+            if (
+                item["candidate_group_id"] == kwargs["candidate_group_id"]
+                and item["bundle_id"] == kwargs["bundle_id"]
+            ):
+                return AnalysisRequestedOutboxRecord(event_id=item["event_id"], created=False)
+        return None
+
     async def next_bundle_version(self, candidate_group_id):
         return 1 + sum(1 for _, draft in self.bundles if draft.candidate_group_id == candidate_group_id)
 
@@ -154,7 +164,13 @@ class FakeRepository:
         self.current_bundle_updates.append(kwargs)
 
     async def insert_analysis_requested_outbox(self, **kwargs):
+        existing = await self.load_analysis_requested_outbox(**kwargs)
+        if existing is not None:
+            return existing
+        event_id = uuid4()
+        kwargs["event_id"] = event_id
         self.outbox.append(kwargs)
+        return AnalysisRequestedOutboxRecord(event_id=event_id, created=True)
 
 
 def add_candidate(repository: FakeRepository, *, candidate_group_id, primary_artifact_id, artifact_type):

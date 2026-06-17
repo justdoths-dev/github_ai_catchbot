@@ -34,14 +34,11 @@ async def test_ready_snapshot_produces_ready_bundle_and_analysis_requested_hando
     assert bundle.judge_profile == "github_primary"
     assert bundle.judge_profile in ALLOWED_JUDGE_PROFILES
     assert len(bundle.members) == 1
-    assert repository.outbox == [
-        {
-            "candidate_group_id": candidate_group_id,
-            "bundle_id": bundle_id,
-            "judge_profile": "github_primary",
-            "escalation_allowed": True,
-        }
-    ]
+    assert len(repository.outbox) == 1
+    assert repository.outbox[0]["candidate_group_id"] == candidate_group_id
+    assert repository.outbox[0]["bundle_id"] == bundle_id
+    assert repository.outbox[0]["judge_profile"] == "github_primary"
+    assert repository.outbox[0]["escalation_allowed"] is True
 
 
 @pytest.mark.asyncio

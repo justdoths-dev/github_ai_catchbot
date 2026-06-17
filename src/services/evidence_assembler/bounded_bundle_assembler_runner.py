@@ -10,14 +10,16 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from .config import EvidenceAssemblerConfig, EvidenceAssemblerConfigurationError
-from .models import AssemblyResult, BundleRefreshTarget, EvidenceBundleDraft
+from .models import AssemblyResult, BundleRefreshTarget, EvidenceBundleDraft, EvidenceBundlePreview
 from .repositories import EvidenceAssemblerRepository
 from .service import EvidenceAssemblerService
 
 
-SCHEMA_VERSION = "bounded_evidence_assembler_job_runner_v1"
+SCHEMA_VERSION = "bounded_candidate_bundle_to_analysis_route_one_shot_v1"
 RUNNER_NAME = "bounded_evidence_assembler_job_runner"
-MODE = "bundle_assembly_one_shot"
+MODE = "candidate_bundle_to_analysis_route_one_shot"
+PREVIEW_MODE = "preview"
+EXECUTE_MODE = "execute"
 QUEUE_NAME = "q.candidate.bundle"
 STAGE_NAME = "bundle"
 ROOT_OBJECT_TYPE = "artifact"
@@ -66,15 +68,20 @@ REQUIRED_EVENT_PAYLOAD_FIELDS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class BoundedBundleAssemblerConfig:
+    run_mode: str = PREVIEW_MODE
     operator_approved: bool = False
     allow_runtime_config: bool = False
+    allow_database_read: bool = False
+    allow_database_write_for_evidence_bundle_only: bool = False
+    allow_redis_read: bool = False
     allow_redis_consume: bool = False
-    allow_database_write: bool = False
+    allow_redis_group_create: bool = False
+    allow_redis_group_destroy: bool = False
     allow_redis_ack: bool = False
-    trigger_event_id: UUID | None = None
-    artifact_id: UUID | None = None
-    redis_message_id: str | None = None
+    queue_name: str | None = None
+    redis_message_id_suffix: str | None = None
     trigger_event_suffix: str | None = None
+    candidate_group_suffix: str | None = None
     max_messages: int = DEFAULT_MAX_MESSAGES
     scan_limit: int = DEFAULT_SCAN_LIMIT
     candidate_fanout_limit: int = DEFAULT_CANDIDATE_FANOUT_LIMIT
@@ -96,12 +103,17 @@ class BoundedBundleAssemblerRuntimeConfig:
 @dataclass(slots=True)
 class BoundedBundleAssemblerState:
     runtime_config_loaded: bool = False
+    redis_read_attempted: bool = False
     redis_consume_attempted: bool = False
+    redis_group_create_attempted: bool = False
     redis_group_created: bool = False
+    redis_group_destroy_attempted: bool = False
+    redis_group_destroy_succeeded: bool = False
     redis_cleanup_attempted: bool = False
     redis_cleanup_suppressed: bool = False
     redis_ack_attempted: bool = False
     database_session_opened: bool = False
+    database_read_attempted: bool = False
     database_write_attempted: bool = False
     event_outbox_read_attempted: bool = False
     trigger_suffix_lookup_attempted: bool = False
@@ -111,11 +123,17 @@ class BoundedBundleAssemblerState:
 class BoundedBundleAssemblerCounters:
     candidate_groups_seen: int = 0
     candidate_groups_processed: int = 0
+    current_bundle_count_before: int = 0
+    bundle_input_existing_count: int = 0
+    bundle_input_new_count: int = 0
     bundles_written_count: int = 0
     bundle_members_written_count: int = 0
     current_bundle_updates_count: int = 0
     reroot_events_written_count: int = 0
     analysis_requested_outbox_count: int = 0
+    analysis_requested_existing_count: int = 0
+    analysis_requested_would_emit_count: int = 0
+    analysis_route_publish_possible_count: int = 0
     existing_bundle_reused_count: int = 0
     ready_for_analysis_count: int = 0
 
@@ -161,6 +179,7 @@ class TriggerEventContract:
     snapshot_status: str
     content_anchor_present: bool
     impacted_candidate_group_count: int
+    selected_candidate_group_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +194,7 @@ class BoundedBundleAssemblerResult:
     target_trigger_event_id_suffix: str | None = None
     target_artifact_id_suffix: str | None = None
     redis_message_id_suffix: str | None = None
+    target_candidate_group_suffix: str | None = None
     target_snapshot_id_suffix: str | None = None
     target_snapshot_type: str | None = None
     target_snapshot_status: str | None = None
@@ -191,6 +211,7 @@ class BoundedBundleAssemblerResult:
             "schema_version": SCHEMA_VERSION,
             "runner_name": RUNNER_NAME,
             "mode": MODE,
+            "run_mode": self.config.run_mode,
             "ok": self.ok,
             "status": self.status,
             "error_code": self.error_code,
@@ -198,6 +219,7 @@ class BoundedBundleAssemblerResult:
             "target_trigger_event_id_suffix": self.target_trigger_event_id_suffix,
             "target_artifact_id_suffix": self.target_artifact_id_suffix,
             "redis_message_id_suffix": self.redis_message_id_suffix,
+            "target_candidate_group_suffix": self.target_candidate_group_suffix,
             "target_snapshot_id_suffix": self.target_snapshot_id_suffix,
             "target_snapshot_type": self.target_snapshot_type,
             "target_snapshot_status": self.target_snapshot_status,
@@ -207,36 +229,62 @@ class BoundedBundleAssemblerResult:
             "messages_matched": self.messages_matched,
             "messages_processed": self.messages_processed_count,
             "messages_processed_count": self.messages_processed_count,
+            "candidate_target_count": self.counters.candidate_groups_seen,
             "candidate_groups_seen": self.counters.candidate_groups_seen,
             "candidate_groups_processed": self.counters.candidate_groups_processed,
+            "current_bundle_count_before": self.counters.current_bundle_count_before,
+            "bundle_input_existing_count": self.counters.bundle_input_existing_count,
+            "bundle_input_new_count": self.counters.bundle_input_new_count,
             "bundles_written_count": self.counters.bundles_written_count,
             "bundle_members_written_count": self.counters.bundle_members_written_count,
             "current_bundle_updates_count": self.counters.current_bundle_updates_count,
             "reroot_events_written_count": self.counters.reroot_events_written_count,
             "analysis_requested_outbox_count": self.counters.analysis_requested_outbox_count,
+            "analysis_requested_existing_count": self.counters.analysis_requested_existing_count,
+            "analysis_requested_would_emit_count": self.counters.analysis_requested_would_emit_count,
+            "analysis_route_publish_possible_count": self.counters.analysis_route_publish_possible_count,
             "existing_bundle_reused_count": self.counters.existing_bundle_reused_count,
             "ready_for_analysis_count": self.counters.ready_for_analysis_count,
+            "ready_for_analysis_would_be_true": self.counters.ready_for_analysis_count > 0,
+            "analysis_requested_would_be_emitted": self.counters.analysis_requested_would_emit_count > 0,
+            "analysis_route_publish_possible_if_gate_supported": self.counters.analysis_route_publish_possible_count > 0,
             "ready_for_analysis": {
                 "count": self.counters.ready_for_analysis_count,
                 "candidate_groups_seen": self.counters.candidate_groups_seen,
             },
+            "redis_read_attempted": self.state.redis_read_attempted,
             "redis_consume_attempted": self.state.redis_consume_attempted,
+            "redis_group_create_allowed": self.config.allow_redis_group_create,
+            "redis_group_destroy_allowed": self.config.allow_redis_group_destroy,
+            "redis_group_create_attempted": self.state.redis_group_create_attempted,
+            "redis_group_destroy_attempted": self.state.redis_group_destroy_attempted,
+            "redis_group_destroy_succeeded": self.state.redis_group_destroy_succeeded,
+            "redis_group_cleanup_suppressed": self.state.redis_cleanup_suppressed,
             "redis_ack_attempted": self.state.redis_ack_attempted,
             "redis_ack_status": self.redis_ack_status,
             "redis_acked_count": self.redis_acked_count,
+            "database_read_attempted": self.state.database_read_attempted,
             "database_write_attempted": self.state.database_write_attempted,
             "event_outbox_read_attempted": self.state.event_outbox_read_attempted,
             "gates": {
                 "operator_approved": self.config.operator_approved,
                 "runtime_config_allowed": self.config.allow_runtime_config,
+                "database_read_allowed": self.config.allow_database_read,
+                "database_write_for_evidence_bundle_only_allowed": (
+                    self.config.allow_database_write_for_evidence_bundle_only
+                ),
+                "redis_read_allowed": self.config.allow_redis_read,
                 "redis_consume_allowed": self.config.allow_redis_consume,
-                "database_write_allowed": self.config.allow_database_write,
+                "redis_group_create_allowed": self.config.allow_redis_group_create,
+                "redis_group_destroy_allowed": self.config.allow_redis_group_destroy,
                 "redis_ack_allowed": self.config.allow_redis_ack,
+                "queue_name": self.config.queue_name,
                 "max_messages": self.config.max_messages,
                 "scan_limit": self.config.scan_limit,
                 "candidate_fanout_limit": self.config.candidate_fanout_limit,
             },
             "side_effects": {
+                "redis_read": self.state.redis_read_attempted,
                 "redis_consume": self.state.redis_consume_attempted,
                 "redis_ack": self.state.redis_ack_attempted,
                 "redis_mutation": self.state.redis_group_created or self.state.redis_ack_attempted,
@@ -305,6 +353,14 @@ class RedisTargetConsumer(Protocol):
 class RedisTargetConsumerClient(Protocol):
     async def xlen(self, name: str) -> int: ...
 
+    async def xrange(
+        self,
+        name: str,
+        min: str = "-",
+        max: str = "+",
+        count: int | None = None,
+    ) -> Any: ...
+
     async def xgroup_create(
         self,
         name: str,
@@ -347,9 +403,17 @@ class BundleAssemblerDatabase(Protocol):
         state: BoundedBundleAssemblerState,
     ) -> TriggerEventContract: ...
 
+    async def preview(
+        self,
+        trigger_event_id: UUID,
+        selected_candidate_group_id: UUID | None,
+        state: BoundedBundleAssemblerState,
+    ) -> list[EvidenceBundlePreview]: ...
+
     async def assemble(
         self,
         trigger_event_id: UUID,
+        selected_candidate_group_id: UUID | None,
         state: BoundedBundleAssemblerState,
     ) -> list[AssemblyResult]: ...
 
@@ -401,10 +465,34 @@ class TemporaryGroupRedisTargetConsumer:
         config: BoundedBundleAssemblerConfig,
         state: BoundedBundleAssemblerState,
     ) -> tuple[TargetedRedisBundleMessage | None, int, int]:
-        state.redis_consume_attempted = True
+        state.redis_read_attempted = True
         available_messages = await self._client.xlen(self._queue_name)
         if available_messages <= 0:
             return None, 0, 0
+        if config.run_mode == PREVIEW_MODE:
+            messages_seen = 0
+            messages_matched = 0
+            selected: TargetedRedisBundleMessage | None = None
+            scan_limit = min(config.scan_limit, available_messages)
+            raw_entries = await self._client.xrange(self._queue_name, min="-", max="+", count=scan_limit)
+            for message_id, fields in raw_entries or []:
+                messages_seen += 1
+                decoded_fields = _decode_fields(fields)
+                decoded_message_id = str(_decode_value(message_id))
+                if _matches_target(decoded_message_id, decoded_fields, config):
+                    messages_matched += 1
+                    if selected is None:
+                        selected = TargetedRedisBundleMessage(
+                            redis_message_id=decoded_message_id,
+                            fields=decoded_fields,
+                            message=RedisBundleMessage.from_stream_fields(decoded_fields),
+                        )
+                if messages_seen >= scan_limit:
+                    break
+            return selected, messages_seen, messages_matched
+
+        state.redis_consume_attempted = True
+        state.redis_group_create_attempted = True
         await self._client.xgroup_create(self._queue_name, self._group_name, id="0", mkstream=False)
         self._group_created = True
         state.redis_group_created = True
@@ -451,11 +539,14 @@ class TemporaryGroupRedisTargetConsumer:
     async def cleanup(self, state: BoundedBundleAssemblerState) -> None:
         if not self._group_created:
             return
+        state.redis_group_destroy_attempted = True
         state.redis_cleanup_attempted = True
         try:
             await self._client.xgroup_destroy(self._queue_name, self._group_name)
+            state.redis_group_destroy_succeeded = True
         except Exception:
             state.redis_cleanup_suppressed = True
+            raise
 
 
 class CountingEvidenceAssemblerRepository:
@@ -465,10 +556,12 @@ class CountingEvidenceAssemblerRepository:
         counters: BoundedBundleAssemblerCounters,
         *,
         fanout_limit: int,
+        candidate_group_id_filter: UUID | None = None,
     ) -> None:
         self._repository = repository
         self._counters = counters
         self._fanout_limit = fanout_limit
+        self._candidate_group_id_filter = candidate_group_id_filter
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._repository, name)
@@ -481,6 +574,12 @@ class CountingEvidenceAssemblerRepository:
         self._counters.candidate_groups_seen = len(targets)
         if len(targets) > self._fanout_limit:
             raise BoundedBundleAssemblerError("candidate_fanout_limit_exceeded")
+        if self._candidate_group_id_filter is not None:
+            targets = [
+                target
+                for target in targets
+                if target.candidate_group_id == self._candidate_group_id_filter
+            ]
         return targets
 
     async def append_reroot_event(self, **kwargs: Any) -> None:
@@ -497,9 +596,13 @@ class CountingEvidenceAssemblerRepository:
         await self._repository.update_current_bundle(**kwargs)
         self._counters.current_bundle_updates_count += 1
 
-    async def insert_analysis_requested_outbox(self, **kwargs: Any) -> None:
-        await self._repository.insert_analysis_requested_outbox(**kwargs)
-        self._counters.analysis_requested_outbox_count += 1
+    async def insert_analysis_requested_outbox(self, **kwargs: Any) -> Any:
+        record = await self._repository.insert_analysis_requested_outbox(**kwargs)
+        if record.created:
+            self._counters.analysis_requested_outbox_count += 1
+        else:
+            self._counters.analysis_requested_existing_count += 1
+        return record
 
 
 class NoDiscoveredPromotionEvidenceAssemblerService(EvidenceAssemblerService):
@@ -580,6 +683,7 @@ class SqlAlchemyBoundedBundleAssemblerDatabase:
         if row is None:
             raise BoundedBundleAssemblerError("trigger_event_not_found")
 
+        state.database_read_attempted = True
         payload = _json_loads(row["payload_json"]) or {}
         if not isinstance(payload, dict):
             raise BoundedBundleAssemblerError("malformed_event_payload")
@@ -597,16 +701,45 @@ class SqlAlchemyBoundedBundleAssemblerDatabase:
             impacted_candidate_group_count=0,
         )
         _validate_trigger_contract(event=event, selected=selected, config=config)
-        impacted_count = await self._count_impacted_candidate_groups(event.aggregate_id)
-        if impacted_count <= 0:
+        impacted_candidate_group_ids = await self._impacted_candidate_group_ids(event.aggregate_id)
+        if not impacted_candidate_group_ids:
             raise BoundedBundleAssemblerError("candidate_group_not_found")
-        if impacted_count > self._fanout_limit:
+        if len(impacted_candidate_group_ids) > self._fanout_limit:
             raise BoundedBundleAssemblerError("candidate_fanout_limit_exceeded")
-        return replace(event, impacted_candidate_group_count=impacted_count)
+        selected_candidate_group_id = _select_candidate_group(
+            impacted_candidate_group_ids,
+            candidate_group_suffix=config.candidate_group_suffix,
+        )
+        return replace(
+            event,
+            impacted_candidate_group_count=len(impacted_candidate_group_ids),
+            selected_candidate_group_id=selected_candidate_group_id,
+        )
+
+    async def preview(
+        self,
+        trigger_event_id: UUID,
+        selected_candidate_group_id: UUID | None,
+        state: BoundedBundleAssemblerState,
+    ) -> list[EvidenceBundlePreview]:
+        state.database_read_attempted = True
+        repository = CountingEvidenceAssemblerRepository(
+            EvidenceAssemblerRepository(self._session),
+            self._counters,
+            fanout_limit=self._fanout_limit,
+            candidate_group_id_filter=selected_candidate_group_id,
+        )
+        service = NoDiscoveredPromotionEvidenceAssemblerService(
+            self._assembler_config,
+            repository=repository,  # type: ignore[arg-type]
+            logger=self._logger,
+        )
+        return await service.preview_trigger_event(trigger_event_id)
 
     async def assemble(
         self,
         trigger_event_id: UUID,
+        selected_candidate_group_id: UUID | None,
         state: BoundedBundleAssemblerState,
     ) -> list[AssemblyResult]:
         state.database_write_attempted = True
@@ -614,6 +747,7 @@ class SqlAlchemyBoundedBundleAssemblerDatabase:
             EvidenceAssemblerRepository(self._session),
             self._counters,
             fanout_limit=self._fanout_limit,
+            candidate_group_id_filter=selected_candidate_group_id,
         )
         service = NoDiscoveredPromotionEvidenceAssemblerService(
             self._assembler_config,
@@ -622,20 +756,21 @@ class SqlAlchemyBoundedBundleAssemblerDatabase:
         )
         return await service.handle_trigger_event(trigger_event_id)
 
-    async def _count_impacted_candidate_groups(self, artifact_id: UUID) -> int:
+    async def _impacted_candidate_group_ids(self, artifact_id: UUID) -> list[UUID]:
         import sqlalchemy as sa  # type: ignore[import-not-found]
 
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT COUNT(DISTINCT candidate_group_id)
+                SELECT DISTINCT candidate_group_id
                 FROM candidate_group_members
                 WHERE artifact_id = CAST(:artifact_id AS uuid)
+                ORDER BY candidate_group_id
                 """
             ),
             {"artifact_id": str(artifact_id)},
         )
-        return int(result.scalar_one())
+        return [UUID(str(row["candidate_group_id"])) for row in result.mappings().all()]
 
 
 async def build_default_bounded_bundle_assembler_redis_consumer(
@@ -653,13 +788,19 @@ async def build_default_bounded_bundle_assembler_redis_consumer(
     )
 
     async def close() -> None:
-        await consumer.cleanup(state)
-        close_client = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
-        if close_client is None:
-            return
-        result = close_client()
-        if hasattr(result, "__await__"):
-            await result
+        cleanup_error: Exception | None = None
+        try:
+            await consumer.cleanup(state)
+        except Exception as exc:
+            cleanup_error = exc
+        finally:
+            close_client = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
+            if close_client is not None:
+                result = close_client()
+                if hasattr(result, "__await__"):
+                    await result
+        if cleanup_error is not None:
+            raise cleanup_error
 
     return BoundedBundleAssemblerRedisHandle(consumer=consumer, close=close)
 
@@ -744,6 +885,10 @@ async def run_bounded_bundle_assembler(
         return _result("blocked", "scan_limit_out_of_range", config=config, state=state)
     if config.candidate_fanout_limit <= 0 or config.candidate_fanout_limit > HARD_CANDIDATE_FANOUT_LIMIT:
         return _result("blocked", "candidate_fanout_limit_out_of_range", config=config, state=state)
+    if config.run_mode == EXECUTE_MODE and not config.allow_redis_group_create:
+        return _result("blocked", "redis_group_create_not_allowed", config=config, state=state)
+    if config.run_mode == EXECUTE_MODE and not config.allow_redis_group_destroy:
+        return _result("blocked", "redis_group_destroy_not_allowed", config=config, state=state)
     if not config.allow_runtime_config:
         return _result("blocked", "runtime_config_not_allowed", config=config, state=state)
 
@@ -756,11 +901,15 @@ async def run_bounded_bundle_assembler(
     except Exception:
         return _result("blocked", "runtime_config_error", config=config, state=state)
 
-    if not config.allow_redis_consume:
+    if not config.allow_redis_read:
+        return _result("blocked", "redis_read_not_allowed", config=config, state=state)
+    if config.run_mode == EXECUTE_MODE and not config.allow_redis_consume:
         return _result("blocked", "redis_consume_not_allowed", config=config, state=state)
-    if not config.allow_database_write:
-        return _result("blocked", "database_write_not_allowed", config=config, state=state)
-    if not config.allow_redis_ack:
+    if not config.allow_database_read:
+        return _result("blocked", "database_read_not_allowed", config=config, state=state)
+    if config.run_mode == EXECUTE_MODE and not config.allow_database_write_for_evidence_bundle_only:
+        return _result("blocked", "database_write_for_evidence_bundle_only_not_allowed", config=config, state=state)
+    if config.run_mode == EXECUTE_MODE and not config.allow_redis_ack:
         return _result("blocked", "redis_ack_not_allowed", config=config, state=state)
 
     redis_handle: BoundedBundleAssemblerRedisHandle | None = None
@@ -820,20 +969,56 @@ async def run_bounded_bundle_assembler(
             config.candidate_fanout_limit,
         )
         try:
-            if config.trigger_event_suffix is not None:
-                resolved_event_id = await database_handle.database.resolve_trigger_event_suffix(
-                    config.trigger_event_suffix,
-                    state,
-                )
-                if resolved_event_id != _uuid_or_none(selected.message.trigger_event_id):
-                    raise BoundedBundleAssemblerError("trigger_event_suffix_mismatch")
+            resolved_event_id = await database_handle.database.resolve_trigger_event_suffix(
+                config.trigger_event_suffix or "",
+                state,
+            )
+            if resolved_event_id != _uuid_or_none(selected.message.trigger_event_id):
+                raise BoundedBundleAssemblerError("trigger_event_suffix_mismatch")
             trigger_event = await database_handle.database.validate_trigger_event(selected, config, state)
             if trigger_event.impacted_candidate_group_count <= 0:
                 raise BoundedBundleAssemblerError("candidate_group_not_found")
             if trigger_event.impacted_candidate_group_count > config.candidate_fanout_limit:
                 raise BoundedBundleAssemblerError("candidate_fanout_limit_exceeded")
             database_handle.counters.candidate_groups_seen = trigger_event.impacted_candidate_group_count
-            assembly_results = await database_handle.database.assemble(trigger_event.event_id, state)
+            if config.run_mode == PREVIEW_MODE:
+                preview_results = await database_handle.database.preview(
+                    trigger_event.event_id,
+                    trigger_event.selected_candidate_group_id,
+                    state,
+                )
+                _apply_preview_results(database_handle.counters, preview_results)
+                if database_handle.counters.candidate_groups_processed <= 0:
+                    result = _result(
+                        "blocked",
+                        "candidate_group_not_processed",
+                        config=config,
+                        state=state,
+                        selected=selected,
+                        trigger_event=trigger_event,
+                        messages_seen=messages_seen,
+                        messages_matched=messages_matched,
+                        counters=database_handle.counters,
+                    )
+                    raise _BoundedBundleAssemblerResultReady
+                result = _result(
+                    "previewed",
+                    None,
+                    config=config,
+                    state=state,
+                    selected=selected,
+                    trigger_event=trigger_event,
+                    messages_seen=messages_seen,
+                    messages_matched=messages_matched,
+                    counters=database_handle.counters,
+                )
+                raise _BoundedBundleAssemblerResultReady
+
+            assembly_results = await database_handle.database.assemble(
+                trigger_event.event_id,
+                trigger_event.selected_candidate_group_id,
+                state,
+            )
             _apply_assembly_results(database_handle.counters, assembly_results)
             if database_handle.counters.candidate_groups_processed <= 0:
                 result = _result(
@@ -848,6 +1033,8 @@ async def run_bounded_bundle_assembler(
                     counters=database_handle.counters,
                 )
                 raise _BoundedBundleAssemblerResultReady
+        except _BoundedBundleAssemblerResultReady:
+            raise
         except BoundedBundleAssemblerError as exc:
             result = _result(
                 "blocked",
@@ -978,8 +1165,18 @@ async def run_bounded_bundle_assembler(
         if redis_handle is not None:
             try:
                 await redis_handle.close()
-            except Exception:
+            except Exception as exc:
                 state.redis_cleanup_suppressed = True
+                result = _redis_cleanup_failure_result(
+                    result,
+                    exc,
+                    config=config,
+                    state=state,
+                    selected=selected,
+                    trigger_event=trigger_event,
+                    messages_seen=messages_seen,
+                    messages_matched=messages_matched,
+                )
 
     assert result is not None
     return result
@@ -1036,25 +1233,27 @@ def _result(
     counters: BoundedBundleAssemblerCounters | None = None,
 ) -> BoundedBundleAssemblerResult:
     effective_counters = counters or BoundedBundleAssemblerCounters()
-    trigger_event_id = config.trigger_event_id
-    artifact_id = config.artifact_id
-    redis_message_id = config.redis_message_id
+    trigger_event_id: UUID | None = None
+    artifact_id: UUID | None = None
+    redis_message_id: str | None = None
+    candidate_group_id: UUID | None = None
     snapshot_id: UUID | None = None
     snapshot_type: str | None = None
     snapshot_status: str | None = None
     if selected is not None:
         redis_message_id = selected.redis_message_id
-        trigger_event_id = _uuid_or_none(selected.message.trigger_event_id) or trigger_event_id
-        artifact_id = _uuid_or_none(selected.message.root_object_id) or artifact_id
+        trigger_event_id = _uuid_or_none(selected.message.trigger_event_id)
+        artifact_id = _uuid_or_none(selected.message.root_object_id)
     if trigger_event is not None:
         trigger_event_id = trigger_event.event_id
         artifact_id = trigger_event.aggregate_id
+        candidate_group_id = trigger_event.selected_candidate_group_id
         snapshot_id = trigger_event.snapshot_id
         snapshot_type = trigger_event.snapshot_type or None
         snapshot_status = trigger_event.snapshot_status or None
     return BoundedBundleAssemblerResult(
         status=status,
-        ok=status == "assembled" and error_code is None,
+        ok=status in {"previewed", "assembled"} and error_code is None,
         error_code=error_code,
         error_class=error_class,
         config=config,
@@ -1063,6 +1262,7 @@ def _result(
         target_trigger_event_id_suffix=_optional_id_suffix(trigger_event_id),
         target_artifact_id_suffix=_optional_id_suffix(artifact_id),
         redis_message_id_suffix=_optional_id_suffix(redis_message_id),
+        target_candidate_group_suffix=_optional_id_suffix(candidate_group_id),
         target_snapshot_id_suffix=_optional_id_suffix(snapshot_id),
         target_snapshot_type=snapshot_type,
         target_snapshot_status=snapshot_status,
@@ -1106,6 +1306,57 @@ def _close_failure_result(
     )
 
 
+def _redis_cleanup_failure_result(
+    result: BoundedBundleAssemblerResult | None,
+    exc: Exception,
+    *,
+    config: BoundedBundleAssemblerConfig,
+    state: BoundedBundleAssemblerState,
+    selected: TargetedRedisBundleMessage | None,
+    trigger_event: TriggerEventContract | None,
+    messages_seen: int,
+    messages_matched: int,
+) -> BoundedBundleAssemblerResult:
+    group_destroy_failed = (
+        state.redis_group_created
+        and state.redis_group_destroy_attempted
+        and not state.redis_group_destroy_succeeded
+    )
+    if not group_destroy_failed:
+        if result is not None:
+            return result
+        return _result(
+            "failed",
+            "redis_cleanup_failed",
+            error_class=_safe_exception_class(exc),
+            config=config,
+            state=state,
+            selected=selected,
+            trigger_event=trigger_event,
+            messages_seen=messages_seen,
+            messages_matched=messages_matched,
+        )
+    if result is None:
+        return _result(
+            "failed",
+            "redis_group_destroy_failed",
+            error_class=_safe_exception_class(exc),
+            config=config,
+            state=state,
+            selected=selected,
+            trigger_event=trigger_event,
+            messages_seen=messages_seen,
+            messages_matched=messages_matched,
+        )
+    return replace(
+        result,
+        status="failed",
+        ok=False,
+        error_code="redis_group_destroy_failed",
+        error_class=_safe_exception_class(exc),
+    )
+
+
 def _apply_assembly_results(
     counters: BoundedBundleAssemblerCounters,
     results: list[AssemblyResult],
@@ -1113,22 +1364,45 @@ def _apply_assembly_results(
     counters.candidate_groups_processed = len(results)
     counters.existing_bundle_reused_count = sum(1 for result in results if result.reused_existing_bundle)
     counters.ready_for_analysis_count = sum(1 for result in results if result.ready_for_analysis)
+    counters.analysis_requested_would_emit_count = sum(
+        1 for result in results if result.emitted_analysis_requested
+    )
+    counters.analysis_route_publish_possible_count = sum(
+        1 for result in results if result.ready_for_analysis and result.analysis_requested_event_id is not None
+    )
+
+
+def _apply_preview_results(
+    counters: BoundedBundleAssemblerCounters,
+    results: list[EvidenceBundlePreview],
+) -> None:
+    counters.candidate_groups_processed = len(results)
+    counters.current_bundle_count_before = sum(1 for result in results if result.current_bundle_present_before)
+    counters.bundle_input_existing_count = sum(1 for result in results if result.bundle_input_existing)
+    counters.bundle_input_new_count = sum(1 for result in results if not result.bundle_input_existing)
+    counters.analysis_requested_existing_count = sum(1 for result in results if result.analysis_requested_existing)
+    counters.analysis_requested_would_emit_count = sum(1 for result in results if result.analysis_requested_would_emit)
+    counters.analysis_route_publish_possible_count = (
+        counters.analysis_requested_existing_count + counters.analysis_requested_would_emit_count
+    )
+    counters.ready_for_analysis_count = sum(1 for result in results if result.ready_for_analysis)
 
 
 def _target_error(config: BoundedBundleAssemblerConfig) -> str | None:
-    selected = [
-        config.trigger_event_id is not None,
-        config.artifact_id is not None,
-        bool(config.redis_message_id),
-        bool(config.trigger_event_suffix),
-    ]
-    count = sum(1 for item in selected if item)
-    if count == 0:
-        return "target_missing"
-    if count > 1:
-        return "target_conflict"
-    if config.trigger_event_suffix is not None and not _is_valid_trigger_event_suffix(config.trigger_event_suffix):
+    if config.run_mode not in {PREVIEW_MODE, EXECUTE_MODE}:
+        return "invalid_mode"
+    if config.queue_name != QUEUE_NAME:
+        return "queue_name_not_allowed"
+    if not config.redis_message_id_suffix:
+        return "redis_message_id_suffix_missing"
+    if not _is_valid_redis_message_id_suffix(config.redis_message_id_suffix):
+        return "invalid_redis_message_id_suffix"
+    if not config.trigger_event_suffix:
+        return "trigger_event_suffix_missing"
+    if not _is_valid_trigger_event_suffix(config.trigger_event_suffix):
         return "invalid_trigger_event_suffix"
+    if config.candidate_group_suffix is not None and not _is_valid_candidate_group_suffix(config.candidate_group_suffix):
+        return "invalid_candidate_group_suffix"
     return None
 
 
@@ -1137,15 +1411,9 @@ def _matches_target(
     fields: Mapping[str, Any],
     config: BoundedBundleAssemblerConfig,
 ) -> bool:
-    if config.redis_message_id:
-        return message_id == config.redis_message_id
-    if config.trigger_event_id is not None:
-        return str(fields.get("trigger_event_id", "")) == str(config.trigger_event_id)
-    if config.artifact_id is not None:
-        return str(fields.get("root_object_id", "")) == str(config.artifact_id)
-    if config.trigger_event_suffix is not None:
-        return str(fields.get("trigger_event_id", "")).lower().endswith(config.trigger_event_suffix.lower())
-    return False
+    return message_id.endswith(config.redis_message_id_suffix or "") and str(
+        fields.get("trigger_event_id", "")
+    ).lower().endswith((config.trigger_event_suffix or "").lower())
 
 
 def _selected_message_contract_error(
@@ -1166,10 +1434,8 @@ def _selected_message_contract_error(
     selected_artifact_id = _uuid_or_none(selected.message.root_object_id)
     if selected_artifact_id is None:
         return "redis_message_contract_invalid"
-    if config.trigger_event_id is not None and selected_trigger_event_id != config.trigger_event_id:
-        return "target_trigger_event_mismatch"
-    if config.artifact_id is not None and selected_artifact_id != config.artifact_id:
-        return "target_artifact_mismatch"
+    if not selected.redis_message_id.endswith(config.redis_message_id_suffix or ""):
+        return "target_redis_message_mismatch"
     if config.trigger_event_suffix is not None and not str(selected_trigger_event_id).lower().endswith(
         config.trigger_event_suffix.lower()
     ):
@@ -1195,8 +1461,6 @@ def _validate_trigger_contract(
         raise BoundedBundleAssemblerError("aggregate_type_not_allowed")
     if event.aggregate_id != selected_artifact_id:
         raise BoundedBundleAssemblerError("aggregate_root_mismatch")
-    if config.artifact_id is not None and event.aggregate_id != config.artifact_id:
-        raise BoundedBundleAssemblerError("target_artifact_mismatch")
     if not all(_payload_field_present(event.payload_json.get(field)) for field in REQUIRED_EVENT_PAYLOAD_FIELDS):
         raise BoundedBundleAssemblerError("malformed_event_payload")
     payload_artifact_id = _payload_uuid(event.payload_json, "artifact_id")
@@ -1204,6 +1468,27 @@ def _validate_trigger_contract(
         raise BoundedBundleAssemblerError("payload_artifact_id_mismatch")
     if _payload_uuid(event.payload_json, "snapshot_id") is None:
         raise BoundedBundleAssemblerError("malformed_event_payload")
+
+
+def _select_candidate_group(
+    candidate_group_ids: list[UUID],
+    *,
+    candidate_group_suffix: str | None,
+) -> UUID | None:
+    if len(candidate_group_ids) == 1 and candidate_group_suffix is None:
+        return candidate_group_ids[0]
+    if candidate_group_suffix is None:
+        raise BoundedBundleAssemblerError("candidate_group_suffix_required")
+    matches = [
+        candidate_group_id
+        for candidate_group_id in candidate_group_ids
+        if str(candidate_group_id).lower().endswith(candidate_group_suffix.lower())
+    ]
+    if not matches:
+        raise BoundedBundleAssemblerError("candidate_group_suffix_not_found")
+    if len(matches) > 1:
+        raise BoundedBundleAssemblerError("candidate_group_suffix_not_unique")
+    return matches[0]
 
 
 def _flatten_stream_entries(raw: Any) -> list[tuple[str, Mapping[str, Any]]]:
@@ -1277,6 +1562,16 @@ def _optional_id_suffix(value: UUID | str | None) -> str | None:
 def _is_valid_trigger_event_suffix(value: str) -> bool:
     stripped = value.strip().lower()
     return 4 <= len(stripped) <= 36 and all(char in "0123456789abcdef-" for char in stripped)
+
+
+def _is_valid_candidate_group_suffix(value: str) -> bool:
+    stripped = value.strip().lower()
+    return 4 <= len(stripped) <= 36 and all(char in "0123456789abcdef-" for char in stripped)
+
+
+def _is_valid_redis_message_id_suffix(value: str) -> bool:
+    stripped = value.strip()
+    return 3 <= len(stripped) <= 64 and all(char in "0123456789-" for char in stripped)
 
 
 def _safe_exception_class(exc: BaseException) -> str:
