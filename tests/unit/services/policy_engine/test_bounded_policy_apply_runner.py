@@ -57,6 +57,7 @@ class FakeRedisClient:
         group_pending: int = 0,
         group_lag: int | None = None,
         group_last_delivered_id: str = "0-0",
+        group_create_error: BaseException | None = None,
         ack_error: BaseException | None = None,
         order: list[str] | None = None,
     ) -> None:
@@ -65,11 +66,13 @@ class FakeRedisClient:
         self.group_pending = group_pending
         self.group_lag = len(self.entries) if group_lag is None else group_lag
         self.group_last_delivered_id = group_last_delivered_id
+        self.group_create_error = group_create_error
         self.ack_error = ack_error
         self.order = order
         self.cursor = 0
         self.xrange_calls: list[dict[str, object]] = []
         self.xinfo_calls = 0
+        self.xgroup_create_calls: list[dict[str, object]] = []
         self.xreadgroup_calls = 0
         self.acked: list[str] = []
 
@@ -108,6 +111,29 @@ class FakeRedisClient:
                 "last-delivered-id": self.group_last_delivered_id,
             }
         ]
+
+    async def xgroup_create(self, name: str, groupname: str, id: str = "$", mkstream: bool = False):
+        assert name == "q.analysis.policy"
+        assert groupname == "policy-engine"
+        assert id == "0-0"
+        assert mkstream is False
+        if self.order is not None:
+            self.order.append("redis:group_create")
+        self.xgroup_create_calls.append(
+            {
+                "name": name,
+                "groupname": groupname,
+                "id": id,
+                "mkstream": mkstream,
+            }
+        )
+        if self.group_create_error is not None:
+            raise self.group_create_error
+        self.group_exists = True
+        self.group_pending = 0
+        self.group_lag = len(self.entries)
+        self.group_last_delivered_id = id
+        return True
 
     async def xreadgroup(
         self,
@@ -308,6 +334,7 @@ def _config(*, mode: str = "execute", **overrides) -> BoundedPolicyApplyConfig:
         "operator_approved": True,
         "allow_runtime_config": True,
         "allow_redis_read": True,
+        "allow_redis_group_create": False,
         "allow_database_read": True,
         "allow_redis_consume": mode == "execute",
         "allow_database_write": mode == "execute",
@@ -526,24 +553,35 @@ def test_gate_failures_before_runtime_config_db_or_redis() -> None:
         assert report["side_effects"]["db_write"] is False
 
 
-def test_preview_has_no_db_write_consume_ack_and_reports_group_metadata() -> None:
+def test_preview_with_group_missing_blocks_without_side_effects_even_when_create_flag_passed() -> None:
     repository = FakeRepository()
     client = FakeRedisClient([_redis_message()], group_exists=False)
 
-    result, client, _ = _run(repository, client=client, config=_config(mode="preview"))
+    result, client, repo_builder = _run(
+        repository,
+        client=client,
+        config=_config(mode="preview", allow_redis_group_create=True),
+    )
     report = result.to_sanitized_dict()
 
-    assert report["ok"] is True
-    assert report["status"] == "preview"
+    assert report["ok"] is False
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "consumer_group_missing"
     assert report["group_name"] == "policy-engine"
     assert report["group_exists"] is False
-    assert report["planned_action"] == "create_analysis_and_notification_intent"
+    assert report["group_create_attempted"] is False
+    assert report["group_created"] is False
+    assert report["group_create_skipped_reason"] == "preview_mode"
+    assert report["planned_action"] == "fail_closed"
     assert report["would_fail_closed"] is True
+    assert client.xgroup_create_calls == []
     assert client.xreadgroup_calls == 0
     assert client.acked == []
+    assert repo_builder.calls == 0
     assert repository.inserted_analyses == []
     assert repository.notification_rows == []
     assert repository.commits == 0
+    assert report["side_effects"]["redis_group_create_called"] is False
     assert report["side_effects"]["redis_consume_called"] is False
     assert report["side_effects"]["redis_ack_called"] is False
     assert report["side_effects"]["db_write"] is False
@@ -613,23 +651,35 @@ def test_skip_creates_analysis_without_notification_intent() -> None:
     assert report["delivery_decision"] == "suppress"
     assert len(repository.inserted_analyses) == 1
     assert repository.notification_rows == []
+    assert report["target_notification_plan_event_suffix"] is None
+    assert report["side_effects"]["q_notification_send_published"] is False
 
 
 def test_existing_analysis_reuse_does_not_duplicate_analysis_or_notification_intent() -> None:
-    repository = FakeRepository(existing_analysis=_existing_analysis())
+    order: list[str] = []
+    repository = FakeRepository(
+        existing_analysis=_existing_analysis(),
+        judge_output=_judge_output(_skip_scores(), model_proposed_verdict="skip"),
+        order=order,
+    )
+    client = FakeRedisClient([_redis_message()], order=order)
 
-    result, client, _ = _run(repository)
+    result, client, _ = _run(repository, client=client)
     report = result.to_sanitized_dict()
 
     assert report["ok"] is True
     assert report["planned_action"] == "reuse_existing_analysis"
     assert report["existing_analysis_found"] is True
+    assert report["verdict"] == "skip"
+    assert report["delivery_decision"] == "suppress"
+    assert report["urgency_profile"] == "suppressed"
     assert report["analysis_written"] is False
     assert report["notification_plan_intent_outbox_written"] is False
     assert repository.inserted_analyses == []
     assert repository.notification_rows == []
     assert repository.commits == 1
     assert client.acked == [REDIS_MESSAGE_ID]
+    assert order == ["db:commit", "redis:ack"]
 
 
 def test_stale_bundle_blocks_before_consume_write_or_ack() -> None:
@@ -724,6 +774,37 @@ def test_notification_plan_created_payload_is_intent_only_without_rendered_teleg
     assert str(CHAT_ID) not in report_text
 
 
+def test_sanitized_report_omits_full_ids_locators_chat_raw_payload_and_dedupe_keys() -> None:
+    repository = FakeRepository(existing_analysis=_existing_analysis())
+
+    result, _, _ = _run(repository)
+    report_text = json.dumps(result.to_sanitized_dict(), ensure_ascii=False)
+
+    forbidden_fragments = {
+        REDIS_MESSAGE_ID,
+        str(POLICY_APPLY_EVENT_ID),
+        str(JUDGE_RUN_ID),
+        str(JUDGE_OUTPUT_ID),
+        str(BUNDLE_ID),
+        str(CANDIDATE_GROUP_ID),
+        str(ANALYSIS_ID),
+        DB_LOCATOR,
+        REDIS_LOCATOR,
+        str(CHAT_ID),
+        RAW_PAYLOAD_SENTINEL,
+        RAW_EXCEPTION_SENTINEL,
+        IDEMPOTENCY_SENTINEL,
+        f"analysis-policy-apply:{JUDGE_RUN_ID}:{JUDGE_OUTPUT_ID}",
+    }
+    for fragment in forbidden_fragments:
+        assert fragment not in report_text
+
+    assert '"target_policy_apply_event_suffix": "3d5b3290"' in report_text
+    assert '"target_judge_run_id_suffix": "7a111d13"' in report_text
+    assert '"target_judge_output_id_suffix": "c7d7ef5e"' in report_text
+    assert '"target_redis_message_id_suffix": "223450-0"' in report_text
+
+
 def test_redis_group_missing_blocks_execute_before_consume_db_or_ack() -> None:
     repository = FakeRepository()
     client = FakeRedisClient([_redis_message()], group_exists=False)
@@ -731,11 +812,105 @@ def test_redis_group_missing_blocks_execute_before_consume_db_or_ack() -> None:
     result, client, repo_builder = _run(repository, client=client)
     report = result.to_sanitized_dict()
 
-    assert report["error_code"] == "consumer_group_missing"
+    assert report["error_code"] == "redis_group_create_not_allowed"
+    assert report["group_create_attempted"] is False
+    assert report["group_created"] is False
+    assert report["group_create_skipped_reason"] == "redis_group_create_not_allowed"
+    assert client.xgroup_create_calls == []
     assert client.xreadgroup_calls == 0
     assert client.acked == []
     assert repo_builder.calls == 0
     assert repository.inserted_analyses == []
+
+
+def test_group_missing_with_create_authority_creates_group_then_reuses_existing_analysis_and_acks() -> None:
+    order: list[str] = []
+    repository = FakeRepository(
+        existing_analysis=_existing_analysis(),
+        judge_output=_judge_output(_skip_scores(), model_proposed_verdict="skip"),
+        order=order,
+    )
+    client = FakeRedisClient([_redis_message()], group_exists=False, order=order)
+
+    result, client, _ = _run(
+        repository,
+        client=client,
+        config=_config(allow_redis_group_create=True),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["ok"] is True
+    assert report["status"] == "applied"
+    assert report["group_create_attempted"] is True
+    assert report["group_created"] is True
+    assert report["group_create_skipped_reason"] is None
+    assert report["group_exists"] is True
+    assert report["group_last_delivered_id_suffix"] == "0-0"
+    assert report["target_is_next_deliverable"] is True
+    assert report["existing_analysis_found"] is True
+    assert report["planned_action"] == "reuse_existing_analysis"
+    assert report["analysis_written"] is False
+    assert report["notification_plan_intent_outbox_written"] is False
+    assert report["verdict"] == "skip"
+    assert report["delivery_decision"] == "suppress"
+    assert report["urgency_profile"] == "suppressed"
+    assert client.xgroup_create_calls == [
+        {
+            "name": "q.analysis.policy",
+            "groupname": "policy-engine",
+            "id": "0-0",
+            "mkstream": False,
+        }
+    ]
+    assert client.xreadgroup_calls == 1
+    assert client.acked == [REDIS_MESSAGE_ID]
+    assert repository.inserted_analyses == []
+    assert repository.notification_rows == []
+    assert repository.commits == 1
+    assert order == ["redis:group_create", "db:commit", "redis:ack"]
+
+
+def test_group_create_denied_when_target_is_not_first_deliverable() -> None:
+    _, non_target_fields = _redis_message(trigger_event_id=str(uuid4()))
+    non_target = "1700000223449-0", non_target_fields
+    repository = FakeRepository(existing_analysis=_existing_analysis())
+    client = FakeRedisClient([non_target, _redis_message()], group_exists=False)
+
+    result, client, repo_builder = _run(
+        repository,
+        client=client,
+        config=_config(allow_redis_group_create=True),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "target_not_first_deliverable_for_group_create"
+    assert report["group_create_attempted"] is False
+    assert report["group_created"] is False
+    assert report["group_create_skipped_reason"] == "target_not_first_deliverable_for_group_create"
+    assert client.xgroup_create_calls == []
+    assert client.xreadgroup_calls == 0
+    assert client.acked == []
+    assert repo_builder.calls == 0
+
+
+def test_group_create_requires_exact_secondary_selector() -> None:
+    repository = FakeRepository()
+    client = FakeRedisClient([_redis_message()], group_exists=False)
+
+    result, client, repo_builder = _run(
+        repository,
+        client=client,
+        config=_config(allow_redis_group_create=True, judge_run_suffix=None, judge_output_suffix=None),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "group_create_exact_selector_missing"
+    assert report["group_create_attempted"] is False
+    assert report["group_create_skipped_reason"] == "group_create_exact_selector_missing"
+    assert client.xgroup_create_calls == []
+    assert repo_builder.calls == 0
 
 
 def test_group_pending_nonzero_blocks_execute() -> None:

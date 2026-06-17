@@ -51,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--operator-approved", action="store_true")
     parser.add_argument("--allow-runtime-config", action="store_true")
     parser.add_argument("--allow-redis-read", action="store_true")
+    parser.add_argument("--allow-redis-group-create", action="store_true")
     parser.add_argument("--allow-database-read", action="store_true")
     parser.add_argument("--allow-redis-consume", action="store_true")
     parser.add_argument("--allow-database-write", action="store_true")
@@ -94,6 +95,7 @@ def run(
             operator_approved=bool(args.operator_approved),
             allow_runtime_config=bool(args.allow_runtime_config),
             allow_redis_read=bool(args.allow_redis_read),
+            allow_redis_group_create=bool(args.allow_redis_group_create),
             allow_database_read=bool(args.allow_database_read),
             allow_redis_consume=bool(args.allow_redis_consume),
             allow_database_write=bool(args.allow_database_write),

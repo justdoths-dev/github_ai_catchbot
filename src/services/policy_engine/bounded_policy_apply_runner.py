@@ -95,6 +95,7 @@ class BoundedPolicyApplyConfig:
     operator_approved: bool = False
     allow_runtime_config: bool = False
     allow_redis_read: bool = False
+    allow_redis_group_create: bool = False
     allow_database_read: bool = False
     allow_redis_consume: bool = False
     allow_database_write: bool = False
@@ -145,6 +146,7 @@ class BoundedPolicyApplyRuntimeConfig:
 class BoundedPolicyApplyState:
     runtime_config_loaded: bool = False
     redis_read_attempted: bool = False
+    redis_group_create_attempted: bool = False
     redis_consume_attempted: bool = False
     redis_ack_attempted: bool = False
     database_session_opened: bool = False
@@ -156,6 +158,8 @@ class BoundedPolicyApplyState:
     group_pending: int | None = None
     group_lag: int | None = None
     group_last_delivered_id_suffix: str | None = None
+    group_created: bool = False
+    group_create_skipped_reason: str | None = None
     target_after_group_last_delivered: bool | None = None
     target_is_next_deliverable: bool | None = None
 
@@ -261,12 +265,16 @@ class BoundedPolicyApplyResult:
             "group_pending": self.state.group_pending,
             "group_lag": self.state.group_lag,
             "group_last_delivered_id_suffix": self.state.group_last_delivered_id_suffix,
+            "group_create_attempted": self.state.redis_group_create_attempted,
+            "group_created": self.state.group_created,
+            "group_create_skipped_reason": self.state.group_create_skipped_reason,
             "target_after_group_last_delivered": self.state.target_after_group_last_delivered,
             "target_is_next_deliverable": self.state.target_is_next_deliverable,
             "gates": {
                 "operator_approved": self.config.operator_approved,
                 "runtime_config_allowed": self.config.allow_runtime_config,
                 "redis_read_allowed": self.config.allow_redis_read,
+                "redis_group_create_allowed": self.config.allow_redis_group_create,
                 "database_read_allowed": self.config.allow_database_read,
                 "redis_consume_allowed": self.config.allow_redis_consume,
                 "database_write_allowed": self.config.allow_database_write,
@@ -275,6 +283,7 @@ class BoundedPolicyApplyResult:
             },
             "side_effects": {
                 "redis_read_called": self.state.redis_read_attempted,
+                "redis_group_create_called": self.state.redis_group_create_attempted,
                 "redis_consume_called": self.state.redis_consume_attempted,
                 "redis_ack_called": self.state.redis_ack_attempted,
                 "db_read": self.state.database_read_attempted,
@@ -327,6 +336,7 @@ class RedisPolicyApplyConsumerClient(Protocol):
     async def xlen(self, name: str) -> int: ...
     async def xrange(self, name: str, min: str = "-", max: str = "+", count: int | None = None) -> Any: ...
     async def xinfo_groups(self, name: str) -> Any: ...
+    async def xgroup_create(self, name: str, groupname: str, id: str = "$", mkstream: bool = False) -> Any: ...
     async def xreadgroup(
         self,
         groupname: str,
@@ -399,6 +409,29 @@ class RedisPolicyApplyConsumer:
         )
         next_entries = _flatten_direct_stream_entries(raw_next)
         state.target_is_next_deliverable = bool(next_entries and next_entries[0][0] == selected.redis_message_id)
+
+    async def target_is_first_deliverable(
+        self,
+        selected: TargetPolicyApplyMessage,
+        state: BoundedPolicyApplyState,
+    ) -> bool:
+        state.redis_read_attempted = True
+        raw_first = await self._client.xrange(self._queue_name, min="-", max="+", count=1)
+        first_entries = _flatten_direct_stream_entries(raw_first)
+        return bool(first_entries and first_entries[0][0] == selected.redis_message_id)
+
+    async def create_group_at_start(self, state: BoundedPolicyApplyState) -> None:
+        if self._queue_name != QUEUE_NAME or self._consumer_group != CONSUMER_GROUP:
+            raise BoundedPolicyApplyError("redis_group_create_target_not_allowed")
+        state.redis_group_create_attempted = True
+        result = await self._client.xgroup_create(
+            self._queue_name,
+            self._consumer_group,
+            id="0-0",
+            mkstream=False,
+        )
+        state.group_created = bool(result) if result is not None else True
+        state.group_create_skipped_reason = None
 
     async def consume_target(
         self,
@@ -740,6 +773,8 @@ async def run_bounded_policy_apply(
 
     if runtime_config.queue_name != QUEUE_NAME:
         return _result("blocked", "queue_not_allowed", config=config, state=state)
+    if runtime_config.consumer_group != CONSUMER_GROUP:
+        return _result("blocked", "consumer_group_not_allowed", config=config, state=state)
 
     redis_handle: BoundedPolicyApplyRedisHandle | None = None
     repository_handle: BoundedPolicyApplyRepositoryHandle | None = None
@@ -810,7 +845,46 @@ async def run_bounded_policy_apply(
         group_error = _group_preflight_error(state)
         if group_error is not None:
             would_fail_closed = True
-            if config.mode == MODE_EXECUTE:
+            if group_error == "consumer_group_missing":
+                group_create_error = await _maybe_create_missing_group(
+                    redis_handle.consumer,
+                    selected=selected,
+                    config=config,
+                    state=state,
+                )
+                if group_create_error is not None:
+                    result = _result(
+                        "blocked",
+                        group_create_error if config.mode == MODE_EXECUTE else group_error,
+                        config=config,
+                        state=state,
+                        selected=selected,
+                        messages_seen=messages_seen,
+                        messages_matched=messages_matched,
+                        planned_action="fail_closed",
+                        would_fail_closed=would_fail_closed,
+                    )
+                    raise _ResultReady
+                await redis_handle.consumer.preflight_group(selected, state)
+                group_error = _group_preflight_error(state)
+                if group_error is not None:
+                    result = _result(
+                        "blocked",
+                        "post_group_create_preflight_failed",
+                        config=config,
+                        state=state,
+                        selected=selected,
+                        messages_seen=messages_seen,
+                        messages_matched=messages_matched,
+                        planned_action="fail_closed",
+                        would_fail_closed=True,
+                    )
+                    raise _ResultReady
+                would_fail_closed = False
+            elif state.group_create_skipped_reason is None:
+                state.group_create_skipped_reason = "group_exists"
+
+            if group_error is not None:
                 result = _result(
                     "blocked",
                     group_error,
@@ -823,6 +897,8 @@ async def run_bounded_policy_apply(
                     would_fail_closed=would_fail_closed,
                 )
                 raise _ResultReady
+        elif state.group_create_skipped_reason is None:
+            state.group_create_skipped_reason = "group_exists"
 
         repository_handle = await (repository_builder or build_default_repository)(
             runtime_config,
@@ -1354,6 +1430,44 @@ def _gate_error(config: BoundedPolicyApplyConfig) -> str | None:
             return "database_write_not_allowed"
         if not config.allow_redis_ack:
             return "redis_ack_not_allowed"
+    return None
+
+
+async def _maybe_create_missing_group(
+    consumer: RedisPolicyApplyConsumer,
+    *,
+    selected: TargetPolicyApplyMessage,
+    config: BoundedPolicyApplyConfig,
+    state: BoundedPolicyApplyState,
+) -> str | None:
+    create_error = _group_create_authority_error(config)
+    if create_error is not None:
+        state.group_create_skipped_reason = create_error
+        return create_error
+    if not await consumer.target_is_first_deliverable(selected, state):
+        state.group_create_skipped_reason = "target_not_first_deliverable_for_group_create"
+        return "target_not_first_deliverable_for_group_create"
+    try:
+        await consumer.create_group_at_start(state)
+    except Exception as exc:
+        state.group_create_skipped_reason = "redis_group_create_failed"
+        raise BoundedPolicyApplyError("redis_group_create_failed") from exc
+    return None
+
+
+def _group_create_authority_error(config: BoundedPolicyApplyConfig) -> str | None:
+    if config.mode != MODE_EXECUTE:
+        return "preview_mode"
+    if not config.operator_approved:
+        return "operator_approval_missing"
+    if not config.allow_runtime_config:
+        return "runtime_config_not_allowed"
+    if not config.allow_redis_read:
+        return "redis_read_not_allowed"
+    if not config.allow_redis_group_create:
+        return "redis_group_create_not_allowed"
+    if not config.trigger_event_suffix or not (config.judge_run_suffix or config.judge_output_suffix):
+        return "group_create_exact_selector_missing"
     return None
 
 
