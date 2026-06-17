@@ -500,7 +500,7 @@ async def test_validator_policy_suppress_path_stops_before_notification_queue() 
     analysis = ledger.analyses[0]
     assert analysis.verdict == "skip"
     assert analysis.delivery_decision == "suppress"
-    assert "verdict_skip" in analysis.reason_codes_json
+    assert "policy_verdict_skip" in analysis.reason_codes_json
     assert ledger.rows_of_type("notification.plan.created.v1") == []
     assert processed == 0
     assert relay_repo.marked_published == []
