@@ -57,6 +57,7 @@ class FakeRedisClient:
         group_pending: int = 0,
         group_lag: int | None = None,
         group_last_delivered_id: str = "0-0",
+        pending_entries: list[dict[str, object]] | None = None,
         group_create_error: BaseException | None = None,
         ack_error: BaseException | None = None,
         order: list[str] | None = None,
@@ -66,12 +67,14 @@ class FakeRedisClient:
         self.group_pending = group_pending
         self.group_lag = len(self.entries) if group_lag is None else group_lag
         self.group_last_delivered_id = group_last_delivered_id
+        self.pending_entries = pending_entries or []
         self.group_create_error = group_create_error
         self.ack_error = ack_error
         self.order = order
         self.cursor = 0
         self.xrange_calls: list[dict[str, object]] = []
         self.xinfo_calls = 0
+        self.xpending_range_calls: list[dict[str, object]] = []
         self.xgroup_create_calls: list[dict[str, object]] = []
         self.xreadgroup_calls = 0
         self.acked: list[str] = []
@@ -88,12 +91,14 @@ class FakeRedisClient:
         count: int | None = None,
     ) -> list[tuple[str, dict[str, object]]]:
         assert name == "q.analysis.policy"
-        assert max == "+"
+        assert max == "+" or max == min
         self.xrange_calls.append({"min": min, "count": count})
         if min == "-":
             entries = self.entries
         elif min.startswith("("):
             entries = [entry for entry in self.entries if _redis_stream_id_greater(entry[0], min[1:])]
+        elif max == min:
+            entries = [entry for entry in self.entries if entry[0] == min]
         else:
             raise AssertionError(f"unexpected xrange min: {min}")
         return entries[: count or len(entries)]
@@ -111,6 +116,29 @@ class FakeRedisClient:
                 "last-delivered-id": self.group_last_delivered_id,
             }
         ]
+
+    async def xpending_range(
+        self,
+        name: str,
+        groupname: str,
+        min: str,
+        max: str,
+        count: int,
+    ) -> list[dict[str, object]]:
+        assert name == "q.analysis.policy"
+        assert groupname == "policy-engine"
+        assert min == "-"
+        assert max == "+"
+        self.xpending_range_calls.append(
+            {
+                "name": name,
+                "groupname": groupname,
+                "min": min,
+                "max": max,
+                "count": count,
+            }
+        )
+        return self.pending_entries[:count]
 
     async def xgroup_create(self, name: str, groupname: str, id: str = "$", mkstream: bool = False):
         assert name == "q.analysis.policy"
@@ -920,7 +948,217 @@ def test_group_pending_nonzero_blocks_execute() -> None:
     result, client, repo_builder = _run(repository, client=client)
     report = result.to_sanitized_dict()
 
-    assert report["error_code"] == "consumer_group_pending_nonzero"
+    assert report["error_code"] == "consumer_group_pending_not_exactly_one"
+    assert report["target_pending_found"] is False
+    assert report["pending_recovery_attempted"] is False
+    assert report["pending_recovery_skipped_reason"] == "consumer_group_pending_not_exactly_one"
+    assert client.xpending_range_calls == [
+        {
+            "name": "q.analysis.policy",
+            "groupname": "policy-engine",
+            "min": "-",
+            "max": "+",
+            "count": 2,
+        }
+    ]
+    assert client.xreadgroup_calls == 0
+    assert client.acked == []
+    assert repo_builder.calls == 0
+
+
+def test_preview_with_exact_pending_target_reports_without_recovery_or_ack() -> None:
+    repository = FakeRepository(existing_analysis=_existing_analysis())
+    client = FakeRedisClient(
+        [_redis_message()],
+        group_pending=1,
+        pending_entries=[
+            {
+                "message_id": REDIS_MESSAGE_ID,
+                "consumer": "bounded-policy-apply-f4bfa3c1",
+                "times_delivered": 1,
+            }
+        ],
+    )
+
+    result, client, repo_builder = _run(repository, client=client, config=_config(mode="preview"))
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "preview_mode"
+    assert report["target_pending_found"] is True
+    assert report["target_pending_consumer"] == "bounded-policy-apply-f4bfa3c1"
+    assert report["target_pending_times_delivered"] == 1
+    assert report["pending_recovery_attempted"] is False
+    assert report["pending_recovery_path"] is None
+    assert report["pending_recovery_skipped_reason"] == "preview_mode"
+    assert client.xreadgroup_calls == 0
+    assert client.acked == []
+    assert repo_builder.calls == 0
+    assert repository.commits == 0
+
+
+def test_execute_with_pending_target_missing_consume_authority_fails_before_runtime() -> None:
+    result = run_bounded_policy_apply_sync(
+        _config(allow_redis_consume=False),
+        runtime_config_loader=_raising_runtime_config,
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "redis_consume_not_allowed"
+    assert report["target_pending_found"] is False
+    assert report["pending_recovery_attempted"] is False
+    assert report["side_effects"]["redis_read_called"] is False
+    assert report["side_effects"]["redis_ack_called"] is False
+
+
+def test_execute_with_pending_target_missing_ack_authority_fails_before_ack() -> None:
+    result = run_bounded_policy_apply_sync(
+        _config(allow_redis_ack=False),
+        runtime_config_loader=_raising_runtime_config,
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "redis_ack_not_allowed"
+    assert report["pending_recovery_attempted"] is False
+    assert report["side_effects"]["redis_read_called"] is False
+    assert report["side_effects"]["redis_ack_called"] is False
+
+
+def test_exact_pending_target_rehydrates_via_xrange_reuses_existing_analysis_and_acks_after_commit() -> None:
+    order: list[str] = []
+    repository = FakeRepository(
+        existing_analysis=_existing_analysis(),
+        judge_output=_judge_output(_skip_scores(), model_proposed_verdict="skip"),
+        order=order,
+    )
+    client = FakeRedisClient(
+        [_redis_message()],
+        group_pending=1,
+        pending_entries=[
+            {
+                "message_id": REDIS_MESSAGE_ID,
+                "consumer": "bounded-policy-apply-f4bfa3c1",
+                "times_delivered": 1,
+            }
+        ],
+        order=order,
+    )
+
+    result, client, _ = _run(repository, client=client)
+    report = result.to_sanitized_dict()
+
+    assert report["ok"] is True
+    assert report["status"] == "applied"
+    assert report["target_pending_found"] is True
+    assert report["target_pending_consumer"] == "bounded-policy-apply-f4bfa3c1"
+    assert report["target_pending_times_delivered"] == 1
+    assert report["pending_recovery_attempted"] is True
+    assert report["pending_recovery_path"] == "xrange_exact_stream_id"
+    assert report["pending_recovery_skipped_reason"] is None
+    assert report["existing_analysis_found"] is True
+    assert report["planned_action"] == "reuse_existing_analysis"
+    assert report["analysis_written"] is False
+    assert report["notification_plan_intent_outbox_written"] is False
+    assert report["verdict"] == "skip"
+    assert report["delivery_decision"] == "suppress"
+    assert report["urgency_profile"] == "suppressed"
+    assert report["redis_ack_status"] == "acked"
+    assert report["redis_acked_count"] == 1
+    assert client.xreadgroup_calls == 0
+    assert {"min": REDIS_MESSAGE_ID, "count": 1} in client.xrange_calls
+    assert client.acked == [REDIS_MESSAGE_ID]
+    assert repository.inserted_analyses == []
+    assert repository.notification_rows == []
+    assert repository.commits == 1
+    assert order == ["db:commit", "redis:ack"]
+
+
+def test_pending_target_selector_mismatch_fails_closed_without_ack() -> None:
+    repository = FakeRepository(
+        existing_analysis=_existing_analysis(),
+        judge_output=_judge_output(_skip_scores(), model_proposed_verdict="skip"),
+    )
+    client = FakeRedisClient(
+        [_redis_message()],
+        group_pending=1,
+        pending_entries=[
+            {
+                "message_id": REDIS_MESSAGE_ID,
+                "consumer": "bounded-policy-apply-f4bfa3c1",
+                "times_delivered": 1,
+            }
+        ],
+    )
+
+    result, client, _ = _run(repository, client=client, config=_config(judge_output_suffix="badc0de"))
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "judge_output_selector_mismatch"
+    assert report["target_pending_found"] is True
+    assert report["pending_recovery_attempted"] is True
+    assert client.xreadgroup_calls == 0
+    assert client.acked == []
+    assert repository.commits == 0
+
+
+def test_non_target_pending_message_is_not_processed_or_acked() -> None:
+    repository = FakeRepository(existing_analysis=_existing_analysis())
+    client = FakeRedisClient(
+        [_redis_message()],
+        group_pending=1,
+        pending_entries=[
+            {
+                "message_id": "1700000223449-0",
+                "consumer": "bounded-policy-apply-other",
+                "times_delivered": 1,
+            }
+        ],
+    )
+
+    result, client, repo_builder = _run(repository, client=client)
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "pending_message_not_target"
+    assert report["target_pending_found"] is False
+    assert report["pending_recovery_attempted"] is False
+    assert report["pending_recovery_skipped_reason"] == "pending_message_not_target"
+    assert client.xreadgroup_calls == 0
+    assert client.acked == []
+    assert repo_builder.calls == 0
+    assert repository.commits == 0
+
+
+def test_multiple_pending_messages_fail_closed_without_touching_non_target() -> None:
+    repository = FakeRepository(existing_analysis=_existing_analysis())
+    client = FakeRedisClient(
+        [_redis_message()],
+        group_pending=2,
+        pending_entries=[
+            {
+                "message_id": REDIS_MESSAGE_ID,
+                "consumer": "bounded-policy-apply-f4bfa3c1",
+                "times_delivered": 1,
+            },
+            {
+                "message_id": "1700000223449-0",
+                "consumer": "bounded-policy-apply-other",
+                "times_delivered": 1,
+            },
+        ],
+    )
+
+    result, client, repo_builder = _run(repository, client=client)
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "consumer_group_pending_not_exactly_one"
+    assert report["target_pending_found"] is False
+    assert report["pending_recovery_attempted"] is False
+    assert client.xpending_range_calls == []
     assert client.xreadgroup_calls == 0
     assert client.acked == []
     assert repo_builder.calls == 0

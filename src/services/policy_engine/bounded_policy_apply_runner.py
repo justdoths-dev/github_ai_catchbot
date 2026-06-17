@@ -162,6 +162,12 @@ class BoundedPolicyApplyState:
     group_create_skipped_reason: str | None = None
     target_after_group_last_delivered: bool | None = None
     target_is_next_deliverable: bool | None = None
+    target_pending_found: bool = False
+    target_pending_consumer: str | None = None
+    target_pending_times_delivered: int | None = None
+    pending_recovery_attempted: bool = False
+    pending_recovery_path: str | None = None
+    pending_recovery_skipped_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +276,12 @@ class BoundedPolicyApplyResult:
             "group_create_skipped_reason": self.state.group_create_skipped_reason,
             "target_after_group_last_delivered": self.state.target_after_group_last_delivered,
             "target_is_next_deliverable": self.state.target_is_next_deliverable,
+            "target_pending_found": self.state.target_pending_found,
+            "target_pending_consumer": self.state.target_pending_consumer,
+            "target_pending_times_delivered": self.state.target_pending_times_delivered,
+            "pending_recovery_attempted": self.state.pending_recovery_attempted,
+            "pending_recovery_path": self.state.pending_recovery_path,
+            "pending_recovery_skipped_reason": self.state.pending_recovery_skipped_reason,
             "gates": {
                 "operator_approved": self.config.operator_approved,
                 "runtime_config_allowed": self.config.allow_runtime_config,
@@ -332,10 +344,25 @@ class _ResultReady(Exception):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class PendingPolicyApplyEntry:
+    redis_message_id: str
+    consumer: str | None
+    times_delivered: int | None
+
+
 class RedisPolicyApplyConsumerClient(Protocol):
     async def xlen(self, name: str) -> int: ...
     async def xrange(self, name: str, min: str = "-", max: str = "+", count: int | None = None) -> Any: ...
     async def xinfo_groups(self, name: str) -> Any: ...
+    async def xpending_range(
+        self,
+        name: str,
+        groupname: str,
+        min: str,
+        max: str,
+        count: int,
+    ) -> Any: ...
     async def xgroup_create(self, name: str, groupname: str, id: str = "$", mkstream: bool = False) -> Any: ...
     async def xreadgroup(
         self,
@@ -409,6 +436,65 @@ class RedisPolicyApplyConsumer:
         )
         next_entries = _flatten_direct_stream_entries(raw_next)
         state.target_is_next_deliverable = bool(next_entries and next_entries[0][0] == selected.redis_message_id)
+
+    async def inspect_pending_target(
+        self,
+        selected: TargetPolicyApplyMessage,
+        state: BoundedPolicyApplyState,
+    ) -> str | None:
+        state.redis_read_attempted = True
+        state.pending_recovery_skipped_reason = None
+        if state.group_exists is not True:
+            state.pending_recovery_skipped_reason = "consumer_group_missing"
+            return "consumer_group_missing"
+        if state.group_pending != 1:
+            state.pending_recovery_skipped_reason = "consumer_group_pending_not_exactly_one"
+            return "consumer_group_pending_not_exactly_one"
+        raw_pending = await self._client.xpending_range(
+            self._queue_name,
+            self._consumer_group,
+            "-",
+            "+",
+            2,
+        )
+        pending_entries = _flatten_pending_entries(raw_pending)
+        if len(pending_entries) != 1:
+            state.pending_recovery_skipped_reason = "consumer_group_pending_not_exactly_one"
+            return "consumer_group_pending_not_exactly_one"
+        pending = pending_entries[0]
+        if pending.redis_message_id != selected.redis_message_id:
+            state.pending_recovery_skipped_reason = "pending_message_not_target"
+            return "pending_message_not_target"
+        state.target_pending_found = True
+        state.target_pending_consumer = pending.consumer
+        state.target_pending_times_delivered = pending.times_delivered
+        return None
+
+    async def recover_pending_target(
+        self,
+        selected: TargetPolicyApplyMessage,
+        config: BoundedPolicyApplyConfig,
+        state: BoundedPolicyApplyState,
+    ) -> TargetPolicyApplyMessage | None:
+        state.pending_recovery_attempted = True
+        state.pending_recovery_path = "xrange_exact_stream_id"
+        raw = await self._client.xrange(
+            self._queue_name,
+            min=selected.redis_message_id,
+            max=selected.redis_message_id,
+            count=1,
+        )
+        entries = _flatten_direct_stream_entries(raw)
+        if len(entries) != 1:
+            state.pending_recovery_skipped_reason = "pending_target_payload_missing"
+            return None
+        message_id, fields = entries[0]
+        decoded_fields = _decode_fields(fields)
+        if message_id != selected.redis_message_id or not _matches_target(message_id, decoded_fields, config):
+            state.pending_recovery_skipped_reason = "pending_target_payload_mismatch"
+            return None
+        state.pending_recovery_skipped_reason = None
+        return TargetPolicyApplyMessage(redis_message_id=message_id, fields=decoded_fields)
 
     async def target_is_first_deliverable(
         self,
@@ -797,6 +883,7 @@ async def run_bounded_policy_apply(
     analysis_written = False
     state_transition_written = False
     notification_outbox_written = False
+    pending_recovery_selected = False
     result: BoundedPolicyApplyResult | None = None
 
     try:
@@ -881,6 +968,33 @@ async def run_bounded_policy_apply(
                     )
                     raise _ResultReady
                 would_fail_closed = False
+            elif group_error == "consumer_group_pending_nonzero":
+                pending_error = await redis_handle.consumer.inspect_pending_target(selected, state)
+                if pending_error is None:
+                    if config.mode != MODE_EXECUTE:
+                        state.pending_recovery_skipped_reason = "preview_mode"
+                    elif not (config.judge_run_suffix or config.judge_output_suffix):
+                        state.pending_recovery_skipped_reason = "pending_recovery_exact_selector_missing"
+                    else:
+                        recovered = await redis_handle.consumer.recover_pending_target(selected, config, state)
+                        if recovered is not None:
+                            selected = recovered
+                            pending_recovery_selected = True
+                            group_error = None
+                            would_fail_closed = False
+                if group_error is not None:
+                    result = _result(
+                        "blocked",
+                        state.pending_recovery_skipped_reason or pending_error or group_error,
+                        config=config,
+                        state=state,
+                        selected=selected,
+                        messages_seen=messages_seen,
+                        messages_matched=messages_matched,
+                        planned_action="fail_closed",
+                        would_fail_closed=True,
+                    )
+                    raise _ResultReady
             elif state.group_create_skipped_reason is None:
                 state.group_create_skipped_reason = "group_exists"
 
@@ -1064,34 +1178,35 @@ async def run_bounded_policy_apply(
             )
             raise _ResultReady
 
-        consumed, consume_seen, consume_matched = await redis_handle.consumer.consume_target(config, state)
-        if (
-            consumed is None
-            or consume_seen != 1
-            or consume_matched != 1
-            or consumed.redis_message_id != selected.redis_message_id
-        ):
-            result = _result(
-                "blocked",
-                "target_message_not_consumable_exactly",
-                config=config,
-                state=state,
-                selected=selected,
-                event=event,
-                candidate=candidate,
-                judge_run=judge_run,
-                judge_output=judge_output,
-                bundle=bundle,
-                existing_analysis=existing_analysis,
-                analysis_id=analysis_id,
-                analysis=analysis,
-                evaluation=evaluation,
-                messages_seen=messages_seen,
-                messages_matched=messages_matched,
-                planned_action="fail_closed",
-                would_fail_closed=True,
-            )
-            raise _ResultReady
+        if not pending_recovery_selected:
+            consumed, consume_seen, consume_matched = await redis_handle.consumer.consume_target(config, state)
+            if (
+                consumed is None
+                or consume_seen != 1
+                or consume_matched != 1
+                or consumed.redis_message_id != selected.redis_message_id
+            ):
+                result = _result(
+                    "blocked",
+                    "target_message_not_consumable_exactly",
+                    config=config,
+                    state=state,
+                    selected=selected,
+                    event=event,
+                    candidate=candidate,
+                    judge_run=judge_run,
+                    judge_output=judge_output,
+                    bundle=bundle,
+                    existing_analysis=existing_analysis,
+                    analysis_id=analysis_id,
+                    analysis=analysis,
+                    evaluation=evaluation,
+                    messages_seen=messages_seen,
+                    messages_matched=messages_matched,
+                    planned_action="fail_closed",
+                    would_fail_closed=True,
+                )
+                raise _ResultReady
 
         if existing_analysis is None:
             state.database_write_attempted = True
@@ -1853,6 +1968,49 @@ def _flatten_group_stream_entries(raw: Any) -> list[tuple[str, Mapping[str, Any]
         for entry in stream_entries:
             if isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[1], Mapping):
                 entries.append((str(_decode_scalar(entry[0])), entry[1]))
+    return entries
+
+
+def _flatten_pending_entries(raw: Any) -> list[PendingPolicyApplyEntry]:
+    if not isinstance(raw, list):
+        return []
+    entries: list[PendingPolicyApplyEntry] = []
+    for item in raw:
+        if isinstance(item, Mapping):
+            message_id = _string_or_none(
+                item.get("message_id")
+                or item.get("message-id")
+                or item.get("id")
+                or item.get("name")
+            )
+            consumer = _string_or_none(item.get("consumer") or item.get("consumername") or item.get("consumer-name"))
+            times_delivered = _int_or_none(
+                item.get("times_delivered")
+                or item.get("times-delivered")
+                or item.get("delivery_count")
+                or item.get("delivery-count")
+            )
+            if message_id is not None:
+                entries.append(
+                    PendingPolicyApplyEntry(
+                        redis_message_id=message_id,
+                        consumer=consumer,
+                        times_delivered=times_delivered,
+                    )
+                )
+            continue
+        if isinstance(item, tuple) and len(item) >= 4:
+            message_id = _string_or_none(item[0])
+            consumer = _string_or_none(item[1])
+            times_delivered = _int_or_none(item[3])
+            if message_id is not None:
+                entries.append(
+                    PendingPolicyApplyEntry(
+                        redis_message_id=message_id,
+                        consumer=consumer,
+                        times_delivered=times_delivered,
+                    )
+                )
     return entries
 
 
