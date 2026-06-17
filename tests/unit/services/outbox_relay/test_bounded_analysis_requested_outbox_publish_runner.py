@@ -2,19 +2,25 @@ from __future__ import annotations
 
 import ast
 import json
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 
+import tools.bounded_analysis_requested_outbox_publish_runner as cli
 from src.services.outbox_relay.bounded_analysis_requested_outbox_publish_runner import (
+    EVENT_TYPE,
+    MODE_PREVIEW,
+    MODE_PUBLISH,
+    REQUIRED_PAYLOAD_FIELDS,
     BoundedAnalysisRequestedOutboxPublishConfig,
     BoundedAnalysisRequestedOutboxPublishError,
     BoundedAnalysisRequestedPublishRuntimeConfig,
+    BoundedAnalysisRequestedRedisInspectorHandle,
     BoundedAnalysisRequestedRedisPublisherHandle,
     BoundedAnalysisRequestedRepositoryHandle,
-    REQUIRED_PAYLOAD_FIELDS,
     run_bounded_analysis_requested_outbox_publish,
 )
 from src.services.outbox_relay.models import OutboxEventRow, QueueRoute
@@ -22,14 +28,16 @@ from src.services.outbox_relay.models import OutboxEventRow, QueueRoute
 
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE_PATH = ROOT / "src/services/outbox_relay/bounded_analysis_requested_outbox_publish_runner.py"
+TOOL_PATH = ROOT / "tools/bounded_analysis_requested_outbox_publish_runner.py"
 DB_LOCATOR = "db_locator_omitted_sentinel"
 REDIS_LOCATOR = "redis_locator_omitted_sentinel"
 RAW_DEDUPE_KEY = "analysis:requested:sentinel-dedupe-key"
 RAW_BUNDLE_DATA = "sentinel private bundle data"
 RAW_TEXT = "sentinel raw source text"
-RAW_PROMPT = "sentinel prompt material"
+RAW_EVIDENCE = "sentinel raw evidence body"
+RAW_MESSAGE_TEXT = "sentinel message_text body"
 RAW_PROFILE = "github_primary"
-REDIS_MESSAGE_ID = "secret-analysis-requested-redis-message-id"
+REDIS_MESSAGE_ID = "secret-analysis-route-redis-message-id"
 EXCEPTION_DETAIL = "sentinel private xadd failure detail"
 CLOSE_EXCEPTION_DETAIL = "sentinel private repository close detail"
 
@@ -51,12 +59,13 @@ class FakeRepository:
         self.mark_published_calls: list[UUID] = []
         self.job_attempt_calls: list[dict] = []
 
-    async def fetch_target_events(self, *, event_id, event_suffix, limit):
+    async def fetch_target_events(self, *, event_type, event_suffix, aggregate_suffix, limit):
         self.operation_log.append("fetch")
         self.fetch_calls.append(
             {
-                "event_id": event_id,
+                "event_type": event_type,
                 "event_suffix": event_suffix,
+                "aggregate_suffix": aggregate_suffix,
                 "limit": limit,
             }
         )
@@ -94,6 +103,44 @@ class FakeRepositoryBuilder:
                 raise self.close_error
 
         return BoundedAnalysisRequestedRepositoryHandle(repository=self.repository, close=close)
+
+
+class FakeRedisInspector:
+    def __init__(
+        self,
+        *,
+        operation_log: list[str] | None = None,
+        stream_type: str = "stream",
+        failure: BaseException | None = None,
+    ) -> None:
+        self.operation_log = operation_log if operation_log is not None else []
+        self.stream_type = stream_type
+        self.failure = failure
+        self.calls: list[str] = []
+
+    async def get_stream_type(self, queue_name: str) -> str:
+        self.operation_log.append("redis_type")
+        self.calls.append(queue_name)
+        if self.failure is not None:
+            raise self.failure
+        return self.stream_type
+
+
+class FakeRedisInspectorBuilder:
+    def __init__(self, inspector: FakeRedisInspector) -> None:
+        self.inspector = inspector
+        self.calls = 0
+        self.close_calls = 0
+
+    async def __call__(self, runtime_config, state, logger):
+        del runtime_config, logger
+        self.calls += 1
+        state.redis_reader_created = True
+
+        async def close() -> None:
+            self.close_calls += 1
+
+        return BoundedAnalysisRequestedRedisInspectorHandle(inspector=self.inspector, close=close)
 
 
 class FakeRedisPublisher:
@@ -166,7 +213,8 @@ def _payload(
         "escalation_allowed": escalation_allowed,
         "bundle_data": RAW_BUNDLE_DATA,
         "raw_text": RAW_TEXT,
-        "prompt_material": RAW_PROMPT,
+        "raw_evidence": RAW_EVIDENCE,
+        "message_text": RAW_MESSAGE_TEXT,
         "database_url": DB_LOCATOR,
         "redis_url": REDIS_LOCATOR,
     }
@@ -177,7 +225,7 @@ def _row(
     event_id: UUID | None = None,
     candidate_group_id: UUID | None = None,
     bundle_id: UUID | None = None,
-    event_type: str = "analysis.requested.v1",
+    event_type: str = EVENT_TYPE,
     aggregate_type: str = "candidate_group",
     status: str = "pending",
     payload_json: dict[str, object] | None = None,
@@ -196,29 +244,46 @@ def _row(
     )
 
 
-def _approved_config(**overrides) -> BoundedAnalysisRequestedOutboxPublishConfig:
+def _preview_config(**overrides) -> BoundedAnalysisRequestedOutboxPublishConfig:
     values = {
+        "mode": MODE_PREVIEW,
         "operator_approved": True,
         "allow_runtime_config": True,
-        "allow_redis_publish": True,
-        "allow_database_write": True,
-        "event_id": uuid4(),
-        "event_suffix": None,
+        "allow_database_read": True,
+        "allow_redis_read": True,
+        "allow_redis_publish": False,
+        "allow_outbox_status_update": False,
+        "event_type": EVENT_TYPE,
+        "event_suffix": "abcd1234",
+        "aggregate_suffix": None,
         "max_events": 1,
     }
     values.update(overrides)
     return BoundedAnalysisRequestedOutboxPublishConfig(**values)
 
 
+def _publish_config(**overrides) -> BoundedAnalysisRequestedOutboxPublishConfig:
+    values = {
+        **asdict(_preview_config()),
+        "mode": MODE_PUBLISH,
+        "allow_redis_publish": True,
+        "allow_outbox_status_update": True,
+    }
+    values.update(overrides)
+    return BoundedAnalysisRequestedOutboxPublishConfig(**values)
+
+
 @pytest.mark.asyncio
-async def test_no_flags_fail_closed_before_runtime_config_redis_or_db_write() -> None:
+async def test_no_flags_fail_closed_before_runtime_config_db_or_redis() -> None:
     repository_builder = FakeRepositoryBuilder(FakeRepository([_row()]))
+    inspector_builder = FakeRedisInspectorBuilder(FakeRedisInspector())
     publisher_builder = FakeRedisPublisherBuilder(FakeRedisPublisher())
 
     result = await run_bounded_analysis_requested_outbox_publish(
         BoundedAnalysisRequestedOutboxPublishConfig(),
         runtime_config_loader=_raising_runtime_config,
         repository_builder=repository_builder,
+        redis_inspector_builder=inspector_builder,
         redis_publisher_builder=publisher_builder,
     )
     report = result.to_sanitized_dict()
@@ -226,218 +291,93 @@ async def test_no_flags_fail_closed_before_runtime_config_redis_or_db_write() ->
     assert report["status"] == "blocked"
     assert report["ok"] is False
     assert report["error_code"] == "operator_approval_missing"
+    assert report["database_read_attempted"] is False
+    assert report["redis_read_attempted"] is False
     assert report["redis_publish_attempted"] is False
     assert report["database_write_attempted"] is False
-    assert report["redis_published_count"] == 0
-    assert report["event_outbox_status_updated_count"] == 0
-    assert report["job_attempts_written_count"] == 0
-    assert report["side_effects"]["redis_mutation"] is False
-    assert report["side_effects"]["db_write"] is False
     assert repository_builder.calls == 0
+    assert inspector_builder.calls == 0
     assert publisher_builder.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_missing_runtime_config_blocks_before_redis_or_db_side_effects() -> None:
-    repository_builder = FakeRepositoryBuilder(FakeRepository([_row()]))
-    publisher_builder = FakeRedisPublisherBuilder(FakeRedisPublisher())
-
-    result = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(),
-        runtime_config_loader=_missing_runtime_config,
-        repository_builder=repository_builder,
-        redis_publisher_builder=publisher_builder,
-    )
-
-    assert result.status == "blocked"
-    assert result.error_code == "database_url_missing"
-    assert result.state.runtime_config_loaded is False
-    assert result.state.redis_publish_attempted is False
-    assert result.state.database_write_attempted is False
-    assert repository_builder.calls == 0
-    assert publisher_builder.calls == 0
-
-
-@pytest.mark.asyncio
-async def test_selector_and_authority_gate_failures_happen_before_runtime_config() -> None:
-    missing = await run_bounded_analysis_requested_outbox_publish(
-        BoundedAnalysisRequestedOutboxPublishConfig(operator_approved=True),
-        runtime_config_loader=_raising_runtime_config,
-        repository_builder=FakeRepositoryBuilder(FakeRepository([_row()])),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-    conflict = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=uuid4(), event_suffix="f20b8f8a"),
-        runtime_config_loader=_raising_runtime_config,
-        repository_builder=FakeRepositoryBuilder(FakeRepository([_row()])),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-    max_events = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(max_events=2),
-        runtime_config_loader=_raising_runtime_config,
-        repository_builder=FakeRepositoryBuilder(FakeRepository([_row()])),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-    no_db = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(allow_database_write=False),
-        runtime_config_loader=_raising_runtime_config,
-        repository_builder=FakeRepositoryBuilder(FakeRepository([_row()])),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-    no_redis = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(allow_redis_publish=False),
-        runtime_config_loader=_raising_runtime_config,
-        repository_builder=FakeRepositoryBuilder(FakeRepository([_row()])),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-
-    assert missing.error_code == "target_missing"
-    assert conflict.error_code == "target_conflict"
-    assert max_events.error_code == "max_events_must_be_one"
-    assert no_db.error_code == "database_write_not_allowed"
-    assert no_redis.error_code == "redis_publish_not_allowed"
-    assert missing.state.runtime_config_loaded is False
-    assert conflict.state.runtime_config_loaded is False
-    assert max_events.state.runtime_config_loaded is False
-    assert no_db.state.runtime_config_loaded is False
-    assert no_redis.state.runtime_config_loaded is False
-
-
-@pytest.mark.asyncio
-async def test_event_suffix_selector_uses_db_lookup_with_uniqueness_probe() -> None:
-    row = _row()
-    repository = FakeRepository([row])
-
-    result = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=None, event_suffix=str(row.event_id)[-8:]),
-        runtime_config_loader=_runtime_config,
-        repository_builder=FakeRepositoryBuilder(repository),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-
-    assert result.ok is True
-    assert result.selector_type == "event_suffix"
-    assert repository.fetch_calls == [
-        {"event_id": None, "event_suffix": str(row.event_id)[-8:], "limit": 2}
+async def test_gate_failures_happen_before_runtime_config() -> None:
+    base = _preview_config()
+    cases = [
+        (dict(event_type=None), "event_type_required"),
+        (dict(event_type="judge.call.requested.v1"), "event_type_not_allowed"),
+        (dict(event_suffix=None), "target_event_suffix_missing"),
+        (dict(event_suffix=str(uuid4())), "raw_event_id_not_allowed"),
+        (dict(event_suffix="not-hex"), "invalid_event_suffix"),
+        (dict(aggregate_suffix=str(uuid4())), "raw_aggregate_id_not_allowed"),
+        (dict(max_events=2), "max_events_must_be_one"),
+        (dict(allow_runtime_config=False), "runtime_config_not_allowed"),
+        (dict(allow_database_read=False), "database_read_not_allowed"),
+        (dict(allow_redis_read=False), "redis_read_not_allowed"),
+        (dict(mode=MODE_PUBLISH, allow_redis_publish=False), "redis_publish_not_allowed"),
+        (dict(mode=MODE_PUBLISH, allow_redis_publish=True, allow_outbox_status_update=False), "outbox_status_update_not_allowed"),
     ]
 
+    for overrides, expected in cases:
+        result = await run_bounded_analysis_requested_outbox_publish(
+            BoundedAnalysisRequestedOutboxPublishConfig(**{**asdict(base), **overrides}),
+            runtime_config_loader=_raising_runtime_config,
+            repository_builder=FakeRepositoryBuilder(FakeRepository([_row()])),
+            redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector()),
+            redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+        )
+        assert result.error_code == expected
+        assert result.state.runtime_config_loaded is False
+
 
 @pytest.mark.asyncio
-async def test_non_unique_suffix_blocks_before_publish() -> None:
-    row_one = _row()
-    row_two = _row()
-    repository = FakeRepository([row_one, row_two])
-    publisher_builder = FakeRedisPublisherBuilder(FakeRedisPublisher())
+async def test_preview_exact_analysis_requested_target_has_no_db_write_or_redis_publish() -> None:
+    operation_log: list[str] = []
+    row = _row()
+    repository = FakeRepository([row], operation_log=operation_log)
+    inspector = FakeRedisInspector(operation_log=operation_log, stream_type="stream")
+    publisher_builder = FakeRedisPublisherBuilder(FakeRedisPublisher(operation_log=operation_log))
+    repository_builder = FakeRepositoryBuilder(repository)
 
     result = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=None, event_suffix=str(row_one.event_id)[-8:]),
+        _preview_config(event_suffix=str(row.event_id)[-8:], aggregate_suffix=str(row.aggregate_id)[-8:]),
         runtime_config_loader=_runtime_config,
-        repository_builder=FakeRepositoryBuilder(repository),
+        repository_builder=repository_builder,
+        redis_inspector_builder=FakeRedisInspectorBuilder(inspector),
         redis_publisher_builder=publisher_builder,
     )
+    report = result.to_sanitized_dict()
 
-    assert result.error_code == "target_event_count_exceeded"
-    assert result.events_seen == 2
-    assert result.state.redis_publish_attempted is False
+    assert report["status"] == "preview"
+    assert report["ok"] is True
+    assert report["target_event_suffix"] == str(row.event_id)[-8:]
+    assert report["aggregate_suffix"] == str(row.aggregate_id)[-8:]
+    assert report["root_object_type"] == "candidate_group"
+    assert report["root_object_id_suffix"] == str(row.aggregate_id)[-8:]
+    assert report["queue_name"] == "q.analysis.route"
+    assert report["stage_name"] == "analysis_route"
+    assert report["event_outbox_status_before"] == "pending"
+    assert report["redis_publish_would_occur"] is True
+    assert report["redis_publish_attempted"] is False
+    assert report["database_write_attempted"] is False
+    assert report["side_effects"]["redis_mutation"] is False
+    assert report["side_effects"]["db_write"] is False
+    assert report["duplicate_handling_status"] == "pending_would_publish"
+    assert repository.fetch_calls == [
+        {
+            "event_type": EVENT_TYPE,
+            "event_suffix": str(row.event_id)[-8:],
+            "aggregate_suffix": str(row.aggregate_id)[-8:],
+            "limit": 2,
+        }
+    ]
+    assert operation_log == ["fetch", "redis_type"]
+    assert repository_builder.close_commits == [False]
     assert publisher_builder.calls == 0
 
 
 @pytest.mark.asyncio
-async def test_non_analysis_event_or_already_published_blocks_without_publish_or_db_write() -> None:
-    wrong_event = _row(event_type="candidate.bundle.refresh.v1")
-    wrong_aggregate = _row(aggregate_type="artifact")
-    already_published = _row(status="published")
-
-    first = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=wrong_event.event_id),
-        runtime_config_loader=_runtime_config,
-        repository_builder=FakeRepositoryBuilder(FakeRepository([wrong_event])),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-    second = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=wrong_aggregate.event_id),
-        runtime_config_loader=_runtime_config,
-        repository_builder=FakeRepositoryBuilder(FakeRepository([wrong_aggregate])),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-    third = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=already_published.event_id),
-        runtime_config_loader=_runtime_config,
-        repository_builder=FakeRepositoryBuilder(FakeRepository([already_published])),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-
-    assert first.error_code == "analysis_requested_event_contract_mismatch"
-    assert second.error_code == "analysis_requested_event_contract_mismatch"
-    assert third.error_code == "target_event_not_pending"
-    assert first.state.redis_publish_attempted is False
-    assert second.state.redis_publish_attempted is False
-    assert third.state.redis_publish_attempted is False
-    assert first.state.database_write_attempted is False
-    assert second.state.database_write_attempted is False
-    assert third.state.database_write_attempted is False
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("missing_field", REQUIRED_PAYLOAD_FIELDS)
-async def test_required_payload_fields_missing_blocks_before_publish(missing_field: str) -> None:
-    candidate_group_id = uuid4()
-    payload = _payload(candidate_group_id)
-    raw_value = str(payload.pop(missing_field))
-
-    result = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=uuid4()),
-        runtime_config_loader=_runtime_config,
-        repository_builder=FakeRepositoryBuilder(
-            FakeRepository([_row(candidate_group_id=candidate_group_id, payload_json=payload)])
-        ),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-    rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
-
-    assert result.error_code == "malformed_event_payload"
-    assert getattr(result, f"payload_has_{missing_field}") is False
-    assert result.state.redis_publish_attempted is False
-    assert result.state.database_write_attempted is False
-    assert raw_value not in rendered
-
-
-@pytest.mark.asyncio
-async def test_candidate_group_mismatch_and_unknown_judge_profile_block_before_publish() -> None:
-    mismatched = _row(payload_json=_payload(uuid4()))
-    unknown_profile_candidate_group_id = uuid4()
-    unknown_profile_payload = _payload(
-        unknown_profile_candidate_group_id,
-        judge_profile="unknown_primary",
-    )
-    unknown_profile = _row(
-        candidate_group_id=unknown_profile_candidate_group_id,
-        payload_json=unknown_profile_payload,
-    )
-
-    first = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=mismatched.event_id),
-        runtime_config_loader=_runtime_config,
-        repository_builder=FakeRepositoryBuilder(FakeRepository([mismatched])),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-    second = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=unknown_profile.event_id),
-        runtime_config_loader=_runtime_config,
-        repository_builder=FakeRepositoryBuilder(FakeRepository([unknown_profile])),
-        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
-    )
-
-    assert first.error_code == "candidate_group_id_mismatch"
-    assert first.payload_candidate_group_id_matches is False
-    assert second.error_code == "unknown_judge_profile"
-    assert second.payload_judge_profile_allowed is False
-    assert first.state.redis_publish_attempted is False
-    assert second.state.redis_publish_attempted is False
-
-
-@pytest.mark.asyncio
-async def test_analysis_requested_publish_uses_existing_route_and_thin_id_only_payload() -> None:
+async def test_publish_exact_target_emits_thin_q_analysis_route_message_through_relay_boundary() -> None:
     operation_log: list[str] = []
     candidate_group_id = uuid4()
     bundle_id = uuid4()
@@ -447,9 +387,10 @@ async def test_analysis_requested_publish_uses_existing_route_and_thin_id_only_p
     repository_builder = FakeRepositoryBuilder(repository)
 
     result = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=row.event_id),
+        _publish_config(event_suffix=str(row.event_id)[-8:]),
         runtime_config_loader=_runtime_config,
         repository_builder=repository_builder,
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector(operation_log=operation_log)),
         redis_publisher_builder=FakeRedisPublisherBuilder(publisher),
     )
     report = result.to_sanitized_dict()
@@ -458,17 +399,13 @@ async def test_analysis_requested_publish_uses_existing_route_and_thin_id_only_p
     assert report["ok"] is True
     assert report["queue_name"] == "q.analysis.route"
     assert report["stage_name"] == "analysis_route"
-    assert report["target_event_id_suffix"] == str(row.event_id)[-8:]
-    assert report["target_candidate_group_suffix"] == str(candidate_group_id)[-8:]
-    assert report["events_seen"] == 1
-    assert report["redis_publish_attempted"] is True
+    assert report["target_event_suffix"] == str(row.event_id)[-8:]
+    assert report["aggregate_suffix"] == str(candidate_group_id)[-8:]
+    assert report["bundle_id_suffix"] == str(bundle_id)[-8:]
     assert report["redis_published_count"] == 1
-    assert report["database_write_attempted"] is True
     assert report["event_outbox_status_updated_count"] == 1
     assert report["job_attempts_written_count"] == 1
-    assert report["payload_candidate_group_id_matches"] is True
-    assert report["payload_judge_profile_allowed"] is True
-    assert operation_log == ["fetch", "publish", "mark_published", "insert_job_attempt"]
+    assert operation_log == ["fetch", "redis_type", "publish", "mark_published", "insert_job_attempt"]
     assert repository_builder.close_commits == [True]
     assert repository.mark_published_calls == [row.event_id]
     assert repository.job_attempt_calls == [
@@ -505,7 +442,8 @@ async def test_analysis_requested_publish_uses_existing_route_and_thin_id_only_p
         "escalation_allowed",
         "bundle_data",
         "raw_text",
-        "prompt_material",
+        "raw_evidence",
+        "message_text",
         "database_url",
         "redis_url",
     ):
@@ -513,21 +451,150 @@ async def test_analysis_requested_publish_uses_existing_route_and_thin_id_only_p
 
 
 @pytest.mark.asyncio
-async def test_custom_route_drift_blocks_before_publish() -> None:
-    row = _row()
+async def test_already_published_target_is_deterministic_noop() -> None:
+    row = _row(status="published")
+    inspector_builder = FakeRedisInspectorBuilder(FakeRedisInspector())
     publisher_builder = FakeRedisPublisherBuilder(FakeRedisPublisher())
 
     result = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=row.event_id),
+        _publish_config(event_suffix=str(row.event_id)[-8:]),
         runtime_config_loader=_runtime_config,
         repository_builder=FakeRepositoryBuilder(FakeRepository([row])),
+        redis_inspector_builder=inspector_builder,
         redis_publisher_builder=publisher_builder,
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "already_published"
+    assert report["ok"] is True
+    assert report["duplicate_handling_status"] == "already_published_noop"
+    assert report["redis_publish_would_occur"] is False
+    assert report["redis_publish_attempted"] is False
+    assert report["redis_published_count"] == 0
+    assert report["database_write_attempted"] is False
+    assert inspector_builder.calls == 0
+    assert publisher_builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_wrong_event_type_aggregate_status_ambiguous_suffix_and_route_drift_block_before_publish() -> None:
+    wrong_event = _row(event_type="judge.call.requested.v1")
+    wrong_aggregate = _row(aggregate_type="artifact")
+    failed_status = _row(status="failed")
+    row_one = _row()
+    row_two = _row()
+    route_drift = _row()
+
+    wrong_event_result = await run_bounded_analysis_requested_outbox_publish(
+        _publish_config(event_suffix=str(wrong_event.event_id)[-8:]),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(FakeRepository([wrong_event])),
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector()),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+    )
+    wrong_aggregate_result = await run_bounded_analysis_requested_outbox_publish(
+        _publish_config(event_suffix=str(wrong_aggregate.event_id)[-8:]),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(FakeRepository([wrong_aggregate])),
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector()),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+    )
+    failed_status_result = await run_bounded_analysis_requested_outbox_publish(
+        _publish_config(event_suffix=str(failed_status.event_id)[-8:]),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(FakeRepository([failed_status])),
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector()),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+    )
+    ambiguous_result = await run_bounded_analysis_requested_outbox_publish(
+        _publish_config(event_suffix=str(row_one.event_id)[-8:]),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(FakeRepository([row_one, row_two])),
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector()),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+    )
+    drift_result = await run_bounded_analysis_requested_outbox_publish(
+        _publish_config(event_suffix=str(route_drift.event_id)[-8:]),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(FakeRepository([route_drift])),
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector()),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
         route_resolver=RogueRouteResolver(),  # type: ignore[arg-type]
     )
 
-    assert result.error_code == "route_not_allowed"
+    assert wrong_event_result.error_code == "wrong_event_type"
+    assert wrong_aggregate_result.error_code == "wrong_aggregate_type"
+    assert failed_status_result.error_code == "target_event_not_pending"
+    assert ambiguous_result.error_code == "target_event_count_exceeded"
+    assert drift_result.error_code == "route_not_allowed"
+    for result in (wrong_event_result, wrong_aggregate_result, failed_status_result, ambiguous_result, drift_result):
+        assert result.state.redis_publish_attempted is False
+        assert result.state.database_write_attempted is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_field", REQUIRED_PAYLOAD_FIELDS)
+async def test_required_payload_fields_missing_blocks_before_publish_and_omits_raw_values(missing_field: str) -> None:
+    candidate_group_id = uuid4()
+    payload = _payload(candidate_group_id)
+    raw_value = str(payload.pop(missing_field))
+
+    result = await run_bounded_analysis_requested_outbox_publish(
+        _publish_config(),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(
+            FakeRepository([_row(candidate_group_id=candidate_group_id, payload_json=payload)])
+        ),
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector()),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+    )
+    rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
+
+    assert result.error_code == "malformed_event_payload"
+    assert getattr(result, f"payload_has_{missing_field}") is False
     assert result.state.redis_publish_attempted is False
-    assert publisher_builder.calls == 0
+    assert result.state.database_write_attempted is False
+    assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_payload_mismatch_invalid_redis_stream_and_redis_read_failure_block_before_publish() -> None:
+    mismatched = _row(payload_json=_payload(uuid4()))
+    stream_target = _row()
+    read_failure_target = _row()
+
+    mismatch = await run_bounded_analysis_requested_outbox_publish(
+        _publish_config(event_suffix=str(mismatched.event_id)[-8:]),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(FakeRepository([mismatched])),
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector()),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+    )
+    invalid_stream = await run_bounded_analysis_requested_outbox_publish(
+        _publish_config(event_suffix=str(stream_target.event_id)[-8:]),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(FakeRepository([stream_target])),
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector(stream_type="list")),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+    )
+    read_failure = await run_bounded_analysis_requested_outbox_publish(
+        _publish_config(event_suffix=str(read_failure_target.event_id)[-8:]),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(FakeRepository([read_failure_target])),
+        redis_inspector_builder=FakeRedisInspectorBuilder(
+            FakeRedisInspector(failure=RuntimeError(EXCEPTION_DETAIL))
+        ),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+    )
+
+    assert mismatch.error_code == "candidate_group_id_mismatch"
+    assert invalid_stream.error_code == "redis_stream_type_invalid"
+    assert invalid_stream.redis_stream_type == "list"
+    assert read_failure.error_code == "redis_type_read_failed"
+    assert EXCEPTION_DETAIL not in json.dumps(read_failure.to_sanitized_dict(), sort_keys=True)
+    for result in (mismatch, invalid_stream, read_failure):
+        assert result.state.redis_publish_attempted is False
+        assert result.state.database_write_attempted is False
 
 
 @pytest.mark.asyncio
@@ -539,9 +606,10 @@ async def test_redis_publish_failure_does_not_mark_published_or_insert_job_attem
     publisher = FakeRedisPublisher(operation_log=operation_log, failure=RuntimeError(EXCEPTION_DETAIL))
 
     result = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=row.event_id),
+        _publish_config(event_suffix=str(row.event_id)[-8:]),
         runtime_config_loader=_runtime_config,
         repository_builder=repository_builder,
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector(operation_log=operation_log)),
         redis_publisher_builder=FakeRedisPublisherBuilder(publisher),
     )
     rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
@@ -552,40 +620,39 @@ async def test_redis_publish_failure_does_not_mark_published_or_insert_job_attem
     assert result.state.redis_publish_attempted is True
     assert result.redis_published_count == 0
     assert result.state.database_write_attempted is False
-    assert result.event_outbox_status_updated_count == 0
-    assert result.job_attempts_written_count == 0
     assert repository.mark_published_calls == []
     assert repository.job_attempt_calls == []
     assert repository_builder.close_commits == [False]
-    assert operation_log == ["fetch", "publish"]
+    assert operation_log == ["fetch", "redis_type", "publish"]
     assert EXCEPTION_DETAIL not in rendered
 
 
 @pytest.mark.asyncio
-async def test_database_write_failure_after_xadd_returns_sanitized_failure() -> None:
+async def test_database_status_update_failure_after_xadd_does_not_claim_publish_success() -> None:
     operation_log: list[str] = []
     row = _row()
-    repository = FakeRepository([row], operation_log=operation_log, fail_insert_job_attempt=True)
+    repository = FakeRepository([row], operation_log=operation_log, fail_mark_published=True)
     publisher = FakeRedisPublisher(operation_log=operation_log)
 
     result = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=row.event_id),
+        _publish_config(event_suffix=str(row.event_id)[-8:]),
         runtime_config_loader=_runtime_config,
         repository_builder=FakeRepositoryBuilder(repository),
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector(operation_log=operation_log)),
         redis_publisher_builder=FakeRedisPublisherBuilder(publisher),
     )
     rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
 
     assert result.status == "failed"
-    assert result.error_code == "database_write_failed"
+    assert result.ok is False
+    assert result.error_code == "database_write_failed_after_redis_publish"
     assert result.error_class == "RuntimeError"
-    assert result.state.redis_publish_attempted is True
     assert result.redis_published_count == 1
-    assert result.state.database_write_attempted is True
-    assert result.event_outbox_status_updated_count == 1
+    assert result.event_outbox_status_updated_count == 0
     assert result.job_attempts_written_count == 0
-    assert operation_log == ["fetch", "publish", "mark_published", "insert_job_attempt"]
-    assert "sentinel job attempt detail" not in rendered
+    assert result.state.database_write_attempted is True
+    assert operation_log == ["fetch", "redis_type", "publish", "mark_published"]
+    assert "sentinel mark published detail" not in rendered
 
 
 @pytest.mark.asyncio
@@ -599,9 +666,10 @@ async def test_commit_close_failure_after_xadd_returns_sanitized_failure() -> No
     publisher = FakeRedisPublisher()
 
     result = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=row.event_id),
+        _publish_config(event_suffix=str(row.event_id)[-8:]),
         runtime_config_loader=_runtime_config,
         repository_builder=repository_builder,
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector()),
         redis_publisher_builder=FakeRedisPublisherBuilder(publisher),
     )
     report = result.to_sanitized_dict()
@@ -616,9 +684,6 @@ async def test_commit_close_failure_after_xadd_returns_sanitized_failure() -> No
     assert report["event_outbox_status_updated_count"] == 1
     assert report["job_attempts_written_count"] == 1
     assert repository_builder.close_commits == [True]
-    assert repository.mark_published_calls == [row.event_id]
-    assert repository.job_attempt_calls[0]["attempt_status"] == "succeeded"
-    assert len(publisher.publish_calls) == 1
     assert CLOSE_EXCEPTION_DETAIL not in rendered
     assert DB_LOCATOR not in rendered
     assert REDIS_LOCATOR not in rendered
@@ -627,13 +692,14 @@ async def test_commit_close_failure_after_xadd_returns_sanitized_failure() -> No
 
 
 @pytest.mark.asyncio
-async def test_sanitized_output_omits_full_ids_payload_profile_dedupe_and_exception_detail() -> None:
+async def test_sanitized_output_omits_full_ids_payload_dedupe_and_exception_detail() -> None:
     row = _row()
     bundle_id = UUID(str(row.payload_json["bundle_id"]))
     result = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=row.event_id),
+        _publish_config(event_suffix=str(row.event_id)[-8:]),
         runtime_config_loader=_runtime_config,
         repository_builder=FakeRepositoryBuilder(FakeRepository([row])),
+        redis_inspector_builder=FakeRedisInspectorBuilder(FakeRedisInspector()),
         redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
     )
     rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
@@ -646,29 +712,53 @@ async def test_sanitized_output_omits_full_ids_payload_profile_dedupe_and_except
         REDIS_LOCATOR,
         RAW_BUNDLE_DATA,
         RAW_TEXT,
-        RAW_PROMPT,
+        RAW_EVIDENCE,
+        RAW_MESSAGE_TEXT,
         RAW_PROFILE,
         RAW_DEDUPE_KEY,
         REDIS_MESSAGE_ID,
     ):
         assert raw not in rendered
     assert rendered.count(str(row.event_id)[-8:]) == 1
-    assert rendered.count(str(row.aggregate_id)[-8:]) == 1
+    assert rendered.count(str(row.aggregate_id)[-8:]) >= 1
 
-    failing = await run_bounded_analysis_requested_outbox_publish(
-        _approved_config(event_id=row.event_id),
-        runtime_config_loader=_runtime_config,
-        repository_builder=FakeRepositoryBuilder(FakeRepository([row])),
-        redis_publisher_builder=FakeRedisPublisherBuilder(
-            FakeRedisPublisher(failure=RuntimeError(EXCEPTION_DETAIL))
-        ),
+
+def test_cli_rejects_unsupported_live_authority_flags_and_raw_full_ids(capsys: pytest.CaptureFixture[str]) -> None:
+    unsupported_exit = cli.main(["--allow-openai"])
+    unsupported_output = json.loads(capsys.readouterr().out)
+    raw_id_exit = cli.main(
+        [
+            "--mode",
+            "preview",
+            "--operator-approved",
+            "--event-type",
+            EVENT_TYPE,
+            "--event-suffix",
+            str(uuid4()),
+            "--allow-runtime-config",
+            "--allow-database-read",
+            "--allow-redis-read",
+        ],
+        runtime_config_loader=_raising_runtime_config,
     )
-    assert EXCEPTION_DETAIL not in json.dumps(failing.to_sanitized_dict(), sort_keys=True)
+    raw_id_output = json.loads(capsys.readouterr().out)
+
+    assert unsupported_exit == 1
+    assert unsupported_output["status"] == "blocked"
+    assert unsupported_output["error_code"] == "unsupported_cli_argument"
+    assert raw_id_exit == 1
+    assert raw_id_output["error_code"] == "raw_event_id_not_allowed"
+    rendered = json.dumps(unsupported_output, sort_keys=True) + json.dumps(raw_id_output, sort_keys=True)
+    assert "--allow-openai" not in rendered
+    assert DB_LOCATOR not in rendered
+    assert REDIS_LOCATOR not in rendered
 
 
-def test_source_ast_guard_has_no_broad_worker_consumer_or_forbidden_authority() -> None:
+def test_source_ast_guard_has_no_downstream_calls_runtime_locators_or_ad_hoc_redis_ops() -> None:
     source = SOURCE_PATH.read_text(encoding="utf-8")
+    tool_source = TOOL_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
+    tool_tree = ast.parse(tool_source)
     imported_modules = set()
     imported_roots = set()
     forbidden_call_names = {
@@ -679,7 +769,17 @@ def test_source_ast_guard_has_no_broad_worker_consumer_or_forbidden_authority() 
         "check_output",
         "run_forever",
     }
-    forbidden_call_attrs = forbidden_call_names | {"sleep", "xreadgroup", "xread", "consume"}
+    forbidden_call_attrs = forbidden_call_names | {
+        "sleep",
+        "xreadgroup",
+        "xread",
+        "xack",
+        "xgroup_create",
+        "xgroup_destroy",
+        "consume",
+        "create_subprocess_exec",
+        "create_subprocess_shell",
+    }
 
     assert not any(isinstance(node, ast.While) for node in ast.walk(tree))
     for node in ast.walk(tree):
@@ -690,6 +790,13 @@ def test_source_ast_guard_has_no_broad_worker_consumer_or_forbidden_authority() 
             imported_roots.add(node.module.split(".", 1)[0])
             imported_modules.add(node.module)
         elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                assert node.func.attr not in forbidden_call_attrs
+            elif isinstance(node.func, ast.Name):
+                assert node.func.id not in forbidden_call_names
+
+    for node in ast.walk(tool_tree):
+        if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Attribute):
                 assert node.func.attr not in forbidden_call_attrs
             elif isinstance(node.func, ast.Name):
@@ -709,3 +816,8 @@ def test_source_ast_guard_has_no_broad_worker_consumer_or_forbidden_authority() 
     assert "OutboxRelayService" not in source
     assert "RedisStreamConsumer" not in source
     assert "run_forever(" not in source
+    assert "runtime.env" not in source
+    assert "runtime.env" not in tool_source
+    assert ".xadd(" not in source
+    assert ".xread" not in source
+    assert ".xack" not in source

@@ -20,9 +20,10 @@ from .redis_streams import RedisStreamsPublisher
 from .repositories import AsyncSessionLike, OutboxRelayRepository
 from .routing import OutboxRouteResolver, UnsupportedOutboxEventTypeError
 
-SCHEMA_VERSION = "bounded_analysis_requested_outbox_publish_v1"
+SCHEMA_VERSION = "bounded_analysis_requested_outbox_publish_v2"
 RUNNER_NAME = "bounded_analysis_requested_outbox_publish_runner"
-MODE = "analysis_requested_outbox_one_shot_publish"
+MODE_PREVIEW = "preview"
+MODE_PUBLISH = "publish"
 EVENT_TYPE = "analysis.requested.v1"
 ROOT_OBJECT_TYPE = "candidate_group"
 QUEUE_NAME = "q.analysis.route"
@@ -36,23 +37,20 @@ REQUIRED_PAYLOAD_FIELDS = (
     "judge_profile",
     "escalation_allowed",
 )
-ALLOWED_JUDGE_PROFILES = frozenset(
-    {
-        "github_primary",
-        "x_primary",
-        "text_idea_primary",
-    }
-)
 
 
 @dataclass(frozen=True, slots=True)
 class BoundedAnalysisRequestedOutboxPublishConfig:
+    mode: str = MODE_PREVIEW
     operator_approved: bool = False
     allow_runtime_config: bool = False
+    allow_database_read: bool = False
+    allow_redis_read: bool = False
     allow_redis_publish: bool = False
-    allow_database_write: bool = False
-    event_id: UUID | None = None
+    allow_outbox_status_update: bool = False
+    event_type: str | None = None
     event_suffix: str | None = None
+    aggregate_suffix: str | None = None
     max_events: int = DEFAULT_MAX_EVENTS
 
 
@@ -68,6 +66,8 @@ class BoundedAnalysisRequestedOutboxPublishState:
     runtime_config_loaded: bool = False
     database_session_opened: bool = False
     database_read_attempted: bool = False
+    redis_reader_created: bool = False
+    redis_read_attempted: bool = False
     redis_publisher_created: bool = False
     redis_publish_attempted: bool = False
     event_outbox_status_write_attempted: bool = False
@@ -92,8 +92,9 @@ class BoundedAnalysisRequestedOutboxRepository(Protocol):
     async def fetch_target_events(
         self,
         *,
-        event_id: UUID | None,
-        event_suffix: str | None,
+        event_type: str,
+        event_suffix: str,
+        aggregate_suffix: str | None,
         limit: int,
     ) -> list[OutboxEventRow]: ...
 
@@ -110,6 +111,10 @@ class BoundedAnalysisRequestedOutboxRepository(Protocol):
     ) -> None: ...
 
 
+class RedisInspector(Protocol):
+    async def get_stream_type(self, queue_name: str) -> str: ...
+
+
 class RedisPublisher(Protocol):
     async def publish(self, route: QueueRoute, message: RedisQueuedMessage) -> str: ...
 
@@ -118,6 +123,12 @@ class RedisPublisher(Protocol):
 class BoundedAnalysisRequestedRepositoryHandle:
     repository: BoundedAnalysisRequestedOutboxRepository
     close: Callable[[bool], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedAnalysisRequestedRedisInspectorHandle:
+    inspector: RedisInspector
+    close: Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +144,15 @@ class BoundedAnalysisRequestedRepositoryBuilder(Protocol):
         state: BoundedAnalysisRequestedOutboxPublishState,
         logger: logging.Logger,
     ) -> BoundedAnalysisRequestedRepositoryHandle: ...
+
+
+class BoundedAnalysisRequestedRedisInspectorBuilder(Protocol):
+    async def __call__(
+        self,
+        runtime_config: BoundedAnalysisRequestedPublishRuntimeConfig,
+        state: BoundedAnalysisRequestedOutboxPublishState,
+        logger: logging.Logger,
+    ) -> BoundedAnalysisRequestedRedisInspectorHandle: ...
 
 
 class BoundedAnalysisRequestedRedisPublisherBuilder(Protocol):
@@ -155,15 +175,21 @@ class BoundedAnalysisRequestedOutboxPublishResult:
         default_factory=BoundedAnalysisRequestedOutboxPublishState
     )
     selector_type: str | None = None
-    target_event_id_suffix: str | None = None
-    target_candidate_group_suffix: str | None = None
+    target_event_suffix: str | None = None
+    aggregate_suffix: str | None = None
+    root_object_type: str | None = None
+    root_object_id_suffix: str | None = None
+    bundle_id_suffix: str | None = None
     events_seen: int = 0
     redis_published_count: int = 0
     event_outbox_status_updated_count: int = 0
     job_attempts_written_count: int = 0
     queue_name: str | None = None
     stage_name: str | None = None
-    selected_event_status: str | None = None
+    event_outbox_status_before: str | None = None
+    duplicate_handling_status: str | None = None
+    redis_stream_type: str | None = None
+    redis_publish_would_occur: bool = False
     selected_event_type: str | None = None
     selected_aggregate_type: str | None = None
     payload_has_candidate_group_id: bool = False
@@ -171,36 +197,46 @@ class BoundedAnalysisRequestedOutboxPublishResult:
     payload_has_judge_profile: bool = False
     payload_has_escalation_allowed: bool = False
     payload_candidate_group_id_matches: bool = False
-    payload_judge_profile_allowed: bool = False
+    payload_bundle_id_is_uuid: bool = False
 
     def to_sanitized_dict(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
             "runner_name": RUNNER_NAME,
-            "mode": MODE,
+            "mode": self.config.mode,
             "ok": self.ok,
             "status": self.status,
             "error_code": self.error_code,
             "error_class": self.error_class,
             "selector_type": self.selector_type,
-            "target_event_id_suffix": self.target_event_id_suffix,
-            "target_candidate_group_suffix": self.target_candidate_group_suffix,
+            "target_event_suffix": self.target_event_suffix,
+            "aggregate_suffix": self.aggregate_suffix,
+            "root_object_type": self.root_object_type,
+            "root_object_id_suffix": self.root_object_id_suffix,
+            "bundle_id_suffix": self.bundle_id_suffix,
             "events_seen": self.events_seen,
             "queue_name": self.queue_name,
             "stage_name": self.stage_name,
+            "event_outbox_status_before": self.event_outbox_status_before,
+            "duplicate_handling_status": self.duplicate_handling_status,
+            "redis_stream_type": self.redis_stream_type,
+            "redis_read_attempted": self.state.redis_read_attempted,
+            "redis_publish_would_occur": self.redis_publish_would_occur,
             "redis_publish_attempted": self.state.redis_publish_attempted,
             "redis_published_count": self.redis_published_count,
+            "database_read_attempted": self.state.database_read_attempted,
             "database_write_attempted": self.state.database_write_attempted,
             "event_outbox_status_updated_count": self.event_outbox_status_updated_count,
             "job_attempts_written_count": self.job_attempts_written_count,
             "gates": {
                 "operator_approved": self.config.operator_approved,
                 "runtime_config_allowed": self.config.allow_runtime_config,
+                "database_read_allowed": self.config.allow_database_read,
+                "redis_read_allowed": self.config.allow_redis_read,
                 "redis_publish_allowed": self.config.allow_redis_publish,
-                "database_write_allowed": self.config.allow_database_write,
+                "outbox_status_update_allowed": self.config.allow_outbox_status_update,
                 "max_events": self.config.max_events,
             },
-            "selected_event_status": self.selected_event_status,
             "selected_event_type": self.selected_event_type,
             "selected_aggregate_type": self.selected_aggregate_type,
             "payload_has_candidate_group_id": self.payload_has_candidate_group_id,
@@ -208,7 +244,7 @@ class BoundedAnalysisRequestedOutboxPublishResult:
             "payload_has_judge_profile": self.payload_has_judge_profile,
             "payload_has_escalation_allowed": self.payload_has_escalation_allowed,
             "payload_candidate_group_id_matches": self.payload_candidate_group_id_matches,
-            "payload_judge_profile_allowed": self.payload_judge_profile_allowed,
+            "payload_bundle_id_is_uuid": self.payload_bundle_id_is_uuid,
             "redactions_applied": {
                 "full_event_id_omitted": True,
                 "full_candidate_group_id_omitted": True,
@@ -216,9 +252,11 @@ class BoundedAnalysisRequestedOutboxPublishResult:
                 "idempotency_key_omitted": True,
                 "payload_json_omitted": True,
                 "bundle_data_omitted": True,
+                "message_text_omitted": True,
+                "raw_evidence_omitted": True,
                 "judge_profile_value_omitted": True,
+                "source_text_omitted": True,
                 "raw_text_omitted": True,
-                "prompt_material_omitted": True,
                 "database_url_omitted": True,
                 "redis_url_omitted": True,
                 "redis_message_id_omitted": True,
@@ -228,6 +266,9 @@ class BoundedAnalysisRequestedOutboxPublishResult:
                 "redis_mutation": self.redis_published_count > 0,
                 "db_write": self.state.database_write_attempted,
                 "queue_consume_called": False,
+                "redis_ack_called": False,
+                "redis_group_create_called": False,
+                "redis_group_destroy_called": False,
                 "analysis_router_called": False,
                 "judge_run_created": False,
                 "judge_call_requested_event_emitted": False,
@@ -261,26 +302,29 @@ class SqlAlchemyBoundedAnalysisRequestedOutboxRepository:
     async def fetch_target_events(
         self,
         *,
-        event_id: UUID | None,
-        event_suffix: str | None,
+        event_type: str,
+        event_suffix: str,
+        aggregate_suffix: str | None,
         limit: int,
     ) -> list[OutboxEventRow]:
-        if event_id is not None:
-            statement = _SELECT_TARGET_EVENT + """
-                WHERE event_id = CAST(:event_id AS uuid)
-                ORDER BY created_at ASC, event_id ASC
-                LIMIT :limit
-                """
-            params: dict[str, Any] = {"event_id": str(event_id), "limit": limit}
-        elif event_suffix is not None:
-            statement = _SELECT_TARGET_EVENT + """
-                WHERE lower(CAST(event_id AS text)) LIKE :event_suffix_pattern
-                ORDER BY created_at ASC, event_id ASC
-                LIMIT :limit
-                """
-            params = {"event_suffix_pattern": f"%{event_suffix.lower()}", "limit": limit}
-        else:  # pragma: no cover - guarded before repository calls
-            raise BoundedAnalysisRequestedOutboxPublishError("target_missing")
+        statement = _SELECT_TARGET_EVENT + """
+            WHERE event_type = :event_type
+              AND lower(CAST(event_id AS text)) LIKE :event_suffix_pattern
+            """
+        params: dict[str, Any] = {
+            "event_type": event_type,
+            "event_suffix_pattern": f"%{event_suffix.lower()}",
+            "limit": limit,
+        }
+        if aggregate_suffix is not None:
+            statement += """
+              AND lower(CAST(aggregate_id AS text)) LIKE :aggregate_suffix_pattern
+            """
+            params["aggregate_suffix_pattern"] = f"%{aggregate_suffix.lower()}"
+        statement += """
+            ORDER BY created_at ASC, event_id ASC
+            LIMIT :limit
+            """
 
         result = await self._session.execute(_sql(statement), params)
         return [_row_from_mapping(row) for row in result.mappings().all()]
@@ -306,6 +350,17 @@ class SqlAlchemyBoundedAnalysisRequestedOutboxRepository:
             attempt_status=attempt_status,
             error_code=error_code,
         )
+
+
+class RedisTypeInspector:
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    async def get_stream_type(self, queue_name: str) -> str:
+        value = await self._client.type(queue_name)
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
 
 
 def load_bounded_analysis_requested_publish_runtime_config(
@@ -356,6 +411,29 @@ async def build_default_bounded_analysis_requested_repository(
     return BoundedAnalysisRequestedRepositoryHandle(repository=repository, close=close)
 
 
+async def build_default_bounded_analysis_requested_redis_inspector(
+    runtime_config: BoundedAnalysisRequestedPublishRuntimeConfig,
+    state: BoundedAnalysisRequestedOutboxPublishState,
+    logger: logging.Logger,
+) -> BoundedAnalysisRequestedRedisInspectorHandle:
+    del logger
+    from redis.asyncio import Redis  # type: ignore[import-not-found]
+
+    redis_client = Redis.from_url(runtime_config.redis_url, decode_responses=True)
+    state.redis_reader_created = True
+    inspector = RedisTypeInspector(redis_client)
+
+    async def close() -> None:
+        close_client = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
+        if close_client is None:
+            return
+        result = close_client()
+        if hasattr(result, "__await__"):
+            await result
+
+    return BoundedAnalysisRequestedRedisInspectorHandle(inspector=inspector, close=close)
+
+
 async def build_default_bounded_analysis_requested_redis_publisher(
     runtime_config: BoundedAnalysisRequestedPublishRuntimeConfig,
     state: BoundedAnalysisRequestedOutboxPublishState,
@@ -386,27 +464,16 @@ async def run_bounded_analysis_requested_outbox_publish(
         load_bounded_analysis_requested_publish_runtime_config
     ),
     repository_builder: BoundedAnalysisRequestedRepositoryBuilder | None = None,
+    redis_inspector_builder: BoundedAnalysisRequestedRedisInspectorBuilder | None = None,
     redis_publisher_builder: BoundedAnalysisRequestedRedisPublisherBuilder | None = None,
     route_resolver: OutboxRouteResolver | None = None,
     clock: Callable[[], datetime] | None = None,
     logger: logging.Logger | None = None,
 ) -> BoundedAnalysisRequestedOutboxPublishResult:
     state = BoundedAnalysisRequestedOutboxPublishState()
-    if not config.operator_approved:
-        return _result("blocked", "operator_approval_missing", config=config, state=state)
-    if _selector_count(config) != 1:
-        error_code = "target_missing" if _selector_count(config) == 0 else "target_conflict"
-        return _result("blocked", error_code, config=config, state=state)
-    if config.event_suffix is not None and not _is_valid_event_suffix(config.event_suffix):
-        return _result("blocked", "invalid_event_suffix", config=config, state=state)
-    if config.max_events != HARD_MAX_EVENTS:
-        return _result("blocked", "max_events_must_be_one", config=config, state=state)
-    if not config.allow_runtime_config:
-        return _result("blocked", "runtime_config_not_allowed", config=config, state=state)
-    if not config.allow_database_write:
-        return _result("blocked", "database_write_not_allowed", config=config, state=state)
-    if not config.allow_redis_publish:
-        return _result("blocked", "redis_publish_not_allowed", config=config, state=state)
+    gate_error = _gate_error(config)
+    if gate_error is not None:
+        return _result("blocked", gate_error, config=config, state=state)
 
     effective_logger = logger or logging.getLogger(__name__)
     try:
@@ -418,6 +485,7 @@ async def run_bounded_analysis_requested_outbox_publish(
         return _result("blocked", "runtime_config_error", config=config, state=state)
 
     repository_handle: BoundedAnalysisRequestedRepositoryHandle | None = None
+    inspector_handle: BoundedAnalysisRequestedRedisInspectorHandle | None = None
     publisher_handle: BoundedAnalysisRequestedRedisPublisherHandle | None = None
     commit_repository = False
     result: BoundedAnalysisRequestedOutboxPublishResult | None = None
@@ -430,13 +498,20 @@ async def run_bounded_analysis_requested_outbox_publish(
         repository = repository_handle.repository
         state.database_read_attempted = True
         rows = await repository.fetch_target_events(
-            event_id=config.event_id,
-            event_suffix=config.event_suffix,
+            event_type=EVENT_TYPE,
+            event_suffix=str(config.event_suffix),
+            aggregate_suffix=config.aggregate_suffix,
             limit=HARD_MAX_EVENTS + 1,
         )
         events_seen = len(rows)
         if events_seen == 0:
-            result = _result("blocked", "target_event_not_found", config=config, state=state)
+            result = _result(
+                "blocked",
+                "target_event_not_found",
+                config=config,
+                state=state,
+                events_seen=events_seen,
+            )
             raise _PublishResultReady
         if events_seen > HARD_MAX_EVENTS:
             result = _result(
@@ -450,71 +525,69 @@ async def run_bounded_analysis_requested_outbox_publish(
 
         row = rows[0]
         payload_flags = _payload_presence_flags(row.payload_json)
-        candidate_group_id_matches = _payload_candidate_group_id_matches(row)
-        judge_profile_allowed = _payload_judge_profile_allowed(row.payload_json)
-        if row.status != "pending":
-            result = _result(
-                "blocked",
-                "target_event_not_pending",
-                config=config,
-                state=state,
-                selected_event=row,
-                events_seen=events_seen,
-                payload_flags=payload_flags,
-                candidate_group_id_matches=candidate_group_id_matches,
-                judge_profile_allowed=judge_profile_allowed,
+        payload_candidate_group_id = _payload_uuid(row.payload_json, "candidate_group_id")
+        payload_bundle_id = _payload_uuid(row.payload_json, "bundle_id")
+        candidate_group_id_matches = (
+            payload_candidate_group_id == row.aggregate_id if payload_candidate_group_id else False
+        )
+        if row.event_type != EVENT_TYPE:
+            result = _blocked_selected(
+                "wrong_event_type",
+                config,
+                state,
+                row,
+                events_seen,
+                payload_flags,
+                candidate_group_id_matches,
+                payload_bundle_id,
             )
             raise _PublishResultReady
-        if row.event_type != EVENT_TYPE or row.aggregate_type != ROOT_OBJECT_TYPE:
-            result = _result(
-                "blocked",
-                "analysis_requested_event_contract_mismatch",
-                config=config,
-                state=state,
-                selected_event=row,
-                events_seen=events_seen,
-                payload_flags=payload_flags,
-                candidate_group_id_matches=candidate_group_id_matches,
-                judge_profile_allowed=judge_profile_allowed,
+        if row.aggregate_type != ROOT_OBJECT_TYPE:
+            result = _blocked_selected(
+                "wrong_aggregate_type",
+                config,
+                state,
+                row,
+                events_seen,
+                payload_flags,
+                candidate_group_id_matches,
+                payload_bundle_id,
             )
             raise _PublishResultReady
-        if not all(payload_flags.values()):
-            result = _result(
-                "blocked",
+        if config.aggregate_suffix is not None and not _ends_with_suffix(row.aggregate_id, config.aggregate_suffix):
+            result = _blocked_selected(
+                "aggregate_suffix_mismatch",
+                config,
+                state,
+                row,
+                events_seen,
+                payload_flags,
+                candidate_group_id_matches,
+                payload_bundle_id,
+            )
+            raise _PublishResultReady
+        if not all(payload_flags.values()) or payload_candidate_group_id is None or payload_bundle_id is None:
+            result = _blocked_selected(
                 "malformed_event_payload",
-                config=config,
-                state=state,
-                selected_event=row,
-                events_seen=events_seen,
-                payload_flags=payload_flags,
-                candidate_group_id_matches=candidate_group_id_matches,
-                judge_profile_allowed=judge_profile_allowed,
+                config,
+                state,
+                row,
+                events_seen,
+                payload_flags,
+                candidate_group_id_matches,
+                payload_bundle_id,
             )
             raise _PublishResultReady
         if not candidate_group_id_matches:
-            result = _result(
-                "blocked",
+            result = _blocked_selected(
                 "candidate_group_id_mismatch",
-                config=config,
-                state=state,
-                selected_event=row,
-                events_seen=events_seen,
-                payload_flags=payload_flags,
-                candidate_group_id_matches=False,
-                judge_profile_allowed=judge_profile_allowed,
-            )
-            raise _PublishResultReady
-        if not judge_profile_allowed:
-            result = _result(
-                "blocked",
-                "unknown_judge_profile",
-                config=config,
-                state=state,
-                selected_event=row,
-                events_seen=events_seen,
-                payload_flags=payload_flags,
-                candidate_group_id_matches=True,
-                judge_profile_allowed=False,
+                config,
+                state,
+                row,
+                events_seen,
+                payload_flags,
+                False,
+                payload_bundle_id,
             )
             raise _PublishResultReady
 
@@ -522,29 +595,119 @@ async def run_bounded_analysis_requested_outbox_publish(
             canonical_route = OutboxRouteResolver().resolve(row)
             route = route_resolver.resolve(row) if route_resolver is not None else canonical_route
         except UnsupportedOutboxEventTypeError:
-            result = _result(
-                "blocked",
+            result = _blocked_selected(
                 "unsupported_event_type",
-                config=config,
-                state=state,
-                selected_event=row,
-                events_seen=events_seen,
-                payload_flags=payload_flags,
-                candidate_group_id_matches=True,
-                judge_profile_allowed=True,
+                config,
+                state,
+                row,
+                events_seen,
+                payload_flags,
+                True,
+                payload_bundle_id,
             )
             raise _PublishResultReady
         if route != canonical_route or route.queue_name != QUEUE_NAME or route.stage_name != STAGE_NAME:
-            result = _result(
-                "blocked",
+            result = _blocked_selected(
                 "route_not_allowed",
+                config,
+                state,
+                row,
+                events_seen,
+                payload_flags,
+                True,
+                payload_bundle_id,
+            )
+            raise _PublishResultReady
+
+        if row.status == "published":
+            result = _result(
+                "already_published",
+                None,
                 config=config,
                 state=state,
                 selected_event=row,
                 events_seen=events_seen,
                 payload_flags=payload_flags,
                 candidate_group_id_matches=True,
-                judge_profile_allowed=True,
+                payload_bundle_id=payload_bundle_id,
+                queue_name=route.queue_name,
+                stage_name=route.stage_name,
+                duplicate_handling_status="already_published_noop",
+            )
+            raise _PublishResultReady
+        if row.status != "pending":
+            result = _blocked_selected(
+                "target_event_not_pending",
+                config,
+                state,
+                row,
+                events_seen,
+                payload_flags,
+                True,
+                payload_bundle_id,
+                route=route,
+            )
+            raise _PublishResultReady
+
+        inspector_handle = await (redis_inspector_builder or build_default_bounded_analysis_requested_redis_inspector)(
+            runtime_config,
+            state,
+            effective_logger,
+        )
+        try:
+            state.redis_read_attempted = True
+            redis_stream_type = await inspector_handle.inspector.get_stream_type(route.queue_name)
+        except Exception as exc:
+            result = _result(
+                "failed",
+                "redis_type_read_failed",
+                error_class=_safe_exception_class(exc),
+                config=config,
+                state=state,
+                selected_event=row,
+                events_seen=events_seen,
+                payload_flags=payload_flags,
+                candidate_group_id_matches=True,
+                payload_bundle_id=payload_bundle_id,
+                queue_name=route.queue_name,
+                stage_name=route.stage_name,
+                duplicate_handling_status="pending_publish_blocked",
+            )
+            raise _PublishResultReady
+        if redis_stream_type not in {"none", "stream"}:
+            result = _result(
+                "blocked",
+                "redis_stream_type_invalid",
+                config=config,
+                state=state,
+                selected_event=row,
+                events_seen=events_seen,
+                payload_flags=payload_flags,
+                candidate_group_id_matches=True,
+                payload_bundle_id=payload_bundle_id,
+                queue_name=route.queue_name,
+                stage_name=route.stage_name,
+                redis_stream_type=redis_stream_type,
+                duplicate_handling_status="pending_publish_blocked",
+            )
+            raise _PublishResultReady
+
+        if config.mode == MODE_PREVIEW:
+            result = _result(
+                "preview",
+                None,
+                config=config,
+                state=state,
+                selected_event=row,
+                events_seen=events_seen,
+                payload_flags=payload_flags,
+                candidate_group_id_matches=True,
+                payload_bundle_id=payload_bundle_id,
+                queue_name=route.queue_name,
+                stage_name=route.stage_name,
+                redis_stream_type=redis_stream_type,
+                redis_publish_would_occur=True,
+                duplicate_handling_status="pending_would_publish",
             )
             raise _PublishResultReady
 
@@ -556,7 +719,7 @@ async def run_bounded_analysis_requested_outbox_publish(
         message = _build_stream_message(row, route)
         try:
             state.redis_publish_attempted = True
-            redis_message_id = await publisher_handle.publisher.publish(route, message)
+            await publisher_handle.publisher.publish(route, message)
         except Exception as exc:
             result = _result(
                 "failed",
@@ -568,9 +731,11 @@ async def run_bounded_analysis_requested_outbox_publish(
                 events_seen=events_seen,
                 payload_flags=payload_flags,
                 candidate_group_id_matches=True,
-                judge_profile_allowed=True,
+                payload_bundle_id=payload_bundle_id,
                 queue_name=route.queue_name,
                 stage_name=route.stage_name,
+                redis_stream_type=redis_stream_type,
+                duplicate_handling_status="pending_publish_failed",
             )
             raise _PublishResultReady
 
@@ -596,7 +761,7 @@ async def run_bounded_analysis_requested_outbox_publish(
         except Exception as exc:
             result = _result(
                 "failed",
-                "database_write_failed",
+                "database_write_failed_after_redis_publish",
                 error_class=_safe_exception_class(exc),
                 config=config,
                 state=state,
@@ -607,9 +772,11 @@ async def run_bounded_analysis_requested_outbox_publish(
                 job_attempts_written_count=job_attempts_written_count,
                 payload_flags=payload_flags,
                 candidate_group_id_matches=True,
-                judge_profile_allowed=True,
+                payload_bundle_id=payload_bundle_id,
                 queue_name=route.queue_name,
                 stage_name=route.stage_name,
+                redis_stream_type=redis_stream_type,
+                duplicate_handling_status="pending_publish_partial_failure",
             )
             raise _PublishResultReady
 
@@ -621,14 +788,16 @@ async def run_bounded_analysis_requested_outbox_publish(
             state=state,
             selected_event=row,
             events_seen=events_seen,
-            redis_published_count=1 if redis_message_id else 1,
+            redis_published_count=1,
             event_outbox_status_updated_count=1,
             job_attempts_written_count=1,
             payload_flags=payload_flags,
             candidate_group_id_matches=True,
-            judge_profile_allowed=True,
+            payload_bundle_id=payload_bundle_id,
             queue_name=route.queue_name,
             stage_name=route.stage_name,
+            redis_stream_type=redis_stream_type,
+            duplicate_handling_status="published_once",
         )
     except _PublishResultReady:
         pass
@@ -644,6 +813,11 @@ async def run_bounded_analysis_requested_outbox_publish(
         if publisher_handle is not None:
             try:
                 await publisher_handle.close()
+            except Exception:
+                pass
+        if inspector_handle is not None:
+            try:
+                await inspector_handle.close()
             except Exception:
                 pass
         if repository_handle is not None:
@@ -679,6 +853,7 @@ def run_bounded_analysis_requested_outbox_publish_sync(
         load_bounded_analysis_requested_publish_runtime_config
     ),
     repository_builder: BoundedAnalysisRequestedRepositoryBuilder | None = None,
+    redis_inspector_builder: BoundedAnalysisRequestedRedisInspectorBuilder | None = None,
     redis_publisher_builder: BoundedAnalysisRequestedRedisPublisherBuilder | None = None,
     route_resolver: OutboxRouteResolver | None = None,
     clock: Callable[[], datetime] | None = None,
@@ -689,6 +864,7 @@ def run_bounded_analysis_requested_outbox_publish_sync(
             config,
             runtime_config_loader=runtime_config_loader,
             repository_builder=repository_builder,
+            redis_inspector_builder=redis_inspector_builder,
             redis_publisher_builder=redis_publisher_builder,
             route_resolver=route_resolver,
             clock=clock,
@@ -710,6 +886,69 @@ def argument_error_report(error_code: str) -> dict[str, Any]:
     ).to_sanitized_dict()
 
 
+def _gate_error(config: BoundedAnalysisRequestedOutboxPublishConfig) -> str | None:
+    if config.mode not in {MODE_PREVIEW, MODE_PUBLISH}:
+        return "invalid_mode"
+    if not config.operator_approved:
+        return "operator_approval_missing"
+    if config.event_type is None:
+        return "event_type_required"
+    if config.event_type != EVENT_TYPE:
+        return "event_type_not_allowed"
+    if config.event_suffix is None:
+        return "target_event_suffix_missing"
+    if _looks_like_full_uuid(config.event_suffix):
+        return "raw_event_id_not_allowed"
+    if not _is_valid_suffix(config.event_suffix):
+        return "invalid_event_suffix"
+    if config.aggregate_suffix is not None:
+        if _looks_like_full_uuid(config.aggregate_suffix):
+            return "raw_aggregate_id_not_allowed"
+        if not _is_valid_suffix(config.aggregate_suffix):
+            return "invalid_aggregate_suffix"
+    if config.max_events != HARD_MAX_EVENTS:
+        return "max_events_must_be_one"
+    if not config.allow_runtime_config:
+        return "runtime_config_not_allowed"
+    if not config.allow_database_read:
+        return "database_read_not_allowed"
+    if not config.allow_redis_read:
+        return "redis_read_not_allowed"
+    if config.mode == MODE_PUBLISH and not config.allow_redis_publish:
+        return "redis_publish_not_allowed"
+    if config.mode == MODE_PUBLISH and not config.allow_outbox_status_update:
+        return "outbox_status_update_not_allowed"
+    return None
+
+
+def _blocked_selected(
+    error_code: str,
+    config: BoundedAnalysisRequestedOutboxPublishConfig,
+    state: BoundedAnalysisRequestedOutboxPublishState,
+    row: OutboxEventRow,
+    events_seen: int,
+    payload_flags: Mapping[str, bool],
+    candidate_group_id_matches: bool,
+    payload_bundle_id: UUID | None,
+    *,
+    route: QueueRoute | None = None,
+) -> BoundedAnalysisRequestedOutboxPublishResult:
+    return _result(
+        "blocked",
+        error_code,
+        config=config,
+        state=state,
+        selected_event=row,
+        events_seen=events_seen,
+        payload_flags=payload_flags,
+        candidate_group_id_matches=candidate_group_id_matches,
+        payload_bundle_id=payload_bundle_id,
+        queue_name=route.queue_name if route else None,
+        stage_name=route.stage_name if route else None,
+        duplicate_handling_status="not_applicable",
+    )
+
+
 def _result(
     status: str,
     error_code: str | None,
@@ -724,34 +963,43 @@ def _result(
     job_attempts_written_count: int = 0,
     payload_flags: Mapping[str, bool] | None = None,
     candidate_group_id_matches: bool = False,
-    judge_profile_allowed: bool = False,
+    payload_bundle_id: UUID | None = None,
     queue_name: str | None = None,
     stage_name: str | None = None,
+    redis_stream_type: str | None = None,
+    redis_publish_would_occur: bool = False,
+    duplicate_handling_status: str | None = None,
 ) -> BoundedAnalysisRequestedOutboxPublishResult:
     flags = dict(payload_flags or {})
-    selected_event_id = selected_event.event_id if selected_event is not None else config.event_id
-    selected_candidate_group_id = (
+    root_object_id = (
         selected_event.aggregate_id
         if selected_event is not None and selected_event.aggregate_type == ROOT_OBJECT_TYPE
         else None
     )
+    ok = error_code is None and status in {"preview", "published", "already_published"}
     return BoundedAnalysisRequestedOutboxPublishResult(
         status=status,
-        ok=status == "published" and error_code is None,
+        ok=ok,
         error_code=error_code,
         error_class=error_class,
         config=config,
         state=state,
-        selector_type=_selector_type(config),
-        target_event_id_suffix=_optional_id_suffix(selected_event_id),
-        target_candidate_group_suffix=_optional_id_suffix(selected_candidate_group_id),
+        selector_type="event_suffix" if config.event_suffix is not None else None,
+        target_event_suffix=_optional_id_suffix(selected_event.event_id if selected_event else config.event_suffix),
+        aggregate_suffix=_optional_id_suffix(root_object_id) or config.aggregate_suffix,
+        root_object_type=ROOT_OBJECT_TYPE if selected_event is not None else None,
+        root_object_id_suffix=_optional_id_suffix(root_object_id),
+        bundle_id_suffix=_optional_id_suffix(payload_bundle_id),
         events_seen=events_seen,
         redis_published_count=redis_published_count,
         event_outbox_status_updated_count=event_outbox_status_updated_count,
         job_attempts_written_count=job_attempts_written_count,
         queue_name=queue_name,
         stage_name=stage_name,
-        selected_event_status=selected_event.status if selected_event is not None else None,
+        event_outbox_status_before=selected_event.status if selected_event is not None else None,
+        duplicate_handling_status=duplicate_handling_status,
+        redis_stream_type=redis_stream_type,
+        redis_publish_would_occur=redis_publish_would_occur,
         selected_event_type=selected_event.event_type if selected_event is not None else None,
         selected_aggregate_type=selected_event.aggregate_type if selected_event is not None else None,
         payload_has_candidate_group_id=flags.get("candidate_group_id", False),
@@ -759,7 +1007,7 @@ def _result(
         payload_has_judge_profile=flags.get("judge_profile", False),
         payload_has_escalation_allowed=flags.get("escalation_allowed", False),
         payload_candidate_group_id_matches=candidate_group_id_matches,
-        payload_judge_profile_allowed=judge_profile_allowed,
+        payload_bundle_id_is_uuid=payload_bundle_id is not None,
     )
 
 
@@ -788,18 +1036,11 @@ def _payload_field_present(value: Any) -> bool:
     return True
 
 
-def _payload_candidate_group_id_matches(row: OutboxEventRow) -> bool:
+def _payload_uuid(payload: Mapping[str, Any], key: str) -> UUID | None:
     try:
-        return UUID(str(row.payload_json.get("candidate_group_id"))) == row.aggregate_id
+        return UUID(str(payload.get(key)))
     except (TypeError, ValueError):
-        return False
-
-
-def _payload_judge_profile_allowed(payload: Mapping[str, Any]) -> bool:
-    value = payload.get("judge_profile")
-    if not isinstance(value, str):
-        return False
-    return value.strip() in ALLOWED_JUDGE_PROFILES
+        return None
 
 
 def _row_from_mapping(row: Mapping[str, Any]) -> OutboxEventRow:
@@ -819,21 +1060,21 @@ def _row_from_mapping(row: Mapping[str, Any]) -> OutboxEventRow:
     )
 
 
-def _selector_count(config: BoundedAnalysisRequestedOutboxPublishConfig) -> int:
-    return sum(value is not None for value in (config.event_id, config.event_suffix))
-
-
-def _selector_type(config: BoundedAnalysisRequestedOutboxPublishConfig) -> str | None:
-    if config.event_id is not None:
-        return "event_id"
-    if config.event_suffix is not None:
-        return "event_suffix"
-    return None
-
-
-def _is_valid_event_suffix(value: str) -> bool:
+def _is_valid_suffix(value: str) -> bool:
     stripped = value.strip().lower()
-    return 4 <= len(stripped) <= 36 and all(char in "0123456789abcdef-" for char in stripped)
+    return 4 <= len(stripped) <= 12 and all(char in "0123456789abcdef" for char in stripped)
+
+
+def _looks_like_full_uuid(value: str) -> bool:
+    try:
+        UUID(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _ends_with_suffix(value: UUID | str, suffix: str) -> bool:
+    return str(value).lower().endswith(suffix.lower())
 
 
 def _optional_id_suffix(value: UUID | str | None) -> str | None:
@@ -883,11 +1124,12 @@ _SELECT_TARGET_EVENT = """
 
 
 __all__ = [
-    "ALLOWED_JUDGE_PROFILES",
     "BoundedAnalysisRequestedOutboxPublishConfig",
     "BoundedAnalysisRequestedOutboxPublishError",
     "BoundedAnalysisRequestedOutboxPublishResult",
     "BoundedAnalysisRequestedPublishRuntimeConfig",
+    "BoundedAnalysisRequestedRedisInspectorBuilder",
+    "BoundedAnalysisRequestedRedisInspectorHandle",
     "BoundedAnalysisRequestedRedisPublisherBuilder",
     "BoundedAnalysisRequestedRedisPublisherHandle",
     "BoundedAnalysisRequestedRepositoryBuilder",
@@ -895,15 +1137,18 @@ __all__ = [
     "DEFAULT_MAX_EVENTS",
     "EVENT_TYPE",
     "HARD_MAX_EVENTS",
-    "MODE",
+    "MODE_PREVIEW",
+    "MODE_PUBLISH",
     "QUEUE_NAME",
     "REQUIRED_PAYLOAD_FIELDS",
     "ROOT_OBJECT_TYPE",
     "RUNNER_NAME",
     "SCHEMA_VERSION",
     "STAGE_NAME",
+    "RedisTypeInspector",
     "SqlAlchemyBoundedAnalysisRequestedOutboxRepository",
     "argument_error_report",
+    "build_default_bounded_analysis_requested_redis_inspector",
     "build_default_bounded_analysis_requested_redis_publisher",
     "build_default_bounded_analysis_requested_repository",
     "load_bounded_analysis_requested_publish_runtime_config",

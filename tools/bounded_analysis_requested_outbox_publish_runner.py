@@ -5,7 +5,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
-from uuid import UUID
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +15,7 @@ from src.services.outbox_relay.bounded_analysis_requested_outbox_publish_runner 
     BoundedAnalysisRequestedOutboxPublishConfig,
     BoundedAnalysisRequestedOutboxPublishResult,
     BoundedAnalysisRequestedPublishRuntimeConfig,
+    BoundedAnalysisRequestedRedisInspectorBuilder,
     BoundedAnalysisRequestedRedisPublisherBuilder,
     BoundedAnalysisRequestedRepositoryBuilder,
     argument_error_report,
@@ -42,15 +42,22 @@ class RunnerResult:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = JsonOnlyArgumentParser(
-        description="Publish exactly one pending analysis.requested.v1 outbox row to q.analysis.route.",
+        description=(
+            "Preview or publish one exact analysis.requested.v1 outbox row "
+            "to q.analysis.route through the outbox relay boundary."
+        ),
         add_help=False,
     )
+    parser.add_argument("--mode", choices=("preview", "publish"), default="preview")
     parser.add_argument("--operator-approved", action="store_true")
     parser.add_argument("--allow-runtime-config", action="store_true")
+    parser.add_argument("--allow-database-read", action="store_true")
+    parser.add_argument("--allow-redis-read", action="store_true")
     parser.add_argument("--allow-redis-publish", action="store_true")
-    parser.add_argument("--allow-database-write", action="store_true")
-    parser.add_argument("--event-id")
+    parser.add_argument("--allow-outbox-status-update", action="store_true")
+    parser.add_argument("--event-type")
     parser.add_argument("--event-suffix")
+    parser.add_argument("--aggregate-suffix")
     return parser
 
 
@@ -59,29 +66,28 @@ def run(
     *,
     runtime_config_loader=None,
     repository_builder: BoundedAnalysisRequestedRepositoryBuilder | None = None,
+    redis_inspector_builder: BoundedAnalysisRequestedRedisInspectorBuilder | None = None,
     redis_publisher_builder: BoundedAnalysisRequestedRedisPublisherBuilder | None = None,
 ) -> RunnerResult:
-    event_id = _parse_optional_uuid(args.event_id, "invalid_event_id")
-    event_suffix = _parse_optional_event_suffix(args.event_suffix)
-    if isinstance(event_id, dict):
-        return RunnerResult(exit_code=1, report=event_id)
-    if isinstance(event_suffix, dict):
-        return RunnerResult(exit_code=1, report=event_suffix)
-
     runner_kwargs: dict[str, Any] = {
         "repository_builder": repository_builder,
+        "redis_inspector_builder": redis_inspector_builder,
         "redis_publisher_builder": redis_publisher_builder,
     }
     if runtime_config_loader is not None:
         runner_kwargs["runtime_config_loader"] = runtime_config_loader
     result = run_bounded_analysis_requested_outbox_publish_sync(
         BoundedAnalysisRequestedOutboxPublishConfig(
+            mode=str(args.mode),
             operator_approved=bool(args.operator_approved),
             allow_runtime_config=bool(args.allow_runtime_config),
+            allow_database_read=bool(args.allow_database_read),
+            allow_redis_read=bool(args.allow_redis_read),
             allow_redis_publish=bool(args.allow_redis_publish),
-            allow_database_write=bool(args.allow_database_write),
-            event_id=event_id,
-            event_suffix=event_suffix,
+            allow_outbox_status_update=bool(args.allow_outbox_status_update),
+            event_type=args.event_type,
+            event_suffix=_clean_optional_suffix(args.event_suffix),
+            aggregate_suffix=_clean_optional_suffix(args.aggregate_suffix),
             max_events=1,
         ),
         **runner_kwargs,
@@ -95,6 +101,7 @@ def main(
     *,
     runtime_config_loader=None,
     repository_builder: BoundedAnalysisRequestedRepositoryBuilder | None = None,
+    redis_inspector_builder: BoundedAnalysisRequestedRedisInspectorBuilder | None = None,
     redis_publisher_builder: BoundedAnalysisRequestedRedisPublisherBuilder | None = None,
 ) -> int:
     try:
@@ -106,34 +113,24 @@ def main(
         args,
         runtime_config_loader=runtime_config_loader,
         repository_builder=repository_builder,
+        redis_inspector_builder=redis_inspector_builder,
         redis_publisher_builder=redis_publisher_builder,
     )
     sys.stdout.write(render_sanitized_json(result.report))
     return result.exit_code
 
 
-def _parse_optional_uuid(value: str | None, error_code: str) -> UUID | None | dict[str, Any]:
+def _clean_optional_suffix(value: str | None) -> str | None:
     if value is None:
         return None
-    try:
-        return UUID(value)
-    except ValueError:
-        return argument_error_report(error_code)
-
-
-def _parse_optional_event_suffix(value: str | None) -> str | None | dict[str, Any]:
-    if value is None:
-        return None
-    stripped = value.strip().lower()
-    if 4 <= len(stripped) <= 36 and all(char in "0123456789abcdef-" for char in stripped):
-        return stripped
-    return argument_error_report("invalid_event_suffix")
+    return value.strip().lower()
 
 
 __all__ = [
     "BoundedAnalysisRequestedOutboxPublishConfig",
     "BoundedAnalysisRequestedOutboxPublishResult",
     "BoundedAnalysisRequestedPublishRuntimeConfig",
+    "BoundedAnalysisRequestedRedisInspectorBuilder",
     "BoundedAnalysisRequestedRedisPublisherBuilder",
     "BoundedAnalysisRequestedRepositoryBuilder",
     "CliArgumentError",
