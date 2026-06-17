@@ -9,6 +9,17 @@ from uuid import UUID
 DeliveryDecision = Literal["send_now", "send_digest", "suppress"]
 UrgencyProfile = Literal["high", "normal_silent", "digest", "suppressed"]
 DeliveryStatus = Literal["planned", "rendered", "queued", "sent", "edited", "suppressed", "failed_retryable", "failed_terminal"]
+NotifierIdempotencyClassification = Literal[
+    "no_existing_plan",
+    "existing_plan_pending",
+    "existing_plan_rendered",
+    "existing_plan_sent",
+    "existing_plan_suppressed",
+    "existing_duplicate_plans",
+    "existing_duplicate_sent_deliveries",
+    "existing_terminal_delivery",
+    "existing_retryable_failure",
+]
 
 
 @dataclass(slots=True, frozen=True)
@@ -102,6 +113,36 @@ class ExistingRecentDelivery:
     urgency_profile: str | None
     render_profile: str | None
     created_at: datetime
+
+
+@dataclass(slots=True, frozen=True)
+class NotifierPlanIdempotencySnapshot:
+    notification_plan_id: UUID
+    status: str
+    render_count: int = 0
+    delivery_record_count: int = 0
+    sent_delivery_count: int = 0
+    suppressed_delivery_count: int = 0
+    terminal_delivery_count: int = 0
+    retryable_failure_count: int = 0
+    sent_delivery_chat_id_present_count: int = 0
+    sent_delivery_message_id_present_count: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class NotifierIdempotencyReadback:
+    primary_classification: NotifierIdempotencyClassification
+    classifications: tuple[NotifierIdempotencyClassification, ...]
+    plan_count: int
+    render_count: int
+    delivery_record_count: int
+    sent_delivery_count: int
+    suppressed_delivery_count: int
+    terminal_delivery_count: int
+    retryable_failure_count: int
+    sent_delivery_chat_id_present_count: int
+    sent_delivery_message_id_present_count: int
+    plan_id_suffixes: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)

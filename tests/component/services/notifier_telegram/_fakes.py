@@ -11,6 +11,7 @@ from services.notifier_telegram.models import (
     ExistingRecentDelivery,
     JudgeOutputRenderContext,
     NotificationIntentJob,
+    NotifierPlanIdempotencySnapshot,
     NotificationPlanDraft,
     NotificationRenderDraft,
     StreamMessage,
@@ -82,6 +83,52 @@ class FakeRepository:
             ):
                 return _plan_row(plan)
         return None
+
+    async def load_idempotency_plan_snapshots(self, intent: NotificationIntentJob):
+        snapshots = []
+        for plan in self.plans.values():
+            if not (
+                plan.notification_plan_id == intent.notification_plan_id
+                or (
+                    plan.analysis_id == intent.analysis_id
+                    and plan.candidate_group_id == intent.candidate_group_id
+                    and plan.target_chat_id == intent.target_chat_id
+                    and plan.dedupe_subject_key == intent.dedupe_subject_key
+                    and plan.material_change_hash == intent.material_change_hash
+                )
+            ):
+                continue
+            records = [
+                record
+                for record in self.delivery_records
+                if record["notification_plan_id"] == plan.notification_plan_id
+            ]
+            sent_records = [record for record in records if record["result_status"] in {"sent", "edited"}]
+            snapshots.append(
+                NotifierPlanIdempotencySnapshot(
+                    notification_plan_id=plan.notification_plan_id,
+                    status=plan.status,
+                    render_count=sum(1 for render in self.renders if render.notification_plan_id == plan.notification_plan_id),
+                    delivery_record_count=len(records),
+                    sent_delivery_count=len(sent_records),
+                    suppressed_delivery_count=sum(1 for record in records if record["result_status"] == "suppressed"),
+                    terminal_delivery_count=sum(
+                        1
+                        for record in records
+                        if record["result_status"] in {"sent", "edited", "suppressed", "failed_terminal"}
+                    ),
+                    retryable_failure_count=sum(
+                        1 for record in records if record["result_status"] == "failed_retryable"
+                    ),
+                    sent_delivery_chat_id_present_count=sum(
+                        1 for record in sent_records if record.get("telegram_chat_id") is not None
+                    ),
+                    sent_delivery_message_id_present_count=sum(
+                        1 for record in sent_records if record.get("telegram_message_id") is not None
+                    ),
+                )
+            )
+        return snapshots
 
     async def insert_notification_plan(self, draft: NotificationPlanDraft) -> UUID:
         existing = await self.load_existing_plan_by_material(

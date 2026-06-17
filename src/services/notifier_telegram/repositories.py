@@ -14,6 +14,7 @@ from .models import (
     ExistingRecentDelivery,
     JudgeOutputRenderContext,
     NotificationIntentJob,
+    NotifierPlanIdempotencySnapshot,
     NotificationPlanDraft,
     NotificationRenderDraft,
 )
@@ -172,6 +173,76 @@ class NotifierTelegramRepository:
         )
         row = result.mappings().first()
         return dict(row) if row else None
+
+    async def load_idempotency_plan_snapshots(self, intent: NotificationIntentJob) -> list[NotifierPlanIdempotencySnapshot]:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT p.notification_plan_id,
+                       p.status::text AS status,
+                       COUNT(DISTINCT r.notification_render_id) AS render_count,
+                       COUNT(DISTINCT d.notification_delivery_record_id) AS delivery_record_count,
+                       COUNT(DISTINCT d.notification_delivery_record_id) FILTER (
+                           WHERE d.delivery_status::text IN ('sent', 'edited')
+                       ) AS sent_delivery_count,
+                       COUNT(DISTINCT d.notification_delivery_record_id) FILTER (
+                           WHERE d.delivery_status::text = 'suppressed'
+                       ) AS suppressed_delivery_count,
+                       COUNT(DISTINCT d.notification_delivery_record_id) FILTER (
+                           WHERE d.delivery_status::text IN ('sent', 'edited', 'suppressed', 'failed_terminal')
+                       ) AS terminal_delivery_count,
+                       COUNT(DISTINCT d.notification_delivery_record_id) FILTER (
+                           WHERE d.delivery_status::text = 'failed_retryable'
+                       ) AS retryable_failure_count,
+                       COUNT(DISTINCT d.notification_delivery_record_id) FILTER (
+                           WHERE d.delivery_status::text IN ('sent', 'edited')
+                             AND d.telegram_chat_id IS NOT NULL
+                       ) AS sent_delivery_chat_id_present_count,
+                       COUNT(DISTINCT d.notification_delivery_record_id) FILTER (
+                           WHERE d.delivery_status::text IN ('sent', 'edited')
+                             AND d.telegram_message_id IS NOT NULL
+                       ) AS sent_delivery_message_id_present_count
+                FROM notification_plans p
+                LEFT JOIN notification_renders r ON r.notification_plan_id = p.notification_plan_id
+                LEFT JOIN notification_delivery_records d ON d.notification_plan_id = p.notification_plan_id
+                WHERE p.notification_plan_id = CAST(:notification_plan_id AS uuid)
+                   OR (
+                       p.analysis_id = CAST(:analysis_id AS uuid)
+                       AND p.candidate_group_id = CAST(:candidate_group_id AS uuid)
+                       AND p.target_chat_id = :target_chat_id
+                       AND p.dedupe_subject_key = :dedupe_subject_key
+                       AND p.material_change_hash = :material_change_hash
+                   )
+                GROUP BY p.notification_plan_id, p.status, p.created_at
+                ORDER BY p.created_at ASC, p.notification_plan_id ASC
+                """
+            ),
+            {
+                "notification_plan_id": str(intent.notification_plan_id),
+                "analysis_id": str(intent.analysis_id),
+                "candidate_group_id": str(intent.candidate_group_id),
+                "target_chat_id": intent.target_chat_id,
+                "dedupe_subject_key": intent.dedupe_subject_key,
+                "material_change_hash": intent.material_change_hash,
+            },
+        )
+        snapshots: list[NotifierPlanIdempotencySnapshot] = []
+        for row in result.mappings().all():
+            snapshots.append(
+                NotifierPlanIdempotencySnapshot(
+                    notification_plan_id=UUID(str(row["notification_plan_id"])),
+                    status=str(row["status"]),
+                    render_count=int(row["render_count"] or 0),
+                    delivery_record_count=int(row["delivery_record_count"] or 0),
+                    sent_delivery_count=int(row["sent_delivery_count"] or 0),
+                    suppressed_delivery_count=int(row["suppressed_delivery_count"] or 0),
+                    terminal_delivery_count=int(row["terminal_delivery_count"] or 0),
+                    retryable_failure_count=int(row["retryable_failure_count"] or 0),
+                    sent_delivery_chat_id_present_count=int(row["sent_delivery_chat_id_present_count"] or 0),
+                    sent_delivery_message_id_present_count=int(row["sent_delivery_message_id_present_count"] or 0),
+                )
+            )
+        return snapshots
 
     async def insert_notification_plan(self, draft: NotificationPlanDraft) -> UUID:
         result = await self._session.execute(

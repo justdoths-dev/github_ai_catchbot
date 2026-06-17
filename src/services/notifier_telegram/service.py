@@ -7,6 +7,13 @@ from typing import Protocol
 from uuid import UUID
 
 from .config import NotifierTelegramConfig
+from .idempotency import (
+    classify_notifier_idempotency_state,
+    idempotency_noop_reason,
+    idempotency_transition_plan_id,
+    should_fail_closed_before_concretization,
+    should_noop_before_concretization,
+)
 from .models import (
     AnalysisRenderContext,
     CandidateRenderContext,
@@ -14,6 +21,7 @@ from .models import (
     DeliveryResult,
     JudgeOutputRenderContext,
     NotificationIntentJob,
+    NotifierPlanIdempotencySnapshot,
     NotificationPlanDraft,
     NotificationRenderDraft,
 )
@@ -51,6 +59,15 @@ class NotifierTelegramRepositoryProtocol(Protocol):
     ) -> None: ...
     async def insert_state_transition(self, **kwargs) -> None: ...
     async def insert_delivery_result_outbox(self, **kwargs) -> None: ...
+    async def load_idempotency_plan_snapshots(
+        self, intent: NotificationIntentJob
+    ) -> list[NotifierPlanIdempotencySnapshot]: ...
+
+
+class NotifierIdempotencyGuardError(RuntimeError):
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
 
 
 class NotifierTelegramService:
@@ -102,6 +119,25 @@ class NotifierTelegramService:
         if analysis.delivery_decision != intent.delivery_decision:
             await self._transition(intent, to_state="failed_terminal", reason_code="notification_delivery_decision_mismatch")
             return None
+        idempotency_snapshots = await self._repository.load_idempotency_plan_snapshots(intent)
+        idempotency_readback = classify_notifier_idempotency_state(idempotency_snapshots)
+        if should_fail_closed_before_concretization(idempotency_readback):
+            raise NotifierIdempotencyGuardError("duplicate_existing_state")
+        if should_noop_before_concretization(idempotency_readback):
+            reason_code = idempotency_noop_reason(idempotency_readback)
+            transition_plan_id = idempotency_transition_plan_id(idempotency_snapshots, intent.notification_plan_id)
+            await self._transition_for_plan_id(
+                transition_plan_id,
+                to_state=idempotency_readback.primary_classification,
+                reason_code=reason_code,
+            )
+            return DeliveryResult(
+                delivery_status="suppressed",
+                telegram_chat_id=intent.target_chat_id,
+                telegram_message_id=None,
+                attempt_count=0,
+                transport_error_code=reason_code,
+            )
         if intent.delivery_decision == "suppress" or not intent.target_chat_id:
             await self._concretize_plan(intent, status="suppressed")
             await self._transition(intent, to_state="suppressed", reason_code=intent.suppress_reason_code or "notification_suppressed")
@@ -453,10 +489,13 @@ class NotifierTelegramService:
         return await self._repository.count_delivery_attempts(notification_plan_id=notification_plan_id)
 
     async def _transition(self, intent: NotificationIntentJob, *, to_state: str, reason_code: str) -> None:
+        await self._transition_for_plan_id(intent.notification_plan_id, to_state=to_state, reason_code=reason_code)
+
+    async def _transition_for_plan_id(self, notification_plan_id: UUID, *, to_state: str, reason_code: str) -> None:
         async with self._repository.transaction():
             await self._repository.insert_state_transition(
                 object_type="notification_plan",
-                object_id=intent.notification_plan_id,
+                object_id=notification_plan_id,
                 from_state=None,
                 to_state=to_state,
                 reason_code=reason_code,
