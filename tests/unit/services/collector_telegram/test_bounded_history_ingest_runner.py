@@ -3,9 +3,10 @@ from __future__ import annotations
 import ast
 import json
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import pytest
 
@@ -21,11 +22,13 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
 from src.services.collector_telegram.config import CollectorTelegramConfig
 from src.services.collector_telegram.models import CollectorEnvironment, CollectorMode, TrackedChat
 from src.services.collector_telegram.tdlib_client import TDLibClient
+from src.services.outbox_relay.models import OutboxEventRow
 
 
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE_PATH = ROOT / "src/services/collector_telegram/bounded_history_ingest_runner.py"
 TOOL_PATH = ROOT / "tools/bounded_telegram_collector_history_ingest_runner.py"
+NEW_TOOL_PATH = ROOT / "tools/bounded_collector_history_ingest_runner.py"
 DB_URL = "postgresql+psycopg://sentinel_user:sentinel_db_password@127.0.0.1/db"
 RAW_CHAT_ID = 9876543210123
 RAW_MESSAGE_ID = 444555666
@@ -34,6 +37,7 @@ RAW_SECRET = "sentinel_telegram_api_hash_history_ingest"
 EXCEPTION_DETAIL = "private exception detail with sentinel bounded history ingest raw message text"
 CLOSE_EXCEPTION_DETAIL = "private close failure detail with sentinel bounded history ingest raw message text"
 _DEFAULT_SOURCE_MESSAGE_ID = object()
+_DEFAULT_TRACKED_CHAT = object()
 
 
 class FakeTransaction:
@@ -61,14 +65,27 @@ class FakeRepository:
     def __init__(
         self,
         *,
-        tracked: TrackedChat | None = None,
+        tracked: TrackedChat | None | object = _DEFAULT_TRACKED_CHAT,
         fail_upsert: Exception | None = None,
         return_uuid_source_message_id: bool = False,
         upsert_source_message_id: object = _DEFAULT_SOURCE_MESSAGE_ID,
         omit_upsert_source_message_id: bool = False,
+        extra_targets: list[TrackedChat] | None = None,
     ) -> None:
-        self.tracked = tracked
+        if tracked is _DEFAULT_TRACKED_CHAT:
+            self.tracked = TrackedChat(
+                registry_id="11111111-1111-1111-1111-111111111111",
+                chat_id=RAW_CHAT_ID,
+                desired_state="active",
+                access_state="joined",
+                source_kind="public_username",
+                source_value="trendingrepo",
+                priority_weight=100,
+            )
+        else:
+            self.tracked = tracked
         self.fail_upsert = fail_upsert
+        self.extra_targets = list(extra_targets or [])
         self.return_uuid_source_message_id = return_uuid_source_message_id
         self.upsert_source_message_id = upsert_source_message_id
         self.omit_upsert_source_message_id = omit_upsert_source_message_id
@@ -78,6 +95,8 @@ class FakeRepository:
         self.dedupe_keys: set[str] = set()
         self.transactions: list[FakeTransaction] = []
         self.registry_lookups: list[str] = []
+        self.mark_published_calls: list[UUID] = []
+        self.cursor_updates: list[dict[str, Any]] = []
         self.upsert_calls = 0
 
     def snapshot(self) -> Any:
@@ -94,6 +113,31 @@ class FakeRepository:
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction(self)
+
+    async def find_public_username_registry_targets(self, normalized_source_value: str) -> list[dict[str, Any]]:
+        self.registry_lookups.append(normalized_source_value)
+        rows = []
+        for target in [self.tracked, *self.extra_targets]:
+            if target is None:
+                continue
+            source_value = target.source_value.strip().lstrip("@").lower()
+            if target.source_kind != "public_username" or source_value != normalized_source_value:
+                continue
+            rows.append(
+                {
+                    "registry_id": target.registry_id,
+                    "chat_id": target.chat_id,
+                    "desired_state": target.desired_state,
+                    "access_state": target.access_state,
+                    "source_kind": target.source_kind,
+                    "source_value": target.source_value,
+                    "username_snapshot": f"@{target.source_value}",
+                    "priority_weight": target.priority_weight,
+                    "last_seen_message_id": target.last_seen_message_id,
+                    "last_seen_message_date": target.last_seen_message_date,
+                }
+            )
+        return rows
 
     async def get_active_joined_tracked_chat_by_registry_id(self, registry_id: str) -> TrackedChat | None:
         self.registry_lookups.append(registry_id)
@@ -168,6 +212,30 @@ class FakeRepository:
         self.outbox.append(event)
         return True
 
+    async def get_outbox_event_by_dedupe_key(self, dedupe_key: str) -> OutboxEventRow | None:
+        for event in self.outbox:
+            if event.dedupe_key == dedupe_key:
+                return OutboxEventRow(
+                    event_id=uuid5(NAMESPACE_URL, event.dedupe_key),
+                    event_type=event.event_type,
+                    aggregate_type=event.aggregate_type,
+                    aggregate_id=UUID(str(event.aggregate_id)),
+                    dedupe_key=event.dedupe_key,
+                    payload_json=dict(event.payload_json),
+                    status="pending",
+                    fail_count=0,
+                    created_at=datetime.now(timezone.utc),
+                )
+        return None
+
+    async def mark_outbox_published(self, *, event_id: UUID, published_at: Any = None) -> bool:
+        del published_at
+        self.mark_published_calls.append(event_id)
+        return True
+
+    async def update_channel_sync_cursor(self, **kwargs: Any) -> None:
+        self.cursor_updates.append(kwargs)
+
 
 class FakeHistoryClient:
     def __init__(self, messages: list[dict[str, Any]]) -> None:
@@ -181,6 +249,32 @@ class FakeHistoryClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class FakeRedisPublisher:
+    def __init__(self, *, failure: Exception | None = None, message_id: str = "1234567890-0") -> None:
+        self.failure = failure
+        self.message_id = message_id
+        self.publish_calls: list[tuple[Any, Any]] = []
+
+    async def publish(self, route: Any, message: Any) -> str:
+        self.publish_calls.append((route, message))
+        if self.failure is not None:
+            raise self.failure
+        return self.message_id
+
+
+class ObservingRedisPublisher(FakeRedisPublisher):
+    def __init__(self, repository: ImplicitTransactionRepository, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.repository = repository
+        self.committed_counts_at_publish: list[tuple[int, int, int]] = []
+        self.pending_counts_at_publish: list[tuple[int, int, int]] = []
+
+    async def publish(self, route: Any, message: Any) -> str:
+        self.committed_counts_at_publish.append(self.repository.committed_counts())
+        self.pending_counts_at_publish.append(self.repository.pending_counts())
+        return await super().publish(route, message)
 
 
 class FakeTDLibTransport:
@@ -238,11 +332,16 @@ class FakeRuntimeBuilder:
         history_client: FakeHistoryClient,
         *,
         close_error: Exception | None = None,
+        commit_error: Exception | None = None,
+        redis_publisher: FakeRedisPublisher | None = None,
     ) -> None:
         self.repository = repository
         self.history_client = history_client
         self.close_error = close_error
+        self.commit_error = commit_error
+        self.redis_publisher = redis_publisher
         self.calls = 0
+        self.commit_calls = 0
         self.close_commits: list[bool] = []
 
     async def __call__(self, runtime_config, state, logger):
@@ -255,10 +354,17 @@ class FakeRuntimeBuilder:
             if self.close_error is not None:
                 raise self.close_error
 
+        async def commit() -> None:
+            self.commit_calls += 1
+            if self.commit_error is not None:
+                raise self.commit_error
+
         return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
             repository=self.repository,
             history_client=self.history_client,
+            redis_publisher=self.redis_publisher,
             close=close,
+            commit=commit,
         )
 
 
@@ -316,6 +422,7 @@ class ImplicitTransaction:
 
     async def __aenter__(self) -> "ImplicitTransactionRepository":
         self.repository.ensure_pending()
+        self.repository.implicit_transaction_open = True
         self.repository.transaction_enters += 1
         return self.repository
 
@@ -342,6 +449,8 @@ class ImplicitTransactionRepository:
         self.pending_versions: dict[str, list[dict[str, Any]]] | None = None
         self.pending_outbox: list[Any] | None = None
         self.registry_lookups: list[str] = []
+        self.mark_published_calls: list[UUID] = []
+        self.cursor_updates: list[dict[str, Any]] = []
         self.transaction_enters = 0
         self.transaction_exits: list[Any] = []
         self.upsert_calls = 0
@@ -378,6 +487,28 @@ class ImplicitTransactionRepository:
 
     def transaction(self) -> ImplicitTransaction:
         return ImplicitTransaction(self)
+
+    async def find_public_username_registry_targets(self, normalized_source_value: str) -> list[dict[str, Any]]:
+        self.registry_lookups.append(normalized_source_value)
+        self.implicit_transaction_open = True
+        self.ensure_pending()
+        source_value = self.tracked.source_value.strip().lstrip("@").lower()
+        if self.tracked.source_kind != "public_username" or source_value != normalized_source_value:
+            return []
+        return [
+            {
+                "registry_id": self.tracked.registry_id,
+                "chat_id": self.tracked.chat_id,
+                "desired_state": self.tracked.desired_state,
+                "access_state": self.tracked.access_state,
+                "source_kind": self.tracked.source_kind,
+                "source_value": self.tracked.source_value,
+                "username_snapshot": f"@{self.tracked.source_value}",
+                "priority_weight": self.tracked.priority_weight,
+                "last_seen_message_id": self.tracked.last_seen_message_id,
+                "last_seen_message_date": self.tracked.last_seen_message_date,
+            }
+        ]
 
     async def get_active_joined_tracked_chat_by_registry_id(self, registry_id: str) -> TrackedChat | None:
         self.registry_lookups.append(registry_id)
@@ -448,11 +579,46 @@ class ImplicitTransactionRepository:
         self.pending_outbox.append(event)
         return True
 
+    async def get_outbox_event_by_dedupe_key(self, dedupe_key: str) -> OutboxEventRow | None:
+        self.ensure_pending()
+        for event in self.pending_outbox or []:
+            if event.dedupe_key == dedupe_key:
+                return OutboxEventRow(
+                    event_id=uuid5(NAMESPACE_URL, event.dedupe_key),
+                    event_type=event.event_type,
+                    aggregate_type=event.aggregate_type,
+                    aggregate_id=UUID(str(event.aggregate_id)),
+                    dedupe_key=event.dedupe_key,
+                    payload_json=dict(event.payload_json),
+                    status="pending",
+                    fail_count=0,
+                    created_at=datetime.now(timezone.utc),
+                )
+        return None
+
+    async def mark_outbox_published(self, *, event_id: UUID, published_at: Any = None) -> bool:
+        del published_at
+        self.mark_published_calls.append(event_id)
+        return True
+
+    async def update_channel_sync_cursor(self, **kwargs: Any) -> None:
+        self.cursor_updates.append(kwargs)
+
 
 class ImplicitTransactionRuntimeBuilder:
-    def __init__(self, repository: ImplicitTransactionRepository, history_client: FakeHistoryClient) -> None:
+    def __init__(
+        self,
+        repository: ImplicitTransactionRepository,
+        history_client: FakeHistoryClient,
+        *,
+        commit_errors: list[Exception | None] | None = None,
+    ) -> None:
         self.repository = repository
         self.history_client = history_client
+        self.commit_errors = list(commit_errors or [])
+        self.commit_calls = 0
+        self.pre_commit_committed_counts: list[tuple[int, int, int]] = []
+        self.pre_commit_pending_counts: list[tuple[int, int, int]] = []
         self.close_commits: list[bool] = []
         self.pre_close_committed_counts: list[tuple[int, int, int]] = []
         self.pre_close_pending_counts: list[tuple[int, int, int]] = []
@@ -464,13 +630,25 @@ class ImplicitTransactionRuntimeBuilder:
             self.close_commits.append(commit)
             self.pre_close_committed_counts.append(self.repository.committed_counts())
             self.pre_close_pending_counts.append(self.repository.pending_counts())
-            self.repository.finalize(commit=commit)
+            if self.repository.pending_messages is not None:
+                self.repository.finalize(commit=commit)
             await self.history_client.close()
+
+        async def commit() -> None:
+            self.commit_calls += 1
+            self.pre_commit_committed_counts.append(self.repository.committed_counts())
+            self.pre_commit_pending_counts.append(self.repository.pending_counts())
+            if self.commit_errors:
+                error = self.commit_errors.pop(0)
+                if error is not None:
+                    raise error
+            self.repository.finalize(commit=True)
 
         return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
             repository=self.repository,
             history_client=self.history_client,
             close=close,
+            commit=commit,
         )
 
 
@@ -520,26 +698,38 @@ def _message(*, text: str = RAW_MESSAGE_TEXT, message_id: int = RAW_MESSAGE_ID) 
 
 def _approved_config(**overrides: Any) -> BoundedTelegramCollectorHistoryIngestConfig:
     values = {
+        "mode": "execute",
+        "source_kind": "public_username",
+        "source_value": "trendingrepo",
         "operator_approved": True,
         "allow_runtime_config": True,
+        "allow_database_read": True,
         "allow_telegram_read": True,
         "allow_database_write": True,
-        "allow_outbox_write": True,
-        "max_messages": 1,
-        "chat_id": RAW_CHAT_ID,
+        "allow_source_message_write": True,
+        "allow_source_version_write": True,
+        "allow_source_outbox_write": True,
+        "history_limit": 1,
     }
     values.update(overrides)
     return BoundedTelegramCollectorHistoryIngestConfig(**values)
 
 
-def _tracked_chat(registry_id: str = "11111111-1111-1111-1111-111111111111") -> TrackedChat:
+def _tracked_chat(
+    registry_id: str = "11111111-1111-1111-1111-111111111111",
+    *,
+    desired_state: str = "active",
+    access_state: str = "joined",
+    chat_id: int | None = RAW_CHAT_ID,
+    source_value: str = "trendingrepo",
+) -> TrackedChat:
     return TrackedChat(
         registry_id=registry_id,
-        chat_id=RAW_CHAT_ID,
-        desired_state="active",
-        access_state="joined",
-        source_kind="username",
-        source_value="goodvibeai",
+        chat_id=chat_id,
+        desired_state=desired_state,
+        access_state=access_state,
+        source_kind="public_username",
+        source_value=source_value,
         priority_weight=100,
     )
 
@@ -573,11 +763,19 @@ async def _run(
     history: FakeHistoryClient | None = None,
     loader: Loader | None = None,
     close_error: Exception | None = None,
+    commit_error: Exception | None = None,
+    redis_publisher: FakeRedisPublisher | None = None,
 ):
     fake_repository = repository or FakeRepository()
     fake_history = history or FakeHistoryClient([_message()])
     fake_loader = loader or Loader()
-    builder = FakeRuntimeBuilder(fake_repository, fake_history, close_error=close_error)
+    builder = FakeRuntimeBuilder(
+        fake_repository,
+        fake_history,
+        close_error=close_error,
+        commit_error=commit_error,
+        redis_publisher=redis_publisher,
+    )
     result = await run_bounded_telegram_collector_history_ingest(
         config,
         runtime_config_loader=fake_loader,
@@ -649,7 +847,7 @@ async def test_successful_run_with_implicit_transaction_persists_on_close_commit
     builder = ImplicitTransactionRuntimeBuilder(repository, history)
 
     result = await run_bounded_telegram_collector_history_ingest(
-        _approved_config(chat_id=None, registry_id=tracked.registry_id),
+        _approved_config(),
         runtime_config_loader=Loader(),
         runtime_builder=builder,
     )
@@ -659,11 +857,14 @@ async def test_successful_run_with_implicit_transaction_persists_on_close_commit
     assert report["source_messages_created_count"] == 1
     assert report["source_versions_appended_count"] == 1
     assert report["outbox_events_inserted_count"] == 1
-    assert repository.registry_lookups == [tracked.registry_id]
-    assert repository.transaction_enters == 1
+    assert repository.registry_lookups == ["trendingrepo"]
+    assert repository.transaction_enters == 2
+    assert builder.commit_calls == 1
+    assert builder.pre_commit_committed_counts == [(0, 0, 0)]
+    assert builder.pre_commit_pending_counts == [(1, 1, 1)]
     assert builder.close_commits == [True]
-    assert builder.pre_close_committed_counts == [(0, 0, 0)]
-    assert builder.pre_close_pending_counts == [(1, 1, 1)]
+    assert builder.pre_close_committed_counts == [(1, 1, 1)]
+    assert builder.pre_close_pending_counts == [(0, 0, 0)]
     assert repository.committed_counts() == (1, 1, 1)
     assert repository.pending_counts() == (0, 0, 0)
     assert len(repository.committed_outbox) == 1
@@ -681,7 +882,7 @@ async def test_failure_after_write_with_implicit_transaction_rolls_back_pending_
     builder = ImplicitTransactionRuntimeBuilder(repository, history)
 
     result = await run_bounded_telegram_collector_history_ingest(
-        _approved_config(chat_id=None, registry_id=tracked.registry_id),
+        _approved_config(),
         runtime_config_loader=Loader(),
         runtime_builder=builder,
     )
@@ -692,6 +893,7 @@ async def test_failure_after_write_with_implicit_transaction_rolls_back_pending_
     assert report["database_write_attempted"] is True
     assert report["outbox_write_attempted"] is False
     assert repository.transaction_enters == 1
+    assert builder.commit_calls == 0
     assert builder.close_commits == [False]
     assert builder.pre_close_committed_counts == [(0, 0, 0)]
     assert builder.pre_close_pending_counts == [(1, 0, 0)]
@@ -711,7 +913,7 @@ async def test_successful_processing_close_commit_failure_returns_sanitized_bloc
     rendered = json.dumps(report, sort_keys=True)
 
     assert result.ok is False
-    assert report["status"] == "blocked"
+    assert report["status"] == "failed"
     assert report["error_code"] == "runtime_commit_failed"
     assert report["error_class"] == "RuntimeError"
     assert builder.close_commits == [True]
@@ -740,7 +942,7 @@ async def test_failed_processing_close_rollback_failure_returns_sanitized_blocke
     rendered = json.dumps(report, sort_keys=True)
 
     assert result.ok is False
-    assert report["status"] == "blocked"
+    assert report["status"] == "failed"
     assert report["error_code"] == "runtime_rollback_failed"
     assert report["error_class"] == "ValueError"
     assert report["database_write_attempted"] is True
@@ -788,7 +990,7 @@ async def test_no_flags_fail_closed_before_runtime_config_or_authority() -> None
         ({"allow_runtime_config": False}, "runtime_config_not_allowed", 0, 0),
         ({"allow_telegram_read": False}, "telegram_read_not_allowed", 1, 0),
         ({"allow_database_write": False}, "database_write_not_allowed", 1, 0),
-        ({"allow_outbox_write": False}, "outbox_write_not_allowed", 1, 0),
+        ({"allow_source_outbox_write": False}, "source_outbox_write_not_allowed", 1, 0),
     ],
 )
 async def test_missing_each_gate_blocks_before_next_authority(
@@ -812,11 +1014,11 @@ async def test_missing_each_gate_blocks_before_next_authority(
 
 @pytest.mark.asyncio
 async def test_max_messages_hard_cap_blocks_before_runtime_config() -> None:
-    result, loader, builder, _repository, history = await _run(_approved_config(max_messages=4))
+    result, loader, builder, _repository, history = await _run(_approved_config(history_limit=31))
     report = result.to_sanitized_dict()
 
     assert result.ok is False
-    assert report["error_code"] == "max_messages_out_of_bounds"
+    assert report["error_code"] == "history_limit_out_of_bounds"
     assert loader.calls == 0
     assert builder.calls == 0
     assert history.calls == []
@@ -824,22 +1026,154 @@ async def test_max_messages_hard_cap_blocks_before_runtime_config() -> None:
 
 @pytest.mark.asyncio
 async def test_registry_target_requires_active_joined_single_row_before_read() -> None:
-    repository = FakeRepository()
+    repository = FakeRepository(tracked=None)
     history = FakeHistoryClient([_message()])
     result, _loader, builder, repository, history = await _run(
-        _approved_config(chat_id=None, registry_id="11111111-1111-1111-1111-111111111111"),
+        _approved_config(),
         repository=repository,
         history=history,
     )
     report = result.to_sanitized_dict()
 
     assert result.ok is False
-    assert report["error_code"] == "registry_target_not_active_joined"
+    assert report["error_code"] == "registry_target_missing"
     assert report["registry_lookup_attempted"] is True
     assert builder.calls == 1
-    assert repository.registry_lookups == ["11111111-1111-1111-1111-111111111111"]
+    assert repository.registry_lookups == ["trendingrepo"]
     assert history.calls == []
     assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tracked", "error_code"),
+    [
+        (_tracked_chat(access_state="unresolved"), "registry_target_not_joined"),
+        (_tracked_chat(chat_id=None), "registry_target_chat_id_missing"),
+        (_tracked_chat(desired_state="paused"), "registry_target_not_active"),
+    ],
+)
+async def test_exact_public_username_target_rejects_unready_registry_rows(
+    tracked: TrackedChat,
+    error_code: str,
+) -> None:
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(),
+        repository=FakeRepository(tracked=tracked),
+        history=FakeHistoryClient([_message()]),
+    )
+
+    assert result.ok is False
+    assert result.error_code == error_code
+    assert repository.registry_lookups == ["trendingrepo"]
+    assert history.calls == []
+    assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+async def test_exact_public_username_target_rejects_multiple_rows_before_read() -> None:
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(),
+        repository=FakeRepository(
+            tracked=_tracked_chat("11111111-1111-1111-1111-111111111111"),
+            extra_targets=[_tracked_chat("22222222-2222-2222-2222-222222222222")],
+        ),
+        history=FakeHistoryClient([_message()]),
+    )
+
+    assert result.ok is False
+    assert result.error_code == "registry_target_multiple"
+    assert repository.registry_lookups == ["trendingrepo"]
+    assert history.calls == []
+    assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+async def test_exact_public_username_target_accepts_at_prefixed_source_value_and_suffix_gate() -> None:
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(source_value="@trendingrepo", registry_id_suffix="11111111"),
+        history=FakeHistoryClient([_message()]),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is True
+    assert report["source_value_surface"] == "trendingrepo"
+    assert report["target_registry_id_suffix"] == "11111111"
+    assert report["target_joined"] is True
+    assert report["target_chat_id_present"] is True
+    assert repository.registry_lookups == ["trendingrepo"]
+    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
+    assert builder.close_commits == [True]
+
+
+@pytest.mark.asyncio
+async def test_exact_public_username_target_rejects_registry_suffix_mismatch() -> None:
+    result, _loader, builder, _repository, history = await _run(
+        _approved_config(registry_id_suffix="ffffffff"),
+        history=FakeHistoryClient([_message()]),
+    )
+
+    assert result.ok is False
+    assert result.error_code == "registry_id_suffix_mismatch"
+    assert history.calls == []
+    assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+async def test_preview_without_telegram_read_gate_resolves_target_without_fetch_or_writes() -> None:
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(
+            mode="preview",
+            allow_telegram_read=False,
+            allow_database_write=False,
+            allow_source_message_write=False,
+            allow_source_version_write=False,
+            allow_source_outbox_write=False,
+        ),
+        history=FakeHistoryClient([_message()]),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is True
+    assert report["status"] == "preview_completed"
+    assert report["target_joined"] is True
+    assert report["target_chat_id_present"] is True
+    assert report["telegram_read_attempted"] is False
+    assert report["database_write_attempted"] is False
+    assert repository.messages == {}
+    assert repository.outbox == []
+    assert history.calls == []
+    assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+async def test_preview_with_telegram_read_reports_would_counts_and_redacts_body() -> None:
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(
+            mode="preview",
+            allow_database_write=False,
+            allow_source_message_write=False,
+            allow_source_version_write=False,
+            allow_source_outbox_write=False,
+        ),
+        history=FakeHistoryClient([_message()]),
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is True
+    assert report["messages_seen"] == 1
+    assert report["would_insert_source_messages_count"] == 1
+    assert report["would_append_source_versions_count"] == 1
+    assert report["would_insert_outbox_events_count"] == 1
+    assert report["would_skip_same_hash_count"] == 0
+    assert report["database_write_attempted"] is False
+    assert repository.messages == {}
+    assert repository.outbox == []
+    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
+    assert builder.close_commits == [False]
+    assert str(RAW_CHAT_ID) not in rendered
+    assert RAW_MESSAGE_TEXT not in rendered
 
 
 @pytest.mark.asyncio
@@ -866,8 +1200,7 @@ async def test_one_fake_message_flows_through_projection_repository_and_outbox()
     assert report["side_effects"]["x_called"] is False
     assert report["side_effects"]["web_called"] is False
     assert report["side_effects"]["notification_table_write"] is False
-    assert report["side_effects"]["worker_started"] is False
-    assert report["side_effects"]["run_forever_called"] is False
+    assert report["side_effects"]["worker_loop_started"] is False
     assert report["side_effects"]["systemd_called"] is False
     assert report["side_effects"]["docker_called"] is False
     assert report["side_effects"]["alembic_called"] is False
@@ -1123,6 +1456,277 @@ async def test_duplicate_same_message_is_idempotent_noop_without_new_outbox() ->
 
 
 @pytest.mark.asyncio
+async def test_changed_history_message_appends_reconcile_version_and_outbox() -> None:
+    repository = FakeRepository()
+    first_result, _loader, _builder, repository, _history = await _run(
+        _approved_config(),
+        repository=repository,
+        history=FakeHistoryClient([_message()]),
+    )
+    second_result, _loader, _builder, repository, _history = await _run(
+        _approved_config(),
+        repository=repository,
+        history=FakeHistoryClient([_message(text="changed bounded history ingest text")]),
+    )
+    second = second_result.to_sanitized_dict()
+    source_message_id = next(iter(repository.versions))
+
+    assert first_result.ok is True
+    assert second_result.ok is True
+    assert second["source_messages_created_count"] == 0
+    assert second["source_versions_appended_count"] == 1
+    assert second["outbox_events_inserted_count"] == 1
+    assert repository.versions[source_message_id][-1]["version_reason"] == "reconcile"
+    assert len(repository.outbox) == 2
+    assert repository.outbox[-1].event_type == "source_message.reconciled.v1"
+    assert repository.cursor_updates[-1]["last_seen_message_id"] == RAW_MESSAGE_ID
+
+
+@pytest.mark.asyncio
+async def test_publish_after_source_commit() -> None:
+    tracked = _tracked_chat()
+    repository = ImplicitTransactionRepository(tracked=tracked)
+    history = FakeHistoryClient([_message()])
+    publisher = ObservingRedisPublisher(repository)
+    builder = ImplicitTransactionRuntimeBuilder(repository, history)
+
+    async def runtime_builder(runtime_config, state, logger):
+        handle = await builder(runtime_config, state, logger)
+        return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
+            repository=handle.repository,
+            history_client=handle.history_client,
+            close=handle.close,
+            commit=handle.commit,
+            redis_publisher=publisher,
+        )
+
+    result = await run_bounded_telegram_collector_history_ingest(
+        _approved_config(allow_source_outbox_publish=True, allow_redis_publish=True),
+        runtime_config_loader=Loader(),
+        runtime_builder=runtime_builder,
+    )
+
+    assert result.ok is True
+    assert builder.commit_calls == 2
+    assert publisher.committed_counts_at_publish == [(1, 1, 1)]
+    assert publisher.pending_counts_at_publish == [(0, 0, 0)]
+    assert builder.pre_commit_committed_counts[0] == (0, 0, 0)
+    assert builder.pre_commit_pending_counts[0] == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_source_commit_failure_blocks_redis_publish() -> None:
+    tracked = _tracked_chat()
+    repository = ImplicitTransactionRepository(tracked=tracked)
+    history = FakeHistoryClient([_message()])
+    publisher = ObservingRedisPublisher(repository)
+    builder = ImplicitTransactionRuntimeBuilder(
+        repository,
+        history,
+        commit_errors=[RuntimeError(CLOSE_EXCEPTION_DETAIL)],
+    )
+
+    async def runtime_builder(runtime_config, state, logger):
+        handle = await builder(runtime_config, state, logger)
+        return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
+            repository=handle.repository,
+            history_client=handle.history_client,
+            close=handle.close,
+            commit=handle.commit,
+            redis_publisher=publisher,
+        )
+
+    result = await run_bounded_telegram_collector_history_ingest(
+        _approved_config(allow_source_outbox_publish=True, allow_redis_publish=True),
+        runtime_config_loader=Loader(),
+        runtime_builder=runtime_builder,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["error_code"] == "runtime_commit_failed"
+    assert report["error_class"] == "RuntimeError"
+    assert publisher.publish_calls == []
+    assert repository.committed_counts() == (0, 0, 0)
+    assert builder.close_commits == [False]
+    for raw_value in (str(RAW_CHAT_ID), RAW_MESSAGE_TEXT, DB_URL, RAW_SECRET, CLOSE_EXCEPTION_DETAIL):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_redis_publish_failure_preserves_committed_source_and_pending_outbox() -> None:
+    tracked = _tracked_chat()
+    repository = ImplicitTransactionRepository(tracked=tracked)
+    history = FakeHistoryClient([_message()])
+    publisher = ObservingRedisPublisher(
+        repository,
+        failure=RuntimeError("private redis xadd failure detail"),
+    )
+    builder = ImplicitTransactionRuntimeBuilder(repository, history)
+
+    async def runtime_builder(runtime_config, state, logger):
+        handle = await builder(runtime_config, state, logger)
+        return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
+            repository=handle.repository,
+            history_client=handle.history_client,
+            close=handle.close,
+            commit=handle.commit,
+            redis_publisher=publisher,
+        )
+
+    result = await run_bounded_telegram_collector_history_ingest(
+        _approved_config(allow_source_outbox_publish=True, allow_redis_publish=True),
+        runtime_config_loader=Loader(),
+        runtime_builder=runtime_builder,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["error_code"] == "redis_publish_failed"
+    assert report["redis_events_published_count"] == 0
+    assert report["event_outbox_marked_published_count"] == 0
+    assert repository.committed_counts() == (1, 1, 1)
+    assert len(repository.committed_outbox) == 1
+    assert repository.mark_published_calls == []
+    assert builder.close_commits == [False]
+    assert "private redis xadd failure detail" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_mark_published_commit_failure_is_not_success() -> None:
+    tracked = _tracked_chat()
+    repository = ImplicitTransactionRepository(tracked=tracked)
+    history = FakeHistoryClient([_message()])
+    publisher = ObservingRedisPublisher(repository, message_id="9999999999-0")
+    builder = ImplicitTransactionRuntimeBuilder(
+        repository,
+        history,
+        commit_errors=[None, RuntimeError(CLOSE_EXCEPTION_DETAIL)],
+    )
+
+    async def runtime_builder(runtime_config, state, logger):
+        handle = await builder(runtime_config, state, logger)
+        return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
+            repository=handle.repository,
+            history_client=handle.history_client,
+            close=handle.close,
+            commit=handle.commit,
+            redis_publisher=publisher,
+        )
+
+    result = await run_bounded_telegram_collector_history_ingest(
+        _approved_config(allow_source_outbox_publish=True, allow_redis_publish=True),
+        runtime_config_loader=Loader(),
+        runtime_builder=runtime_builder,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["error_code"] == "event_outbox_mark_published_commit_failed"
+    assert report["redis_events_published_count"] == 1
+    assert report["event_outbox_marked_published_count"] == 0
+    assert report["side_effects"]["redis_mutation"] is True
+    assert publisher.publish_calls
+    assert repository.committed_counts() == (1, 1, 1)
+    assert repository.pending_counts() == (0, 0, 0)
+    assert builder.close_commits == [False]
+    for raw_value in (str(RAW_CHAT_ID), RAW_MESSAGE_TEXT, DB_URL, RAW_SECRET, CLOSE_EXCEPTION_DETAIL):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_no_publish_mode_still_commits_source() -> None:
+    tracked = _tracked_chat()
+    repository = ImplicitTransactionRepository(tracked=tracked)
+    history = FakeHistoryClient([_message()])
+    builder = ImplicitTransactionRuntimeBuilder(repository, history)
+    publisher = ObservingRedisPublisher(repository)
+
+    result = await run_bounded_telegram_collector_history_ingest(
+        _approved_config(),
+        runtime_config_loader=Loader(),
+        runtime_builder=builder,
+    )
+
+    assert result.ok is True
+    assert repository.committed_counts() == (1, 1, 1)
+    assert repository.pending_counts() == (0, 0, 0)
+    assert publisher.publish_calls == []
+    assert builder.commit_calls == 1
+    assert builder.close_commits == [True]
+
+
+@pytest.mark.asyncio
+async def test_source_outbox_publish_uses_thin_redis_shape_and_marks_published_after_xadd() -> None:
+    publisher = FakeRedisPublisher(message_id="9999999999-0")
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(allow_source_outbox_publish=True, allow_redis_publish=True),
+        history=FakeHistoryClient([_message()]),
+        redis_publisher=publisher,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is True
+    assert report["redis_events_published_count"] == 1
+    assert report["event_outbox_marked_published_count"] == 1
+    assert report["source_outbox_publish_attempted"] is True
+    assert report["redis_publish_attempted"] is True
+    assert report["event_outbox_status_write_attempted"] is True
+    assert report["event_id_suffixes"]
+    assert report["redis_message_id_suffixes"] == ["999999-0"]
+    assert repository.mark_published_calls == [UUID(publisher.publish_calls[0][1].trigger_event_id)]
+    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
+    assert builder.close_commits == [True]
+
+    route, message = publisher.publish_calls[0]
+    fields = message.as_stream_fields()
+    assert route.queue_name == "q.source.normalize"
+    assert route.stage_name == "normalize"
+    assert fields == {
+        "job_id": message.job_id,
+        "stage_name": "normalize",
+        "root_object_type": "source_message",
+        "root_object_id": message.root_object_id,
+        "idempotency_key": message.idempotency_key,
+        "pipeline_run_id": "",
+        "not_before": "",
+        "trigger_event_id": message.trigger_event_id,
+    }
+    assert fields["job_id"] == fields["trigger_event_id"]
+    assert "payload_json" not in fields
+    assert "raw_message_json" not in fields
+    assert RAW_MESSAGE_TEXT not in json.dumps(fields, sort_keys=True)
+    for raw in (str(RAW_CHAT_ID), RAW_MESSAGE_TEXT, DB_URL, RAW_SECRET, message.job_id, message.root_object_id):
+        assert raw not in rendered
+
+
+@pytest.mark.asyncio
+async def test_redis_publish_failure_does_not_mark_event_published_or_claim_success() -> None:
+    publisher = FakeRedisPublisher(failure=RuntimeError("private redis xadd failure detail"))
+    result, _loader, builder, repository, _history = await _run(
+        _approved_config(allow_source_outbox_publish=True, allow_redis_publish=True),
+        history=FakeHistoryClient([_message()]),
+        redis_publisher=publisher,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["error_code"] == "redis_publish_failed"
+    assert report["redis_events_published_count"] == 0
+    assert report["event_outbox_marked_published_count"] == 0
+    assert report["redis_publish_attempted"] is True
+    assert report["event_outbox_status_write_attempted"] is False
+    assert repository.mark_published_calls == []
+    assert builder.close_commits == [False]
+    assert "private redis xadd failure detail" not in rendered
+
+
+@pytest.mark.asyncio
 async def test_failure_report_omits_raw_message_json_secrets_and_exception_detail() -> None:
     repository = FakeRepository(fail_upsert=RuntimeError(EXCEPTION_DETAIL))
     result, _loader, _builder, _repository, _history = await _run(
@@ -1160,8 +1764,19 @@ def test_runner_and_cli_do_not_import_forbidden_authority_modules() -> None:
     }
     forbidden_call_names = {"run_forever", "systemctl", "docker", "alembic"}
 
-    for path in (SOURCE_PATH, TOOL_PATH):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+    forbidden_text = (
+        "run_forever",
+        "runtime.env",
+        "xreadgroup",
+        "xack",
+        "xgroup_create",
+        "xclaim",
+        "xautoclaim",
+    )
+
+    for path in (SOURCE_PATH, TOOL_PATH, NEW_TOOL_PATH):
+        source_text = path.read_text(encoding="utf-8")
+        tree = ast.parse(source_text)
         imported: set[str] = set()
         called: set[str] = set()
         for node in ast.walk(tree):
@@ -1178,3 +1793,5 @@ def test_runner_and_cli_do_not_import_forbidden_authority_modules() -> None:
 
         assert not (imported & forbidden_import_roots)
         assert not (called & forbidden_call_names)
+        for forbidden in forbidden_text:
+            assert forbidden not in source_text

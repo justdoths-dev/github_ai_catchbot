@@ -14,24 +14,36 @@ from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from src.services.outbox_relay.models import OutboxEventRow, QueueRoute, RedisQueuedMessage
+from src.services.outbox_relay.redis_streams import RedisStreamsPublisher
+from src.services.outbox_relay.routing import OutboxRouteResolver, UnsupportedOutboxEventTypeError
+
 from .config import CollectorTelegramConfig
 from .exceptions import TDLibTransportError
 from .idempotency import IdempotencyPolicy
 from .message_projection import MessageProjectionBuilder
-from .models import SourceMessageProjection, TrackedChat
+from .models import SourceMessageProjection
 from .outbox import CollectorOutboxBuilder
 from .repositories import CollectorRepository
 from .tdlib_client import TDJsonTransport, TDLibClient
 
-SCHEMA_VERSION = "bounded_telegram_collector_history_ingest_v1"
-RUNNER_NAME = "bounded_telegram_collector_history_ingest_runner"
-MODE = "telegram_collector_one_shot_history_ingest"
-DEFAULT_MAX_MESSAGES = 1
-MAX_MESSAGES_HARD_LIMIT = 3
+SCHEMA_VERSION = "bounded_collector_history_ingest_v1"
+RUNNER_NAME = "bounded_collector_history_ingest_runner"
+MODE_PREVIEW = "preview"
+MODE_EXECUTE = "execute"
+DEFAULT_HISTORY_LIMIT = 10
+MAX_HISTORY_LIMIT = 30
+DEFAULT_MAX_MESSAGES = DEFAULT_HISTORY_LIMIT
+MAX_MESSAGES_HARD_LIMIT = MAX_HISTORY_LIMIT
 HISTORY_READ_TIMEOUT_SEC = 30.0
 HISTORY_RECEIVE_TIMEOUT_SEC = 1.0
 AUTH_READY_TIMEOUT_SEC = 30.0
 AUTH_RECEIVE_TIMEOUT_SEC = 1.0
+SOURCE_KIND_PUBLIC_USERNAME = "public_username"
+QUEUE_NAME = "q.source.normalize"
+STAGE_NAME = "normalize"
+ROOT_OBJECT_TYPE = "source_message"
+DEFAULT_XADD_MAXLEN = 10000
 
 _INTERACTIVE_AUTHORIZATION_STATES = frozenset(
     {
@@ -48,21 +60,34 @@ _TERMINAL_NOT_READY_AUTHORIZATION_STATES = frozenset(
         "authorizationStateClosed",
     }
 )
+_SOURCE_EVENT_TYPES = frozenset(
+    {
+        "source_message.created.v1",
+        "source_message.edited.v1",
+        "source_message.deleted.v1",
+        "source_message.reconciled.v1",
+    }
+)
 
 JsonDict = dict[str, Any]
 RuntimeConfigLoader = Callable[[], CollectorTelegramConfig]
 
 
 class BoundedHistoryIngestError(RuntimeError):
-    def __init__(self, error_code: str) -> None:
+    def __init__(self, error_code: str, *, partial_publish: "PublishEventsResult | None" = None) -> None:
         super().__init__(error_code)
         self.error_code = error_code
+        self.partial_publish = partial_publish
+
+
+class _RunResultReady(Exception):
+    pass
 
 
 class BoundedHistoryRepository(Protocol):
     def transaction(self) -> Any: ...
 
-    async def get_active_joined_tracked_chat_by_registry_id(self, registry_id: str) -> TrackedChat | None: ...
+    async def find_public_username_registry_targets(self, normalized_source_value: str) -> Sequence[Any]: ...
 
     async def get_source_message(
         self,
@@ -93,20 +118,54 @@ class BoundedHistoryRepository(Protocol):
 
     async def insert_outbox_event(self, event: Any) -> bool | None: ...
 
+    async def get_outbox_event_by_dedupe_key(self, dedupe_key: str) -> Any | None: ...
+
+    async def mark_outbox_published(
+        self,
+        *,
+        event_id: UUID,
+        published_at: datetime | None = None,
+    ) -> bool | None: ...
+
+    async def update_channel_sync_cursor(
+        self,
+        *,
+        registry_id: str,
+        last_seen_message_id: int | None = None,
+        last_seen_message_date: datetime | None = None,
+        last_history_sync_at: datetime | None = None,
+    ) -> None: ...
+
 
 class BoundedHistoryClient(Protocol):
     async def fetch_newest_history_messages(self, *, chat_id: int, limit: int) -> Sequence[Mapping[str, Any]]: ...
     async def close(self) -> None: ...
 
 
+class BoundedHistoryRedisPublisher(Protocol):
+    async def publish(self, route: QueueRoute, message: RedisQueuedMessage) -> str: ...
+
+
 @dataclass(frozen=True, slots=True)
 class BoundedTelegramCollectorHistoryIngestConfig:
+    mode: str = MODE_PREVIEW
+    source_kind: str = SOURCE_KIND_PUBLIC_USERNAME
+    source_value: str | None = None
+    registry_id_suffix: str | None = None
+    history_limit: int = DEFAULT_HISTORY_LIMIT
     operator_approved: bool = False
     allow_runtime_config: bool = False
+    allow_database_read: bool = False
     allow_telegram_read: bool = False
     allow_database_write: bool = False
+    allow_source_message_write: bool = False
+    allow_source_version_write: bool = False
+    allow_source_outbox_write: bool = False
+    allow_source_outbox_publish: bool = False
+    allow_redis_publish: bool = False
+    # Legacy construction aliases kept for old tests/importers; the CLI no longer exposes them.
     allow_outbox_write: bool = False
-    max_messages: int = DEFAULT_MAX_MESSAGES
+    max_messages: int | None = None
     chat_id: int | None = None
     registry_id: str | None = None
 
@@ -115,6 +174,7 @@ class BoundedTelegramCollectorHistoryIngestConfig:
 class BoundedTelegramCollectorHistoryIngestState:
     runtime_config_attempted: bool = False
     runtime_builder_attempted: bool = False
+    database_read_attempted: bool = False
     registry_lookup_attempted: bool = False
     tdlib_auth_ready_checked: bool = False
     tdlib_auth_ready: bool = False
@@ -123,8 +183,23 @@ class BoundedTelegramCollectorHistoryIngestState:
     tdlib_log_suppression_confirmed: bool = False
     telegram_read_attempted: bool = False
     telegram_read_called: bool = False
-    database_write_attempted: bool = False
-    outbox_write_attempted: bool = False
+    source_message_write_attempted: bool = False
+    source_version_write_attempted: bool = False
+    source_outbox_write_attempted: bool = False
+    channel_cursor_write_attempted: bool = False
+    source_outbox_publish_attempted: bool = False
+    redis_publish_attempted: bool = False
+    event_outbox_status_write_attempted: bool = False
+
+    @property
+    def database_write_attempted(self) -> bool:
+        return (
+            self.source_message_write_attempted
+            or self.source_version_write_attempted
+            or self.source_outbox_write_attempted
+            or self.channel_cursor_write_attempted
+            or self.event_outbox_status_write_attempted
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +207,9 @@ class BoundedTelegramCollectorHistoryIngestRuntimeHandle:
     repository: BoundedHistoryRepository
     history_client: BoundedHistoryClient
     close: Callable[[bool], Awaitable[None]]
+    redis_publisher: BoundedHistoryRedisPublisher | None = None
+    commit: Callable[[], Awaitable[None]] | None = None
+    rollback: Callable[[], Awaitable[None]] | None = None
 
 
 class BoundedTelegramCollectorHistoryIngestRuntimeBuilder(Protocol):
@@ -149,6 +227,24 @@ class HistoryMessageApplyResult:
     source_version_appended: bool = False
     outbox_event_inserted: bool = False
     idempotent_noop: bool = False
+    source_message_id_suffix: str | None = None
+    outbox_event: OutboxEventRow | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryMessagePreviewResult:
+    would_insert_source_message: bool = False
+    would_append_source_version: bool = False
+    would_insert_outbox_event: bool = False
+    would_skip_same_hash: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PublishEventsResult:
+    published_count: int = 0
+    marked_published_count: int = 0
+    event_id_suffixes: tuple[str, ...] = ()
+    redis_message_id_suffixes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,29 +254,45 @@ class BoundedTelegramCollectorHistoryIngestResult:
     error_code: str | None
     config: BoundedTelegramCollectorHistoryIngestConfig
     state: BoundedTelegramCollectorHistoryIngestState = field(default_factory=BoundedTelegramCollectorHistoryIngestState)
-    target_selection_mode: str = "none"
-    target_chat_id_suffix: str | None = None
-    target_chat_id_sha256_12: str | None = None
+    mode: str = MODE_PREVIEW
+    source_kind: str = SOURCE_KIND_PUBLIC_USERNAME
+    source_value_surface: str | None = None
     target_registry_id_suffix: str | None = None
-    messages_requested: int = DEFAULT_MAX_MESSAGES
+    target_joined: bool = False
+    target_chat_id_present: bool = False
+    messages_requested: int = DEFAULT_HISTORY_LIMIT
     messages_seen: int = 0
+    would_insert_source_messages_count: int = 0
+    would_append_source_versions_count: int = 0
+    would_insert_outbox_events_count: int = 0
+    would_skip_same_hash_count: int = 0
     source_messages_created_count: int = 0
     source_versions_appended_count: int = 0
     outbox_events_inserted_count: int = 0
     idempotent_noop_count: int = 0
+    redis_events_published_count: int = 0
+    event_outbox_marked_published_count: int = 0
+    source_message_id_suffixes: tuple[str, ...] = ()
+    event_id_suffixes: tuple[str, ...] = ()
+    redis_message_id_suffixes: tuple[str, ...] = ()
     error_class: str | None = None
 
     def to_sanitized_dict(self) -> dict[str, Any]:
         gates = {
             "operator_approved": self.config.operator_approved,
             "runtime_config_allowed": self.config.allow_runtime_config,
+            "database_read_allowed": self.config.allow_database_read,
             "telegram_read_allowed": self.config.allow_telegram_read,
             "database_write_allowed": self.config.allow_database_write,
-            "outbox_write_allowed": self.config.allow_outbox_write,
+            "source_message_write_allowed": self.config.allow_source_message_write,
+            "source_version_write_allowed": self.config.allow_source_version_write,
+            "source_outbox_write_allowed": _source_outbox_write_allowed(self.config),
+            "source_outbox_publish_allowed": self.config.allow_source_outbox_publish,
+            "redis_publish_allowed": self.config.allow_redis_publish,
         }
         side_effects = {
             "db_write": self.state.database_write_attempted,
-            "redis_mutation": False,
+            "redis_mutation": self.redis_events_published_count > 0,
             "telegram_read_called": self.state.telegram_read_called,
             "telegram_send_called": False,
             "telegram_edit_called": False,
@@ -189,8 +301,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "x_called": False,
             "web_called": False,
             "notification_table_write": False,
-            "worker_started": False,
-            "run_forever_called": False,
+            "worker_loop_started": False,
             "systemd_called": False,
             "docker_called": False,
             "alembic_called": False,
@@ -198,34 +309,58 @@ class BoundedTelegramCollectorHistoryIngestResult:
         return {
             "schema_version": SCHEMA_VERSION,
             "runner_name": RUNNER_NAME,
-            "mode": MODE,
+            "mode": self.mode,
+            "source_kind": self.source_kind,
+            "source_value_surface": self.source_value_surface,
+            "target_registry_id_suffix": self.target_registry_id_suffix,
+            "target_joined": self.target_joined,
+            "target_chat_id_present": self.target_chat_id_present,
             "gates": gates,
             "operator_approved": self.config.operator_approved,
             "runtime_config_allowed": self.config.allow_runtime_config,
+            "database_read_allowed": self.config.allow_database_read,
             "telegram_read_allowed": self.config.allow_telegram_read,
             "database_write_allowed": self.config.allow_database_write,
-            "outbox_write_allowed": self.config.allow_outbox_write,
+            "source_message_write_allowed": self.config.allow_source_message_write,
+            "source_version_write_allowed": self.config.allow_source_version_write,
+            "source_outbox_write_allowed": _source_outbox_write_allowed(self.config),
+            "source_outbox_publish_allowed": self.config.allow_source_outbox_publish,
+            "redis_publish_allowed": self.config.allow_redis_publish,
             "runtime_config_attempted": self.state.runtime_config_attempted,
             "runtime_builder_attempted": self.state.runtime_builder_attempted,
+            "database_read_attempted": self.state.database_read_attempted,
             "registry_lookup_attempted": self.state.registry_lookup_attempted,
-            "target_selection_mode": self.target_selection_mode,
-            "target_chat_id_suffix": self.target_chat_id_suffix,
-            "target_chat_id_sha256_12": self.target_chat_id_sha256_12,
-            "target_registry_id_suffix": self.target_registry_id_suffix,
             "tdlib_auth_ready_checked": self.state.tdlib_auth_ready_checked,
             "tdlib_auth_ready": self.state.tdlib_auth_ready,
             "tdlib_parameters_submitted": self.state.tdlib_parameters_submitted,
             "tdlib_log_suppression_attempted": self.state.tdlib_log_suppression_attempted,
             "tdlib_log_suppression_confirmed": self.state.tdlib_log_suppression_confirmed,
             "telegram_read_attempted": self.state.telegram_read_attempted,
+            "telegram_read_called": self.state.telegram_read_called,
             "database_write_attempted": self.state.database_write_attempted,
-            "outbox_write_attempted": self.state.outbox_write_attempted,
+            "source_message_write_attempted": self.state.source_message_write_attempted,
+            "source_version_write_attempted": self.state.source_version_write_attempted,
+            "source_outbox_write_attempted": self.state.source_outbox_write_attempted,
+            "outbox_write_attempted": self.state.source_outbox_write_attempted,
+            "channel_cursor_write_attempted": self.state.channel_cursor_write_attempted,
+            "source_outbox_publish_attempted": self.state.source_outbox_publish_attempted,
+            "redis_publish_attempted": self.state.redis_publish_attempted,
+            "event_outbox_status_write_attempted": self.state.event_outbox_status_write_attempted,
             "messages_requested": self.messages_requested,
             "messages_seen": self.messages_seen,
+            "would_insert_source_messages_count": self.would_insert_source_messages_count,
+            "would_append_source_versions_count": self.would_append_source_versions_count,
+            "would_insert_outbox_events_count": self.would_insert_outbox_events_count,
+            "would_skip_same_hash_count": self.would_skip_same_hash_count,
             "source_messages_created_count": self.source_messages_created_count,
             "source_versions_appended_count": self.source_versions_appended_count,
             "outbox_events_inserted_count": self.outbox_events_inserted_count,
             "idempotent_noop_count": self.idempotent_noop_count,
+            "redis_events_published_count": self.redis_events_published_count,
+            "event_outbox_marked_published_count": self.event_outbox_marked_published_count,
+            "source_message_id_suffixes": list(self.source_message_id_suffixes),
+            "event_id_suffixes": list(self.event_id_suffixes),
+            "redis_message_id_suffixes": list(self.redis_message_id_suffixes),
             "status": self.status,
             "ok": self.ok,
             "error_code": self.error_code,
@@ -233,9 +368,15 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "redactions_applied": [
                 "full_chat_id_omitted",
                 "full_registry_id_omitted",
+                "full_source_message_id_omitted",
+                "full_event_id_omitted",
+                "full_redis_message_id_omitted",
                 "raw_message_json_omitted",
                 "message_text_omitted",
+                "entities_json_omitted",
+                "url_surface_json_omitted",
                 "database_url_omitted",
+                "redis_url_omitted",
                 "telegram_credentials_omitted",
                 "tdlib_session_paths_omitted",
                 "exception_detail_omitted",
@@ -246,9 +387,13 @@ class BoundedTelegramCollectorHistoryIngestResult:
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedTarget:
-    mode: str
     chat_id: int
-    registry_id: str | None = None
+    registry_id: str
+    source_value_surface: str
+    joined: bool
+    chat_id_present: bool
+    last_seen_message_id: int | None = None
+    last_seen_message_date: datetime | None = None
 
 
 class _TDLibBoundedHistoryClient:
@@ -382,6 +527,29 @@ class HistoryMessageIngestProcessor:
         self._outbox_builder = outbox_builder
         self._state = state
 
+    async def preview_history_message(self, message: Mapping[str, Any]) -> HistoryMessagePreviewResult:
+        projection = self._projection_builder.build_source_projection(dict(message))
+        self._state.database_read_attempted = True
+        existing = await self._repository.get_source_message(
+            platform="telegram",
+            chat_id=projection.chat_id,
+            message_id=projection.message_id,
+        )
+        source_message_id = _coerce_source_message_id(existing)
+        if source_message_id is None:
+            return HistoryMessagePreviewResult(
+                would_insert_source_message=True,
+                would_append_source_version=True,
+                would_insert_outbox_event=True,
+            )
+        latest = await self._repository.get_latest_version(source_message_id)
+        if latest is not None and str(latest.get("content_hash")) == projection.content_hash:
+            return HistoryMessagePreviewResult(would_skip_same_hash=True)
+        return HistoryMessagePreviewResult(
+            would_append_source_version=True,
+            would_insert_outbox_event=True,
+        )
+
     async def apply_history_message(self, message: Mapping[str, Any]) -> HistoryMessageApplyResult:
         projection = self._projection_builder.build_source_projection(dict(message))
         observed_at = datetime.now(timezone.utc)
@@ -396,12 +564,16 @@ class HistoryMessageIngestProcessor:
             if source_message_id is not None:
                 latest = await self._repository.get_latest_version(source_message_id)
                 if latest is not None and str(latest.get("content_hash")) == projection.content_hash:
-                    return HistoryMessageApplyResult(idempotent_noop=True)
+                    return HistoryMessageApplyResult(
+                        idempotent_noop=True,
+                        source_message_id_suffix=_safe_suffix(source_message_id),
+                    )
 
-            self._state.database_write_attempted = True
+            self._state.source_message_write_attempted = True
             current_row = await self._repository.upsert_source_message(projection, platform="telegram")
             resolved_source_message_id = _require_source_message_id(current_row)
 
+            self._state.source_version_write_attempted = True
             changed, version_row = await self._repository.append_source_message_version_if_changed(
                 source_message_id=resolved_source_message_id,
                 projection=projection,
@@ -410,7 +582,10 @@ class HistoryMessageIngestProcessor:
                 telegram_edit_date=projection.edited_at,
             )
             if not changed or version_row is None:
-                return HistoryMessageApplyResult(idempotent_noop=True)
+                return HistoryMessageApplyResult(
+                    idempotent_noop=True,
+                    source_message_id_suffix=_safe_suffix(resolved_source_message_id),
+                )
 
             version_no = _require_version_no(version_row)
             if existing is None:
@@ -426,15 +601,24 @@ class HistoryMessageIngestProcessor:
                     current_version_no=version_no,
                     logical_post_key=projection.logical_post_key,
                     occurred_at=observed_at,
-                    reconcile_reason="bounded_one_shot_history_ingest",
+                    reconcile_reason="bounded_history_ingest",
                 )
-            self._state.outbox_write_attempted = True
+            self._state.source_outbox_write_attempted = True
             inserted = await self._repository.insert_outbox_event(outbox)
+            outbox_event = None
+            if inserted is None or bool(inserted):
+                outbox_event = _coerce_outbox_event_row(
+                    await self._repository.get_outbox_event_by_dedupe_key(outbox.dedupe_key)
+                )
+                if outbox_event is None:
+                    raise BoundedHistoryIngestError("outbox_event_readback_missing")
             return HistoryMessageApplyResult(
                 source_message_created=existing is None,
                 source_version_appended=True,
                 outbox_event_inserted=True if inserted is None else bool(inserted),
                 idempotent_noop=False,
+                source_message_id_suffix=_safe_suffix(resolved_source_message_id),
+                outbox_event=outbox_event,
             )
 
 
@@ -450,16 +634,43 @@ async def build_default_bounded_history_ingest_runtime(
     repository = CollectorRepository(session, logger=logger)
     tdlib = TDLibClient(runtime_config, transport=TDJsonTransport(), logger=logger)
     history_client = _TDLibBoundedHistoryClient(tdlib, state=state)
+    redis_client: Any | None = None
+    redis_publisher: RedisStreamsPublisher | None = None
+    if runtime_config.redis_url:
+        from redis.asyncio import Redis  # type: ignore[import-not-found]
+
+        redis_client = Redis.from_url(runtime_config.redis_url, decode_responses=True)
+        redis_publisher = RedisStreamsPublisher(redis_client, maxlen=DEFAULT_XADD_MAXLEN)
+
+    transaction_finalized = False
+
+    async def commit() -> None:
+        nonlocal transaction_finalized
+        await session.commit()
+        transaction_finalized = True
+
+    async def rollback() -> None:
+        nonlocal transaction_finalized
+        await session.rollback()
+        transaction_finalized = True
 
     async def close(commit: bool) -> None:
         try:
             if commit:
-                await session.commit()
+                if not transaction_finalized:
+                    await session.commit()
             else:
                 await session.rollback()
         finally:
             with contextlib.suppress(Exception):
                 await history_client.close()
+            if redis_client is not None:
+                close_client = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
+                if close_client is not None:
+                    with contextlib.suppress(Exception):
+                        result = close_client()
+                        if hasattr(result, "__await__"):
+                            await result
             with contextlib.suppress(Exception):
                 await session.close()
             with contextlib.suppress(Exception):
@@ -468,7 +679,10 @@ async def build_default_bounded_history_ingest_runtime(
     return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
         repository=repository,
         history_client=history_client,
+        redis_publisher=redis_publisher,
         close=close,
+        commit=commit,
+        rollback=rollback,
     )
 
 
@@ -481,62 +695,114 @@ async def run_bounded_telegram_collector_history_ingest(
 ) -> BoundedTelegramCollectorHistoryIngestResult:
     state = BoundedTelegramCollectorHistoryIngestState()
     effective_logger = logger or logging.getLogger(__name__)
-    target_mode = _target_selection_mode(config)
+    mode = _normalize_mode(config.mode)
+    history_limit = _history_limit(config)
+    normalized_source_value = _normalize_source_value(config.source_value)
 
-    def blocked(error_code: str, *, error_class: str | None = None) -> BoundedTelegramCollectorHistoryIngestResult:
+    def make_result(
+        status: str,
+        error_code: str | None,
+        *,
+        ok: bool = False,
+        error_class: str | None = None,
+        target: _ResolvedTarget | None = None,
+        messages_seen: int = 0,
+        would_insert: int = 0,
+        would_append: int = 0,
+        would_outbox: int = 0,
+        would_skip: int = 0,
+        created_count: int = 0,
+        version_count: int = 0,
+        outbox_count: int = 0,
+        noop_count: int = 0,
+        publish: PublishEventsResult | None = None,
+        source_message_suffixes: Sequence[str] = (),
+    ) -> BoundedTelegramCollectorHistoryIngestResult:
         return BoundedTelegramCollectorHistoryIngestResult(
-            status="blocked",
-            ok=False,
+            status=status,
+            ok=ok,
             error_code=error_code,
             config=config,
             state=state,
-            target_selection_mode=target_mode,
-            target_registry_id_suffix=_safe_suffix(config.registry_id),
-            messages_requested=config.max_messages,
+            mode=mode,
+            source_kind=SOURCE_KIND_PUBLIC_USERNAME,
+            source_value_surface=normalized_source_value,
+            target_registry_id_suffix=_safe_suffix(target.registry_id) if target is not None else None,
+            target_joined=target.joined if target is not None else False,
+            target_chat_id_present=target.chat_id_present if target is not None else False,
+            messages_requested=history_limit,
+            messages_seen=messages_seen,
+            would_insert_source_messages_count=would_insert,
+            would_append_source_versions_count=would_append,
+            would_insert_outbox_events_count=would_outbox,
+            would_skip_same_hash_count=would_skip,
+            source_messages_created_count=created_count,
+            source_versions_appended_count=version_count,
+            outbox_events_inserted_count=outbox_count,
+            idempotent_noop_count=noop_count,
+            redis_events_published_count=0 if publish is None else publish.published_count,
+            event_outbox_marked_published_count=0 if publish is None else publish.marked_published_count,
+            source_message_id_suffixes=tuple(source_message_suffixes),
+            event_id_suffixes=() if publish is None else publish.event_id_suffixes,
+            redis_message_id_suffixes=() if publish is None else publish.redis_message_id_suffixes,
             error_class=error_class,
         )
 
     if not config.operator_approved:
-        return blocked("operator_approval_missing")
-    if not _valid_max_messages(config.max_messages):
-        return blocked("max_messages_out_of_bounds")
+        return make_result("blocked", "operator_approval_missing")
+    if mode not in {MODE_PREVIEW, MODE_EXECUTE}:
+        return make_result("blocked", "mode_invalid")
+    if config.source_kind != SOURCE_KIND_PUBLIC_USERNAME:
+        return make_result("blocked", "source_kind_unsupported")
+    if normalized_source_value is None:
+        return make_result("blocked", "source_value_missing")
+    if config.chat_id is not None or config.registry_id is not None:
+        return make_result("blocked", "direct_chat_or_registry_id_target_not_allowed")
+    if not _valid_history_limit(history_limit):
+        return make_result("blocked", "history_limit_out_of_bounds")
     if not config.allow_runtime_config:
-        return blocked("runtime_config_not_allowed")
-    if target_mode == "conflict":
-        return blocked("target_selection_conflict")
-    if target_mode == "none":
-        return blocked("target_selection_missing")
+        return make_result("blocked", "runtime_config_not_allowed")
 
     loader = runtime_config_loader or CollectorTelegramConfig.from_env
     state.runtime_config_attempted = True
     try:
         runtime_config = loader()
     except Exception as exc:
-        return blocked("runtime_config_failed", error_class=_safe_exception_class(exc))
+        return make_result("blocked", "runtime_config_failed", error_class=_safe_exception_class(exc))
 
-    if not config.allow_telegram_read:
-        return blocked("telegram_read_not_allowed")
-    if not config.allow_database_write:
-        return blocked("database_write_not_allowed")
-    if not config.allow_outbox_write:
-        return blocked("outbox_write_not_allowed")
+    if not config.allow_database_read:
+        return make_result("blocked", "database_read_not_allowed")
+    if mode == MODE_EXECUTE:
+        write_error = _execute_write_gate_error(config)
+        if write_error is not None:
+            return make_result("blocked", write_error)
+        if config.allow_source_outbox_publish and not config.allow_redis_publish:
+            return make_result("blocked", "redis_publish_not_allowed")
 
     builder = runtime_builder or build_default_bounded_history_ingest_runtime
     state.runtime_builder_attempted = True
     runtime: BoundedTelegramCollectorHistoryIngestRuntimeHandle | None = None
-    commit = False
+    close_commit = False
     result: BoundedTelegramCollectorHistoryIngestResult | None = None
     try:
         runtime = await builder(runtime_config, state, effective_logger)
-        target = await _resolve_target(config, runtime.repository, state)
+        target = await _resolve_exact_public_username_target(config, runtime.repository, state)
+
+        if mode == MODE_PREVIEW and not config.allow_telegram_read:
+            result = make_result("preview_completed", None, ok=True, target=target)
+            raise _RunResultReady
+
+        if not config.allow_telegram_read:
+            result = make_result("blocked", "telegram_read_not_allowed", target=target)
+            raise _RunResultReady
 
         state.telegram_read_attempted = True
         messages = await runtime.history_client.fetch_newest_history_messages(
             chat_id=target.chat_id,
-            limit=config.max_messages,
+            limit=history_limit,
         )
         state.telegram_read_called = True
-        selected_messages = [dict(message) for message in messages if isinstance(message, Mapping)][: config.max_messages]
+        selected_messages = [dict(message) for message in messages if isinstance(message, Mapping)][:history_limit]
 
         processor = HistoryMessageIngestProcessor(
             repository=runtime.repository,
@@ -545,45 +811,167 @@ async def run_bounded_telegram_collector_history_ingest(
             state=state,
         )
 
+        if mode == MODE_PREVIEW:
+            would_insert = 0
+            would_append = 0
+            would_outbox = 0
+            would_skip = 0
+            for message in reversed(selected_messages):
+                preview = await processor.preview_history_message(message)
+                would_insert += int(preview.would_insert_source_message)
+                would_append += int(preview.would_append_source_version)
+                would_outbox += int(preview.would_insert_outbox_event)
+                would_skip += int(preview.would_skip_same_hash)
+            result = make_result(
+                "preview_completed",
+                None,
+                ok=True,
+                target=target,
+                messages_seen=len(selected_messages),
+                would_insert=would_insert,
+                would_append=would_append,
+                would_outbox=would_outbox,
+                would_skip=would_skip,
+            )
+            raise _RunResultReady
+
         created_count = 0
         version_count = 0
         outbox_count = 0
         noop_count = 0
+        outbox_events: list[OutboxEventRow] = []
+        source_message_suffixes: list[str] = []
+        last_seen_message_id: int | None = None
+        last_seen_message_date: datetime | None = None
         for message in reversed(selected_messages):
             applied = await processor.apply_history_message(message)
             created_count += int(applied.source_message_created)
             version_count += int(applied.source_version_appended)
             outbox_count += int(applied.outbox_event_inserted)
             noop_count += int(applied.idempotent_noop)
+            if applied.source_message_id_suffix is not None:
+                source_message_suffixes.append(applied.source_message_id_suffix)
+            if applied.outbox_event is not None:
+                outbox_events.append(applied.outbox_event)
+            message_id = _message_id(message)
+            message_date = _message_date(message)
+            if message_id is not None and (last_seen_message_id is None or message_id > last_seen_message_id):
+                last_seen_message_id = message_id
+                last_seen_message_date = message_date
 
-        commit = True
-        result = BoundedTelegramCollectorHistoryIngestResult(
-            status="completed",
+        if selected_messages and (created_count > 0 or version_count > 0 or outbox_count > 0):
+            async with runtime.repository.transaction():
+                state.channel_cursor_write_attempted = True
+                await runtime.repository.update_channel_sync_cursor(
+                    registry_id=target.registry_id,
+                    last_seen_message_id=last_seen_message_id,
+                    last_seen_message_date=last_seen_message_date,
+                    last_history_sync_at=datetime.now(timezone.utc),
+                )
+
+        if runtime.commit is not None or config.allow_source_outbox_publish:
+            try:
+                await _commit_source_ingest(runtime)
+            except BoundedHistoryIngestError as exc:
+                result = make_result(
+                    "failed",
+                    exc.error_code,
+                    target=target,
+                    messages_seen=len(selected_messages),
+                    created_count=created_count,
+                    version_count=version_count,
+                    outbox_count=outbox_count,
+                    noop_count=noop_count,
+                    source_message_suffixes=source_message_suffixes,
+                )
+                raise _RunResultReady
+            except Exception as exc:
+                result = make_result(
+                    "failed",
+                    "runtime_commit_failed",
+                    error_class=_safe_exception_class(exc),
+                    target=target,
+                    messages_seen=len(selected_messages),
+                    created_count=created_count,
+                    version_count=version_count,
+                    outbox_count=outbox_count,
+                    noop_count=noop_count,
+                    source_message_suffixes=source_message_suffixes,
+                )
+                raise _RunResultReady
+        close_commit = True
+
+        publish_result = PublishEventsResult()
+        if config.allow_source_outbox_publish:
+            if runtime.redis_publisher is None:
+                close_commit = False
+                result = make_result(
+                    "blocked",
+                    "redis_runtime_unavailable",
+                    target=target,
+                    messages_seen=len(selected_messages),
+                    created_count=created_count,
+                    version_count=version_count,
+                    outbox_count=outbox_count,
+                    noop_count=noop_count,
+                    source_message_suffixes=source_message_suffixes,
+                )
+                raise _RunResultReady
+            try:
+                publish_result = await _publish_source_outbox_events(
+                    repository=runtime.repository,
+                    publisher=runtime.redis_publisher,
+                    events=outbox_events,
+                    state=state,
+                    commit_mark_published=runtime.commit,
+                )
+            except BoundedHistoryIngestError as exc:
+                close_commit = False
+                result = make_result(
+                    "failed",
+                    exc.error_code,
+                    error_class=_safe_exception_class(exc.__cause__) if exc.__cause__ is not None else None,
+                    target=target,
+                    messages_seen=len(selected_messages),
+                    created_count=created_count,
+                    version_count=version_count,
+                    outbox_count=outbox_count,
+                    noop_count=noop_count,
+                    publish=exc.partial_publish,
+                    source_message_suffixes=source_message_suffixes,
+                )
+                raise _RunResultReady
+
+        result = make_result(
+            "completed",
+            None,
             ok=True,
-            error_code=None,
-            config=config,
-            state=state,
-            target_selection_mode=target.mode,
-            target_chat_id_suffix=_safe_suffix(target.chat_id),
-            target_chat_id_sha256_12=_safe_hash12(target.chat_id),
-            target_registry_id_suffix=_safe_suffix(target.registry_id),
-            messages_requested=config.max_messages,
+            target=target,
             messages_seen=len(selected_messages),
-            source_messages_created_count=created_count,
-            source_versions_appended_count=version_count,
-            outbox_events_inserted_count=outbox_count,
-            idempotent_noop_count=noop_count,
+            created_count=created_count,
+            version_count=version_count,
+            outbox_count=outbox_count,
+            noop_count=noop_count,
+            publish=publish_result,
+            source_message_suffixes=source_message_suffixes,
         )
+        raise _RunResultReady
+    except _RunResultReady:
+        pass
     except BoundedHistoryIngestError as exc:
-        result = blocked(exc.error_code)
+        result = make_result("blocked", exc.error_code)
     except Exception as exc:
-        result = blocked("unexpected_failure", error_class=_safe_exception_class(exc))
+        result = make_result("failed", "unexpected_failure", error_class=_safe_exception_class(exc))
     finally:
         if runtime is not None:
             try:
-                await runtime.close(commit)
+                await runtime.close(close_commit)
             except Exception as exc:
-                result = blocked(_runtime_close_error_code(commit), error_class=_safe_exception_class(exc))
+                result = make_result(
+                    "failed",
+                    _runtime_close_error_code(close_commit),
+                    error_class=_safe_exception_class(exc),
+                )
 
     assert result is not None
     return result
@@ -607,7 +995,7 @@ def run_bounded_telegram_collector_history_ingest_sync(
 
 
 def render_sanitized_json(report: Mapping[str, Any]) -> str:
-    return json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
 
 
 def argument_error_report(error_code: str) -> dict[str, Any]:
@@ -619,30 +1007,185 @@ def argument_error_report(error_code: str) -> dict[str, Any]:
     ).to_sanitized_dict()
 
 
-async def _resolve_target(
+async def _resolve_exact_public_username_target(
     config: BoundedTelegramCollectorHistoryIngestConfig,
     repository: BoundedHistoryRepository,
     state: BoundedTelegramCollectorHistoryIngestState,
 ) -> _ResolvedTarget:
-    if config.chat_id is not None:
-        return _ResolvedTarget(mode="chat_id", chat_id=int(config.chat_id))
-    if config.registry_id is None:
-        raise BoundedHistoryIngestError("target_selection_missing")
+    normalized_source_value = _normalize_source_value(config.source_value)
+    if normalized_source_value is None:
+        raise BoundedHistoryIngestError("source_value_missing")
     state.registry_lookup_attempted = True
-    tracked = await repository.get_active_joined_tracked_chat_by_registry_id(config.registry_id)
-    if tracked is None or tracked.chat_id is None:
-        raise BoundedHistoryIngestError("registry_target_not_active_joined")
-    return _ResolvedTarget(mode="registry_id", chat_id=int(tracked.chat_id), registry_id=config.registry_id)
+    state.database_read_attempted = True
+    rows = list(await repository.find_public_username_registry_targets(normalized_source_value))
+    if not rows:
+        raise BoundedHistoryIngestError("registry_target_missing")
+    if len(rows) > 1:
+        raise BoundedHistoryIngestError("registry_target_multiple")
+
+    row = rows[0]
+    registry_id = _row_value(row, "registry_id")
+    if not isinstance(registry_id, str) or not registry_id:
+        registry_id = str(registry_id) if isinstance(registry_id, UUID) else ""
+    if not registry_id:
+        raise BoundedHistoryIngestError("registry_id_invalid")
+    if config.registry_id_suffix and not registry_id.endswith(config.registry_id_suffix):
+        raise BoundedHistoryIngestError("registry_id_suffix_mismatch")
+    if _row_value(row, "source_kind") != SOURCE_KIND_PUBLIC_USERNAME:
+        raise BoundedHistoryIngestError("source_kind_unsupported")
+    if _row_value(row, "desired_state") != "active":
+        raise BoundedHistoryIngestError("registry_target_not_active")
+    access_state = _row_value(row, "access_state")
+    if access_state != "joined":
+        raise BoundedHistoryIngestError("registry_target_not_joined")
+    chat_id = _row_value(row, "chat_id")
+    if chat_id is None:
+        raise BoundedHistoryIngestError("registry_target_chat_id_missing")
+    try:
+        chat_id_int = int(chat_id)
+    except (TypeError, ValueError) as exc:
+        raise BoundedHistoryIngestError("registry_target_chat_id_invalid") from exc
+    return _ResolvedTarget(
+        chat_id=chat_id_int,
+        registry_id=registry_id,
+        source_value_surface=normalized_source_value,
+        joined=True,
+        chat_id_present=True,
+        last_seen_message_id=_optional_int(_row_value(row, "last_seen_message_id")),
+        last_seen_message_date=_optional_datetime(_row_value(row, "last_seen_message_date")),
+    )
 
 
-def _target_selection_mode(config: BoundedTelegramCollectorHistoryIngestConfig) -> str:
-    if config.chat_id is not None and config.registry_id is not None:
-        return "conflict"
-    if config.chat_id is not None:
-        return "chat_id"
-    if config.registry_id is not None:
-        return "registry_id"
-    return "none"
+async def _commit_source_ingest(runtime: BoundedTelegramCollectorHistoryIngestRuntimeHandle) -> None:
+    if runtime.commit is None:
+        raise BoundedHistoryIngestError("runtime_commit_unavailable")
+    await runtime.commit()
+
+
+async def _publish_source_outbox_events(
+    *,
+    repository: BoundedHistoryRepository,
+    publisher: BoundedHistoryRedisPublisher,
+    events: Sequence[OutboxEventRow],
+    state: BoundedTelegramCollectorHistoryIngestState,
+    commit_mark_published: Callable[[], Awaitable[None]] | None,
+) -> PublishEventsResult:
+    resolver = OutboxRouteResolver()
+    published = 0
+    marked = 0
+    event_suffixes: list[str] = []
+    redis_suffixes: list[str] = []
+    for row in events:
+        if row.status != "pending":
+            continue
+        if row.aggregate_type != ROOT_OBJECT_TYPE or row.event_type not in _SOURCE_EVENT_TYPES:
+            raise BoundedHistoryIngestError("source_outbox_event_contract_mismatch")
+        try:
+            route = resolver.resolve(row)
+        except UnsupportedOutboxEventTypeError as exc:
+            raise BoundedHistoryIngestError("source_outbox_route_invalid") from exc
+        if route.queue_name != QUEUE_NAME or route.stage_name != STAGE_NAME:
+            raise BoundedHistoryIngestError("source_outbox_route_invalid")
+        message = _build_stream_message(row, route)
+        state.source_outbox_publish_attempted = True
+        state.redis_publish_attempted = True
+        try:
+            redis_message_id = await publisher.publish(route, message)
+        except Exception as exc:
+            raise BoundedHistoryIngestError("redis_publish_failed") from exc
+        partial_after_xadd = PublishEventsResult(
+            published_count=published + 1,
+            marked_published_count=marked,
+            event_id_suffixes=tuple(
+                value for value in [*event_suffixes, _safe_suffix(row.event_id) or ""] if value
+            ),
+            redis_message_id_suffixes=tuple(
+                value for value in [*redis_suffixes, _safe_suffix(redis_message_id) or ""] if value
+            ),
+        )
+        try:
+            async with repository.transaction():
+                state.event_outbox_status_write_attempted = True
+                try:
+                    marked_result = await repository.mark_outbox_published(
+                        event_id=row.event_id,
+                        published_at=datetime.now(timezone.utc),
+                    )
+                except Exception as exc:
+                    raise BoundedHistoryIngestError(
+                        "event_outbox_mark_published_failed",
+                        partial_publish=partial_after_xadd,
+                    ) from exc
+                if marked_result is False:
+                    raise BoundedHistoryIngestError(
+                        "event_outbox_mark_published_failed",
+                        partial_publish=partial_after_xadd,
+                    )
+        except BoundedHistoryIngestError:
+            raise
+        except Exception as exc:
+            raise BoundedHistoryIngestError(
+                "event_outbox_mark_published_commit_failed",
+                partial_publish=partial_after_xadd,
+            ) from exc
+        if commit_mark_published is None:
+            raise BoundedHistoryIngestError(
+                "event_outbox_mark_published_commit_unavailable",
+                partial_publish=partial_after_xadd,
+            )
+        try:
+            await commit_mark_published()
+        except Exception as exc:
+            raise BoundedHistoryIngestError(
+                "event_outbox_mark_published_commit_failed",
+                partial_publish=partial_after_xadd,
+            ) from exc
+        published += 1
+        marked += 1
+        event_suffixes.append(_safe_suffix(row.event_id) or "")
+        redis_suffixes.append(_safe_suffix(redis_message_id) or "")
+    return PublishEventsResult(
+        published_count=published,
+        marked_published_count=marked,
+        event_id_suffixes=tuple(value for value in event_suffixes if value),
+        redis_message_id_suffixes=tuple(value for value in redis_suffixes if value),
+    )
+
+
+def _build_stream_message(row: OutboxEventRow, route: QueueRoute) -> RedisQueuedMessage:
+    return RedisQueuedMessage(
+        job_id=str(row.event_id),
+        stage_name=route.stage_name,
+        root_object_type=row.aggregate_type,
+        root_object_id=str(row.aggregate_id),
+        idempotency_key=row.dedupe_key,
+        pipeline_run_id=None,
+        not_before=None,
+        trigger_event_id=str(row.event_id),
+    )
+
+
+def _coerce_outbox_event_row(row: Any | None) -> OutboxEventRow | None:
+    if row is None:
+        return None
+    if isinstance(row, OutboxEventRow):
+        return row
+    if not isinstance(row, Mapping):
+        raise BoundedHistoryIngestError("outbox_event_readback_invalid")
+    payload = row.get("payload_json") or {}
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    return OutboxEventRow(
+        event_id=UUID(str(row["event_id"])),
+        event_type=str(row["event_type"]),
+        aggregate_type=str(row["aggregate_type"]),
+        aggregate_id=UUID(str(row["aggregate_id"])),
+        dedupe_key=str(row["dedupe_key"]),
+        payload_json=payload if isinstance(payload, dict) else {},
+        status=str(row["status"]),
+        fail_count=int(row.get("fail_count") or 0),
+        created_at=row.get("created_at") or datetime.now(timezone.utc),
+    )
 
 
 def _authorization_state_from_tdlib_payload(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
@@ -659,8 +1202,42 @@ def _is_bounded_auth_extra(value: object) -> bool:
     return isinstance(value, str) and value.startswith(f"{RUNNER_NAME}:")
 
 
-def _valid_max_messages(value: int) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_MESSAGES_HARD_LIMIT
+def _normalize_mode(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def _history_limit(config: BoundedTelegramCollectorHistoryIngestConfig) -> int:
+    value = config.history_limit if config.max_messages is None else config.max_messages
+    return int(value)
+
+
+def _valid_history_limit(value: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_HISTORY_LIMIT
+
+
+def _normalize_source_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lstrip("@").strip().lower()
+    return normalized or None
+
+
+def _source_outbox_write_allowed(config: BoundedTelegramCollectorHistoryIngestConfig) -> bool:
+    return bool(config.allow_source_outbox_write or config.allow_outbox_write)
+
+
+def _execute_write_gate_error(config: BoundedTelegramCollectorHistoryIngestConfig) -> str | None:
+    if not config.allow_telegram_read:
+        return "telegram_read_not_allowed"
+    if not config.allow_database_write:
+        return "database_write_not_allowed"
+    if not config.allow_source_message_write:
+        return "source_message_write_not_allowed"
+    if not config.allow_source_version_write:
+        return "source_version_write_not_allowed"
+    if not _source_outbox_write_allowed(config):
+        return "source_outbox_write_not_allowed"
+    return None
 
 
 def _coerce_source_message_id(row: Mapping[str, Any] | None) -> str | None:
@@ -694,7 +1271,41 @@ def _require_version_no(row: Mapping[str, Any]) -> int:
     raise BoundedHistoryIngestError("source_version_no_invalid")
 
 
-def _safe_suffix(value: object | None, *, width: int = 4) -> str | None:
+def _message_id(message: Mapping[str, Any]) -> int | None:
+    try:
+        return int(message["id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _message_date(message: Mapping[str, Any]) -> datetime | None:
+    raw = message.get("date")
+    try:
+        return datetime.fromtimestamp(int(raw), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _row_value(row: Any, key: str) -> Any:
+    if isinstance(row, Mapping):
+        return row.get(key)
+    return getattr(row, key, None)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_datetime(value: Any) -> datetime | None:
+    return value if isinstance(value, datetime) else None
+
+
+def _safe_suffix(value: object | None, *, width: int = 8) -> str | None:
     if value is None:
         return None
     text = str(value)
@@ -727,7 +1338,9 @@ __all__ = [
     "BoundedTelegramCollectorHistoryIngestRuntimeBuilder",
     "BoundedTelegramCollectorHistoryIngestRuntimeHandle",
     "BoundedTelegramCollectorHistoryIngestState",
+    "DEFAULT_HISTORY_LIMIT",
     "DEFAULT_MAX_MESSAGES",
+    "MAX_HISTORY_LIMIT",
     "MAX_MESSAGES_HARD_LIMIT",
     "RUNNER_NAME",
     "SCHEMA_VERSION",

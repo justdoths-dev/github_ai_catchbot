@@ -468,6 +468,86 @@ class CollectorRepository:
         )
         return result.scalar_one_or_none() is not None
 
+    async def get_outbox_event_by_dedupe_key(self, dedupe_key: str) -> Mapping[str, Any] | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT
+                    event_id,
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    dedupe_key,
+                    payload_json,
+                    status,
+                    fail_count,
+                    created_at
+                FROM event_outbox
+                WHERE dedupe_key = :dedupe_key
+                """
+            ),
+            {"dedupe_key": dedupe_key},
+        )
+        return result.mappings().first()
+
+    async def mark_outbox_published(
+        self,
+        *,
+        event_id: Any,
+        published_at: datetime | None = None,
+    ) -> bool:
+        result = await self._session.execute(
+            sa.text(
+                """
+                UPDATE event_outbox
+                SET
+                    status = 'published'::outbox_status_enum,
+                    published_at = CAST(:published_at AS timestamptz),
+                    last_error = NULL
+                WHERE event_id = CAST(:event_id AS uuid)
+                  AND status = 'pending'::outbox_status_enum
+                RETURNING event_id
+                """
+            ),
+            {
+                "event_id": str(event_id),
+                "published_at": published_at or datetime.now(timezone.utc),
+            },
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def find_public_username_registry_targets(
+        self,
+        normalized_source_value: str,
+    ) -> list[Mapping[str, Any]]:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT
+                    registry_id,
+                    chat_id,
+                    desired_state,
+                    access_state,
+                    source_kind,
+                    source_value,
+                    username_snapshot,
+                    priority_weight,
+                    last_seen_message_id,
+                    last_seen_message_date
+                FROM telegram_channel_registry
+                WHERE source_kind = 'public_username'
+                  AND (
+                    lower(trim(leading '@' from source_value)) = :source_value
+                    OR lower(trim(leading '@' from coalesce(username_snapshot, ''))) = :source_value
+                  )
+                ORDER BY registry_id ASC
+                LIMIT 3
+                """
+            ),
+            {"source_value": normalized_source_value},
+        )
+        return [dict(row) for row in result.mappings().all()]
+
     async def get_active_joined_tracked_chat_by_registry_id(
         self,
         registry_id: str,
