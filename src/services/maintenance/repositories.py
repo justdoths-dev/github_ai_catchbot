@@ -149,6 +149,8 @@ class MaintenanceRepository:
                   AND np.send_after IS NOT NULL
                   AND np.send_after <= :now
                   AND ldr.delivery_status = 'failed_retryable'::notification_status_enum
+                  AND ldr.attempt_count IS NOT NULL
+                  AND ldr.attempt_count > 0
                 ORDER BY np.send_after ASC, np.created_at ASC
                 LIMIT :limit
                 """
@@ -849,6 +851,8 @@ def delivery_result_from_outbox(event: OutboxEvent) -> DeliveryResultEvent | Non
     notification_plan_id = _uuid_or_none(payload.get("notification_plan_id"))
     if notification_plan_id is None:
         return None
+    if event.aggregate_id != notification_plan_id:
+        return None
     return DeliveryResultEvent(
         trigger_event_id=event.event_id,
         notification_plan_id=notification_plan_id,
@@ -861,9 +865,15 @@ def delivery_result_from_outbox(event: OutboxEvent) -> DeliveryResultEvent | Non
 
 
 def replay_requested_from_outbox(event: OutboxEvent) -> ReplayRequestedEvent | None:
+    if event.event_type != "replay.requested.v1":
+        return None
+    if event.aggregate_type != "replay_request":
+        return None
     payload = event.payload_json
     replay_request_id = _uuid_or_none(payload.get("replay_request_id") or event.aggregate_id)
     if replay_request_id is None:
+        return None
+    if event.aggregate_id != replay_request_id:
         return None
     return ReplayRequestedEvent(
         trigger_event_id=event.event_id,

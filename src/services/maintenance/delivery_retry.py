@@ -52,6 +52,8 @@ def evaluate_retry_promotion(
     now_utc = _as_utc(now or datetime.now(timezone.utc))
     if _as_utc(plan.send_after) > now_utc:
         return DeliveryRetryDecision(action="noop", reason_code="notification_plan_not_due")
+    if latest_attempt_count <= 0:
+        return DeliveryRetryDecision(action="noop", reason_code="delivery_attempt_count_nonpositive")
     if latest_attempt_count >= max_attempts:
         return DeliveryRetryDecision(action="dead_letter_retry_ceiling", reason_code="max_notification_retry_attempts_exceeded")
 

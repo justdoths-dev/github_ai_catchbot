@@ -128,6 +128,25 @@ async def test_ceiling_reached_dead_letters_without_retry_intent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_missing_or_nonpositive_attempt_count_noops_without_retry_or_dlq() -> None:
+    now = datetime.now(timezone.utc)
+    repository = FakeRepository()
+    notification_plan = plan(send_after=now - timedelta(seconds=1))
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        attempt_count=0,
+    )
+    service = MaintenanceService(config(), repository=repository, now_fn=lambda: now)
+
+    processed = await service.promote_due_retries_once()
+
+    assert processed == 0
+    assert repository.plan_created_outbox == []
+    assert repository.dead_letters == []
+
+
+@pytest.mark.asyncio
 async def test_suppressed_send_disabled_and_dry_run_rows_are_not_selected_or_processed() -> None:
     now = datetime.now(timezone.utc)
     repository = FakeRepository()

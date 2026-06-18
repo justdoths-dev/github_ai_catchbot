@@ -141,3 +141,31 @@ async def test_missing_notification_plan_fails_closed_without_downstream_emit() 
     assert len(repository.job_attempts) == 1
     assert repository.job_attempts[0]["error_code"] == "notification_plan_missing"
     assert repository.upstream_recompute_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_event_payload_request_id_mismatch_fails_closed_without_status_update() -> None:
+    repository = FakeRepository()
+    notification_plan = plan(status="failed_terminal", send_after=None)
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    request = _replay_request(root_object_id=notification_plan.notification_plan_id)
+    repository.replay_requests[request.replay_request_id] = request
+    event = outbox_event(
+        "replay.requested.v1",
+        aggregate_type="replay_request",
+        aggregate_id=request.replay_request_id,
+        payload_json={
+            "replay_request_id": str(uuid4()),
+            "replay_type": "delivery",
+            "root_object_type": "notification_plan",
+            "root_object_id": str(notification_plan.notification_plan_id),
+        },
+    )
+    repository.events[event.event_id] = event
+    service = MaintenanceService(config(app_env="test"), repository=repository)
+
+    await service.handle_replay_trigger_event(event.event_id)
+
+    assert repository.replay_status_updates == []
+    assert repository.plan_created_outbox == []
+    assert repository.job_attempts == []

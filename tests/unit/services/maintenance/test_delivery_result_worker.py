@@ -392,6 +392,35 @@ async def test_malformed_delivery_event_missing_payload_plan_id_fails_closed_wit
 
 
 @pytest.mark.asyncio
+async def test_delivery_event_payload_plan_id_mismatch_fails_closed_without_db_write() -> None:
+    repository = FakeRepository()
+    notification_plan = plan()
+    other_plan = plan()
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    event = outbox_event(
+        "notification.delivery.result.v1",
+        aggregate_id=notification_plan.notification_plan_id,
+        payload_json={
+            "notification_plan_id": str(other_plan.notification_plan_id),
+            "delivery_status": "failed_retryable",
+        },
+    )
+    repository.events[event.event_id] = event
+    service = MaintenanceService(config(), repository=repository)
+
+    result = await service.handle_maintenance_trigger_event(event.event_id)
+
+    assert result is not None
+    assert result.processed is False
+    assert result.classification == "unsupported"
+    assert result.action == "unsupported"
+    assert result.reason_code == "invalid_delivery_result_payload"
+    assert repository.job_attempts == []
+    assert repository.plan_created_outbox == []
+    assert repository.dead_letters == []
+
+
+@pytest.mark.asyncio
 async def test_wrong_aggregate_type_delivery_event_fails_closed_without_db_write() -> None:
     repository = FakeRepository()
     notification_plan = plan()
