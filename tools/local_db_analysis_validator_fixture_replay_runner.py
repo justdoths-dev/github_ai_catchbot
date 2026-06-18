@@ -125,6 +125,16 @@ SAFE_EXCEPTION_MESSAGES = {
     "semantic_validation_failed",
     "model_refusal",
 }
+COMPARISON_GAP_MARKERS = frozenset(
+    {
+        "comparison_gap",
+        "insufficient_comparables",
+        "no_reliable_comparables",
+        "comparables_unavailable",
+        "comparable_gap",
+    }
+)
+CONSERVATIVE_VERDICTS = frozenset({"later", "skip"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,7 +508,53 @@ def validate_semantic_consistency(
         value = payload.get(key)
         if not isinstance(value, str) or not value.strip():
             failures.append(f"{key}:empty")
+    failures.extend(_github_no_comparables_failures(payload))
     return not failures, tuple(failures)
+
+
+def _github_no_comparables_failures(payload: Mapping[str, Any]) -> list[str]:
+    comparables = payload.get("comparables")
+    if not isinstance(comparables, list) or comparables:
+        return []
+
+    verdict = payload.get("model_proposed_verdict")
+    confidence_band = payload.get("model_confidence_band")
+    scores = payload.get("scores") if isinstance(payload.get("scores"), Mapping) else {}
+    evidence_strength = _score(scores, "evidence_strength")
+    confidence = _score(scores, "confidence")
+
+    if verdict == "inspect_now" or confidence_band == "high" or confidence >= 60:
+        return ["github_comparables_required_for_high_action"]
+    if verdict not in CONSERVATIVE_VERDICTS:
+        return ["github_comparables_missing_comparison_gap"]
+    if evidence_strength >= 50:
+        return ["github_comparables_missing_comparison_gap"]
+    if not _has_comparison_gap_marker(payload):
+        return ["github_comparables_missing_comparison_gap"]
+    return []
+
+
+def _has_comparison_gap_marker(payload: Mapping[str, Any]) -> bool:
+    for field in ("reason_codes", "evidence_limitations_ko"):
+        value = payload.get(field)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            normalized = item.strip().lower().replace("-", "_").replace(" ", "_")
+            if any(marker in normalized for marker in COMPARISON_GAP_MARKERS):
+                return True
+    return False
+
+
+def _score(scores: Mapping[str, Any], field: str) -> int:
+    value = scores.get(field)
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, Real):
+        return int(value)
+    return 0
 
 
 def _execute_analysis_validator_replay(connection: Any, *, replay_namespace: str) -> ReplayExecutionResult:

@@ -99,6 +99,7 @@ SAFE_EXCEPTION_MESSAGES = {
     "judge_output_duplicate_existing",
     "judge_run_succeeded_output_missing",
 }
+COMPARISON_GAP_REASON_CODES = ("comparison_gap", "insufficient_comparables")
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +393,8 @@ def build_fake_judge_output_payload(bundle: BundleContext) -> dict[str, Any]:
     limitations = [str(value) for value in bundle.evidence_limitations if str(value)]
     if not limitations:
         limitations = ["synthetic local fixture; no GitHub API call"]
+    if not any(_has_comparison_gap_marker(value) for value in limitations):
+        limitations.append("comparison_gap: insufficient_comparables in local fixture")
     return {
         "judge_schema_version": JUDGE_SCHEMA_VERSION,
         "candidate_group_id": str(bundle.candidate_group_id),
@@ -409,9 +412,9 @@ def build_fake_judge_output_payload(bundle: BundleContext) -> dict[str, Any]:
         "scores": {
             "novelty": 41,
             "practical_usefulness": 58,
-            "evidence_strength": 62,
+            "evidence_strength": 45,
             "hype_penalty": 20,
-            "confidence": 55,
+            "confidence": 45,
             "code_quality": 58,
             "maintenance_signal": 57,
             "specificity": None,
@@ -421,6 +424,7 @@ def build_fake_judge_output_payload(bundle: BundleContext) -> dict[str, Any]:
             "github_repo_fixture_evidence",
             "tests_and_ci_paths_present",
             "synthetic_fixture_limitation",
+            *COMPARISON_GAP_REASON_CODES,
         ],
         "red_flags_ko": [
             "실제 GitHub API 호출 결과가 아니라 local fixture 기반이다.",
@@ -475,6 +479,11 @@ def structured_output_schema_valid(payload: Mapping[str, Any]) -> bool:
         if not isinstance(payload.get(key), str) or not payload[key]:
             return False
     return True
+
+
+def _has_comparison_gap_marker(value: str) -> bool:
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return any(marker in normalized for marker in COMPARISON_GAP_REASON_CODES)
 
 
 def _execute_fake_judge_output_replay(connection: Any, *, replay_namespace: str) -> ReplayExecutionResult:

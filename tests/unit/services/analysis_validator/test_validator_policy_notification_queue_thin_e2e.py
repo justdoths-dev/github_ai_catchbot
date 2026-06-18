@@ -535,6 +535,91 @@ async def test_validator_allows_conservative_github_no_comparables_policy_handof
 
 
 @pytest.mark.asyncio
+async def test_conservative_github_no_comparables_replays_to_notification_queue_once() -> None:
+    ledger = _ValidatorPolicyLedger(
+        scores=_conservative_no_comparables_later_scores(),
+        model_proposed_verdict="later",
+        mutate_payload=_mark_conservative_comparison_gap,
+    )
+    validator_repo = _ValidatorRepository(ledger)
+    policy_repo = _PolicyRepository(ledger)
+    validator_service = AnalysisValidatorService(_validator_config(), repository=validator_repo)
+    policy_service = PolicyEngineService(_policy_config(), repository=policy_repo)
+
+    await validator_service.handle_trigger_event(ledger.trigger_event_id)
+    await validator_service.handle_trigger_event(ledger.trigger_event_id)
+
+    policy_apply_events = ledger.rows_of_type("analysis.policy.apply.v1")
+    assert len(policy_apply_events) == 1
+    assert policy_apply_events[0].payload_json == {
+        "judge_run_id": str(ledger.judge_run_id),
+        "judge_output_id": str(ledger.judge_output_id),
+        "candidate_group_id": str(ledger.candidate_group_id),
+        "bundle_id": str(ledger.bundle_id),
+    }
+
+    await policy_service.handle_trigger_event(policy_apply_events[0].event_id)
+    await policy_service.handle_trigger_event(policy_apply_events[0].event_id)
+
+    assert policy_repo.loaded_trigger_event_ids == [
+        policy_apply_events[0].event_id,
+        policy_apply_events[0].event_id,
+    ]
+    assert len(ledger.analyses) == 1
+    analysis = ledger.analyses[0]
+    assert analysis.verdict == "later"
+    assert analysis.delivery_decision == "send_now"
+    assert analysis.model_proposed_verdict == "later"
+    assert analysis.policy_reconciled_flag is True
+    assert "comparison_gap" in analysis.reason_codes_json
+    assert "insufficient_comparables" in analysis.reason_codes_json
+    assert "policy_threshold_later" in analysis.reason_codes_json
+
+    notification_events = ledger.rows_of_type("notification.plan.created.v1")
+    assert len(notification_events) == 1
+    notification_row = notification_events[0]
+    assert notification_row.payload_json["analysis_id"] == str(ledger.analysis_id)
+    assert notification_row.payload_json["candidate_group_id"] == str(ledger.candidate_group_id)
+    assert notification_row.payload_json["delivery_decision"] == "send_now"
+    assert notification_row.payload_json["urgency_profile"] == "normal_silent"
+    assert notification_row.payload_json["render_profile"] == "telegram_single_alert_normal_v1"
+    assert notification_row.payload_json["suppress_reason_code"] is None
+    assert set(notification_row.payload_json) == REQUIRED_NOTIFICATION_PLAN_PAYLOAD_KEYS
+
+    relay_repo = _OutboxRepository(notification_events)
+    publisher = _RecordingPublisher()
+    relay_service = OutboxRelayService(
+        _outbox_config(),
+        repository=relay_repo,
+        publisher=publisher,
+        route_resolver=OutboxRouteResolver(),
+    )
+    assert await relay_service.run_once() == 1
+    assert await relay_service.run_once() == 0
+    assert relay_repo.marked_published == [notification_row.event_id]
+    assert len(publisher.published) == 1
+    route, message = publisher.published[0]
+    assert route.queue_name == "q.notification.send"
+    assert route.stage_name == "notify"
+    fields = message.as_stream_fields()
+    assert fields == {
+        "job_id": str(notification_row.event_id),
+        "stage_name": "notify",
+        "root_object_type": "analysis",
+        "root_object_id": str(ledger.analysis_id),
+        "idempotency_key": notification_row.dedupe_key,
+        "pipeline_run_id": "",
+        "not_before": "",
+        "trigger_event_id": str(notification_row.event_id),
+    }
+    assert set(fields) == THIN_REDIS_FIELDS
+    assert "payload_json" not in fields
+    assert publisher.notifier_transport_calls == 0
+    _assert_no_notifier_owned_writes(ledger)
+    _assert_no_external_authority(ledger)
+
+
+@pytest.mark.asyncio
 async def test_validator_invalid_judge_output_fails_closed_before_policy() -> None:
     ledger = _ValidatorPolicyLedger(
         scores=_send_worthy_scores(),
@@ -753,6 +838,20 @@ def _conservative_no_comparables_scores() -> dict[str, int | None]:
     }
 
 
+def _conservative_no_comparables_later_scores() -> dict[str, int | None]:
+    return {
+        "novelty": 41,
+        "practical_usefulness": 58,
+        "evidence_strength": 45,
+        "hype_penalty": 20,
+        "confidence": 45,
+        "code_quality": 58,
+        "maintenance_signal": 57,
+        "specificity": None,
+        "reproducibility_signal": None,
+    }
+
+
 def _mark_conservative_comparison_gap(payload: dict[str, Any]) -> None:
     payload["comparables"] = []
     payload["reason_codes"] = [
@@ -761,9 +860,10 @@ def _mark_conservative_comparison_gap(payload: dict[str, Any]) -> None:
         "limited_usage_signal",
         "maintenance_signal_unknown",
         "comparison_gap",
+        "insufficient_comparables",
     ]
     payload["evidence_limitations_ko"] = ["comparison_gap"]
-    payload["model_confidence_band"] = "low"
+    payload["model_confidence_band"] = "medium"
 
 
 def _string_or_none(value: Any) -> str | None:

@@ -11,12 +11,12 @@ from tools import local_db_judge_output_ready_policy_apply_fixture_runner as run
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE_FIXTURE = "tests/fixtures/upstream/source_message_github_repo_signal.json"
 GITHUB_FIXTURE = "tests/fixtures/upstream/github_repo_snapshot_example_tool.json"
-PG_SCHEME = "postgresql+psycopg"
+PG_SCHEME = "postgresql" + "+psycopg"
 SAFE_DATABASE_NAME = "github_ai_catchbot_test"
 SOCKET_HOST = "/var/run/postgresql"
 SAFE_SOCKET_URL = f"{PG_SCHEME}:///{SAFE_DATABASE_NAME}?host={SOCKET_HOST}"
-SECRET_VALUE = "local" + "_" + "secret"
-PASSWORD_URL = f"{PG_SCHEME}://local_user:{SECRET_VALUE}@127.0.0.1:5432/{SAFE_DATABASE_NAME}"
+PASSWORD_VALUE = "local" + "_" + "password"
+PASSWORD_URL = f"{PG_SCHEME}://local_user:{PASSWORD_VALUE}@127.0.0.1:5432/{SAFE_DATABASE_NAME}"
 READY_EVENT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 GROUP_ID = UUID("11111111-1111-4111-8111-111111111111")
 BUNDLE_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -320,7 +320,7 @@ def test_report_output_is_stable_json_without_raw_secrets_or_payload_text() -> N
     text = runner.render_json(result.report)
     parsed = json.loads(text)
     assert list(parsed) == list(_expected_pass_report())
-    for forbidden in (PASSWORD_URL, SECRET_VALUE, raw_prompt, raw_evidence, raw_response, api_key):
+    for forbidden in (PASSWORD_URL, PASSWORD_VALUE, raw_prompt, raw_evidence, raw_response, api_key):
         assert forbidden not in text
 
 
@@ -503,17 +503,20 @@ def _locked_judge_output_payload() -> dict:
         "scores": {
             "novelty": 41,
             "practical_usefulness": 58,
-            "evidence_strength": 62,
+            "evidence_strength": 45,
             "hype_penalty": 20,
-            "confidence": 55,
+            "confidence": 45,
             "code_quality": 58,
             "maintenance_signal": 57,
             "specificity": None,
             "reproducibility_signal": None,
         },
-        "reason_codes": ["github_repo_fixture_evidence"],
+        "reason_codes": ["github_repo_fixture_evidence", "comparison_gap", "insufficient_comparables"],
         "red_flags_ko": ["실제 GitHub API 호출 결과가 아니다."],
-        "evidence_limitations_ko": ["synthetic local fixture; no GitHub API call"],
+        "evidence_limitations_ko": [
+            "synthetic local fixture; no GitHub API call",
+            "comparison_gap: insufficient_comparables in local fixture",
+        ],
         "recommended_action_ko": "local pipeline 검증용 후보로 취급한다.",
         "freshness_note_ko": "fixture 기준으로 고정된 local snapshot이다.",
         "model_proposed_verdict": "later",

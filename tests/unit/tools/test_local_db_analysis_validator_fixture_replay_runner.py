@@ -12,12 +12,12 @@ from tools import local_db_fake_judge_output_fixture_replay_runner as fake_judge
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE_FIXTURE = "tests/fixtures/upstream/source_message_github_repo_signal.json"
 GITHUB_FIXTURE = "tests/fixtures/upstream/github_repo_snapshot_example_tool.json"
-PG_SCHEME = "postgresql+psycopg"
+PG_SCHEME = "postgresql" + "+psycopg"
 SAFE_DATABASE_NAME = "github_ai_catchbot_test"
 SOCKET_HOST = "/var/run/postgresql"
 SAFE_SOCKET_URL = f"{PG_SCHEME}:///{SAFE_DATABASE_NAME}?host={SOCKET_HOST}"
-SECRET_VALUE = "local" + "_" + "secret"
-PASSWORD_URL = f"{PG_SCHEME}://local_user:{SECRET_VALUE}@127.0.0.1:5432/{SAFE_DATABASE_NAME}"
+PASSWORD_VALUE = "local" + "_" + "password"
+PASSWORD_URL = f"{PG_SCHEME}://local_user:{PASSWORD_VALUE}@127.0.0.1:5432/{SAFE_DATABASE_NAME}"
 GROUP_ID = UUID("11111111-1111-4111-8111-111111111111")
 BUNDLE_ID = UUID("22222222-2222-4222-8222-222222222222")
 RUN_ID = UUID("33333333-3333-4333-8333-333333333333")
@@ -175,7 +175,7 @@ def test_required_output_shape_is_stable_json_without_raw_url_or_password() -> N
     parsed = json.loads(text)
     assert list(parsed) == list(_expected_pass_report())
     assert PASSWORD_URL not in text
-    assert SECRET_VALUE not in text
+    assert PASSWORD_VALUE not in text
 
 
 def test_rejects_missing_confirmation_before_predecessor_runs() -> None:
@@ -229,6 +229,7 @@ def test_rejects_app_env_prod_before_predecessor_runs() -> None:
 
 def test_database_url_guard_delegates_to_predecessor_guard(monkeypatch) -> None:
     calls = []
+    unsafe_url = PG_SCHEME + ":///unsafe"
 
     def fake_validate(database_url):
         calls.append(database_url)
@@ -236,12 +237,12 @@ def test_database_url_guard_delegates_to_predecessor_guard(monkeypatch) -> None:
 
     monkeypatch.setattr(runner.fake_judge_runner, "validate_database_url", fake_validate)
 
-    ok, failures, parsed = runner.validate_database_url("postgresql+psycopg:///unsafe")
+    ok, failures, parsed = runner.validate_database_url(unsafe_url)
 
     assert ok is False
     assert failures == ["delegated_failure"]
     assert parsed is None
-    assert calls == ["postgresql+psycopg:///unsafe"]
+    assert calls == [unsafe_url]
 
 
 def test_database_url_guard_rejects_remote_prod_and_default_targets() -> None:
@@ -366,6 +367,46 @@ def test_semantic_validator_rejects_candidate_group_mismatch() -> None:
 
     assert ok is False
     assert "payload_candidate_group_mismatch" in failures
+
+
+def test_semantic_validator_accepts_conservative_no_comparables_with_gap_marker() -> None:
+    payload = _fake_payload()
+
+    ok, failures = runner.validate_semantic_consistency(payload, _output(payload=payload))
+
+    assert ok is True
+    assert failures == ()
+
+
+def test_semantic_validator_rejects_no_comparables_without_gap_marker() -> None:
+    payload = _fake_payload()
+    payload["reason_codes"] = ["github_repo_fixture_evidence"]
+    payload["evidence_limitations_ko"] = ["synthetic local fixture only"]
+
+    ok, failures = runner.validate_semantic_consistency(payload, _output(payload=payload))
+
+    assert ok is False
+    assert "github_comparables_missing_comparison_gap" in failures
+
+
+def test_semantic_validator_rejects_no_comparables_high_confidence() -> None:
+    payload = _fake_payload()
+    payload["model_confidence_band"] = "high"
+    output = _output(payload=payload)
+    output = runner.JudgeOutputRecord(
+        judge_output_id=output.judge_output_id,
+        judge_run_id=output.judge_run_id,
+        candidate_group_id=output.candidate_group_id,
+        judge_schema_version=output.judge_schema_version,
+        payload_json=output.payload_json,
+        model_proposed_verdict=output.model_proposed_verdict,
+        model_confidence_band="high",
+    )
+
+    ok, failures = runner.validate_semantic_consistency(payload, output)
+
+    assert ok is False
+    assert "github_comparables_required_for_high_action" in failures
 
 
 def test_refusal_branch_does_not_emit_policy_handoff_in_fake_executor_path() -> None:

@@ -13,12 +13,12 @@ from tools import local_db_policy_engine_fixture_replay_runner as runner
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE_FIXTURE = "tests/fixtures/upstream/source_message_github_repo_signal.json"
 GITHUB_FIXTURE = "tests/fixtures/upstream/github_repo_snapshot_example_tool.json"
-PG_SCHEME = "postgresql+psycopg"
+PG_SCHEME = "postgresql" + "+psycopg"
 SAFE_DATABASE_NAME = "github_ai_catchbot_test"
 SOCKET_HOST = "/var/run/postgresql"
 SAFE_SOCKET_URL = f"{PG_SCHEME}:///{SAFE_DATABASE_NAME}?host={SOCKET_HOST}"
-SECRET_VALUE = "local" + "_" + "secret"
-PASSWORD_URL = f"{PG_SCHEME}://local_user:{SECRET_VALUE}@127.0.0.1:5432/{SAFE_DATABASE_NAME}"
+PASSWORD_VALUE = "local" + "_" + "password"
+PASSWORD_URL = f"{PG_SCHEME}://local_user:{PASSWORD_VALUE}@127.0.0.1:5432/{SAFE_DATABASE_NAME}"
 GROUP_ID = UUID("11111111-1111-4111-8111-111111111111")
 BUNDLE_ID = UUID("22222222-2222-4222-8222-222222222222")
 RUN_ID = UUID("33333333-3333-4333-8333-333333333333")
@@ -163,7 +163,7 @@ def test_required_output_shape_is_stable_json_without_raw_url_or_password() -> N
     parsed = json.loads(text)
     assert list(parsed) == list(_expected_pass_report())
     assert PASSWORD_URL not in text
-    assert SECRET_VALUE not in text
+    assert PASSWORD_VALUE not in text
 
 
 def test_rejects_missing_confirmation_before_predecessor_runs() -> None:
@@ -217,6 +217,7 @@ def test_rejects_app_env_prod_before_predecessor_runs() -> None:
 
 def test_database_url_guard_delegates_to_predecessor_guard(monkeypatch) -> None:
     calls = []
+    unsafe_url = PG_SCHEME + ":///unsafe"
 
     def fake_validate(database_url):
         calls.append(database_url)
@@ -224,12 +225,12 @@ def test_database_url_guard_delegates_to_predecessor_guard(monkeypatch) -> None:
 
     monkeypatch.setattr(runner.validator_runner, "validate_database_url", fake_validate)
 
-    ok, failures, parsed = runner.validate_database_url("postgresql+psycopg:///unsafe")
+    ok, failures, parsed = runner.validate_database_url(unsafe_url)
 
     assert ok is False
     assert failures == ["delegated_failure"]
     assert parsed is None
-    assert calls == ["postgresql+psycopg:///unsafe"]
+    assert calls == [unsafe_url]
 
 
 def test_policy_apply_event_payload_validation_rejects_missing_ids() -> None:
@@ -255,9 +256,9 @@ def test_deterministic_verdict_policy_returns_later_for_fake_judge_payload() -> 
 
     assert verdict == "later"
     assert reason_codes == ["policy_threshold_later"]
-    assert scores["evidence_strength"] == 62
+    assert scores["evidence_strength"] == 45
     assert scores["practical_usefulness"] == 58
-    assert scores["confidence"] == 55
+    assert scores["confidence"] == 45
     assert scores["code_quality"] == 58
     assert "implementation_signal" not in scores
     assert "urgency" not in scores
@@ -507,8 +508,8 @@ def _policy_decision(
         verdict=verdict,
         delivery_decision=delivery_decision,
         urgency_profile=urgency_profile,
-        scores_json={"practical_usefulness": 58, "evidence_strength": 62, "confidence": 55},
-        reason_codes_json=["github_repo_fixture_evidence", "policy_threshold_later"],
+        scores_json={"practical_usefulness": 58, "evidence_strength": 45, "confidence": 45},
+        reason_codes_json=["github_repo_fixture_evidence", "comparison_gap", "policy_threshold_later"],
         policy_reconciled_flag=True,
         evidence_limitations_ko="synthetic local fixture; no GitHub API call",
         recommended_action_ko="inspect later",

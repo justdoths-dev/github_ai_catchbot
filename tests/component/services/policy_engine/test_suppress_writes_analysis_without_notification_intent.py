@@ -16,6 +16,6 @@ async def test_suppress_writes_analysis_without_notification_intent() -> None:
     _analysis_id, analysis = repository.analyses[0]
     assert analysis.verdict == "skip"
     assert analysis.delivery_decision == "suppress"
-    assert "verdict_skip" in analysis.reason_codes_json
+    assert "policy_verdict_skip" in analysis.reason_codes_json
     assert repository.state_transitions[0]["to_state"] == "analysis_suppressed"
     assert repository.notification_outbox == []

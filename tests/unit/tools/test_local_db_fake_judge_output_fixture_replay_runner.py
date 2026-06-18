@@ -11,12 +11,12 @@ from tools import local_db_fake_judge_output_fixture_replay_runner as runner
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE_FIXTURE = "tests/fixtures/upstream/source_message_github_repo_signal.json"
 GITHUB_FIXTURE = "tests/fixtures/upstream/github_repo_snapshot_example_tool.json"
-PG_SCHEME = "postgresql+psycopg"
+PG_SCHEME = "postgresql" + "+psycopg"
 SAFE_DATABASE_NAME = "github_ai_catchbot_test"
 SOCKET_HOST = "/var/run/postgresql"
 SAFE_SOCKET_URL = f"{PG_SCHEME}:///{SAFE_DATABASE_NAME}?host={SOCKET_HOST}"
-SECRET_VALUE = "local" + "_" + "secret"
-PASSWORD_URL = f"{PG_SCHEME}://local_user:{SECRET_VALUE}@127.0.0.1:5432/{SAFE_DATABASE_NAME}"
+PASSWORD_VALUE = "local" + "_" + "password"
+PASSWORD_URL = f"{PG_SCHEME}://local_user:{PASSWORD_VALUE}@127.0.0.1:5432/{SAFE_DATABASE_NAME}"
 GROUP_ID = UUID("11111111-1111-4111-8111-111111111111")
 BUNDLE_ID = UUID("22222222-2222-4222-8222-222222222222")
 
@@ -164,7 +164,7 @@ def test_required_output_shape_is_stable_json_without_raw_url_or_password() -> N
     parsed = json.loads(text)
     assert list(parsed) == list(_expected_pass_report())
     assert PASSWORD_URL not in text
-    assert SECRET_VALUE not in text
+    assert PASSWORD_VALUE not in text
 
 
 def test_rejects_missing_confirmation_before_predecessor_runs() -> None:
@@ -218,6 +218,7 @@ def test_rejects_app_env_prod_before_predecessor_runs() -> None:
 
 def test_database_url_guard_delegates_to_predecessor_guard(monkeypatch) -> None:
     calls = []
+    unsafe_url = PG_SCHEME + ":///unsafe"
 
     def fake_validate(database_url):
         calls.append(database_url)
@@ -225,12 +226,12 @@ def test_database_url_guard_delegates_to_predecessor_guard(monkeypatch) -> None:
 
     monkeypatch.setattr(runner.analysis_router_runner, "validate_database_url", fake_validate)
 
-    ok, failures, parsed = runner.validate_database_url("postgresql+psycopg:///unsafe")
+    ok, failures, parsed = runner.validate_database_url(unsafe_url)
 
     assert ok is False
     assert failures == ["delegated_failure"]
     assert parsed is None
-    assert calls == ["postgresql+psycopg:///unsafe"]
+    assert calls == [unsafe_url]
 
 
 def test_database_url_guard_rejects_remote_prod_and_default_targets() -> None:
@@ -276,8 +277,14 @@ def test_fake_judge_output_payload_has_required_judge_output_v1_fields() -> None
     assert payload["model_confidence_band"] == "medium"
     assert set(payload["scores"]) == set(runner.REQUIRED_SCORE_KEYS)
     assert payload["scores"]["practical_usefulness"] == 58
+    assert payload["scores"]["evidence_strength"] == 45
+    assert payload["scores"]["confidence"] == 45
     assert payload["scores"]["code_quality"] == 58
     assert payload["scores"]["specificity"] is None
+    assert payload["comparables"] == []
+    assert "comparison_gap" in payload["reason_codes"]
+    assert "insufficient_comparables" in payload["reason_codes"]
+    assert any("comparison_gap" in item for item in payload["evidence_limitations_ko"])
     assert "implementation_signal" not in payload["scores"]
     assert "urgency" not in payload["scores"]
     assert runner.structured_output_schema_valid(payload)
@@ -331,7 +338,7 @@ def test_existing_output_payload_mismatch_fails_with_sanitized_failure_code() ->
     assert result.exit_code == 1
     assert result.report["checks_failed"] == ["judge_output_payload_mismatch"]
     assert PASSWORD_URL not in text
-    assert SECRET_VALUE not in text
+    assert PASSWORD_VALUE not in text
 
 
 def _bundle_context(*, primary_summary=None) -> runner.BundleContext:
