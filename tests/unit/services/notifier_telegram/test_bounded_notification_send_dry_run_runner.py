@@ -18,6 +18,7 @@ from src.services.notifier_telegram.bounded_notification_send_dry_run_runner imp
     BoundedNotificationSendDryRunRuntimeConfig,
     BoundedNotificationSendDryRunState,
     NotificationDryRunExecution,
+    NotificationDurableReadback,
     NotificationSendContext,
     RedisTargetSelection,
     _execute_context,
@@ -49,6 +50,7 @@ class FakeRuntime:
         selection: RedisTargetSelection | None = None,
         consume_selection: RedisTargetSelection | None = None,
         execution: NotificationDryRunExecution | None = None,
+        readback: NotificationDurableReadback | None = None,
         execute_error: BaseException | None = None,
         publish_error: BaseException | None = None,
         ack_count: int = 1,
@@ -57,6 +59,7 @@ class FakeRuntime:
         self.selection = selection or _matched_selection(context.intent)
         self.consume_selection = consume_selection or self.selection
         self.execution = execution or _execution(context)
+        self.readback = readback or _successful_readback()
         self.execute_error = execute_error
         self.publish_error = publish_error
         self.ack_count = ack_count
@@ -99,6 +102,11 @@ class FakeRuntime:
             raise self.execute_error
         self.state.database_committed = True
         return self.execution
+
+    async def readback_final_state(self, execution):
+        self.call_order.append("readback")
+        assert execution.notification_delivery_record_id == self.execution.notification_delivery_record_id
+        return self.readback
 
     async def publish_maintenance(self, event_row):
         self.call_order.append("publish_maintenance")
@@ -326,6 +334,19 @@ def _execution(context: NotificationSendContext, *, write_counts: dict[str, int]
     )
 
 
+def _successful_readback() -> NotificationDurableReadback:
+    return NotificationDurableReadback(
+        notification_plan_count=1,
+        notification_plan_material_count=1,
+        notification_render_count=1,
+        notification_delivery_record_count=1,
+        notification_delivery_result_event_count=1,
+        delivery_result_event_status="published",
+        q_maintenance_route_verified=True,
+        q_maintenance_message_thin=True,
+    )
+
+
 def _message(intent: NotificationIntentJob, *, fields: dict[str, str] | None = None) -> StreamMessage:
     base = {
         "job_id": str(intent.trigger_event_id),
@@ -533,6 +554,14 @@ async def test_execute_happy_path_commits_publishes_maintenance_then_acks() -> N
     assert "1718000000001-0" not in json.dumps(report)
     assert report["redis_ack_status"] == "acked"
     assert report["redis_acked_count"] == 1
+    assert report["durable_readback"]["ack_safe"] is True
+    assert report["durable_readback"]["notification_plan_exactly_once"] is True
+    assert report["durable_readback"]["notification_render_exactly_once"] is True
+    assert report["durable_readback"]["notification_delivery_record_exactly_once"] is True
+    assert report["durable_readback"]["notification_delivery_result_event_exactly_once"] is True
+    assert report["durable_readback"]["delivery_result_event_published"] is True
+    assert report["durable_readback"]["q_maintenance_message_thin"] is True
+    assert report["redis_ack_after_durable_readback"] is True
     assert report["side_effects"]["database_committed"] is True
     assert report["side_effects"]["maintenance_outbox_status_committed"] is True
     assert report["side_effects"]["telegram_transport_called"] is False
@@ -543,7 +572,54 @@ async def test_execute_happy_path_commits_publishes_maintenance_then_acks() -> N
         "execute",
         "publish_maintenance",
         "mark_published",
+        "readback",
         "ack",
+        "close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_durable_readback_failure_blocks_ack_after_publish_mark() -> None:
+    intent = _intent()
+    context = _context(intent)
+    runtime = FakeRuntime(
+        context=context,
+        readback=NotificationDurableReadback(
+            notification_plan_count=1,
+            notification_plan_material_count=1,
+            notification_render_count=0,
+            notification_delivery_record_count=1,
+            notification_delivery_result_event_count=1,
+            delivery_result_event_status="published",
+            q_maintenance_route_verified=True,
+            q_maintenance_message_thin=True,
+            checks_failed=("notification_render_readback_not_exactly_once",),
+        ),
+    )
+
+    result = await run_bounded_notification_send_dry_run(
+        _base_config(intent),
+        runtime_config_loader=_runtime_config_loader,
+        runtime_builder=FakeRuntimeBuilder(runtime),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "failed"
+    assert report["error_code"] == "durable_readback_failed"
+    assert report["durable_readback"]["ack_safe"] is False
+    assert report["durable_readback"]["notification_render_exactly_once"] is False
+    assert report["durable_readback"]["checks_failed"] == ["notification_render_readback_not_exactly_once"]
+    assert report["side_effects"]["maintenance_outbox_status_committed"] is True
+    assert report["side_effects"]["redis_ack_attempted"] is False
+    assert runtime.acked == []
+    assert runtime.call_order == [
+        "inspect",
+        "load_context",
+        "consume",
+        "execute",
+        "publish_maintenance",
+        "mark_published",
+        "readback",
         "close",
     ]
 
@@ -629,7 +705,8 @@ async def test_already_published_delivery_result_acks_without_q_maintenance_repu
     assert report["q_maintenance_published"] is False
     assert report["q_maintenance_message_suffix"] is None
     assert report["redis_ack_status"] == "acked"
-    assert runtime.call_order == ["inspect", "load_context", "consume", "execute", "ack", "close"]
+    assert report["durable_readback"]["ack_safe"] is True
+    assert runtime.call_order == ["inspect", "load_context", "consume", "execute", "readback", "ack", "close"]
 
 
 @pytest.mark.asyncio

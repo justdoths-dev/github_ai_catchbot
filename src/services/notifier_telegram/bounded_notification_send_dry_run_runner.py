@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Protocol
 from uuid import UUID
@@ -28,7 +28,7 @@ from .models import (
 from .renderer import NotificationRenderer, RenderInput
 from .repositories import NotifierTelegramRepository
 
-SCHEMA_VERSION = "bounded_notification_send_dry_run_runner_v1"
+SCHEMA_VERSION = "bounded_notification_send_dry_run_runner_v2"
 RUNNER_NAME = "bounded_notification_send_dry_run_runner"
 QUEUE_NAME = "q.notification.send"
 STAGE_NAME = "notify"
@@ -188,6 +188,23 @@ class NotificationDryRunExecution:
     notifier_owned_write_counts: Mapping[str, int] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class NotificationDurableReadback:
+    notification_plan_count: int = 0
+    notification_plan_material_count: int = 0
+    notification_render_count: int = 0
+    notification_delivery_record_count: int = 0
+    notification_delivery_result_event_count: int = 0
+    delivery_result_event_status: str | None = None
+    q_maintenance_route_verified: bool = False
+    q_maintenance_message_thin: bool = False
+    checks_failed: tuple[str, ...] = ()
+
+    @property
+    def ack_safe(self) -> bool:
+        return not self.checks_failed
+
+
 class BoundedNotificationSendDryRunRuntime(Protocol):
     async def inspect_target(self, config: BoundedNotificationSendDryRunConfig) -> RedisTargetSelection: ...
     async def consume_target(
@@ -205,6 +222,7 @@ class BoundedNotificationSendDryRunRuntime(Protocol):
         trigger_event_id: UUID,
         config: BoundedNotificationSendDryRunConfig,
     ) -> NotificationDryRunExecution: ...
+    async def readback_final_state(self, execution: NotificationDryRunExecution) -> NotificationDurableReadback: ...
     async def publish_maintenance(self, event_row: OutboxEventRow) -> str: ...
     async def mark_delivery_result_published(self, event_id: UUID) -> None: ...
     async def ack(self, message_id: str) -> int: ...
@@ -231,6 +249,7 @@ class BoundedNotificationSendDryRunResult:
     redis_selection: RedisTargetSelection | None = None
     context: NotificationSendContext | None = None
     execution: NotificationDryRunExecution | None = None
+    durable_readback: NotificationDurableReadback | None = None
     q_maintenance_published: bool = False
     q_maintenance_message_id_present: bool = False
     redis_ack_status: str = "not_attempted"
@@ -240,6 +259,7 @@ class BoundedNotificationSendDryRunResult:
         selection = self.redis_selection
         context = self.context or (self.execution.context if self.execution else None)
         execution = self.execution
+        readback = self.durable_readback
         gates = {
             "operator_approved": self.config.operator_approved,
             "runtime_config_allowed": self.config.allow_runtime_config,
@@ -293,8 +313,12 @@ class BoundedNotificationSendDryRunResult:
                 if self.q_maintenance_message_id_present
                 else None
             ),
+            "durable_readback": _durable_readback_report(readback),
             "redis_ack_status": self.redis_ack_status,
             "redis_acked_count": self.redis_acked_count,
+            "redis_ack_after_durable_readback": bool(
+                readback is not None and readback.ack_safe and self.redis_ack_status == "acked"
+            ),
             "planned_action": context.planned_action if context else "not_evaluated",
             "notifier_owned_write_counts": dict(execution.notifier_owned_write_counts) if execution else {},
             "gates": gates,
@@ -482,6 +506,45 @@ class DefaultBoundedNotificationSendDryRunRuntime:
         except Exception:
             self._state.database_rolled_back = True
             raise
+
+    async def readback_final_state(self, execution: NotificationDryRunExecution) -> NotificationDurableReadback:
+        async with self._session_factory() as session:
+            self._state.database_session_opened = True
+            self._state.database_read_attempted = True
+            repository = NotifierTelegramRepository(session)
+            render_hash = execution.context.render_draft.render_hash if execution.context.render_draft else ""
+            raw = await repository.load_bounded_notification_send_dry_run_readback(
+                notification_plan_id=execution.context.plan_id,
+                analysis_id=execution.context.intent.analysis_id,
+                candidate_group_id=execution.context.intent.candidate_group_id,
+                target_chat_id=execution.context.intent.target_chat_id,
+                dedupe_subject_key=execution.context.intent.dedupe_subject_key,
+                material_change_hash=execution.context.intent.material_change_hash,
+                render_hash=render_hash,
+                notification_delivery_record_id=execution.notification_delivery_record_id,
+                delivery_result_event_id=execution.delivery_result_event_row.event_id,
+                dry_run_reason_code=DRY_RUN_REASON_CODE,
+            )
+        event_status = _string_or_none(raw.get("delivery_result_event_status"))
+        event_row = replace(
+            execution.delivery_result_event_row,
+            status=event_status or execution.delivery_result_event_row.status,
+        )
+        route = self._route_resolver.resolve(event_row)
+        q_maintenance_route_verified = (
+            route.queue_name == MAINTENANCE_QUEUE_NAME and route.stage_name == MAINTENANCE_STAGE_NAME
+        )
+        maintenance_message = _build_stream_message(event_row, route)
+        q_maintenance_message_thin = (
+            q_maintenance_route_verified
+            and set(maintenance_message.as_stream_fields()) == set(REQUIRED_THIN_QUEUE_FIELDS)
+            and "payload_json" not in maintenance_message.as_stream_fields()
+        )
+        return _durable_readback_from_raw(
+            raw,
+            q_maintenance_route_verified=q_maintenance_route_verified,
+            q_maintenance_message_thin=q_maintenance_message_thin,
+        )
 
     async def publish_maintenance(self, event_row: OutboxEventRow) -> str:
         route = self._route_resolver.resolve(event_row)
@@ -699,6 +762,15 @@ async def run_bounded_notification_send_dry_run(
             )
         maintenance_message_id: str | None = None
         if execution.delivery_result_event_row.status == "published":
+            readback, readback_failure = await _readback_or_failure(
+                runtime,
+                execution,
+                config=config,
+                state=state,
+                redis_selection=consumed,
+            )
+            if readback_failure is not None:
+                return readback_failure
             ack_count = await runtime.ack(consumed.message.message_id)
             acked = ack_count == 1
             return _result(
@@ -708,6 +780,7 @@ async def run_bounded_notification_send_dry_run(
                 state=state,
                 redis_selection=consumed,
                 execution=execution,
+                durable_readback=readback,
                 redis_ack_status="acked" if acked else "failed",
                 redis_acked_count=ack_count,
             )
@@ -735,6 +808,18 @@ async def run_bounded_notification_send_dry_run(
                 execution=_with_maintenance_message(execution, maintenance_message_id),
                 q_maintenance_message_id_present=bool(maintenance_message_id),
             )
+        execution_with_maintenance = _with_maintenance_message(execution, maintenance_message_id, marked=True)
+        readback, readback_failure = await _readback_or_failure(
+            runtime,
+            execution_with_maintenance,
+            config=config,
+            state=state,
+            redis_selection=consumed,
+            q_maintenance_published=True,
+            q_maintenance_message_id_present=bool(maintenance_message_id),
+        )
+        if readback_failure is not None:
+            return readback_failure
         ack_count = await runtime.ack(consumed.message.message_id)
         acked = ack_count == 1
         return _result(
@@ -743,7 +828,8 @@ async def run_bounded_notification_send_dry_run(
             config=config,
             state=state,
             redis_selection=consumed,
-            execution=_with_maintenance_message(execution, maintenance_message_id, marked=True),
+            execution=execution_with_maintenance,
+            durable_readback=readback,
             q_maintenance_published=True,
             q_maintenance_message_id_present=bool(maintenance_message_id),
             redis_ack_status="acked" if acked else "failed",
@@ -796,6 +882,56 @@ def argument_error_report(error_code: str) -> dict[str, Any]:
         config=BoundedNotificationSendDryRunConfig(),
         state=BoundedNotificationSendDryRunState(),
     ).to_sanitized_dict()
+
+
+async def _readback_or_failure(
+    runtime: BoundedNotificationSendDryRunRuntime,
+    execution: NotificationDryRunExecution,
+    *,
+    config: BoundedNotificationSendDryRunConfig,
+    state: BoundedNotificationSendDryRunState,
+    redis_selection: RedisTargetSelection,
+    q_maintenance_published: bool = False,
+    q_maintenance_message_id_present: bool = False,
+) -> tuple[NotificationDurableReadback | None, BoundedNotificationSendDryRunResult | None]:
+    try:
+        readback = await runtime.readback_final_state(execution)
+    except BoundedNotificationSendDryRunError as exc:
+        return None, _result(
+            "failed",
+            exc.error_code,
+            config=config,
+            state=state,
+            redis_selection=redis_selection,
+            execution=execution,
+            q_maintenance_published=q_maintenance_published,
+            q_maintenance_message_id_present=q_maintenance_message_id_present,
+        )
+    except Exception as exc:
+        return None, _result(
+            "failed",
+            "durable_readback_failed",
+            error_class=_safe_exception_class(exc),
+            config=config,
+            state=state,
+            redis_selection=redis_selection,
+            execution=execution,
+            q_maintenance_published=q_maintenance_published,
+            q_maintenance_message_id_present=q_maintenance_message_id_present,
+        )
+    if not readback.ack_safe:
+        return readback, _result(
+            "failed",
+            "durable_readback_failed",
+            config=config,
+            state=state,
+            redis_selection=redis_selection,
+            execution=execution,
+            durable_readback=readback,
+            q_maintenance_published=q_maintenance_published,
+            q_maintenance_message_id_present=q_maintenance_message_id_present,
+        )
+    return readback, None
 
 
 async def _load_context(
@@ -1352,6 +1488,7 @@ def _result(
     redis_selection: RedisTargetSelection | None = None,
     context: NotificationSendContext | None = None,
     execution: NotificationDryRunExecution | None = None,
+    durable_readback: NotificationDurableReadback | None = None,
     q_maintenance_published: bool = False,
     q_maintenance_message_id_present: bool = False,
     redis_ack_status: str = "not_attempted",
@@ -1367,11 +1504,88 @@ def _result(
         redis_selection=redis_selection,
         context=context,
         execution=execution,
+        durable_readback=durable_readback,
         q_maintenance_published=q_maintenance_published,
         q_maintenance_message_id_present=q_maintenance_message_id_present,
         redis_ack_status=redis_ack_status,
         redis_acked_count=redis_acked_count,
     )
+
+
+def _durable_readback_from_raw(
+    raw: Mapping[str, Any],
+    *,
+    q_maintenance_route_verified: bool,
+    q_maintenance_message_thin: bool,
+) -> NotificationDurableReadback:
+    plan_count = int(raw.get("notification_plan_count") or 0)
+    material_count = int(raw.get("notification_plan_material_count") or 0)
+    render_count = int(raw.get("notification_render_count") or 0)
+    delivery_record_count = int(raw.get("notification_delivery_record_count") or 0)
+    event_count = int(raw.get("notification_delivery_result_event_count") or 0)
+    event_status = _string_or_none(raw.get("delivery_result_event_status"))
+    failures: list[str] = []
+    if plan_count != 1 or material_count != 1:
+        failures.append("notification_plan_readback_not_exactly_once")
+    if render_count != 1:
+        failures.append("notification_render_readback_not_exactly_once")
+    if delivery_record_count != 1:
+        failures.append("notification_delivery_record_readback_not_exactly_once")
+    if event_count != 1:
+        failures.append("notification_delivery_result_event_readback_not_exactly_once")
+    if event_status != "published":
+        failures.append("notification_delivery_result_event_not_published")
+    if not q_maintenance_route_verified:
+        failures.append("q_maintenance_route_readback_failed")
+    if not q_maintenance_message_thin:
+        failures.append("q_maintenance_thin_message_readback_failed")
+    return NotificationDurableReadback(
+        notification_plan_count=plan_count,
+        notification_plan_material_count=material_count,
+        notification_render_count=render_count,
+        notification_delivery_record_count=delivery_record_count,
+        notification_delivery_result_event_count=event_count,
+        delivery_result_event_status=event_status,
+        q_maintenance_route_verified=q_maintenance_route_verified,
+        q_maintenance_message_thin=q_maintenance_message_thin,
+        checks_failed=tuple(failures),
+    )
+
+
+def _durable_readback_report(readback: NotificationDurableReadback | None) -> dict[str, Any]:
+    if readback is None:
+        return {
+            "performed": False,
+            "ack_safe": False,
+            "notification_plan_exactly_once": False,
+            "notification_render_exactly_once": False,
+            "notification_delivery_record_exactly_once": False,
+            "notification_delivery_result_event_exactly_once": False,
+            "delivery_result_event_published": False,
+            "q_maintenance_route_verified": False,
+            "q_maintenance_message_thin": False,
+            "checks_failed": [],
+        }
+    return {
+        "performed": True,
+        "ack_safe": readback.ack_safe,
+        "notification_plan_exactly_once": (
+            readback.notification_plan_count == 1 and readback.notification_plan_material_count == 1
+        ),
+        "notification_render_exactly_once": readback.notification_render_count == 1,
+        "notification_delivery_record_exactly_once": readback.notification_delivery_record_count == 1,
+        "notification_delivery_result_event_exactly_once": readback.notification_delivery_result_event_count == 1,
+        "delivery_result_event_published": readback.delivery_result_event_status == "published",
+        "q_maintenance_route_verified": readback.q_maintenance_route_verified,
+        "q_maintenance_message_thin": readback.q_maintenance_message_thin,
+        "notification_plan_count": readback.notification_plan_count,
+        "notification_plan_material_count": readback.notification_plan_material_count,
+        "notification_render_count": readback.notification_render_count,
+        "notification_delivery_record_count": readback.notification_delivery_record_count,
+        "notification_delivery_result_event_count": readback.notification_delivery_result_event_count,
+        "delivery_result_event_status": readback.delivery_result_event_status,
+        "checks_failed": list(readback.checks_failed),
+    }
 
 
 def _with_maintenance_message(

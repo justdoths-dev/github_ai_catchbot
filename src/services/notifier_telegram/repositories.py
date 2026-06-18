@@ -928,6 +928,129 @@ class NotifierTelegramRepository:
         inserted = result.scalar_one_or_none()
         return UUID(str(inserted)) if inserted else None
 
+    async def load_bounded_notification_send_dry_run_readback(
+        self,
+        *,
+        notification_plan_id: UUID,
+        analysis_id: UUID,
+        candidate_group_id: UUID,
+        target_chat_id: int,
+        dedupe_subject_key: str,
+        material_change_hash: str,
+        render_hash: str,
+        notification_delivery_record_id: UUID,
+        delivery_result_event_id: UUID,
+        dry_run_reason_code: str,
+    ) -> dict[str, Any]:
+        dedupe_key = _delivery_result_dedupe_key(
+            notification_plan_id=notification_plan_id,
+            notification_delivery_record_id=notification_delivery_record_id,
+        )
+        plan_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM notification_plans
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                  AND analysis_id = CAST(:analysis_id AS uuid)
+                  AND candidate_group_id = CAST(:candidate_group_id AS uuid)
+                  AND target_chat_id = :target_chat_id
+                  AND dedupe_subject_key = :dedupe_subject_key
+                  AND material_change_hash = :material_change_hash
+                """
+            ),
+            {
+                "notification_plan_id": str(notification_plan_id),
+                "analysis_id": str(analysis_id),
+                "candidate_group_id": str(candidate_group_id),
+                "target_chat_id": target_chat_id,
+                "dedupe_subject_key": dedupe_subject_key,
+                "material_change_hash": material_change_hash,
+            },
+        )
+        material_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM notification_plans
+                WHERE analysis_id = CAST(:analysis_id AS uuid)
+                  AND target_chat_id = :target_chat_id
+                  AND material_change_hash = :material_change_hash
+                """
+            ),
+            {
+                "analysis_id": str(analysis_id),
+                "target_chat_id": target_chat_id,
+                "material_change_hash": material_change_hash,
+            },
+        )
+        render_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM notification_renders
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                  AND render_hash = :render_hash
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id), "render_hash": render_hash},
+        )
+        delivery_record_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM notification_delivery_records
+                WHERE notification_delivery_record_id = CAST(:notification_delivery_record_id AS uuid)
+                  AND notification_plan_id = CAST(:notification_plan_id AS uuid)
+                  AND delivery_status = 'suppressed'::notification_status_enum
+                  AND telegram_chat_id IS NULL
+                  AND telegram_message_id IS NULL
+                  AND attempt_count = 0
+                  AND transport_error_code = :dry_run_reason_code
+                  AND telegram_response_json ->> 'dry_run' = 'true'
+                """
+            ),
+            {
+                "notification_plan_id": str(notification_plan_id),
+                "notification_delivery_record_id": str(notification_delivery_record_id),
+                "dry_run_reason_code": dry_run_reason_code,
+            },
+        )
+        event_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*) AS event_count,
+                       max(status::text) AS event_status
+                FROM event_outbox
+                WHERE event_id = CAST(:delivery_result_event_id AS uuid)
+                  AND event_type = 'notification.delivery.result.v1'
+                  AND aggregate_type = 'notification_plan'
+                  AND aggregate_id = CAST(:notification_plan_id AS uuid)
+                  AND dedupe_key = :dedupe_key
+                  AND payload_json ->> 'notification_plan_id' = :notification_plan_id
+                  AND payload_json ->> 'notification_delivery_record_id' = :notification_delivery_record_id
+                  AND payload_json ->> 'delivery_status' = 'suppressed'
+                  AND payload_json ->> 'transport_error_code' = :dry_run_reason_code
+                """
+            ),
+            {
+                "delivery_result_event_id": str(delivery_result_event_id),
+                "notification_plan_id": str(notification_plan_id),
+                "notification_delivery_record_id": str(notification_delivery_record_id),
+                "dedupe_key": dedupe_key,
+                "dry_run_reason_code": dry_run_reason_code,
+            },
+        )
+        event_row = event_result.mappings().first()
+        return {
+            "notification_plan_count": int(plan_result.scalar_one()),
+            "notification_plan_material_count": int(material_result.scalar_one()),
+            "notification_render_count": int(render_result.scalar_one()),
+            "notification_delivery_record_count": int(delivery_record_result.scalar_one()),
+            "notification_delivery_result_event_count": int(event_row["event_count"] or 0) if event_row else 0,
+            "delivery_result_event_status": str(event_row["event_status"]) if event_row and event_row["event_status"] else None,
+        }
+
     async def load_send_disabled_worker_once_proof_verification(
         self,
         *,
