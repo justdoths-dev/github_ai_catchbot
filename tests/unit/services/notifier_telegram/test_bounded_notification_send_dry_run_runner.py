@@ -16,9 +16,11 @@ from src.services.notifier_telegram.bounded_notification_send_dry_run_runner imp
     QUEUE_NAME,
     BoundedNotificationSendDryRunConfig,
     BoundedNotificationSendDryRunRuntimeConfig,
+    BoundedNotificationSendDryRunState,
     NotificationDryRunExecution,
     NotificationSendContext,
     RedisTargetSelection,
+    _execute_context,
     run_bounded_notification_send_dry_run,
 )
 from src.services.notifier_telegram.models import (
@@ -357,6 +359,129 @@ def _matched_selection(intent: NotificationIntentJob) -> RedisTargetSelection:
     )
 
 
+class ExecuteContextRepositoryFake:
+    def __init__(self) -> None:
+        self.plans: dict[UUID, dict[str, object]] = {}
+        self.renders: list[NotificationRenderDraft] = []
+        self.delivery_records: dict[UUID, dict[str, object]] = {}
+        self.events: dict[UUID, dict[str, object]] = {}
+        self.state_transitions: list[dict[str, object]] = []
+
+    async def insert_notification_plan(self, draft) -> UUID:
+        self.plans[draft.notification_plan_id] = {
+            "notification_plan_id": draft.notification_plan_id,
+            "analysis_id": draft.analysis_id,
+            "candidate_group_id": draft.candidate_group_id,
+            "delivery_decision": draft.delivery_decision,
+            "urgency_profile": draft.urgency_profile,
+            "target_chat_id": draft.target_chat_id,
+            "target_thread_id": draft.target_thread_id,
+            "render_profile": draft.render_profile,
+            "dedupe_subject_key": draft.dedupe_subject_key,
+            "material_change_hash": draft.material_change_hash,
+            "send_after": draft.send_after,
+            "suppress_reason_code": draft.suppress_reason_code,
+            "status": draft.status,
+        }
+        return draft.notification_plan_id
+
+    async def insert_notification_render(self, draft: NotificationRenderDraft) -> UUID | None:
+        for existing in self.renders:
+            if (
+                existing.notification_plan_id == draft.notification_plan_id
+                and existing.render_hash == draft.render_hash
+            ):
+                return None
+        self.renders.append(draft)
+        return uuid4()
+
+    async def update_plan_status(self, *, notification_plan_id: UUID, status: str, send_after=None) -> None:
+        plan = self.plans.get(notification_plan_id)
+        if plan is not None:
+            plan["status"] = status
+            if send_after is not None:
+                plan["send_after"] = send_after
+
+    async def insert_state_transition(self, **kwargs) -> None:
+        self.state_transitions.append(kwargs)
+
+    async def insert_delivery_record(self, **kwargs) -> UUID:
+        record_id = uuid4()
+        self.delivery_records[record_id] = {
+            "notification_delivery_record_id": record_id,
+            "created_at": datetime.now(timezone.utc),
+            **kwargs,
+            "delivery_status": kwargs["result_status"],
+        }
+        return record_id
+
+    async def load_suppressed_delivery_record_by_reason(
+        self,
+        *,
+        notification_plan_id: UUID,
+        transport_error_code: str,
+    ):
+        for record in self.delivery_records.values():
+            if (
+                record["notification_plan_id"] == notification_plan_id
+                and record["delivery_status"] == "suppressed"
+                and record["transport_error_code"] == transport_error_code
+                and record["telegram_chat_id"] is None
+                and record["telegram_message_id"] is None
+                and record["telegram_response_json"]["dry_run"] is True
+            ):
+                return record
+        return None
+
+    async def load_delivery_result_outbox_by_record(
+        self,
+        *,
+        notification_plan_id: UUID,
+        notification_delivery_record_id: UUID,
+    ):
+        dedupe_key = f"notification-delivery-result:{notification_plan_id}:{notification_delivery_record_id}"
+        for event in self.events.values():
+            if event["dedupe_key"] == dedupe_key:
+                return event
+        return None
+
+    async def insert_delivery_result_outbox_returning(self, **kwargs) -> UUID | None:
+        record_id = kwargs["notification_delivery_record_id"]
+        plan_id = kwargs["notification_plan_id"]
+        existing = await self.load_delivery_result_outbox_by_record(
+            notification_plan_id=plan_id,
+            notification_delivery_record_id=record_id,
+        )
+        if existing is not None:
+            return existing["event_id"]
+        event_id = uuid4()
+        self.events[event_id] = {
+            "event_id": event_id,
+            "event_type": DELIVERY_RESULT_EVENT_TYPE,
+            "aggregate_type": "notification_plan",
+            "aggregate_id": plan_id,
+            "dedupe_key": f"notification-delivery-result:{plan_id}:{record_id}",
+            "payload_json": {
+                "notification_plan_id": str(plan_id),
+                "notification_delivery_record_id": str(record_id),
+                "delivery_status": kwargs["delivery_status"],
+                "telegram_chat_id": kwargs["telegram_chat_id"],
+                "telegram_message_id": kwargs["telegram_message_id"],
+                "attempt_count": kwargs["attempt_count"],
+                "transport_error_code": kwargs["transport_error_code"],
+                "transport_error_class": kwargs["transport_error_class"],
+                "edited": kwargs["edited"],
+            },
+            "status": "pending",
+            "fail_count": 0,
+            "created_at": datetime.now(timezone.utc),
+        }
+        return event_id
+
+    async def load_event_outbox(self, event_id: UUID):
+        return self.events.get(event_id)
+
+
 @pytest.mark.asyncio
 async def test_preview_exact_target_rehydrates_and_reports_without_side_effects() -> None:
     intent = _intent()
@@ -434,8 +559,8 @@ async def test_idempotent_reconsume_reuses_plan_and_render_without_duplicate_pla
             write_counts={
                 "notification_plans_insert_calls": 0,
                 "notification_renders_insert_calls": 0,
-                "notification_delivery_records_insert_calls": 1,
-                "event_outbox_delivery_result_insert_calls": 1,
+                "notification_delivery_records_insert_calls": 0,
+                "event_outbox_delivery_result_insert_calls": 0,
             },
         ),
     )
@@ -452,8 +577,59 @@ async def test_idempotent_reconsume_reuses_plan_and_render_without_duplicate_pla
     assert report["render_action"] == "reuse_existing_render"
     assert report["notifier_owned_write_counts"]["notification_plans_insert_calls"] == 0
     assert report["notifier_owned_write_counts"]["notification_renders_insert_calls"] == 0
-    assert report["notifier_owned_write_counts"]["notification_delivery_records_insert_calls"] == 1
+    assert report["notifier_owned_write_counts"]["notification_delivery_records_insert_calls"] == 0
+    assert report["notifier_owned_write_counts"]["event_outbox_delivery_result_insert_calls"] == 0
     assert report["side_effects"]["telegram_transport_called"] is False
+
+
+@pytest.mark.asyncio
+async def test_duplicate_execute_context_reuses_dry_run_delivery_record_and_result_event() -> None:
+    intent = _intent()
+    repository = ExecuteContextRepositoryFake()
+
+    first = await _execute_context(repository, _context(intent), BoundedNotificationSendDryRunState())
+    repository.events[first.delivery_result_event_row.event_id]["status"] = "published"
+    second_context = _context(intent, plan_action="reuse_existing_plan", render_action="reuse_existing_render")
+
+    second = await _execute_context(repository, second_context, BoundedNotificationSendDryRunState())
+
+    assert second.context.delivery_action == "reuse_suppressed_dry_run_no_transport"
+    assert second.context.planned_action == "reuse_existing_dry_run_delivery"
+    assert second.notification_delivery_record_id == first.notification_delivery_record_id
+    assert second.delivery_result_event_row.event_id == first.delivery_result_event_row.event_id
+    assert second.delivery_result_event_row.status == "published"
+    assert len(repository.plans) == 1
+    assert len(repository.renders) == 1
+    assert len(repository.delivery_records) == 1
+    assert len(repository.events) == 1
+    assert second.notifier_owned_write_counts["notification_renders_insert_calls"] == 0
+    assert second.notifier_owned_write_counts["notification_delivery_records_insert_calls"] == 0
+    assert second.notifier_owned_write_counts["event_outbox_delivery_result_insert_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_already_published_delivery_result_acks_without_q_maintenance_republish() -> None:
+    intent = _intent()
+    context = _context(intent, plan_action="reuse_existing_plan", render_action="reuse_existing_render")
+    execution = _execution(context)
+    execution = replace(
+        execution,
+        delivery_result_event_row=replace(execution.delivery_result_event_row, status="published"),
+    )
+    runtime = FakeRuntime(context=context, execution=execution)
+
+    result = await run_bounded_notification_send_dry_run(
+        _base_config(intent),
+        runtime_config_loader=_runtime_config_loader,
+        runtime_builder=FakeRuntimeBuilder(runtime),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "pass"
+    assert report["q_maintenance_published"] is False
+    assert report["q_maintenance_message_suffix"] is None
+    assert report["redis_ack_status"] == "acked"
+    assert runtime.call_order == ["inspect", "load_context", "consume", "execute", "ack", "close"]
 
 
 @pytest.mark.asyncio

@@ -701,6 +701,44 @@ class NotifierTelegramRepository:
         )
         return UUID(str(result.scalar_one()))
 
+    async def load_suppressed_delivery_record_by_reason(
+        self,
+        *,
+        notification_plan_id: UUID,
+        transport_error_code: str,
+    ) -> dict[str, Any] | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT notification_delivery_record_id,
+                       notification_plan_id,
+                       delivery_status::text AS delivery_status,
+                       telegram_chat_id,
+                       telegram_message_id,
+                       attempt_count,
+                       transport_error_code,
+                       transport_error_class,
+                       telegram_response_json,
+                       created_at
+                FROM notification_delivery_records
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                  AND delivery_status = 'suppressed'::notification_status_enum
+                  AND transport_error_code = :transport_error_code
+                  AND telegram_chat_id IS NULL
+                  AND telegram_message_id IS NULL
+                  AND telegram_response_json ->> 'dry_run' = 'true'
+                ORDER BY created_at ASC, notification_delivery_record_id ASC
+                LIMIT 1
+                """
+            ),
+            {
+                "notification_plan_id": str(notification_plan_id),
+                "transport_error_code": transport_error_code,
+            },
+        )
+        row = result.mappings().first()
+        return dict(row) if row else None
+
     async def update_plan_status(
         self,
         *,
@@ -748,6 +786,35 @@ class NotifierTelegramRepository:
             },
         )
 
+    async def load_delivery_result_outbox_by_record(
+        self,
+        *,
+        notification_plan_id: UUID,
+        notification_delivery_record_id: UUID,
+    ) -> dict[str, Any] | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT event_id, event_type, aggregate_type, aggregate_id, dedupe_key, payload_json, status,
+                       fail_count, created_at, published_at
+                FROM event_outbox
+                WHERE event_type = 'notification.delivery.result.v1'
+                  AND dedupe_key = :dedupe_key
+                  AND aggregate_type = 'notification_plan'
+                  AND aggregate_id = CAST(:notification_plan_id AS uuid)
+                """
+            ),
+            {
+                "notification_plan_id": str(notification_plan_id),
+                "dedupe_key": _delivery_result_dedupe_key(
+                    notification_plan_id=notification_plan_id,
+                    notification_delivery_record_id=notification_delivery_record_id,
+                ),
+            },
+        )
+        row = result.mappings().first()
+        return dict(row) if row else None
+
     async def insert_delivery_result_outbox(
         self,
         *,
@@ -791,7 +858,10 @@ class NotifierTelegramRepository:
             ),
             {
                 "notification_plan_id": str(notification_plan_id),
-                "dedupe_key": f"notification-delivery-result:{notification_plan_id}:{notification_delivery_record_id}",
+                "dedupe_key": _delivery_result_dedupe_key(
+                    notification_plan_id=notification_plan_id,
+                    notification_delivery_record_id=notification_delivery_record_id,
+                ),
                 "payload_json": _jsonb_dumps(payload),
             },
         )
@@ -823,24 +893,35 @@ class NotifierTelegramRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                INSERT INTO event_outbox (
-                    event_type, aggregate_type, aggregate_id, dedupe_key, payload_json, status, created_at
-                ) VALUES (
-                    'notification.delivery.result.v1',
-                    'notification_plan',
-                    CAST(:notification_plan_id AS uuid),
-                    :dedupe_key,
-                    CAST(:payload_json AS jsonb),
-                    'pending'::outbox_status_enum,
-                    now()
+                WITH inserted AS (
+                    INSERT INTO event_outbox (
+                        event_type, aggregate_type, aggregate_id, dedupe_key, payload_json, status, created_at
+                    ) VALUES (
+                        'notification.delivery.result.v1',
+                        'notification_plan',
+                        CAST(:notification_plan_id AS uuid),
+                        :dedupe_key,
+                        CAST(:payload_json AS jsonb),
+                        'pending'::outbox_status_enum,
+                        now()
+                    )
+                    ON CONFLICT (dedupe_key) DO NOTHING
+                    RETURNING event_id
                 )
-                ON CONFLICT (dedupe_key) DO NOTHING
-                RETURNING event_id
+                SELECT event_id FROM inserted
+                UNION ALL
+                SELECT event_id
+                FROM event_outbox
+                WHERE dedupe_key = :dedupe_key
+                LIMIT 1
                 """
             ),
             {
                 "notification_plan_id": str(notification_plan_id),
-                "dedupe_key": f"notification-delivery-result:{notification_plan_id}:{notification_delivery_record_id}",
+                "dedupe_key": _delivery_result_dedupe_key(
+                    notification_plan_id=notification_plan_id,
+                    notification_delivery_record_id=notification_delivery_record_id,
+                ),
                 "payload_json": _jsonb_dumps(payload),
             },
         )
@@ -1080,6 +1161,10 @@ def _json_default(value: Any) -> str:
 
 def _jsonb_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=_json_default)
+
+
+def _delivery_result_dedupe_key(*, notification_plan_id: UUID, notification_delivery_record_id: UUID) -> str:
+    return f"notification-delivery-result:{notification_plan_id}:{notification_delivery_record_id}"
 
 
 def _string_or_none(value: Any) -> str | None:

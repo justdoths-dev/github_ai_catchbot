@@ -698,6 +698,19 @@ async def run_bounded_notification_send_dry_run(
                 context=context,
             )
         maintenance_message_id: str | None = None
+        if execution.delivery_result_event_row.status == "published":
+            ack_count = await runtime.ack(consumed.message.message_id)
+            acked = ack_count == 1
+            return _result(
+                "pass" if acked else "failed",
+                None if acked else "redis_ack_failed",
+                config=config,
+                state=state,
+                redis_selection=consumed,
+                execution=execution,
+                redis_ack_status="acked" if acked else "failed",
+                redis_acked_count=ack_count,
+            )
         try:
             maintenance_message_id = await runtime.publish_maintenance(execution.delivery_result_event_row)
             await runtime.mark_delivery_result_published(execution.delivery_result_event_row.event_id)
@@ -935,6 +948,60 @@ async def _execute_context(
             parse_strategy=render.parse_strategy,
             render_hash=render.render_hash,
         )
+    existing_delivery_record = await repository.load_suppressed_delivery_record_by_reason(
+        notification_plan_id=plan_id,
+        transport_error_code=DRY_RUN_REASON_CODE,
+    )
+    if existing_delivery_record is not None:
+        record_id = UUID(str(existing_delivery_record["notification_delivery_record_id"]))
+        event_raw = await repository.load_delivery_result_outbox_by_record(
+            notification_plan_id=plan_id,
+            notification_delivery_record_id=record_id,
+        )
+        if event_raw is None:
+            state.delivery_result_outbox_write_attempted = True
+            state.database_write_attempted = True
+            write_counts["event_outbox_delivery_result_insert_calls"] += 1
+            event_id = await repository.insert_delivery_result_outbox_returning(
+                notification_plan_id=plan_id,
+                delivery_status=str(existing_delivery_record["delivery_status"]),
+                telegram_chat_id=_safe_int(existing_delivery_record.get("telegram_chat_id")),
+                telegram_message_id=_safe_int(existing_delivery_record.get("telegram_message_id")),
+                notification_delivery_record_id=record_id,
+                attempt_count=int(existing_delivery_record.get("attempt_count") or 0),
+                transport_error_code=_string_or_none(existing_delivery_record.get("transport_error_code")),
+                transport_error_class=_string_or_none(existing_delivery_record.get("transport_error_class")),
+                edited=False,
+            )
+            if event_id is None:
+                raise BoundedNotificationSendDryRunError("delivery_result_outbox_insert_failed")
+            event_raw = await repository.load_event_outbox(event_id)
+        if event_raw is None:
+            raise BoundedNotificationSendDryRunError("delivery_result_outbox_readback_failed")
+        delivery_result = _delivery_result_from_existing_record(existing_delivery_record)
+        updated_context = NotificationSendContext(
+            trigger_event_id=context.trigger_event_id,
+            event_row=context.event_row,
+            intent=context.intent,
+            analysis=context.analysis,
+            judge_output=context.judge_output,
+            candidate=context.candidate,
+            plan_id=plan_id,
+            existing_plan_status=context.existing_plan_status,
+            plan_action=context.plan_action,
+            render_draft=render,
+            render_action=context.render_action,
+            delivery_action="reuse_suppressed_dry_run_no_transport",
+            delivery_status=delivery_result.delivery_status,
+            planned_action="reuse_existing_dry_run_delivery",
+        )
+        return NotificationDryRunExecution(
+            context=updated_context,
+            delivery_result=delivery_result,
+            notification_delivery_record_id=record_id,
+            delivery_result_event_row=_outbox_event_row(event_raw),
+            notifier_owned_write_counts=write_counts,
+        )
     state.render_write_attempted = True
     state.database_write_attempted = True
     write_counts["notification_renders_insert_calls"] += 1
@@ -1026,6 +1093,18 @@ async def _execute_context(
         notification_delivery_record_id=record_id,
         delivery_result_event_row=_outbox_event_row(event_raw),
         notifier_owned_write_counts=write_counts,
+    )
+
+
+def _delivery_result_from_existing_record(record: Mapping[str, Any]) -> DeliveryResult:
+    return DeliveryResult(
+        delivery_status=str(record["delivery_status"]),  # type: ignore[arg-type]
+        telegram_chat_id=_safe_int(record.get("telegram_chat_id")),
+        telegram_message_id=_safe_int(record.get("telegram_message_id")),
+        attempt_count=int(record.get("attempt_count") or 0),
+        transport_error_code=_string_or_none(record.get("transport_error_code")),
+        transport_error_class=_string_or_none(record.get("transport_error_class")),
+        telegram_response_json=_json_loads(record.get("telegram_response_json")),
     )
 
 
@@ -1470,6 +1549,23 @@ def _safe_int(value: object) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _json_loads(value: object) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return json.loads(value)
+    if isinstance(value, Mapping):
+        return dict(value)
+    return value
+
+
+def _string_or_none(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
 def _env_value(env: Mapping[str, str], name: str, default: str = "") -> str:
