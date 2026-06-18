@@ -26,8 +26,8 @@ from .models import (
     NotificationRenderDraft,
 )
 from .renderer import NotificationRenderer, RenderInput
-from .telegram_client import (
-    TelegramBotClient,
+from .transport import (
+    TelegramTransport,
     TelegramTransportNoopError,
     TelegramTransportRetryableError,
     TelegramTransportTerminalError,
@@ -77,7 +77,7 @@ class NotifierTelegramService:
         *,
         repository: NotifierTelegramRepositoryProtocol,
         renderer: NotificationRenderer | None = None,
-        telegram_client: TelegramBotClient | None = None,
+        telegram_client: TelegramTransport | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self._config = config
