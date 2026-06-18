@@ -186,8 +186,8 @@ class BoundedNotificationSendLiveResult:
 
     def to_sanitized_dict(self) -> dict[str, Any]:
         selection = self.redis_selection
-        context = self.context or (self.execution.context if self.execution else None)
         execution = self.execution
+        context = execution.context if execution else self.context
         delivery_result = execution.delivery_result if execution else None
         readback = self.durable_readback
         return {

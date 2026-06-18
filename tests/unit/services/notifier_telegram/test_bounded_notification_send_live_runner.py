@@ -237,6 +237,8 @@ def _context(
     *,
     error_code: str | None = None,
     planned_action: str = "preview_only",
+    delivery_action: str | None = None,
+    delivery_status: str | None = None,
     event_aggregate_type: str = "analysis",
     event_aggregate_id: UUID | None = None,
 ) -> NotificationSendContext:
@@ -310,8 +312,9 @@ def _context(
             render_hash="render-hash",
         ),
         render_action="not_due" if error_code == "notification_send_after_deferred" else "append_render",
-        delivery_action="defer_until_due" if error_code == "notification_send_after_deferred" else "send",
-        delivery_status=None if error_code else "would_send",
+        delivery_action=delivery_action
+        or ("defer_until_due" if error_code == "notification_send_after_deferred" else "send"),
+        delivery_status=delivery_status if delivery_status is not None else (None if error_code else "would_send"),
         planned_action=planned_action,
         error_code=error_code,
     )
@@ -657,6 +660,72 @@ async def test_execute_success_publishes_maintenance_then_acks() -> None:
     assert str(intent.target_chat_id) not in encoded
     assert "Rendered operator text" not in encoded
     assert "1718000000001-0" not in encoded
+
+
+@pytest.mark.asyncio
+async def test_live_execute_notification_plan_root_ignores_stale_suppressed_preview_context() -> None:
+    intent = replace(_intent(), trigger_event_id=UUID("10000000-0000-4000-8000-0000642b1aa3"))
+    context = _context(
+        intent,
+        planned_action="execute_dry_run_delivery",
+        delivery_action="suppress_dry_run_no_transport",
+        delivery_status="suppressed",
+        event_aggregate_type="notification_plan",
+        event_aggregate_id=intent.notification_plan_id,
+    )
+    context = replace(
+        context,
+        existing_plan_status="suppressed",
+        plan_action="reuse_existing_plan",
+        render_action="reuse_existing_render",
+    )
+    message = _message(
+        intent,
+        fields={
+            "root_object_type": "notification_plan",
+            "root_object_id": str(intent.notification_plan_id),
+        },
+        message_id="1718000102216-0",
+    )
+    config = replace(_base_config(intent), redis_message_suffix="102216-0")
+    selection = _select_exact_message(config, [message], group_pending=0, group_lag=1)
+    runtime = FakeRuntime(
+        context=context,
+        selection=selection,
+        consume_selection=selection,
+        execution=_execution(context),
+    )
+
+    result = await run_bounded_notification_send_live(
+        config,
+        runtime_config_loader=_runtime_config_loader(send_enabled=True, dry_run=False),
+        runtime_builder=FakeRuntimeBuilder(runtime),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "pass"
+    assert report["target_redis_message_suffix"] == "102216-0"
+    assert report["trigger_event_suffix"] == "642b1aa3"
+    assert report["plan_action"] == "reuse_existing_plan"
+    assert report["render_action"] == "reuse_existing_render"
+    assert report["delivery_action"] == "send"
+    assert report["planned_action"] == "execute_live_delivery"
+    assert report["delivery_status"] == "sent"
+    assert report["error_code"] is None
+    assert report["transport_gate_mode"] == "live_transport_required"
+    assert report["side_effects"]["telegram_send_called"] is True
+    assert report["redis_ack_status"] == "acked"
+    assert runtime.call_order == [
+        "inspect",
+        "load_context",
+        "consume",
+        "execute",
+        "publish_maintenance",
+        "mark_published",
+        "readback",
+        "ack",
+        "close",
+    ]
 
 
 @pytest.mark.asyncio

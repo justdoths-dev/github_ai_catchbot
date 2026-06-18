@@ -87,7 +87,40 @@ async def test_existing_duplicate_pending_plans_fail_closed_without_adding_rows(
 
 
 @pytest.mark.asyncio
-async def test_existing_suppressed_plan_noops_without_transport_or_recovery_send() -> None:
+async def test_live_send_enabled_treats_existing_suppressed_plan_as_history_and_sends() -> None:
+    repository, intent = repo_with_valid_case()
+    client = RecordingTelegramClient(target_chat_id=intent.target_chat_id)
+    plan_id = _add_plan(repository, intent, status="suppressed")
+    repository.delivery_records.append(
+        {
+            "notification_delivery_record_id": uuid4(),
+            "notification_plan_id": plan_id,
+            "result_status": "suppressed",
+            "telegram_chat_id": None,
+            "telegram_message_id": None,
+            "transport_error_code": "notification_send_flag_disabled",
+            "created_at": datetime.now(timezone.utc),
+        }
+    )
+
+    result = await service(repository, cfg=config(dry_run=False, enable_notification_send=True), client=client).handle_intent(
+        intent
+    )
+
+    assert result is not None
+    assert result.delivery_status == "sent"
+    assert result.transport_error_code is None
+    assert result.telegram_message_id == 909
+    assert client.send_message_calls == 1
+    assert len(repository.plans) == 1
+    assert len(repository.renders) == 1
+    assert len(repository.delivery_records) == 2
+    assert repository.delivery_records[-1]["result_status"] == "sent"
+    assert len(repository.delivery_outbox) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_disabled_existing_suppressed_plan_still_noops_without_transport() -> None:
     repository, intent = repo_with_valid_case()
     client = RaisingTelegramClient()
     plan_id = _add_plan(repository, intent, status="suppressed")
@@ -98,13 +131,16 @@ async def test_existing_suppressed_plan_noops_without_transport_or_recovery_send
             "result_status": "suppressed",
             "telegram_chat_id": None,
             "telegram_message_id": None,
+            "transport_error_code": "notification_send_flag_disabled",
             "created_at": datetime.now(timezone.utc),
         }
     )
 
-    result = await service(repository, cfg=config(dry_run=False, enable_notification_send=True), client=client).handle_intent(
-        intent
-    )
+    result = await service(
+        repository,
+        cfg=config(dry_run=False, enable_notification_send=False),
+        client=client,
+    ).handle_intent(intent)
 
     assert result is not None
     assert result.delivery_status == "suppressed"
@@ -113,6 +149,31 @@ async def test_existing_suppressed_plan_noops_without_transport_or_recovery_send
     assert len(repository.plans) == 1
     assert len(repository.renders) == 0
     assert len(repository.delivery_records) == 1
+
+
+@pytest.mark.asyncio
+async def test_suppressed_delivery_record_does_not_count_as_successful_material_duplicate() -> None:
+    repository, intent = repo_with_valid_case()
+    plan_id = _add_plan(repository, intent, status="suppressed")
+    repository.delivery_records.append(
+        {
+            "notification_delivery_record_id": uuid4(),
+            "notification_plan_id": plan_id,
+            "result_status": "suppressed",
+            "telegram_chat_id": None,
+            "telegram_message_id": None,
+            "transport_error_code": "dry_run_skip_transport",
+            "created_at": datetime.now(timezone.utc),
+        }
+    )
+
+    action = await service(repository, cfg=config(dry_run=False, enable_notification_send=True)).decide_delivery_action(
+        intent,
+        candidate=repository.candidates[intent.candidate_group_id],
+    )
+
+    assert action.mode == "send"
+    assert action.reason_code == "notification_no_recent_delivery"
 
 
 @pytest.mark.asyncio
@@ -225,3 +286,18 @@ def _add_plan(repository, intent, *, status: str):
         status=status,
     )
     return plan_id
+
+
+class RecordingTelegramClient:
+    def __init__(self, *, target_chat_id: int) -> None:
+        self.target_chat_id = target_chat_id
+        self.send_message_calls = 0
+        self.edit_message_text_calls = 0
+
+    async def send_message(self, **kwargs):
+        self.send_message_calls += 1
+        return {"ok": True, "result": {"message_id": 909, "chat": {"id": self.target_chat_id}}}
+
+    async def edit_message_text(self, **kwargs):
+        self.edit_message_text_calls += 1
+        raise AssertionError("edit_message_text must not be called")

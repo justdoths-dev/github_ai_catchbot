@@ -21,6 +21,7 @@ from .models import (
     DeliveryResult,
     JudgeOutputRenderContext,
     NotificationIntentJob,
+    NotifierIdempotencyReadback,
     NotifierPlanIdempotencySnapshot,
     NotificationPlanDraft,
     NotificationRenderDraft,
@@ -121,9 +122,14 @@ class NotifierTelegramService:
             return None
         idempotency_snapshots = await self._repository.load_idempotency_plan_snapshots(intent)
         idempotency_readback = classify_notifier_idempotency_state(idempotency_snapshots)
+        stale_suppressed_history_only = _is_stale_suppressed_history_for_live_send(
+            intent,
+            idempotency_readback,
+            transport_enabled=self._config.transport_enabled,
+        )
         if should_fail_closed_before_concretization(idempotency_readback):
             raise NotifierIdempotencyGuardError("duplicate_existing_state")
-        if should_noop_before_concretization(idempotency_readback):
+        if should_noop_before_concretization(idempotency_readback) and not stale_suppressed_history_only:
             reason_code = idempotency_noop_reason(idempotency_readback)
             transition_plan_id = idempotency_transition_plan_id(idempotency_snapshots, intent.notification_plan_id)
             await self._transition_for_plan_id(
@@ -539,6 +545,25 @@ def _should_terminal_duplicate_noop(plan_row: dict | None, *, transport_enabled:
     if status in {"suppressed", "failed_terminal"} and not transport_enabled:
         return True
     return False
+
+
+def _is_stale_suppressed_history_for_live_send(
+    intent: NotificationIntentJob,
+    readback: NotifierIdempotencyReadback,
+    *,
+    transport_enabled: bool,
+) -> bool:
+    if not transport_enabled or intent.delivery_decision != "send_now":
+        return False
+    if readback.plan_count != 1:
+        return False
+    if readback.suppressed_delivery_count <= 0:
+        return False
+    if readback.sent_delivery_count > 0:
+        return False
+    if readback.sent_delivery_chat_id_present_count > 0 or readback.sent_delivery_message_id_present_count > 0:
+        return False
+    return readback.terminal_delivery_count == readback.suppressed_delivery_count
 
 
 def _is_delivered_plan_status(plan_row: dict | None) -> bool:
