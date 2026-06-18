@@ -18,6 +18,8 @@ from .models import (
     SnapshotWritePlan,
 )
 
+SUPPORTED_GITHUB_ARTIFACT_TYPES = {"github_repo", "github_subpath", "github_repo_page", "github_gist"}
+
 
 class AsyncSessionLike(Protocol):
     def in_transaction(self) -> bool: ...
@@ -41,7 +43,8 @@ class GhEnricherRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT event_id, event_type, payload_json
+                SELECT event_id, event_type, aggregate_type, aggregate_id,
+                       status, payload_json
                 FROM event_outbox
                 WHERE event_id = CAST(:event_id AS uuid)
                 """
@@ -53,6 +56,10 @@ class GhEnricherRepository:
             return None
         if row["event_type"] != "artifact.enrich.requested.v1":
             return None
+        if row["status"] != "published":
+            raise ValueError("artifact.enrich.requested.v1 must be published")
+        if row["aggregate_type"] != "artifact":
+            raise ValueError("artifact.enrich.requested.v1 aggregate_type must be artifact")
 
         payload = _json_loads(row["payload_json"]) or {}
         required = [
@@ -66,6 +73,12 @@ class GhEnricherRepository:
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"artifact.enrich.requested.v1 missing required fields: {', '.join(missing)}")
+        if payload["provider_route"] != "github":
+            return None
+        if payload["artifact_type"] not in SUPPORTED_GITHUB_ARTIFACT_TYPES:
+            raise ValueError("artifact.enrich.requested.v1 artifact_type must be supported GitHub type")
+        if str(payload["artifact_id"]) != str(row["aggregate_id"]):
+            raise ValueError("artifact.enrich.requested.v1 artifact_id must match aggregate_id")
 
         return ArtifactEnrichmentJob(
             trigger_event_id=UUID(str(row["event_id"])),
@@ -411,7 +424,7 @@ class GhEnricherRepository:
         snapshot_id: UUID,
         status: str,
         content_anchor: str,
-    ) -> None:
+    ) -> UUID | None:
         payload = {
             "artifact_id": str(artifact_id),
             "snapshot_id": str(snapshot_id),
@@ -419,7 +432,7 @@ class GhEnricherRepository:
             "status": status,
             "content_anchor": content_anchor,
         }
-        await self._session.execute(
+        result = await self._session.execute(
             sa.text(
                 """
                 INSERT INTO event_outbox (
@@ -441,6 +454,7 @@ class GhEnricherRepository:
                     now()
                 )
                 ON CONFLICT (dedupe_key) DO NOTHING
+                RETURNING event_id
                 """
             ),
             {
@@ -449,6 +463,8 @@ class GhEnricherRepository:
                 "payload_json": _jsonb_dumps(payload),
             },
         )
+        row = result.scalar_one_or_none()
+        return UUID(str(row)) if row else None
 
 
 def _repo_params(snapshot_id: UUID, repo: GitHubRepoProjection) -> dict[str, Any]:
