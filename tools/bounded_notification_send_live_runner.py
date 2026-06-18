@@ -47,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trigger-event-suffix")
     parser.add_argument("--notification-plan-id-suffix")
     parser.add_argument("--analysis-id-suffix")
+    parser.add_argument("--target-chat-id-suffix")
     parser.add_argument("--redis-message-suffix")
     parser.add_argument("--scan-limit", type=int, default=10)
     parser.add_argument("--operator-approved", action="store_true")
@@ -90,6 +91,7 @@ def run(
             trigger_event_suffix=args.trigger_event_suffix,
             notification_plan_id_suffix=args.notification_plan_id_suffix,
             analysis_id_suffix=args.analysis_id_suffix,
+            target_chat_id_suffix=args.target_chat_id_suffix,
             redis_message_suffix=args.redis_message_suffix,
             scan_limit=int(args.scan_limit),
         ),

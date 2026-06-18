@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -20,17 +20,22 @@ from .bounded_notification_send_dry_run_runner import (
     MAINTENANCE_QUEUE_NAME,
     MAINTENANCE_STAGE_NAME,
     QUEUE_NAME,
+    REQUIRED_THIN_QUEUE_FIELDS,
     STAGE_NAME,
+    NotificationDurableReadback,
     NotificationSendContext,
     RedisExactNotificationSendConsumer,
     RedisTargetSelection,
     _build_stream_message,
+    _durable_readback_from_raw,
+    _durable_readback_report,
     _env_value,
     _float_env,
     _int_env,
     _message_suffix,
     _outbox_event_row,
     _safe_exception_class,
+    _string_or_none,
     _target_suffix_error,
     _utc_now,
     _uuid_or_none,
@@ -72,6 +77,7 @@ class BoundedNotificationSendLiveConfig:
     trigger_event_suffix: str | None = None
     notification_plan_id_suffix: str | None = None
     analysis_id_suffix: str | None = None
+    target_chat_id_suffix: str | None = None
     redis_message_suffix: str | None = None
     scan_limit: int = DEFAULT_SCAN_LIMIT
 
@@ -119,6 +125,7 @@ class BoundedNotificationSendLiveError(RuntimeError):
 class NotificationLiveExecution:
     context: NotificationSendContext
     delivery_result: DeliveryResult
+    notification_delivery_record_id: UUID
     delivery_result_event_row: OutboxEventRow
     q_maintenance_message_id: str | None = None
     q_maintenance_marked_published: bool = False
@@ -143,6 +150,7 @@ class BoundedNotificationSendLiveRuntime(Protocol):
         context: NotificationSendContext,
         config: BoundedNotificationSendLiveConfig,
     ) -> NotificationLiveExecution: ...
+    async def readback_final_state(self, execution: NotificationLiveExecution) -> NotificationDurableReadback: ...
     async def publish_maintenance(self, event_row: OutboxEventRow) -> str: ...
     async def mark_delivery_result_published(self, event_id: UUID) -> None: ...
     async def ack(self, message_id: str) -> int: ...
@@ -169,6 +177,7 @@ class BoundedNotificationSendLiveResult:
     redis_selection: RedisTargetSelection | None = None
     context: NotificationSendContext | None = None
     execution: NotificationLiveExecution | None = None
+    durable_readback: NotificationDurableReadback | None = None
     q_maintenance_published: bool = False
     q_maintenance_message_id_present: bool = False
     redis_ack_status: str = "not_attempted"
@@ -180,6 +189,7 @@ class BoundedNotificationSendLiveResult:
         context = self.context or (self.execution.context if self.execution else None)
         execution = self.execution
         delivery_result = execution.delivery_result if execution else None
+        readback = self.durable_readback
         return {
             "schema_version": SCHEMA_VERSION,
             "runner_name": RUNNER_NAME,
@@ -202,6 +212,15 @@ class BoundedNotificationSendLiveResult:
             ),
             "analysis_id_suffix": _uuid_suffix(self.config.analysis_id_suffix)
             or _uuid_suffix(context.intent.analysis_id if context else None),
+            "target_chat_id_suffix": _chat_suffix(
+                self.config.target_chat_id_suffix or (context.intent.target_chat_id if context else None)
+            ),
+            "target_chat_suffix_verified": bool(
+                context is not None
+                and self.config.target_chat_id_suffix
+                and str(context.intent.target_chat_id).endswith(self.config.target_chat_id_suffix)
+                and str(context.intent.target_chat_id) != self.config.target_chat_id_suffix
+            ),
             "plan_action": context.plan_action if context else "not_evaluated",
             "render_action": context.render_action if context else "not_evaluated",
             "delivery_action": context.delivery_action if context else "not_evaluated",
@@ -225,6 +244,10 @@ class BoundedNotificationSendLiveResult:
             ),
             "redis_ack_status": self.redis_ack_status,
             "redis_acked_count": self.redis_acked_count,
+            "durable_readback": _durable_readback_report(readback),
+            "redis_ack_after_durable_readback": bool(
+                readback is not None and readback.ack_safe and self.redis_ack_status == "acked"
+            ),
             "transport_gate_mode": self.transport_gate_mode,
             "notifier_owned_write_counts": dict(execution.notifier_owned_write_counts) if execution else {},
             "gates": {
@@ -239,6 +262,7 @@ class BoundedNotificationSendLiveResult:
                 "render_write_allowed": self.config.allow_render_write,
                 "delivery_record_write_allowed": self.config.allow_delivery_record_write,
                 "delivery_result_outbox_write_allowed": self.config.allow_delivery_result_outbox_write,
+                "target_chat_suffix_required": True,
                 "telegram_transport_allowed": self.config.allow_telegram_transport,
                 "telegram_send_allowed": self.config.allow_telegram_send,
             },
@@ -367,13 +391,17 @@ class DefaultBoundedNotificationSendLiveRuntime:
                     raise BoundedNotificationSendLiveError("notifier_invocation_no_result")
                 if repository.delivery_result_event_id is None:
                     raise BoundedNotificationSendLiveError("delivery_result_outbox_insert_failed")
+                if repository.notification_delivery_record_id is None:
+                    raise BoundedNotificationSendLiveError("notification_delivery_record_readback_failed")
                 event_raw = await repository.load_event_outbox(repository.delivery_result_event_id)
                 if event_raw is None:
                     raise BoundedNotificationSendLiveError("delivery_result_outbox_readback_failed")
+                event_row = _outbox_event_row(event_raw)
                 execution = NotificationLiveExecution(
-                    context=_context_with_delivery_result(context, result),
+                    context=_context_with_delivery_result(context, result, plan_id=event_row.aggregate_id),
                     delivery_result=result,
-                    delivery_result_event_row=_outbox_event_row(event_raw),
+                    notification_delivery_record_id=repository.notification_delivery_record_id,
+                    delivery_result_event_row=event_row,
                     notifier_owned_write_counts=dict(repository.write_counts),
                 )
             self._state.database_committed = True
@@ -381,6 +409,51 @@ class DefaultBoundedNotificationSendLiveRuntime:
         except Exception:
             self._state.database_rolled_back = True
             raise
+
+    async def readback_final_state(self, execution: NotificationLiveExecution) -> NotificationDurableReadback:
+        async with self._session_factory() as session:
+            self._state.database_session_opened = True
+            self._state.database_read_attempted = True
+            repository = NotifierTelegramRepository(session)
+            render_hash = execution.context.render_draft.render_hash if execution.context.render_draft else ""
+            result = execution.delivery_result
+            raw = await repository.load_bounded_notification_send_readback(
+                notification_plan_id=execution.context.plan_id,
+                analysis_id=execution.context.intent.analysis_id,
+                candidate_group_id=execution.context.intent.candidate_group_id,
+                target_chat_id=execution.context.intent.target_chat_id,
+                dedupe_subject_key=execution.context.intent.dedupe_subject_key,
+                material_change_hash=execution.context.intent.material_change_hash,
+                render_hash=render_hash,
+                notification_delivery_record_id=execution.notification_delivery_record_id,
+                delivery_result_event_id=execution.delivery_result_event_row.event_id,
+                delivery_status=result.delivery_status,
+                telegram_chat_id=result.telegram_chat_id,
+                telegram_message_id=result.telegram_message_id,
+                attempt_count=result.attempt_count,
+                transport_error_code=result.transport_error_code,
+                edited=result.edited,
+            )
+        event_status = _string_or_none(raw.get("delivery_result_event_status"))
+        event_row = replace(
+            execution.delivery_result_event_row,
+            status=event_status or execution.delivery_result_event_row.status,
+        )
+        route = self._route_resolver.resolve(event_row)
+        q_maintenance_route_verified = (
+            route.queue_name == MAINTENANCE_QUEUE_NAME and route.stage_name == MAINTENANCE_STAGE_NAME
+        )
+        maintenance_message = _build_stream_message(event_row, route)
+        q_maintenance_message_thin = (
+            q_maintenance_route_verified
+            and set(maintenance_message.as_stream_fields()) == set(REQUIRED_THIN_QUEUE_FIELDS)
+            and "payload_json" not in maintenance_message.as_stream_fields()
+        )
+        return _durable_readback_from_raw(
+            raw,
+            q_maintenance_route_verified=q_maintenance_route_verified,
+            q_maintenance_message_thin=q_maintenance_message_thin,
+        )
 
     async def publish_maintenance(self, event_row: OutboxEventRow) -> str:
         route = self._route_resolver.resolve(event_row)
@@ -414,6 +487,7 @@ class _CountingLiveRepository:
         self._wrapped = wrapped
         self._state = state
         self.delivery_result_event_id: UUID | None = None
+        self.notification_delivery_record_id: UUID | None = None
         self.write_counts = {
             "notification_plans_insert_calls": 0,
             "notification_renders_insert_calls": 0,
@@ -441,7 +515,8 @@ class _CountingLiveRepository:
         self._state.database_write_attempted = True
         self._state.delivery_record_write_attempted = True
         self.write_counts["notification_delivery_records_insert_calls"] += 1
-        return await self._wrapped.insert_delivery_record(*args, **kwargs)
+        self.notification_delivery_record_id = await self._wrapped.insert_delivery_record(*args, **kwargs)
+        return self.notification_delivery_record_id
 
     async def update_plan_status(self, *args: Any, **kwargs: Any) -> None:
         self._state.database_write_attempted = True
@@ -508,6 +583,8 @@ class _DryStateBridge:
 def _context_with_delivery_result(
     context: NotificationSendContext,
     result: DeliveryResult,
+    *,
+    plan_id: UUID | None = None,
 ) -> NotificationSendContext:
     return NotificationSendContext(
         trigger_event_id=context.trigger_event_id,
@@ -516,7 +593,7 @@ def _context_with_delivery_result(
         analysis=context.analysis,
         judge_output=context.judge_output,
         candidate=context.candidate,
-        plan_id=context.plan_id,
+        plan_id=plan_id or context.plan_id,
         existing_plan_status=context.existing_plan_status,
         plan_action=context.plan_action,
         render_draft=context.render_draft,
@@ -668,6 +745,17 @@ async def run_bounded_notification_send_live(
                 context=context,
                 transport_gate_mode=transport_gate_mode,
             )
+        target_chat_error = _target_chat_context_error(context, config)
+        if target_chat_error is not None:
+            return _result(
+                "blocked",
+                target_chat_error,
+                config=config,
+                state=state,
+                redis_selection=selection,
+                context=context,
+                transport_gate_mode=transport_gate_mode,
+            )
         if not selection.target_is_next:
             return _result(
                 "blocked",
@@ -733,6 +821,45 @@ async def run_bounded_notification_send_live(
                 transport_gate_mode=transport_gate_mode,
             )
         maintenance_message_id: str | None = None
+        if execution.delivery_result_event_row.status == "published":
+            readback, readback_failure = await _readback_or_failure(
+                runtime,
+                execution,
+                config=config,
+                state=state,
+                redis_selection=consumed,
+                transport_gate_mode=transport_gate_mode,
+            )
+            if readback_failure is not None:
+                return readback_failure
+            try:
+                ack_count = await runtime.ack(consumed.message.message_id)
+            except Exception as exc:
+                return _result(
+                    "failed",
+                    "ack_failed_after_durable_completion",
+                    error_class=_safe_exception_class(exc),
+                    config=config,
+                    state=state,
+                    redis_selection=consumed,
+                    execution=execution,
+                    durable_readback=readback,
+                    redis_ack_status="failed_after_durable_completion",
+                    transport_gate_mode=transport_gate_mode,
+                )
+            acked = ack_count == 1
+            return _result(
+                "pass" if acked else "failed",
+                None if acked else "ack_failed_after_durable_completion",
+                config=config,
+                state=state,
+                redis_selection=consumed,
+                execution=execution,
+                durable_readback=readback,
+                redis_ack_status="acked" if acked else "failed_after_durable_completion",
+                redis_acked_count=ack_count,
+                transport_gate_mode=transport_gate_mode,
+            )
         try:
             maintenance_message_id = await runtime.publish_maintenance(execution.delivery_result_event_row)
             await runtime.mark_delivery_result_published(execution.delivery_result_event_row.event_id)
@@ -759,6 +886,19 @@ async def run_bounded_notification_send_live(
                 q_maintenance_message_id_present=bool(maintenance_message_id),
                 transport_gate_mode=transport_gate_mode,
             )
+        execution_with_maintenance = _with_live_maintenance_message(execution, maintenance_message_id, marked=True)
+        readback, readback_failure = await _readback_or_failure(
+            runtime,
+            execution_with_maintenance,
+            config=config,
+            state=state,
+            redis_selection=consumed,
+            q_maintenance_published=True,
+            q_maintenance_message_id_present=bool(maintenance_message_id),
+            transport_gate_mode=transport_gate_mode,
+        )
+        if readback_failure is not None:
+            return readback_failure
         try:
             ack_count = await runtime.ack(consumed.message.message_id)
         except Exception as exc:
@@ -769,7 +909,8 @@ async def run_bounded_notification_send_live(
                 config=config,
                 state=state,
                 redis_selection=consumed,
-                execution=_with_live_maintenance_message(execution, maintenance_message_id, marked=True),
+                execution=execution_with_maintenance,
+                durable_readback=readback,
                 q_maintenance_published=True,
                 q_maintenance_message_id_present=bool(maintenance_message_id),
                 redis_ack_status="failed_after_durable_completion",
@@ -782,7 +923,8 @@ async def run_bounded_notification_send_live(
             config=config,
             state=state,
             redis_selection=consumed,
-            execution=_with_live_maintenance_message(execution, maintenance_message_id, marked=True),
+            execution=execution_with_maintenance,
+            durable_readback=readback,
             q_maintenance_published=True,
             q_maintenance_message_id_present=bool(maintenance_message_id),
             redis_ack_status="acked" if acked else "failed_after_durable_completion",
@@ -853,6 +995,8 @@ def _pre_config_gate_error(config: BoundedNotificationSendLiveConfig) -> str | N
     suffix_error = _target_suffix_error(config)  # type: ignore[arg-type]
     if suffix_error is not None:
         return suffix_error
+    if not _valid_chat_suffix(config.target_chat_id_suffix):
+        return "target_chat_id_suffix_missing_or_invalid"
     if config.scan_limit < 1 or config.scan_limit > 100:
         return "scan_limit_out_of_range"
     if config.mode == "execute":
@@ -871,6 +1015,73 @@ def _pre_config_gate_error(config: BoundedNotificationSendLiveConfig) -> str | N
         if not config.allow_redis_ack:
             return "redis_ack_not_allowed"
     return None
+
+
+def _target_chat_context_error(
+    context: NotificationSendContext,
+    config: BoundedNotificationSendLiveConfig,
+) -> str | None:
+    suffix = str(config.target_chat_id_suffix or "").strip()
+    target = str(context.intent.target_chat_id)
+    if not target.endswith(suffix):
+        return "target_chat_id_mismatch"
+    if target == suffix:
+        return "target_chat_id_suffix_must_not_be_full_id"
+    return None
+
+
+async def _readback_or_failure(
+    runtime: BoundedNotificationSendLiveRuntime,
+    execution: NotificationLiveExecution,
+    *,
+    config: BoundedNotificationSendLiveConfig,
+    state: BoundedNotificationSendLiveState,
+    redis_selection: RedisTargetSelection,
+    q_maintenance_published: bool = False,
+    q_maintenance_message_id_present: bool = False,
+    transport_gate_mode: str = "not_evaluated",
+) -> tuple[NotificationDurableReadback | None, BoundedNotificationSendLiveResult | None]:
+    try:
+        readback = await runtime.readback_final_state(execution)
+    except BoundedNotificationSendLiveError as exc:
+        return None, _result(
+            "failed",
+            exc.error_code,
+            config=config,
+            state=state,
+            redis_selection=redis_selection,
+            execution=execution,
+            q_maintenance_published=q_maintenance_published,
+            q_maintenance_message_id_present=q_maintenance_message_id_present,
+            transport_gate_mode=transport_gate_mode,
+        )
+    except Exception as exc:
+        return None, _result(
+            "failed",
+            "durable_readback_failed",
+            error_class=_safe_exception_class(exc),
+            config=config,
+            state=state,
+            redis_selection=redis_selection,
+            execution=execution,
+            q_maintenance_published=q_maintenance_published,
+            q_maintenance_message_id_present=q_maintenance_message_id_present,
+            transport_gate_mode=transport_gate_mode,
+        )
+    if not readback.ack_safe:
+        return readback, _result(
+            "failed",
+            "durable_readback_failed",
+            config=config,
+            state=state,
+            redis_selection=redis_selection,
+            execution=execution,
+            durable_readback=readback,
+            q_maintenance_published=q_maintenance_published,
+            q_maintenance_message_id_present=q_maintenance_message_id_present,
+            transport_gate_mode=transport_gate_mode,
+        )
+    return readback, None
 
 
 def _telegram_gate_error(
@@ -916,6 +1127,7 @@ def _result(
     redis_selection: RedisTargetSelection | None = None,
     context: NotificationSendContext | None = None,
     execution: NotificationLiveExecution | None = None,
+    durable_readback: NotificationDurableReadback | None = None,
     q_maintenance_published: bool = False,
     q_maintenance_message_id_present: bool = False,
     redis_ack_status: str = "not_attempted",
@@ -932,6 +1144,7 @@ def _result(
         redis_selection=redis_selection,
         context=context,
         execution=execution,
+        durable_readback=durable_readback,
         q_maintenance_published=q_maintenance_published,
         q_maintenance_message_id_present=q_maintenance_message_id_present,
         redis_ack_status=redis_ack_status,
@@ -949,11 +1162,24 @@ def _with_live_maintenance_message(
     return NotificationLiveExecution(
         context=execution.context,
         delivery_result=execution.delivery_result,
+        notification_delivery_record_id=execution.notification_delivery_record_id,
         delivery_result_event_row=execution.delivery_result_event_row,
         q_maintenance_message_id=message_id,
         q_maintenance_marked_published=marked,
         notifier_owned_write_counts=execution.notifier_owned_write_counts,
     )
+
+
+def _valid_chat_suffix(value: str | None) -> bool:
+    text = str(value or "").strip()
+    return text.isdigit() and 2 <= len(text) <= 6
+
+
+def _chat_suffix(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    return text[-6:]
 
 
 def _safe_token(value: object) -> str | None:

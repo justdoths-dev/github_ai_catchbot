@@ -3,13 +3,16 @@ from __future__ import annotations
 import ast
 import json
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 
-from src.services.notifier_telegram.bounded_notification_send_dry_run_runner import NotificationSendContext
+from src.services.notifier_telegram.bounded_notification_send_dry_run_runner import (
+    NotificationDurableReadback,
+    NotificationSendContext,
+)
 from src.services.notifier_telegram.bounded_notification_send_live_runner import (
     BoundedNotificationSendLiveConfig,
     BoundedNotificationSendLiveRuntimeConfig,
@@ -45,8 +48,10 @@ class FakeRuntime:
         selection: RedisTargetSelection | None = None,
         consume_selection: RedisTargetSelection | None = None,
         execution: NotificationLiveExecution | None = None,
+        readback: NotificationDurableReadback | None = None,
         execute_error: BaseException | None = None,
         publish_error: BaseException | None = None,
+        readback_error: BaseException | None = None,
         ack_error: BaseException | None = None,
         ack_count: int = 1,
         transport_constructed: bool = True,
@@ -56,8 +61,10 @@ class FakeRuntime:
         self.selection = selection or _matched_selection(context.intent)
         self.consume_selection = consume_selection or self.selection
         self.execution = execution or _execution(context)
+        self.readback = readback or _successful_readback()
         self.execute_error = execute_error
         self.publish_error = publish_error
+        self.readback_error = readback_error
         self.ack_error = ack_error
         self.ack_count = ack_count
         self.transport_constructed = transport_constructed
@@ -118,6 +125,13 @@ class FakeRuntime:
         assert event_id == self.execution.delivery_result_event_row.event_id
         self.state.maintenance_outbox_status_committed = True
 
+    async def readback_final_state(self, execution):
+        self.call_order.append("readback")
+        assert execution.notification_delivery_record_id == self.execution.notification_delivery_record_id
+        if self.readback_error is not None:
+            raise self.readback_error
+        return self.readback
+
     async def ack(self, message_id: str):
         self.call_order.append("ack")
         self.state.redis_ack_attempted = True
@@ -174,6 +188,7 @@ def _base_config(intent: NotificationIntentJob, *, mode: str = "execute", telegr
         trigger_event_suffix=str(intent.trigger_event_id)[-8:],
         notification_plan_id_suffix=str(intent.notification_plan_id)[-8:],
         analysis_id_suffix=str(intent.analysis_id)[-8:],
+        target_chat_id_suffix=str(intent.target_chat_id)[-4:],
         redis_message_suffix="0000000000000-0"[-8:],
         scan_limit=5,
     )
@@ -190,12 +205,13 @@ def _preview_config(intent: NotificationIntentJob) -> BoundedNotificationSendLiv
         trigger_event_suffix=base.trigger_event_suffix,
         notification_plan_id_suffix=base.notification_plan_id_suffix,
         analysis_id_suffix=base.analysis_id_suffix,
+        target_chat_id_suffix=base.target_chat_id_suffix,
         redis_message_suffix=base.redis_message_suffix,
         scan_limit=base.scan_limit,
     )
 
 
-def _intent() -> NotificationIntentJob:
+def _intent(*, send_after=None) -> NotificationIntentJob:
     return NotificationIntentJob(
         trigger_event_id=uuid4(),
         event_type="notification.plan.created.v1",
@@ -209,12 +225,17 @@ def _intent() -> NotificationIntentJob:
         render_profile="telegram_single_alert_high_v1",
         dedupe_subject_key="subject",
         material_change_hash="material",
-        send_after=None,
+        send_after=send_after,
         suppress_reason_code=None,
     )
 
 
-def _context(intent: NotificationIntentJob) -> NotificationSendContext:
+def _context(
+    intent: NotificationIntentJob,
+    *,
+    error_code: str | None = None,
+    planned_action: str = "preview_only",
+) -> NotificationSendContext:
     event_row = OutboxEventRow(
         event_id=intent.trigger_event_id,
         event_type="notification.plan.created.v1",
@@ -266,7 +287,9 @@ def _context(intent: NotificationIntentJob) -> NotificationSendContext:
         plan_id=intent.notification_plan_id,
         existing_plan_status=None,
         plan_action="concretize",
-        render_draft=NotificationRenderDraft(
+        render_draft=None
+        if error_code is not None
+        else NotificationRenderDraft(
             notification_plan_id=intent.notification_plan_id,
             message_text="Rendered operator text that must stay out of reports",
             entities_json=[],
@@ -277,10 +300,11 @@ def _context(intent: NotificationIntentJob) -> NotificationSendContext:
             parse_strategy="entities",
             render_hash="render-hash",
         ),
-        render_action="append_render",
-        delivery_action="send",
-        delivery_status="would_send",
-        planned_action="preview_only",
+        render_action="not_due" if error_code == "notification_send_after_deferred" else "append_render",
+        delivery_action="defer_until_due" if error_code == "notification_send_after_deferred" else "send",
+        delivery_status=None if error_code else "would_send",
+        planned_action=planned_action,
+        error_code=error_code,
     )
 
 
@@ -320,6 +344,7 @@ def _execution(
             planned_action="execute_live_delivery",
         ),
         delivery_result=result,
+        notification_delivery_record_id=uuid4(),
         delivery_result_event_row=event_row,
         notifier_owned_write_counts=write_counts
         or {
@@ -328,6 +353,19 @@ def _execution(
             "notification_delivery_records_insert_calls": 1,
             "event_outbox_delivery_result_insert_calls": 1,
         },
+    )
+
+
+def _successful_readback() -> NotificationDurableReadback:
+    return NotificationDurableReadback(
+        notification_plan_count=1,
+        notification_plan_material_count=1,
+        notification_render_count=1,
+        notification_delivery_record_count=1,
+        notification_delivery_result_event_count=1,
+        delivery_result_event_status="published",
+        q_maintenance_route_verified=True,
+        q_maintenance_message_thin=True,
     )
 
 
@@ -453,6 +491,65 @@ async def test_pending_target_under_other_consumer_fails_closed_without_takeover
 
 
 @pytest.mark.asyncio
+async def test_forbidden_redis_payload_fails_closed_before_db_write_or_ack() -> None:
+    intent = _intent()
+    runtime = FakeRuntime(
+        context=_context(intent),
+        selection=RedisTargetSelection(
+            status="blocked",
+            error_code="forbidden_redis_payload_field",
+            redis_message_count=1,
+            group_lag=1,
+            group_pending=0,
+            checks_failed=("forbidden_redis_payload_field",),
+        ),
+    )
+
+    report = (
+        await run_bounded_notification_send_live(
+            _preview_config(intent),
+            runtime_config_loader=_runtime_config_loader(send_enabled=True),
+            runtime_builder=FakeRuntimeBuilder(runtime),
+        )
+    ).to_sanitized_dict()
+
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "forbidden_redis_payload_field"
+    assert report["side_effects"]["database_read_attempted"] is False
+    assert report["side_effects"]["database_write_attempted"] is False
+    assert report["side_effects"]["redis_ack_attempted"] is False
+    assert runtime.call_order == ["inspect", "close"]
+
+
+@pytest.mark.asyncio
+async def test_future_send_after_blocks_before_consume_write_or_ack() -> None:
+    intent = _intent(send_after=datetime.now(timezone.utc) + timedelta(hours=1))
+    runtime = FakeRuntime(
+        context=_context(
+            intent,
+            error_code="notification_send_after_deferred",
+            planned_action="wait_until_send_after",
+        )
+    )
+
+    report = (
+        await run_bounded_notification_send_live(
+            _base_config(intent),
+            runtime_config_loader=_runtime_config_loader(send_enabled=True),
+            runtime_builder=FakeRuntimeBuilder(runtime),
+        )
+    ).to_sanitized_dict()
+
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "notification_send_after_deferred"
+    assert report["planned_action"] == "wait_until_send_after"
+    assert report["side_effects"]["redis_consume_attempted"] is False
+    assert report["side_effects"]["database_write_attempted"] is False
+    assert report["side_effects"]["redis_ack_attempted"] is False
+    assert runtime.call_order == ["inspect", "load_context", "close"]
+
+
+@pytest.mark.asyncio
 async def test_execute_success_publishes_maintenance_then_acks() -> None:
     intent = _intent()
     runtime = FakeRuntime(context=_context(intent))
@@ -472,6 +569,15 @@ async def test_execute_success_publishes_maintenance_then_acks() -> None:
     assert report["q_maintenance_published"] is True
     assert report["redis_ack_status"] == "acked"
     assert report["redis_acked_count"] == 1
+    assert report["durable_readback"]["ack_safe"] is True
+    assert report["durable_readback"]["notification_plan_exactly_once"] is True
+    assert report["durable_readback"]["notification_render_exactly_once"] is True
+    assert report["durable_readback"]["notification_delivery_record_exactly_once"] is True
+    assert report["durable_readback"]["notification_delivery_result_event_exactly_once"] is True
+    assert report["durable_readback"]["delivery_result_event_published"] is True
+    assert report["durable_readback"]["q_maintenance_message_thin"] is True
+    assert report["redis_ack_after_durable_readback"] is True
+    assert report["target_chat_suffix_verified"] is True
     assert report["side_effects"]["telegram_transport_constructed"] is True
     assert report["side_effects"]["telegram_send_called"] is True
     assert runtime.call_order == [
@@ -481,6 +587,7 @@ async def test_execute_success_publishes_maintenance_then_acks() -> None:
         "execute",
         "publish_maintenance",
         "mark_published",
+        "readback",
         "ack",
         "close",
     ]
@@ -523,7 +630,8 @@ async def test_transport_failure_records_result_handoff_and_ack(delivery_status:
     assert report["transport_error_code"] == error_code
     assert report["q_maintenance_published"] is True
     assert report["redis_ack_status"] == "acked"
-    assert runtime.call_order.index("publish_maintenance") < runtime.call_order.index("ack")
+    assert runtime.call_order.index("publish_maintenance") < runtime.call_order.index("readback")
+    assert runtime.call_order.index("readback") < runtime.call_order.index("ack")
 
 
 @pytest.mark.asyncio
@@ -604,6 +712,8 @@ async def test_send_disabled_config_suppresses_without_transport_and_still_hands
     assert report["side_effects"]["telegram_send_called"] is False
     assert report["q_maintenance_published"] is True
     assert report["redis_ack_status"] == "acked"
+    assert report["durable_readback"]["ack_safe"] is True
+    assert report["redis_ack_after_durable_readback"] is True
 
 
 @pytest.mark.asyncio
@@ -652,6 +762,116 @@ async def test_full_uuid_and_full_redis_id_selectors_are_rejected_without_echo()
     assert full_uuid not in json.dumps(uuid_report, sort_keys=True)
     assert full_stream_id not in json.dumps(redis_report, sort_keys=True)
     assert runtime.call_order == []
+
+
+@pytest.mark.asyncio
+async def test_target_chat_suffix_is_required_and_verified_without_raw_chat_id() -> None:
+    intent = _intent()
+    context = _context(intent)
+    runtime = FakeRuntime(context=context)
+
+    missing = (
+        await run_bounded_notification_send_live(
+            replace(_base_config(intent), target_chat_id_suffix=None),
+            runtime_config_loader=_runtime_config_loader(send_enabled=True),
+            runtime_builder=FakeRuntimeBuilder(runtime),
+        )
+    ).to_sanitized_dict()
+    mismatch = (
+        await run_bounded_notification_send_live(
+            replace(_base_config(intent), target_chat_id_suffix="9999"),
+            runtime_config_loader=_runtime_config_loader(send_enabled=True),
+            runtime_builder=FakeRuntimeBuilder(runtime),
+        )
+    ).to_sanitized_dict()
+
+    assert missing["error_code"] == "target_chat_id_suffix_missing_or_invalid"
+    assert mismatch["error_code"] == "target_chat_id_mismatch"
+    assert str(intent.target_chat_id) not in json.dumps(mismatch, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_durable_readback_failure_blocks_ack_after_publish_mark() -> None:
+    intent = _intent()
+    runtime = FakeRuntime(
+        context=_context(intent),
+        readback=NotificationDurableReadback(
+            notification_plan_count=1,
+            notification_plan_material_count=1,
+            notification_render_count=0,
+            notification_delivery_record_count=1,
+            notification_delivery_result_event_count=1,
+            delivery_result_event_status="published",
+            q_maintenance_route_verified=True,
+            q_maintenance_message_thin=True,
+            checks_failed=("notification_render_readback_not_exactly_once",),
+        ),
+    )
+
+    report = (
+        await run_bounded_notification_send_live(
+            _base_config(intent),
+            runtime_config_loader=_runtime_config_loader(send_enabled=True),
+            runtime_builder=FakeRuntimeBuilder(runtime),
+        )
+    ).to_sanitized_dict()
+
+    assert report["status"] == "failed"
+    assert report["error_code"] == "durable_readback_failed"
+    assert report["durable_readback"]["ack_safe"] is False
+    assert report["durable_readback"]["checks_failed"] == ["notification_render_readback_not_exactly_once"]
+    assert report["side_effects"]["maintenance_outbox_status_committed"] is True
+    assert report["side_effects"]["redis_ack_attempted"] is False
+    assert runtime.acked == []
+    assert runtime.call_order == [
+        "inspect",
+        "load_context",
+        "consume",
+        "execute",
+        "publish_maintenance",
+        "mark_published",
+        "readback",
+        "close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_already_published_delivery_result_acks_after_readback_without_republish() -> None:
+    intent = _intent()
+    context = _context(intent)
+    execution = _execution(
+        context,
+        write_counts={
+            "notification_plans_insert_calls": 0,
+            "notification_renders_insert_calls": 0,
+            "notification_delivery_records_insert_calls": 0,
+            "event_outbox_delivery_result_insert_calls": 0,
+        },
+    )
+    execution = replace(
+        execution,
+        delivery_result_event_row=replace(execution.delivery_result_event_row, status="published"),
+    )
+    runtime = FakeRuntime(context=context, execution=execution)
+
+    report = (
+        await run_bounded_notification_send_live(
+            _base_config(intent),
+            runtime_config_loader=_runtime_config_loader(send_enabled=True),
+            runtime_builder=FakeRuntimeBuilder(runtime),
+        )
+    ).to_sanitized_dict()
+
+    assert report["status"] == "pass"
+    assert report["q_maintenance_published"] is False
+    assert report["q_maintenance_message_suffix"] is None
+    assert report["redis_ack_status"] == "acked"
+    assert report["durable_readback"]["ack_safe"] is True
+    assert report["notifier_owned_write_counts"]["notification_plans_insert_calls"] == 0
+    assert report["notifier_owned_write_counts"]["notification_renders_insert_calls"] == 0
+    assert report["notifier_owned_write_counts"]["notification_delivery_records_insert_calls"] == 0
+    assert report["notifier_owned_write_counts"]["event_outbox_delivery_result_insert_calls"] == 0
+    assert runtime.call_order == ["inspect", "load_context", "consume", "execute", "readback", "ack", "close"]
 
 
 def test_exact_live_runner_static_authority_guards() -> None:

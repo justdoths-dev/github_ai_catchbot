@@ -942,10 +942,51 @@ class NotifierTelegramRepository:
         delivery_result_event_id: UUID,
         dry_run_reason_code: str,
     ) -> dict[str, Any]:
+        return await self.load_bounded_notification_send_readback(
+            notification_plan_id=notification_plan_id,
+            analysis_id=analysis_id,
+            candidate_group_id=candidate_group_id,
+            target_chat_id=target_chat_id,
+            dedupe_subject_key=dedupe_subject_key,
+            material_change_hash=material_change_hash,
+            render_hash=render_hash,
+            notification_delivery_record_id=notification_delivery_record_id,
+            delivery_result_event_id=delivery_result_event_id,
+            delivery_status="suppressed",
+            telegram_chat_id=None,
+            telegram_message_id=None,
+            attempt_count=0,
+            transport_error_code=dry_run_reason_code,
+            edited=False,
+        )
+
+    async def load_bounded_notification_send_readback(
+        self,
+        *,
+        notification_plan_id: UUID,
+        analysis_id: UUID,
+        candidate_group_id: UUID,
+        target_chat_id: int,
+        dedupe_subject_key: str,
+        material_change_hash: str,
+        render_hash: str,
+        notification_delivery_record_id: UUID,
+        delivery_result_event_id: UUID,
+        delivery_status: str,
+        telegram_chat_id: int | None,
+        telegram_message_id: int | None,
+        attempt_count: int,
+        transport_error_code: str | None,
+        edited: bool,
+    ) -> dict[str, Any]:
         dedupe_key = _delivery_result_dedupe_key(
             notification_plan_id=notification_plan_id,
             notification_delivery_record_id=notification_delivery_record_id,
         )
+        telegram_chat_id_text = str(telegram_chat_id) if telegram_chat_id is not None else None
+        telegram_message_id_text = str(telegram_message_id) if telegram_message_id is not None else None
+        attempt_count_text = str(attempt_count)
+        edited_text = "true" if edited else "false"
         plan_result = await self._session.execute(
             sa.text(
                 """
@@ -1002,18 +1043,21 @@ class NotifierTelegramRepository:
                 FROM notification_delivery_records
                 WHERE notification_delivery_record_id = CAST(:notification_delivery_record_id AS uuid)
                   AND notification_plan_id = CAST(:notification_plan_id AS uuid)
-                  AND delivery_status = 'suppressed'::notification_status_enum
-                  AND telegram_chat_id IS NULL
-                  AND telegram_message_id IS NULL
-                  AND attempt_count = 0
-                  AND transport_error_code = :dry_run_reason_code
-                  AND telegram_response_json ->> 'dry_run' = 'true'
+                  AND delivery_status = CAST(:delivery_status AS notification_status_enum)
+                  AND telegram_chat_id IS NOT DISTINCT FROM :telegram_chat_id
+                  AND telegram_message_id IS NOT DISTINCT FROM :telegram_message_id
+                  AND attempt_count = :attempt_count
+                  AND transport_error_code IS NOT DISTINCT FROM :transport_error_code
                 """
             ),
             {
                 "notification_plan_id": str(notification_plan_id),
                 "notification_delivery_record_id": str(notification_delivery_record_id),
-                "dry_run_reason_code": dry_run_reason_code,
+                "delivery_status": delivery_status,
+                "telegram_chat_id": telegram_chat_id,
+                "telegram_message_id": telegram_message_id,
+                "attempt_count": attempt_count,
+                "transport_error_code": transport_error_code,
             },
         )
         event_result = await self._session.execute(
@@ -1029,8 +1073,21 @@ class NotifierTelegramRepository:
                   AND dedupe_key = :dedupe_key
                   AND payload_json ->> 'notification_plan_id' = :notification_plan_id
                   AND payload_json ->> 'notification_delivery_record_id' = :notification_delivery_record_id
-                  AND payload_json ->> 'delivery_status' = 'suppressed'
-                  AND payload_json ->> 'transport_error_code' = :dry_run_reason_code
+                  AND payload_json ->> 'delivery_status' = :delivery_status
+                  AND payload_json ->> 'attempt_count' = :attempt_count_text
+                  AND (
+                      (:telegram_chat_id_text IS NULL AND payload_json ->> 'telegram_chat_id' IS NULL)
+                      OR payload_json ->> 'telegram_chat_id' = :telegram_chat_id_text
+                  )
+                  AND (
+                      (:telegram_message_id_text IS NULL AND payload_json ->> 'telegram_message_id' IS NULL)
+                      OR payload_json ->> 'telegram_message_id' = :telegram_message_id_text
+                  )
+                  AND (
+                      (:transport_error_code IS NULL AND payload_json ->> 'transport_error_code' IS NULL)
+                      OR payload_json ->> 'transport_error_code' = :transport_error_code
+                  )
+                  AND payload_json ->> 'edited' = :edited_text
                 """
             ),
             {
@@ -1038,7 +1095,12 @@ class NotifierTelegramRepository:
                 "notification_plan_id": str(notification_plan_id),
                 "notification_delivery_record_id": str(notification_delivery_record_id),
                 "dedupe_key": dedupe_key,
-                "dry_run_reason_code": dry_run_reason_code,
+                "delivery_status": delivery_status,
+                "attempt_count_text": attempt_count_text,
+                "telegram_chat_id_text": telegram_chat_id_text,
+                "telegram_message_id_text": telegram_message_id_text,
+                "transport_error_code": transport_error_code,
+                "edited_text": edited_text,
             },
         )
         event_row = event_result.mappings().first()
