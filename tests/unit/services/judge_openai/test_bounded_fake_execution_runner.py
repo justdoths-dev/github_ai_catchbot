@@ -705,6 +705,7 @@ def test_fake_payload_is_schema_valid_stable_and_marked_fake() -> None:
     assert left["judge_schema_version"] == "judge_output_v1"
     assert left["candidate_group_id"] == str(CANDIDATE_GROUP_ID)
     assert "bounded_fake_openai_execution" in left["reason_codes"]
+    assert "comparison_gap" in left["reason_codes"]
     assert left["model_proposed_verdict"] == "later"
     assert left["model_confidence_band"] == "low"
     assert set(left["scores"]) == {

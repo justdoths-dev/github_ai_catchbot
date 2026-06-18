@@ -7,6 +7,14 @@ from .models import BundleValidationContext, ValidationDecision
 
 
 _GITHUB_PRIMARY_TYPES = {"github_repo", "github_subpath", "github_repo_page", "github_gist"}
+_COMPARISON_GAP_MARKERS = {
+    "comparison_gap",
+    "insufficient_comparables",
+    "no_reliable_comparables",
+    "comparables_unavailable",
+    "comparable_gap",
+}
+_CONSERVATIVE_VERDICTS = {"later", "skip"}
 _TRUNCATION_FINISH_REASONS = {"incomplete", "max_output_tokens", "output_truncated", "truncated"}
 
 
@@ -53,14 +61,20 @@ class AnalysisValidatorBusinessRules:
             return self._semantic("validator_score_range_invalid")
 
         comparables = payload.get("comparables")
+        verdict = payload.get("model_proposed_verdict")
         if (
             bundle.current_primary_artifact_type in _GITHUB_PRIMARY_TYPES
             and isinstance(comparables, list)
             and len(comparables) == 0
         ):
-            return self._semantic("validator_missing_github_comparables")
+            comparables_decision = self._validate_github_no_comparables(
+                payload=payload,
+                scores=scores,
+                verdict=verdict,
+            )
+            if comparables_decision is not None:
+                return comparables_decision
 
-        verdict = payload.get("model_proposed_verdict")
         if verdict == "inspect_now":
             evidence_strength = self._score(scores, "evidence_strength")
             confidence = self._score(scores, "confidence")
@@ -105,4 +119,54 @@ class AnalysisValidatorBusinessRules:
             action="failed_terminal",
             reason_code=reason_code,
             transition_to_state="analysis_failed_semantic",
+        )
+
+    def _validate_github_no_comparables(
+        self,
+        *,
+        payload: dict[str, Any],
+        scores: dict[str, Any],
+        verdict: Any,
+    ) -> ValidationDecision | None:
+        evidence_strength = self._score(scores, "evidence_strength")
+        confidence = self._score(scores, "confidence")
+        confidence_band = payload.get("model_confidence_band")
+
+        if verdict == "inspect_now" or confidence_band == "high" or (
+            confidence is not None and confidence >= 60
+        ):
+            return self._semantic("validator_github_comparables_required_for_high_action")
+        if verdict not in _CONSERVATIVE_VERDICTS:
+            return self._semantic("validator_missing_github_comparables")
+        if evidence_strength is None or evidence_strength >= 50:
+            return self._semantic("validator_missing_github_comparables")
+        if not self._has_comparison_gap_marker(payload):
+            return self._semantic("validator_missing_github_comparables")
+        return None
+
+    @classmethod
+    def _has_comparison_gap_marker(cls, payload: dict[str, Any]) -> bool:
+        for field in ("reason_codes", "evidence_limitations_ko"):
+            value = payload.get(field)
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                if not isinstance(item, str):
+                    continue
+                normalized = cls._comparison_marker_key(item)
+                if field == "reason_codes" and normalized in _COMPARISON_GAP_MARKERS:
+                    return True
+                if field == "evidence_limitations_ko" and any(
+                    marker in normalized for marker in _COMPARISON_GAP_MARKERS
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _comparison_marker_key(value: str) -> str:
+        return (
+            value.strip()
+            .lower()
+            .replace("-", "_")
+            .replace(" ", "_")
         )

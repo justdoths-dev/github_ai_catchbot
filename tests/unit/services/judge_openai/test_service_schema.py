@@ -49,3 +49,12 @@ def test_judge_output_schema_rejects_old_score_contract_names() -> None:
     assert "usefulness" not in scores["properties"]
     assert "execution_risk" not in scores["properties"]
     assert scores["additionalProperties"] is False
+
+
+def test_judge_output_schema_documents_no_fabricated_comparables_contract() -> None:
+    properties = JudgeOpenAIService.judge_output_schema()["properties"]
+
+    assert "supported by the provided CandidateEvidenceBundle" in properties["comparables"]["description"]
+    assert "do not use latent/general knowledge" in properties["comparables"]["description"]
+    assert "use [] when no reliable comparables are available" in properties["comparables"]["description"]
+    assert "comparison_gap or insufficient_comparables" in properties["reason_codes"]["description"]

@@ -225,7 +225,14 @@ def build_judge_output_schema() -> dict[str, Any]:
             "summary_one_line_ko": {"type": "string"},
             "skeptical_take_ko": {"type": "string"},
             "why_it_might_matter_ko": {"type": "string"},
-            "comparables": {"type": "array", "items": {"type": "string"}},
+            "comparables": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Comparable tools only when supported by the provided CandidateEvidenceBundle; "
+                    "do not use latent/general knowledge; use [] when no reliable comparables are available."
+                ),
+            },
             "scores": {
                 "type": "object",
                 "additionalProperties": False,
@@ -252,7 +259,14 @@ def build_judge_output_schema() -> dict[str, Any]:
                     "reproducibility_signal": nullable_score_0_to_100,
                 },
             },
-            "reason_codes": {"type": "array", "items": {"type": "string"}},
+            "reason_codes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Include comparison_gap or insufficient_comparables when comparables is [] "
+                    "because no reliable comparable tools are available."
+                ),
+            },
             "red_flags_ko": {"type": "array", "items": {"type": "string"}},
             "evidence_limitations_ko": {"type": "array", "items": {"type": "string"}},
             "recommended_action_ko": {"type": "string"},

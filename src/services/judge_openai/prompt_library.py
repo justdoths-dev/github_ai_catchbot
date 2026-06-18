@@ -74,6 +74,10 @@ class PromptLibrary:
                 "Do not browse, search, fetch, call tools, or assume facts outside the bundle.",
                 "Evaluate negative-first: identify why the candidate may not be worth attention before upside.",
                 "Do not invent comparables, repo activity, social proof, dates, or evidence.",
+                "Only include comparables when supported by the provided CandidateEvidenceBundle.",
+                "Do not use latent/general knowledge to fill comparables.",
+                "Do not use latent/general knowledge to fill comparables.",
+                "If no reliable comparables are available, set comparables=[] and include comparison_gap or insufficient_comparables in reason_codes or evidence_limitations_ko.",
                 "If evidence is weak, reflect that in scores, red flags, limitations, and confidence.",
                 "Do not decide final verdict or delivery_decision; downstream deterministic services do that later.",
             ]

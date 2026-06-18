@@ -1479,6 +1479,7 @@ def build_deterministic_fake_judge_output_payload(
             "bounded_fake_openai_execution",
             "pipeline_validation_only",
             "conservative_default",
+            "comparison_gap",
         ],
         "red_flags_ko": [
             "Fake OpenAI execution; no live model judgment was performed.",

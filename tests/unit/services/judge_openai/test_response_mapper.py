@@ -22,6 +22,46 @@ def test_response_mapper_parses_valid_structured_json_from_output_text() -> None
     assert result.raw_response_id == "resp_1"
 
 
+def test_response_mapper_preserves_conservative_empty_comparables_without_defaults() -> None:
+    payload = {
+        "judge_schema_version": "judge_output_v1",
+        "candidate_group_id": "candidate-1",
+        "headline": "Useful but early repository",
+        "summary_one_line_ko": "short summary",
+        "skeptical_take_ko": "comparison evidence is unavailable",
+        "why_it_might_matter_ko": "could help workflow automation",
+        "comparables": [],
+        "scores": {
+            "novelty": 35,
+            "practical_usefulness": 40,
+            "evidence_strength": 1,
+            "hype_penalty": 20,
+            "confidence": 20,
+            "code_quality": None,
+            "maintenance_signal": None,
+            "specificity": 20,
+            "reproducibility_signal": None,
+        },
+        "reason_codes": ["comparison_gap"],
+        "red_flags_ko": ["comparison evidence is missing"],
+        "evidence_limitations_ko": ["comparison_gap"],
+        "recommended_action_ko": "review later",
+        "freshness_note_ko": "freshness unknown",
+        "model_proposed_verdict": "later",
+        "model_confidence_band": "low",
+    }
+    response = {
+        "status": "completed",
+        "output_text": json.dumps(payload),
+    }
+
+    result = OpenAIResponseMapper().parse(response, started_monotonic=time.monotonic())
+
+    assert result.payload_json == payload
+    assert result.payload_json["comparables"] == []
+    assert "comparison_gap" in result.payload_json["reason_codes"]
+
+
 def test_response_mapper_extracts_refusal_text_from_output_blocks() -> None:
     response = {
         "status": "completed",

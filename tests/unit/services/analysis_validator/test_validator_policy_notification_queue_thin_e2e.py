@@ -510,6 +510,31 @@ async def test_validator_policy_suppress_path_stops_before_notification_queue() 
 
 
 @pytest.mark.asyncio
+async def test_validator_allows_conservative_github_no_comparables_policy_handoff_only_with_gap_marker() -> None:
+    ledger = _ValidatorPolicyLedger(
+        scores=_conservative_no_comparables_scores(),
+        model_proposed_verdict="later",
+        mutate_payload=_mark_conservative_comparison_gap,
+    )
+    _validator_repo, policy_repo, relay_repo, publisher, processed = await _run_pipeline(ledger)
+
+    policy_apply_events = ledger.rows_of_type("analysis.policy.apply.v1")
+    assert len(policy_apply_events) == 1
+    assert policy_repo.loaded_trigger_event_ids == [policy_apply_events[0].event_id]
+    assert len(ledger.analyses) == 1
+    analysis = ledger.analyses[0]
+    assert analysis.verdict == "skip"
+    assert analysis.delivery_decision == "suppress"
+    assert "comparison_gap" in analysis.reason_codes_json
+    assert ledger.rows_of_type("notification.plan.created.v1") == []
+    assert processed == 0
+    assert relay_repo.marked_published == []
+    assert publisher.published == []
+    _assert_no_notifier_owned_writes(ledger)
+    _assert_no_external_authority(ledger)
+
+
+@pytest.mark.asyncio
 async def test_validator_invalid_judge_output_fails_closed_before_policy() -> None:
     ledger = _ValidatorPolicyLedger(
         scores=_send_worthy_scores(),
@@ -712,6 +737,33 @@ def _suppress_scores() -> dict[str, int | None]:
         "specificity": 10,
         "reproducibility_signal": 10,
     }
+
+
+def _conservative_no_comparables_scores() -> dict[str, int | None]:
+    return {
+        "novelty": 22,
+        "practical_usefulness": 28,
+        "evidence_strength": 1,
+        "hype_penalty": 35,
+        "confidence": 20,
+        "code_quality": None,
+        "maintenance_signal": None,
+        "specificity": 20,
+        "reproducibility_signal": None,
+    }
+
+
+def _mark_conservative_comparison_gap(payload: dict[str, Any]) -> None:
+    payload["comparables"] = []
+    payload["reason_codes"] = [
+        "repo_scope_unclear",
+        "low_evidence_strength",
+        "limited_usage_signal",
+        "maintenance_signal_unknown",
+        "comparison_gap",
+    ]
+    payload["evidence_limitations_ko"] = ["comparison_gap"]
+    payload["model_confidence_band"] = "low"
 
 
 def _string_or_none(value: Any) -> str | None:

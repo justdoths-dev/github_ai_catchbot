@@ -16,6 +16,34 @@ def _bundle(artifact_type: str | None = "web_article") -> BundleValidationContex
     )
 
 
+def _live_terminal_no_comparables_payload() -> dict:
+    payload = valid_payload()
+    payload["comparables"] = []
+    payload["scores"].update(
+        {
+            "novelty": 22,
+            "practical_usefulness": 28,
+            "evidence_strength": 1,
+            "hype_penalty": 35,
+            "confidence": 20,
+            "code_quality": None,
+            "maintenance_signal": None,
+        }
+    )
+    payload["reason_codes"] = [
+        "repo_scope_unclear",
+        "low_evidence_strength",
+        "limited_usage_signal",
+        "maintenance_signal_unknown",
+        "defer_until_more_evidence",
+    ]
+    payload["evidence_limitations_ko"] = ["only limited public bundle evidence was available"]
+    payload["recommended_action_ko"] = "review later after more evidence"
+    payload["model_proposed_verdict"] = "later"
+    payload["model_confidence_band"] = "low"
+    return payload
+
+
 def test_business_rules_pass_valid_payload() -> None:
     payload = valid_payload()
     payload["comparables"] = []
@@ -89,9 +117,21 @@ def test_business_rules_reject_inspect_now_with_hype_penalty_70_or_higher() -> N
     assert decision.reason_code == "validator_inspect_now_hype_too_high"
 
 
-def test_business_rules_reject_github_family_primary_with_empty_comparables() -> None:
-    payload = valid_payload()
-    payload["comparables"] = []
+def test_business_rules_allow_conservative_github_no_comparables_with_comparison_gap() -> None:
+    payload = _live_terminal_no_comparables_payload()
+    payload["reason_codes"].append("comparison_gap")
+
+    decision = AnalysisValidatorBusinessRules().validate_semantics(
+        payload=payload,
+        bundle=_bundle("github_repo"),
+    )
+
+    assert decision.action == "forward_policy"
+    assert decision.reason_code == "validator_passed"
+
+
+def test_business_rules_reject_github_no_comparables_without_comparison_gap_marker() -> None:
+    payload = _live_terminal_no_comparables_payload()
 
     decision = AnalysisValidatorBusinessRules().validate_semantics(
         payload=payload,
@@ -100,6 +140,29 @@ def test_business_rules_reject_github_family_primary_with_empty_comparables() ->
 
     assert decision.action == "failed_terminal"
     assert decision.reason_code == "validator_missing_github_comparables"
+
+
+def test_business_rules_reject_github_no_comparables_high_action_even_with_comparison_gap() -> None:
+    payload = valid_payload()
+    payload["comparables"] = []
+    payload["reason_codes"] = ["comparison_gap"]
+    payload["scores"].update(
+        {
+            "evidence_strength": 80,
+            "confidence": 85,
+            "hype_penalty": 10,
+        }
+    )
+    payload["model_proposed_verdict"] = "inspect_now"
+    payload["model_confidence_band"] = "high"
+
+    decision = AnalysisValidatorBusinessRules().validate_semantics(
+        payload=payload,
+        bundle=_bundle("github_repo"),
+    )
+
+    assert decision.action == "failed_terminal"
+    assert decision.reason_code == "validator_github_comparables_required_for_high_action"
 
 
 def test_refusal_branch_produces_analysis_refused_and_no_policy_handoff_decision() -> None:
