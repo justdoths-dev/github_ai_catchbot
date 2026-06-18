@@ -12,6 +12,8 @@ import pytest
 from src.services.notifier_telegram.bounded_notification_send_dry_run_runner import (
     NotificationDurableReadback,
     NotificationSendContext,
+    REQUIRED_THIN_QUEUE_FIELDS,
+    _select_exact_message,
 )
 from src.services.notifier_telegram.bounded_notification_send_live_runner import (
     BoundedNotificationSendLiveConfig,
@@ -235,12 +237,19 @@ def _context(
     *,
     error_code: str | None = None,
     planned_action: str = "preview_only",
+    event_aggregate_type: str = "analysis",
+    event_aggregate_id: UUID | None = None,
 ) -> NotificationSendContext:
     event_row = OutboxEventRow(
         event_id=intent.trigger_event_id,
         event_type="notification.plan.created.v1",
-        aggregate_type="analysis",
-        aggregate_id=intent.analysis_id,
+        aggregate_type=event_aggregate_type,
+        aggregate_id=event_aggregate_id
+        or (
+            intent.notification_plan_id
+            if event_aggregate_type == "notification_plan"
+            else intent.analysis_id
+        ),
         dedupe_key=f"notify:{intent.analysis_id}",
         payload_json={
             "notification_plan_id": str(intent.notification_plan_id),
@@ -369,20 +378,28 @@ def _successful_readback() -> NotificationDurableReadback:
     )
 
 
-def _message(intent: NotificationIntentJob) -> StreamMessage:
+def _message(
+    intent: NotificationIntentJob,
+    *,
+    fields: dict[str, str] | None = None,
+    message_id: str = "1718000000000-0",
+) -> StreamMessage:
+    base = {
+        "job_id": str(intent.trigger_event_id),
+        "stage_name": "notify",
+        "root_object_type": "analysis",
+        "root_object_id": str(intent.analysis_id),
+        "idempotency_key": f"notify:{intent.analysis_id}",
+        "pipeline_run_id": "",
+        "not_before": "",
+        "trigger_event_id": str(intent.trigger_event_id),
+    }
+    if fields:
+        base.update(fields)
     return StreamMessage(
         stream="q.notification.send",
-        message_id="1718000000000-0",
-        fields={
-            "job_id": str(intent.trigger_event_id),
-            "stage_name": "notify",
-            "root_object_type": "analysis",
-            "root_object_id": str(intent.analysis_id),
-            "idempotency_key": f"notify:{intent.analysis_id}",
-            "pipeline_run_id": "",
-            "not_before": "",
-            "trigger_event_id": str(intent.trigger_event_id),
-        },
+        message_id=message_id,
+        fields=base,
     )
 
 
@@ -417,6 +434,52 @@ async def test_preview_exact_target_rehydrates_without_writes_or_transport() -> 
 
     assert report["status"] == "pass"
     assert report["mode"] == "preview"
+    assert report["side_effects"]["redis_consume_attempted"] is False
+    assert report["side_effects"]["redis_ack_attempted"] is False
+    assert report["side_effects"]["database_write_attempted"] is False
+    assert report["side_effects"]["telegram_transport_constructed"] is False
+    assert runtime.call_order == ["inspect", "load_context", "close"]
+
+
+@pytest.mark.asyncio
+async def test_preview_accepts_materialized_notification_plan_root_without_side_effects() -> None:
+    intent = replace(_intent(), trigger_event_id=UUID("10000000-0000-4000-8000-0000642b1aa3"))
+    context = _context(
+        intent,
+        event_aggregate_type="notification_plan",
+        event_aggregate_id=intent.notification_plan_id,
+    )
+    message = _message(
+        intent,
+        fields={
+            "root_object_type": "notification_plan",
+            "root_object_id": str(intent.notification_plan_id),
+        },
+        message_id="1718000102216-0",
+    )
+    config = replace(_preview_config(intent), redis_message_suffix="102216-0")
+    selection = _select_exact_message(config, [message], group_pending=0, group_lag=1)
+    runtime = FakeRuntime(
+        context=context,
+        selection=selection,
+        transport_constructed=False,
+        telegram_send_called=False,
+    )
+
+    result = await run_bounded_notification_send_live(
+        config,
+        runtime_config_loader=_runtime_config_loader(send_enabled=True),
+        runtime_builder=FakeRuntimeBuilder(runtime),
+    )
+    report = result.to_sanitized_dict()
+
+    assert set(message.fields) == set(REQUIRED_THIN_QUEUE_FIELDS)
+    assert selection.status == "matched"
+    assert selection.message_root_object_type == "notification_plan"
+    assert report["status"] == "pass"
+    assert report["mode"] == "preview"
+    assert report["target_redis_message_suffix"] == "102216-0"
+    assert report["trigger_event_suffix"] == "642b1aa3"
     assert report["side_effects"]["redis_consume_attempted"] is False
     assert report["side_effects"]["redis_ack_attempted"] is False
     assert report["side_effects"]["database_write_attempted"] is False

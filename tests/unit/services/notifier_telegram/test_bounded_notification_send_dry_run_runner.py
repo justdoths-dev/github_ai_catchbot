@@ -14,6 +14,7 @@ from src.services.notifier_telegram.bounded_notification_send_dry_run_runner imp
     DRY_RUN_REASON_CODE,
     EVENT_TYPE,
     QUEUE_NAME,
+    REQUIRED_THIN_QUEUE_FIELDS,
     BoundedNotificationSendDryRunConfig,
     BoundedNotificationSendDryRunRuntimeConfig,
     BoundedNotificationSendDryRunState,
@@ -22,6 +23,9 @@ from src.services.notifier_telegram.bounded_notification_send_dry_run_runner imp
     NotificationSendContext,
     RedisTargetSelection,
     _execute_context,
+    _event_row_error,
+    _intent_selector_error,
+    _select_exact_message,
     run_bounded_notification_send_dry_run,
 )
 from src.services.notifier_telegram.models import (
@@ -216,12 +220,19 @@ def _context(
     render_action: str = "append_render",
     error_code: str | None = None,
     planned_action: str = "execute_dry_run_delivery",
+    event_aggregate_type: str = "analysis",
+    event_aggregate_id: UUID | None = None,
 ) -> NotificationSendContext:
     event_row = OutboxEventRow(
         event_id=intent.trigger_event_id,
         event_type=EVENT_TYPE,
-        aggregate_type="analysis",
-        aggregate_id=intent.analysis_id,
+        aggregate_type=event_aggregate_type,
+        aggregate_id=event_aggregate_id
+        or (
+            intent.notification_plan_id
+            if event_aggregate_type == "notification_plan"
+            else intent.analysis_id
+        ),
         dedupe_key=f"notify:{intent.analysis_id}",
         payload_json={
             "notification_plan_id": str(intent.notification_plan_id),
@@ -347,7 +358,12 @@ def _successful_readback() -> NotificationDurableReadback:
     )
 
 
-def _message(intent: NotificationIntentJob, *, fields: dict[str, str] | None = None) -> StreamMessage:
+def _message(
+    intent: NotificationIntentJob,
+    *,
+    fields: dict[str, str] | None = None,
+    message_id: str = "1718000000000-0",
+) -> StreamMessage:
     base = {
         "job_id": str(intent.trigger_event_id),
         "stage_name": "notify",
@@ -360,7 +376,7 @@ def _message(intent: NotificationIntentJob, *, fields: dict[str, str] | None = N
     }
     if fields:
         base.update(fields)
-    return StreamMessage(stream=QUEUE_NAME, message_id="1718000000000-0", fields=base)
+    return StreamMessage(stream=QUEUE_NAME, message_id=message_id, fields=base)
 
 
 def _matched_selection(intent: NotificationIntentJob) -> RedisTargetSelection:
@@ -529,6 +545,115 @@ async def test_preview_exact_target_rehydrates_and_reports_without_side_effects(
     assert report["side_effects"]["database_write_attempted"] is False
     assert report["side_effects"]["maintenance_redis_publish_attempted"] is False
     assert runtime.call_order == ["inspect", "load_context", "close"]
+
+
+def test_exact_selector_accepts_legacy_analysis_root() -> None:
+    intent = _intent()
+
+    selection = _select_exact_message(
+        _base_config(intent),
+        [_message(intent)],
+        group_pending=0,
+        group_lag=1,
+    )
+
+    assert selection.status == "matched"
+    assert selection.message is not None
+    assert selection.message_root_object_type == "analysis"
+    assert selection.target_is_next is True
+
+
+def test_context_gate_accepts_notification_plan_outbox_aggregate_shape() -> None:
+    intent = _intent()
+    config = _preview_config(intent)
+    context = _context(
+        intent,
+        event_aggregate_type="notification_plan",
+        event_aggregate_id=intent.notification_plan_id,
+    )
+
+    assert _event_row_error(context.event_row, config) is None
+    assert _intent_selector_error(intent, context.event_row, config) is None
+
+    wrong_type = replace(context.event_row, aggregate_type="candidate_group")
+    wrong_id = replace(context.event_row, aggregate_id=uuid4())
+
+    assert _event_row_error(wrong_type, config) == "notification_plan_event_aggregate_type_invalid"
+    assert _intent_selector_error(intent, wrong_id, config) == "notification_plan_event_aggregate_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_preview_exact_target_accepts_notification_plan_root_and_loads_context() -> None:
+    intent = replace(_intent(), trigger_event_id=UUID("10000000-0000-4000-8000-0000642b1aa3"))
+    context = _context(
+        intent,
+        planned_action="preview_only",
+        event_aggregate_type="notification_plan",
+        event_aggregate_id=intent.notification_plan_id,
+    )
+    message = _message(
+        intent,
+        fields={
+            "root_object_type": "notification_plan",
+            "root_object_id": str(intent.notification_plan_id),
+        },
+        message_id="1718000102216-0",
+    )
+    config = replace(_preview_config(intent), redis_message_suffix="102216-0")
+    selection = _select_exact_message(config, [message], group_pending=0, group_lag=1)
+    runtime = FakeRuntime(context=context, selection=selection)
+
+    result = await run_bounded_notification_send_dry_run(
+        config,
+        runtime_config_loader=_runtime_config_loader,
+        runtime_builder=FakeRuntimeBuilder(runtime),
+    )
+    report = result.to_sanitized_dict()
+
+    assert set(message.fields) == set(REQUIRED_THIN_QUEUE_FIELDS)
+    assert selection.status == "matched"
+    assert selection.message_root_object_type == "notification_plan"
+    assert report["status"] == "pass"
+    assert report["target_redis_message_suffix"] == "102216-0"
+    assert report["trigger_event_suffix"] == "642b1aa3"
+    assert report["side_effects"]["database_session_opened"] is True
+    assert report["side_effects"]["database_read_attempted"] is True
+    assert report["side_effects"]["database_write_attempted"] is False
+    assert report["side_effects"]["redis_consume_attempted"] is False
+    assert report["side_effects"]["redis_ack_attempted"] is False
+    assert report["side_effects"]["telegram_transport_called"] is False
+    assert runtime.call_order == ["inspect", "load_context", "close"]
+
+
+@pytest.mark.asyncio
+async def test_unexpected_root_object_type_fails_closed_before_context_consume_or_ack() -> None:
+    intent = _intent()
+    message = _message(
+        intent,
+        fields={
+            "root_object_type": "candidate_group",
+            "root_object_id": str(intent.candidate_group_id),
+        },
+    )
+    selection = _select_exact_message(_preview_config(intent), [message], group_pending=0, group_lag=1)
+    runtime = FakeRuntime(context=_context(intent), selection=selection)
+
+    result = await run_bounded_notification_send_dry_run(
+        _preview_config(intent),
+        runtime_config_loader=_runtime_config_loader,
+        runtime_builder=FakeRuntimeBuilder(runtime),
+    )
+    report = result.to_sanitized_dict()
+
+    assert selection.message is None
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "redis_target_ambiguous_or_missing"
+    assert report["side_effects"]["database_session_opened"] is False
+    assert report["side_effects"]["database_read_attempted"] is False
+    assert report["side_effects"]["database_write_attempted"] is False
+    assert report["side_effects"]["redis_consume_attempted"] is False
+    assert report["side_effects"]["redis_ack_attempted"] is False
+    assert runtime.call_order == ["inspect", "close"]
 
 
 @pytest.mark.asyncio

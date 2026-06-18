@@ -33,6 +33,8 @@ RUNNER_NAME = "bounded_notification_send_dry_run_runner"
 QUEUE_NAME = "q.notification.send"
 STAGE_NAME = "notify"
 ROOT_OBJECT_TYPE = "analysis"
+NOTIFICATION_PLAN_ROOT_OBJECT_TYPE = "notification_plan"
+ACCEPTED_ROOT_OBJECT_TYPES = frozenset({ROOT_OBJECT_TYPE, NOTIFICATION_PLAN_ROOT_OBJECT_TYPE})
 EVENT_TYPE = "notification.plan.created.v1"
 DELIVERY_RESULT_EVENT_TYPE = "notification.delivery.result.v1"
 MAINTENANCE_QUEUE_NAME = "q.maintenance"
@@ -1361,24 +1363,20 @@ def _thin_message_failures(message: StreamMessage, config: BoundedNotificationSe
         failures.append("forbidden_redis_payload_field")
     if fields.get("stage_name") != STAGE_NAME:
         failures.append("message_stage_mismatch")
-    if fields.get("root_object_type") != ROOT_OBJECT_TYPE:
+    if fields.get("root_object_type") not in ACCEPTED_ROOT_OBJECT_TYPES:
         failures.append("root_object_type_mismatch")
     if config.redis_message_suffix and not message.message_id.endswith(config.redis_message_suffix):
         failures.append("redis_message_id_mismatch")
     trigger_event_id = str(fields.get("trigger_event_id") or "")
     if not trigger_event_id.endswith(str(config.trigger_event_suffix)):
         failures.append("trigger_event_id_mismatch")
-    if config.analysis_id_suffix:
-        analysis_id = str(fields.get("root_object_id") or "")
-        if not analysis_id.endswith(str(config.analysis_id_suffix)):
-            failures.append("analysis_mismatch")
     return tuple(failures)
 
 
 def _event_row_error(row: OutboxEventRow, config: BoundedNotificationSendDryRunConfig) -> str | None:
     if row.event_type != EVENT_TYPE:
         return "notification_plan_event_type_invalid"
-    if row.aggregate_type != ROOT_OBJECT_TYPE:
+    if row.aggregate_type not in ACCEPTED_ROOT_OBJECT_TYPES:
         return "notification_plan_event_aggregate_type_invalid"
     if _payload_has_forbidden_key(row.payload_json):
         return "malformed_notification_intent_payload"
@@ -1392,7 +1390,10 @@ def _intent_selector_error(
     row: OutboxEventRow,
     config: BoundedNotificationSendDryRunConfig,
 ) -> str | None:
-    if row.aggregate_id != intent.analysis_id:
+    expected_aggregate_id = intent.analysis_id
+    if row.aggregate_type == NOTIFICATION_PLAN_ROOT_OBJECT_TYPE:
+        expected_aggregate_id = intent.notification_plan_id
+    if row.aggregate_id != expected_aggregate_id:
         return "notification_plan_event_aggregate_mismatch"
     if config.notification_plan_id_suffix and not str(intent.notification_plan_id).endswith(
         config.notification_plan_id_suffix
