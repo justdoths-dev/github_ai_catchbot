@@ -983,6 +983,8 @@ class NotifierTelegramRepository:
             notification_plan_id=notification_plan_id,
             notification_delivery_record_id=notification_delivery_record_id,
         )
+        notification_plan_id_text = str(notification_plan_id)
+        notification_delivery_record_id_text = str(notification_delivery_record_id)
         telegram_chat_id_text = str(telegram_chat_id) if telegram_chat_id is not None else None
         telegram_message_id_text = str(telegram_message_id) if telegram_message_id is not None else None
         attempt_count_text = str(attempt_count)
@@ -995,7 +997,7 @@ class NotifierTelegramRepository:
                 WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
                   AND analysis_id = CAST(:analysis_id AS uuid)
                   AND candidate_group_id = CAST(:candidate_group_id AS uuid)
-                  AND target_chat_id = :target_chat_id
+                  AND target_chat_id = CAST(:target_chat_id AS bigint)
                   AND dedupe_subject_key = :dedupe_subject_key
                   AND material_change_hash = :material_change_hash
                 """
@@ -1015,7 +1017,7 @@ class NotifierTelegramRepository:
                 SELECT count(*)
                 FROM notification_plans
                 WHERE analysis_id = CAST(:analysis_id AS uuid)
-                  AND target_chat_id = :target_chat_id
+                  AND target_chat_id = CAST(:target_chat_id AS bigint)
                   AND material_change_hash = :material_change_hash
                 """
             ),
@@ -1044,10 +1046,10 @@ class NotifierTelegramRepository:
                 WHERE notification_delivery_record_id = CAST(:notification_delivery_record_id AS uuid)
                   AND notification_plan_id = CAST(:notification_plan_id AS uuid)
                   AND delivery_status = CAST(:delivery_status AS notification_status_enum)
-                  AND telegram_chat_id IS NOT DISTINCT FROM :telegram_chat_id
-                  AND telegram_message_id IS NOT DISTINCT FROM :telegram_message_id
-                  AND attempt_count = :attempt_count
-                  AND transport_error_code IS NOT DISTINCT FROM :transport_error_code
+                  AND telegram_chat_id IS NOT DISTINCT FROM CAST(:telegram_chat_id AS bigint)
+                  AND telegram_message_id IS NOT DISTINCT FROM CAST(:telegram_message_id AS bigint)
+                  AND attempt_count = CAST(:attempt_count AS integer)
+                  AND transport_error_code IS NOT DISTINCT FROM CAST(:transport_error_code AS text)
                 """
             ),
             {
@@ -1071,21 +1073,21 @@ class NotifierTelegramRepository:
                   AND aggregate_type = 'notification_plan'
                   AND aggregate_id = CAST(:notification_plan_id AS uuid)
                   AND dedupe_key = :dedupe_key
-                  AND payload_json ->> 'notification_plan_id' = :notification_plan_id
-                  AND payload_json ->> 'notification_delivery_record_id' = :notification_delivery_record_id
+                  AND payload_json ->> 'notification_plan_id' = :notification_plan_id_text
+                  AND payload_json ->> 'notification_delivery_record_id' = :notification_delivery_record_id_text
                   AND payload_json ->> 'delivery_status' = :delivery_status
                   AND payload_json ->> 'attempt_count' = :attempt_count_text
                   AND (
-                      (:telegram_chat_id_text IS NULL AND payload_json ->> 'telegram_chat_id' IS NULL)
-                      OR payload_json ->> 'telegram_chat_id' = :telegram_chat_id_text
+                      (CAST(:telegram_chat_id_text AS text) IS NULL AND payload_json ->> 'telegram_chat_id' IS NULL)
+                      OR payload_json ->> 'telegram_chat_id' = CAST(:telegram_chat_id_text AS text)
                   )
                   AND (
-                      (:telegram_message_id_text IS NULL AND payload_json ->> 'telegram_message_id' IS NULL)
-                      OR payload_json ->> 'telegram_message_id' = :telegram_message_id_text
+                      (CAST(:telegram_message_id_text AS text) IS NULL AND payload_json ->> 'telegram_message_id' IS NULL)
+                      OR payload_json ->> 'telegram_message_id' = CAST(:telegram_message_id_text AS text)
                   )
                   AND (
-                      (:transport_error_code IS NULL AND payload_json ->> 'transport_error_code' IS NULL)
-                      OR payload_json ->> 'transport_error_code' = :transport_error_code
+                      (CAST(:transport_error_code AS text) IS NULL AND payload_json ->> 'transport_error_code' IS NULL)
+                      OR payload_json ->> 'transport_error_code' = CAST(:transport_error_code AS text)
                   )
                   AND payload_json ->> 'edited' = :edited_text
                 """
@@ -1093,7 +1095,8 @@ class NotifierTelegramRepository:
             {
                 "delivery_result_event_id": str(delivery_result_event_id),
                 "notification_plan_id": str(notification_plan_id),
-                "notification_delivery_record_id": str(notification_delivery_record_id),
+                "notification_plan_id_text": notification_plan_id_text,
+                "notification_delivery_record_id_text": notification_delivery_record_id_text,
                 "dedupe_key": dedupe_key,
                 "delivery_status": delivery_status,
                 "attempt_count_text": attempt_count_text,
