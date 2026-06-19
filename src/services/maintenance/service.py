@@ -147,18 +147,24 @@ class MaintenanceService:
             await self._repository.insert_delivery_result_noop_job_attempt(notification_plan_id)
         return decision
 
-    async def handle_replay_trigger_event(self, trigger_event_id: str | UUID) -> None:
+    async def load_outbox_event(self, trigger_event_id: str | UUID) -> OutboxEvent | None:
+        event_id = _parse_uuid(trigger_event_id)
+        if event_id is None:
+            return None
+        return await self._repository.load_outbox_event(event_id)
+
+    async def handle_replay_trigger_event(self, trigger_event_id: str | UUID) -> DeliveryReplayDecision | None:
         event_id = _parse_uuid(trigger_event_id)
         if event_id is None:
             self._logger.warning("maintenance_replay_invalid_trigger_event_id")
-            return
+            return None
         event = await self._repository.load_outbox_event(event_id)
         if event is None or event.event_type != REPLAY_REQUESTED_EVENT_TYPE:
-            return
+            return None
         replay_event = replay_requested_from_outbox(event)
         if replay_event is None:
-            return
-        await self.dispatch_delivery_replay_request(
+            return None
+        return await self.dispatch_delivery_replay_request(
             replay_event.replay_request_id,
             replay_reason=replay_event.replay_reason,
         )

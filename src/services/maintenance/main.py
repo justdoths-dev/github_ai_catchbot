@@ -26,8 +26,15 @@ from .delivery_gate_preflight import (
     run_delivery_gate_preflight,
 )
 from .delivery_gate_preflight_invocation import run_delivery_gate_preflight_invocation_proof
+from .delivery_replay import REPLAY_REQUESTED_EVENT_TYPE
+from .delivery_retry import DELIVERY_RESULT_EVENT_TYPE
 from .mvp_readiness import run_restricted_live_mvp_readiness
 from .redis_streams import RedisStreamConsumer
+from .restricted_queue_activation import (
+    RestrictedQueueActivationReport,
+    RestrictedQueueActivationRequest,
+    run_restricted_queue_activation,
+)
 from .repositories import MaintenanceRepository
 from .service import MaintenanceService
 from .worker import DueRetryPromotionWorker, MaintenanceQueueWorker, ReplayQueueWorker
@@ -154,6 +161,17 @@ def build_parser() -> argparse.ArgumentParser:
     delivery_replay.add_argument("--replay-request-id", required=True)
     delivery_replay.add_argument("--confirm", choices=["write"], default=None)
     delivery_replay.add_argument("--env-file")
+
+    queue_activate = subcommands.add_parser("queue-activate")
+    queue_activate_subcommands = queue_activate.add_subparsers(dest="activation_queue", required=True)
+    for queue_name in ("maintenance", "replay"):
+        activate = queue_activate_subcommands.add_parser(queue_name)
+        activate.add_argument("--mode", choices=["plan", "execute", "proof"], required=True)
+        activate.add_argument("--max-messages", type=int, default=1)
+        activate.add_argument("--confirm", choices=["ack"], default=None)
+        activate.add_argument("--allow-create-group", action="store_true")
+        activate.add_argument("--exact-trigger-event-id")
+        activate.add_argument("--env-file", required=True)
 
     recovery = subcommands.add_parser("batch-recovery")
     recovery_subcommands = recovery.add_subparsers(dest="recovery_mode", required=True)
@@ -733,6 +751,7 @@ def _one_shot_command_uses_explicit_env_file(command: str, args: argparse.Namesp
         "delivery-result",
         "due-retry",
         "delivery-replay",
+        "queue-activate",
     } and bool(getattr(args, "env_file", None))
 
 
@@ -1001,6 +1020,136 @@ async def _run_delivery_replay_operation(config: MaintenanceConfig, args: argpar
         await engine.dispose()
 
 
+async def _run_queue_activate_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
+    request_error = _queue_activate_request_error(args)
+    request = _queue_activate_request(config, args)
+    if request_error is not None:
+        print(_to_json(asdict(_queue_activate_blocked_report(request, args.mode, request_error))))
+        return 2
+
+    from redis.asyncio import Redis  # type: ignore[import-not-found]
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
+
+    engine = create_async_engine(config.database_url, future=True)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    redis_client = Redis.from_url(config.redis_url, decode_responses=True)
+    consumer = RedisStreamConsumer(
+        redis_client,
+        queue_name=request.queue_name,
+        consumer_group=request.consumer_group,
+        consumer_name=request.consumer_name,
+        block_ms=config.block_ms,
+        batch_size=request.max_messages,
+    )
+
+    class SessionBackedRestrictedService:
+        async def load_outbox_event(self, trigger_event_id: UUID):
+            async with session_factory() as session:
+                return await MaintenanceRepository(session).load_outbox_event(trigger_event_id)
+
+        async def handle_maintenance_trigger_event(self, trigger_event_id: UUID):
+            async with session_factory.begin() as session:
+                return await MaintenanceService(config, repository=MaintenanceRepository(session)).handle_maintenance_trigger_event(
+                    trigger_event_id
+                )
+
+        async def handle_replay_trigger_event(self, trigger_event_id: UUID):
+            async with session_factory.begin() as session:
+                return await MaintenanceService(config, repository=MaintenanceRepository(session)).handle_replay_trigger_event(
+                    trigger_event_id
+                )
+
+    try:
+        report = await run_restricted_queue_activation(
+            request,
+            consumer=consumer,
+            service=SessionBackedRestrictedService(),
+            mode=args.mode,
+        )
+        print(_to_json(asdict(report)))
+        return 0 if report.status == "pass" else 2
+    finally:
+        close = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
+        if close is not None:
+            maybe_awaitable = close()
+            if asyncio.iscoroutine(maybe_awaitable):
+                await maybe_awaitable
+        await engine.dispose()
+
+
+def _queue_activate_request(config: MaintenanceConfig, args: argparse.Namespace) -> RestrictedQueueActivationRequest:
+    if args.activation_queue == "maintenance":
+        queue_name = config.maintenance_queue_name
+        consumer_group = config.maintenance_consumer_group
+        consumer_name = config.maintenance_consumer_name
+        expected_event_type = DELIVERY_RESULT_EVENT_TYPE
+    else:
+        queue_name = config.replay_queue_name
+        consumer_group = config.replay_consumer_group
+        consumer_name = config.replay_consumer_name
+        expected_event_type = REPLAY_REQUESTED_EVENT_TYPE
+    return RestrictedQueueActivationRequest(
+        queue_name=queue_name,
+        consumer_group=consumer_group,
+        consumer_name=consumer_name,
+        max_messages=int(args.max_messages),
+        ack=args.mode == "execute" and args.confirm == "ack",
+        dry_run=args.mode != "execute",
+        allow_create_group=bool(args.allow_create_group),
+        expected_event_type=expected_event_type,
+        exact_trigger_event_id=_parse_uuid(args.exact_trigger_event_id),
+    )
+
+
+def _queue_activate_request_error(args: argparse.Namespace) -> str | None:
+    if args.max_messages < 1 or args.max_messages > 10:
+        return "max_messages_not_allowed"
+    if args.mode == "execute" and args.confirm != "ack":
+        return "ack_confirm_missing"
+    if args.mode != "execute" and args.confirm == "ack":
+        return "ack_confirm_not_allowed_for_dry_run"
+    if args.mode != "execute" and args.allow_create_group:
+        return "allow_create_group_not_allowed_for_dry_run"
+    if args.exact_trigger_event_id and _parse_uuid(args.exact_trigger_event_id) is None:
+        return "exact_trigger_event_id_invalid"
+    return None
+
+
+def _queue_activate_blocked_report(
+    request: RestrictedQueueActivationRequest,
+    mode: str,
+    reason_code: str,
+) -> RestrictedQueueActivationReport:
+    return RestrictedQueueActivationReport(
+        schema_version="restricted_queue_activation_report_v1",
+        queue_name=request.queue_name,
+        consumer_group=request.consumer_group,
+        consumer_name=request.consumer_name,
+        mode=mode,
+        status="blocked",
+        processed_count=0,
+        acked_count=0,
+        skipped_count=0,
+        results=[],
+        reason_code=reason_code,
+        redactions_applied={
+            "full_uuid_omitted": True,
+            "full_redis_message_id_omitted": True,
+            "payload_json_omitted": True,
+            "database_url_omitted": True,
+            "redis_url_omitted": True,
+            "exception_body_omitted": True,
+        },
+    )
+
+
+def _parse_uuid(value: object) -> UUID | None:
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def _exact_target_error(rows: list, label: str) -> str | None:
     if not rows:
         return f"{label}_missing"
@@ -1171,6 +1320,8 @@ async def _run(argv: list[str] | None = None) -> int:
         return await _run_due_retry_operation(config, args)
     if command == "delivery-replay":
         return await _run_delivery_replay_operation(config, args)
+    if command == "queue-activate":
+        return await _run_queue_activate_operation(config, args)
     if command == "batch-recovery":
         return await _run_batch_recovery(config, args)
     parser.error(f"unsupported command: {command}")
