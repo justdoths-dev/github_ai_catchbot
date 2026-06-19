@@ -37,6 +37,7 @@ async def test_replay_requested_delivery_dispatches_notification_plan_created_re
     )
     event = outbox_event(
         "replay.requested.v1",
+        aggregate_type="replay_request",
         aggregate_id=replay_request_id,
         payload_json={
             "replay_request_id": str(replay_request_id),

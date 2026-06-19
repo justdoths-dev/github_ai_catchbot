@@ -26,12 +26,13 @@ async def test_worker_rehydrates_replay_request_and_dispatches_delivery_intent()
     )
     event = outbox_event(
         "replay.requested.v1",
+        aggregate_type="replay_request",
         aggregate_id=replay_request_id,
         payload_json={
             "replay_request_id": str(replay_request_id),
-            "replay_type": "full_pipeline",
-            "root_object_type": "analysis",
-            "root_object_id": str(uuid4()),
+            "replay_type": "delivery",
+            "root_object_type": "notification_plan",
+            "root_object_id": str(notification_plan.notification_plan_id),
             "replay_reason": "operator_recovery",
         },
     )
@@ -43,7 +44,6 @@ async def test_worker_rehydrates_replay_request_and_dispatches_delivery_intent()
     worker = ReplayQueueWorker(config(app_env="replay"), consumer=consumer, service=service)
 
     result = await worker.run_once()
-    await service.handle_replay_trigger_event(event.event_id)
 
     assert result.processed == 1
     assert consumer.acked == ["1-0"]

@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import Protocol
+from uuid import UUID
 
+from .ack_decision import maintenance_result_allows_ack, replay_result_allows_ack
 from .config import MaintenanceConfig
-from .models import DeliveryResultWorkerResult, StreamMessage, WorkerBatchResult
+from .models import DeliveryReplayDecision, DeliveryResultWorkerResult, StreamMessage, WorkerBatchResult
 
 
 class RedisStreamConsumerProtocol(Protocol):
@@ -15,8 +17,8 @@ class RedisStreamConsumerProtocol(Protocol):
 
 
 class MaintenanceServiceProtocol(Protocol):
-    async def handle_maintenance_trigger_event(self, trigger_event_id: str) -> DeliveryResultWorkerResult | None: ...
-    async def handle_replay_trigger_event(self, trigger_event_id: str): ...
+    async def handle_maintenance_trigger_event(self, trigger_event_id: str | UUID) -> DeliveryResultWorkerResult | None: ...
+    async def handle_replay_trigger_event(self, trigger_event_id: str | UUID) -> DeliveryReplayDecision | None: ...
     async def promote_due_retries_once(self, limit: int | None = None) -> int: ...
 
 
@@ -61,17 +63,33 @@ class MaintenanceQueueWorker:
         acked = 0
         for message in messages:
             processed += 1
-            await self._process_message(message)
-            await self._consumer.ack(message.message_id)
-            acked += 1
+            if await self._process_message(message):
+                if await self._ack_message(message):
+                    acked += 1
         return WorkerBatchResult(processed=processed, acked=acked)
 
-    async def _process_message(self, message: StreamMessage) -> None:
-        trigger_event_id = message.fields.get("trigger_event_id")
-        if not trigger_event_id:
+    async def _process_message(self, message: StreamMessage) -> bool:
+        if message.stream != self._config.maintenance_queue_name:
+            self._logger.error("maintenance_stream_queue_mismatch")
+            return False
+        trigger_event_id = _parse_uuid(message.fields.get("trigger_event_id"))
+        if trigger_event_id is None:
             self._logger.error("maintenance_stream_missing_trigger_event_id")
-            return
-        await self._service.handle_maintenance_trigger_event(trigger_event_id)
+            return False
+        try:
+            result = await self._service.handle_maintenance_trigger_event(trigger_event_id)
+        except Exception:
+            self._logger.error("maintenance_handler_failed")
+            return False
+        return maintenance_result_allows_ack(result)
+
+    async def _ack_message(self, message: StreamMessage) -> bool:
+        try:
+            await self._consumer.ack(message.message_id)
+        except Exception:
+            self._logger.error("maintenance_stream_ack_failed")
+            return False
+        return True
 
 
 class ReplayQueueWorker:
@@ -115,17 +133,33 @@ class ReplayQueueWorker:
         acked = 0
         for message in messages:
             processed += 1
-            await self._process_message(message)
-            await self._consumer.ack(message.message_id)
-            acked += 1
+            if await self._process_message(message):
+                if await self._ack_message(message):
+                    acked += 1
         return WorkerBatchResult(processed=processed, acked=acked)
 
-    async def _process_message(self, message: StreamMessage) -> None:
-        trigger_event_id = message.fields.get("trigger_event_id")
-        if not trigger_event_id:
+    async def _process_message(self, message: StreamMessage) -> bool:
+        if message.stream != self._config.replay_queue_name:
+            self._logger.error("maintenance_replay_stream_queue_mismatch")
+            return False
+        trigger_event_id = _parse_uuid(message.fields.get("trigger_event_id"))
+        if trigger_event_id is None:
             self._logger.error("maintenance_replay_stream_missing_trigger_event_id")
-            return
-        await self._service.handle_replay_trigger_event(trigger_event_id)
+            return False
+        try:
+            result = await self._service.handle_replay_trigger_event(trigger_event_id)
+        except Exception:
+            self._logger.error("maintenance_replay_handler_failed")
+            return False
+        return replay_result_allows_ack(result)
+
+    async def _ack_message(self, message: StreamMessage) -> bool:
+        try:
+            await self._consumer.ack(message.message_id)
+        except Exception:
+            self._logger.error("maintenance_replay_stream_ack_failed")
+            return False
+        return True
 
 
 class DueRetryPromotionWorker:
@@ -163,3 +197,10 @@ class DueRetryPromotionWorker:
     async def run_once(self) -> WorkerBatchResult:
         processed = await self._service.promote_due_retries_once()
         return WorkerBatchResult(processed=processed, acked=0)
+
+
+def _parse_uuid(value: object) -> UUID | None:
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None

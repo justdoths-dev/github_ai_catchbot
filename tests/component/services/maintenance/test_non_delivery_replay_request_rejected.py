@@ -44,6 +44,7 @@ async def test_non_delivery_replay_request_is_rejected_without_notification_inte
     )
     event = outbox_event(
         "replay.requested.v1",
+        aggregate_type="replay_request",
         aggregate_id=replay_request_id,
         payload_json={
             "replay_request_id": str(replay_request_id),
@@ -85,6 +86,7 @@ async def test_delivery_replay_request_missing_notification_plan_fails_without_n
     )
     event = outbox_event(
         "replay.requested.v1",
+        aggregate_type="replay_request",
         aggregate_id=replay_request_id,
         payload_json={
             "replay_request_id": str(replay_request_id),

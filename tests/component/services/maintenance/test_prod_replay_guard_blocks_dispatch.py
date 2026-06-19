@@ -31,6 +31,7 @@ def _prepare_valid_delivery_replay(repository: FakeRepository):
     )
     event = outbox_event(
         "replay.requested.v1",
+        aggregate_type="replay_request",
         aggregate_id=replay_request_id,
         payload_json={
             "replay_request_id": str(replay_request_id),

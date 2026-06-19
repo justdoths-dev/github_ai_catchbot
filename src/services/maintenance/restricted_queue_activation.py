@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 from uuid import UUID
 
+from .ack_decision import maintenance_result_allows_ack, replay_result_allows_ack
 from .delivery_replay import REPLAY_REQUESTED_EVENT_TYPE
 from .delivery_retry import DELIVERY_RESULT_EVENT_TYPE, MAINTENANCE_QUEUE_NAME
 from .models import DeliveryReplayDecision, DeliveryResultWorkerResult, OutboxEvent, StreamMessage
@@ -178,12 +179,12 @@ async def _process_message(
     try:
         if request.queue_name == MAINTENANCE_QUEUE_NAME:
             result = await service.handle_maintenance_trigger_event(trigger_event_id)
-            handled = _maintenance_result_allows_ack(result)
+            handled = maintenance_result_allows_ack(result)
             reason_code = result.reason_code if result is not None else "handler_returned_none"
             action = result.action if result is not None else "handle"
         else:
             replay_result = await service.handle_replay_trigger_event(trigger_event_id)
-            handled = replay_result is not None and replay_result.action == "emit_replay_intent"
+            handled = replay_result_allows_ack(replay_result)
             reason_code = replay_result.reason_code if replay_result is not None else "handler_returned_none"
             action = replay_result.action if replay_result is not None else "handle"
     except Exception:
@@ -255,14 +256,6 @@ def _request_gate_error(request: RestrictedQueueActivationRequest, mode: str) ->
     if request.queue_name == REPLAY_QUEUE_NAME and request.expected_event_type != REPLAY_REQUESTED_EVENT_TYPE:
         return "expected_event_type_mismatch"
     return None
-
-
-def _maintenance_result_allows_ack(result: DeliveryResultWorkerResult | None) -> bool:
-    if result is None or not result.processed:
-        return False
-    if result.classification == "identity_invalid" or result.action == "fail_closed":
-        return False
-    return True
 
 
 def _replay_contract_error(request: RestrictedQueueActivationRequest, event: OutboxEvent) -> str | None:
