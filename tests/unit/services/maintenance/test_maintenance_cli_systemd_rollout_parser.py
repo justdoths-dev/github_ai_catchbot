@@ -13,6 +13,7 @@ from services.maintenance.main import build_parser
         ("start", "start"),
         ("proof", None),
         ("rollback", "rollback"),
+        ("diagnose", None),
     ],
 )
 def test_parser_accepts_systemd_rollout_modes(mode: str, confirm: str | None) -> None:

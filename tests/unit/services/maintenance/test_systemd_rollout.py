@@ -4,12 +4,21 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+import pytest
+
 from services.maintenance.systemd_rollout import (
+    SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES,
     SERVICE_NAME,
+    LocalUserSystemdAdapter,
+    SystemdAdapterError,
+    SystemdDiagnosticRequest,
+    SystemdDiagnosticState,
     SystemdReadback,
     SystemdRolloutRequest,
     SystemdUnitPlan,
     build_systemd_unit_plan,
+    parse_systemd_show_properties,
+    run_systemd_diagnostic,
     run_systemd_rollout,
 )
 
@@ -63,6 +72,21 @@ class FakeSystemdAdapter:
         )
 
 
+class FakeDiagnosticAdapter:
+    def __init__(self, state: SystemdDiagnosticState) -> None:
+        self.state = state
+        self.calls: list[str] = []
+
+    def diagnostic_state(self, unit_name: str) -> SystemdDiagnosticState:
+        self.calls.append(unit_name)
+        return self.state
+
+
+class FailingDiagnosticAdapter:
+    def diagnostic_state(self, unit_name: str) -> SystemdDiagnosticState:
+        raise SystemdAdapterError("systemctl_show_failed")
+
+
 def _request(
     tmp_path: Path,
     *,
@@ -98,6 +122,17 @@ def _request(
         runtime_env_file=runtime_env_file.resolve(),
         systemd_user_dir=systemd_user_dir.resolve(),
         dry_run=mode in {"plan", "proof"},
+    )
+
+
+def _diagnostic_request(tmp_path: Path, *, target: str = "maintenance-worker") -> SystemdDiagnosticRequest:
+    runtime_env_file = tmp_path / "sentinel-runtime-secret.env"
+    systemd_user_dir = tmp_path / "user-systemd"
+    systemd_user_dir.mkdir(parents=True, exist_ok=True)
+    return SystemdDiagnosticRequest(
+        target=target,
+        runtime_env_file=runtime_env_file.resolve(),
+        systemd_user_dir=systemd_user_dir.resolve(),
     )
 
 
@@ -151,6 +186,7 @@ def test_plan_report_omits_runtime_env_path_and_secret_values(tmp_path: Path) ->
 
     assert report.redactions_applied["runtime_env_path_omitted"] is True
     assert str(request.runtime_env_file) not in output
+    assert plan_unit_content_absent(output)
     assert "sentinel-runtime-secret" not in output
     assert "sentinel-db-secret" not in output
     assert "sentinel-redis-secret" not in output
@@ -343,8 +379,192 @@ def test_service_unit_uses_environment_file_without_shell_or_broad_permissions(t
     plan = build_systemd_unit_plan(_request(tmp_path, mode="plan"))
 
     assert "EnvironmentFile=" in plan.service_unit_content
+    assert "Environment=PYTHONPATH=" not in plan.service_unit_content
+    assert "PYTHONPATH=" not in plan.service_unit_content
     assert "ExecStart=" in plan.service_unit_content
     assert "/bin/sh" not in plan.service_unit_content
     assert " source " not in plan.service_unit_content
+    assert " cat " not in plan.service_unit_content
+    assert " export " not in plan.service_unit_content
+    assert "printenv" not in plan.service_unit_content
+    assert "chmod" not in plan.service_unit_content
+    assert "chown" not in plan.service_unit_content
     assert "User=" not in plan.service_unit_content
     assert "Group=" not in plan.service_unit_content
+
+
+def test_diagnostic_invalid_target_blocks_before_env_file_checks(tmp_path: Path) -> None:
+    request = _diagnostic_request(tmp_path, target="other-target")
+    adapter = FakeDiagnosticAdapter(
+        SystemdDiagnosticState(
+            service_file_present=True,
+            service_enabled=True,
+            service_active=True,
+        )
+    )
+
+    report = run_systemd_diagnostic(request, adapter=adapter)
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.schema_version == "maintenance_systemd_diagnostic_report_v1"
+    assert report.status == "blocked"
+    assert report.reason_code == "target_not_allowed"
+    assert adapter.calls == []
+    assert str(request.runtime_env_file) not in output
+    assert "sentinel-runtime-secret" not in output
+
+
+def test_diagnostic_reads_exact_service_only_and_reports_active_state(tmp_path: Path) -> None:
+    state = SystemdDiagnosticState(
+        service_file_present=True,
+        service_enabled=True,
+        service_active=True,
+        load_state="loaded",
+        active_state="active",
+        sub_state="running",
+        result="success",
+        exec_main_code=0,
+        exec_main_status=0,
+        n_restarts=0,
+        unit_file_state="enabled",
+    )
+    adapter = FakeDiagnosticAdapter(state)
+
+    report = run_systemd_diagnostic(_diagnostic_request(tmp_path), adapter=adapter)
+
+    assert report.status == "pass"
+    assert report.reason_code is None
+    assert report.service_name == SERVICE_NAME
+    assert report.service_file_present is True
+    assert report.service_enabled is True
+    assert report.service_active is True
+    assert report.load_state == "loaded"
+    assert report.active_state == "active"
+    assert report.restart_likely is False
+    assert report.exited_after_start_likely is False
+    assert adapter.calls == [SERVICE_NAME]
+
+
+def test_diagnostic_flags_service_that_exited_after_start(tmp_path: Path) -> None:
+    state = SystemdDiagnosticState(
+        service_file_present=True,
+        service_enabled=True,
+        service_active=False,
+        load_state="loaded",
+        active_state="inactive",
+        sub_state="dead",
+        result="exit-code",
+        exec_main_code=1,
+        exec_main_status=1,
+        n_restarts=2,
+        unit_file_state="enabled",
+    )
+
+    report = run_systemd_diagnostic(_diagnostic_request(tmp_path), adapter=FakeDiagnosticAdapter(state))
+
+    assert report.status == "blocked"
+    assert report.reason_code == "service_exited_after_start"
+    assert report.restart_likely is True
+    assert report.exited_after_start_likely is True
+
+
+def test_diagnostic_redacts_systemctl_failure_output_paths_and_journal_text(tmp_path: Path) -> None:
+    request = _diagnostic_request(tmp_path)
+
+    report = run_systemd_diagnostic(request, adapter=FailingDiagnosticAdapter())
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "failed"
+    assert report.reason_code == "systemctl_show_failed"
+    assert str(request.runtime_env_file) not in output
+    assert str(request.systemd_user_dir) not in output
+    assert "sentinel-secret" not in output
+    assert "journal body sentinel" not in output
+    assert report.redactions_applied["systemctl_stderr_omitted"] is True
+    assert report.redactions_applied["journal_output_omitted"] is True
+
+
+def test_parse_systemd_show_properties_allows_only_safe_properties_and_redacts_fragment_path() -> None:
+    output = "\n".join(
+        [
+            "LoadState=loaded",
+            "ActiveState=inactive",
+            "SubState=dead",
+            "Result=exit-code",
+            "ExecMainCode=1",
+            "ExecMainStatus=1",
+            "NRestarts=2",
+            "UnitFileState=enabled",
+            "FragmentPath=/home/dev/private/github-ai-catchbot-maintenance.service",
+            "Environment=DATABASE_URL=sentinel-secret",
+            "ExecStart=/bin/sh -c sentinel-secret",
+            "StatusText=journal body sentinel",
+        ]
+    )
+
+    properties = parse_systemd_show_properties(output)
+    serialized = json.dumps(properties, sort_keys=True)
+
+    assert set(properties) == set(SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES)
+    assert properties["FragmentPath"] == "present"
+    assert "/home/dev/private" not in serialized
+    assert "sentinel-secret" not in serialized
+    assert "journal body sentinel" not in serialized
+
+
+def test_local_diagnostic_uses_exact_user_systemctl_show_allowlist(monkeypatch, tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(args, check, stdout, stderr, text):
+        del check, stdout, stderr, text
+        calls.append(list(args))
+
+        class Result:
+            returncode = 0
+            stdout = "\n".join(
+                [
+                    "LoadState=loaded",
+                    "ActiveState=active",
+                    "SubState=running",
+                    "Result=success",
+                    "ExecMainCode=0",
+                    "ExecMainStatus=0",
+                    "NRestarts=0",
+                    "UnitFileState=enabled",
+                    "FragmentPath=/redacted/path",
+                    "Environment=DATABASE_URL=sentinel-secret",
+                ]
+            )
+
+        return Result()
+
+    monkeypatch.setattr("services.maintenance.systemd_rollout.subprocess.run", fake_run)
+    adapter = LocalUserSystemdAdapter(tmp_path)
+
+    state = adapter.diagnostic_state(SERVICE_NAME)
+
+    assert state.service_file_present is True
+    assert calls[0] == [
+        "systemctl",
+        "--user",
+        "show",
+        SERVICE_NAME,
+        *(f"--property={property_name}" for property_name in SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES),
+    ]
+    assert calls[1] == ["systemctl", "--user", "is-enabled", SERVICE_NAME]
+    assert calls[2] == ["systemctl", "--user", "is-active", SERVICE_NAME]
+
+
+def test_local_diagnostic_rejects_non_exact_service_without_systemctl(monkeypatch, tmp_path: Path) -> None:
+    def fail_run(*args, **kwargs):
+        raise AssertionError("systemctl must not run for non-exact diagnostic unit")
+
+    monkeypatch.setattr("services.maintenance.systemd_rollout.subprocess.run", fail_run)
+    adapter = LocalUserSystemdAdapter(tmp_path)
+
+    with pytest.raises(SystemdAdapterError):
+        adapter.diagnostic_state("other.service")
+
+
+def plan_unit_content_absent(output: str) -> bool:
+    return "EnvironmentFile=" not in output and "ExecStart=" not in output and "PYTHONPATH=" not in output

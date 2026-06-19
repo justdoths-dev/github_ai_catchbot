@@ -7,11 +7,24 @@ from typing import Protocol
 
 
 SCHEMA_VERSION = "maintenance_systemd_rollout_report_v1"
+DIAGNOSTIC_SCHEMA_VERSION = "maintenance_systemd_diagnostic_report_v1"
 TARGET_MAINTENANCE_WORKER = "maintenance-worker"
 SERVICE_NAME = "github-ai-catchbot-maintenance.service"
 TIMER_NAME = "github-ai-catchbot-maintenance.timer"
 WORKER_MODULE = "src.services.maintenance.main"
 WORKER_COMMAND = "worker"
+
+SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "Result",
+    "ExecMainCode",
+    "ExecMainStatus",
+    "NRestarts",
+    "UnitFileState",
+    "FragmentPath",
+)
 
 _ALLOWED_MODES = {"plan", "install", "start", "proof", "rollback"}
 _WRITE_MODES = {"install", "start", "rollback"}
@@ -32,6 +45,14 @@ class SystemdRolloutRequest:
     service_name: str = SERVICE_NAME
     timer_name: str | None = None
     dry_run: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class SystemdDiagnosticRequest:
+    target: str
+    runtime_env_file: Path
+    systemd_user_dir: Path
+    service_name: str = SERVICE_NAME
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +100,44 @@ class SystemdRolloutReport:
     redactions_applied: dict[str, bool] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class SystemdDiagnosticState:
+    service_file_present: bool
+    service_enabled: bool
+    service_active: bool
+    load_state: str | None = None
+    active_state: str | None = None
+    sub_state: str | None = None
+    result: str | None = None
+    exec_main_code: int | None = None
+    exec_main_status: int | None = None
+    n_restarts: int | None = None
+    unit_file_state: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SystemdDiagnosticReport:
+    schema_version: str
+    target: str
+    service_name: str
+    status: str
+    reason_code: str | None
+    service_file_present: bool
+    service_enabled: bool
+    service_active: bool
+    load_state: str | None
+    active_state: str | None
+    sub_state: str | None
+    result: str | None
+    exec_main_code: int | None
+    exec_main_status: int | None
+    n_restarts: int | None
+    unit_file_state: str | None
+    restart_likely: bool
+    exited_after_start_likely: bool
+    redactions_applied: dict[str, bool] = field(default_factory=dict)
+
+
 class SystemdRolloutAdapter(Protocol):
     def write_unit_file(self, unit_name: str, content: str) -> None: ...
     def remove_unit_file(self, unit_name: str) -> None: ...
@@ -88,6 +147,10 @@ class SystemdRolloutAdapter(Protocol):
     def start_unit(self, unit_name: str) -> None: ...
     def stop_unit(self, unit_name: str) -> None: ...
     def readback(self, plan: SystemdUnitPlan) -> SystemdReadback: ...
+
+
+class SystemdDiagnosticAdapter(Protocol):
+    def diagnostic_state(self, unit_name: str) -> SystemdDiagnosticState: ...
 
 
 class SystemdAdapterError(RuntimeError):
@@ -140,6 +203,23 @@ class LocalUserSystemdAdapter:
             rollback_plan_available=service_file_present or timer_file_present,
         )
 
+    def diagnostic_state(self, unit_name: str) -> SystemdDiagnosticState:
+        checked = self._checked_service_name(unit_name)
+        properties = self._systemctl_show_allowed_properties(checked)
+        return SystemdDiagnosticState(
+            service_file_present=_service_file_present_from_properties(properties),
+            service_enabled=self._systemctl_bool("is-enabled", checked),
+            service_active=self._systemctl_bool("is-active", checked),
+            load_state=_blank_to_none(properties.get("LoadState")),
+            active_state=_blank_to_none(properties.get("ActiveState")),
+            sub_state=_blank_to_none(properties.get("SubState")),
+            result=_blank_to_none(properties.get("Result")),
+            exec_main_code=_safe_int(properties.get("ExecMainCode")),
+            exec_main_status=_safe_int(properties.get("ExecMainStatus")),
+            n_restarts=_safe_int(properties.get("NRestarts")),
+            unit_file_state=_blank_to_none(properties.get("UnitFileState")),
+        )
+
     def _unit_path(self, unit_name: str) -> Path:
         checked = self._checked_unit_name(unit_name)
         return self._systemd_user_dir / checked
@@ -147,6 +227,14 @@ class LocalUserSystemdAdapter:
     @staticmethod
     def _checked_unit_name(unit_name: str) -> str:
         if unit_name not in {SERVICE_NAME, TIMER_NAME}:
+            raise SystemdAdapterError("unit_name_not_allowed")
+        if "/" in unit_name or "\\" in unit_name:
+            raise SystemdAdapterError("unit_name_not_allowed")
+        return unit_name
+
+    @staticmethod
+    def _checked_service_name(unit_name: str) -> str:
+        if unit_name != SERVICE_NAME:
             raise SystemdAdapterError("unit_name_not_allowed")
         if "/" in unit_name or "\\" in unit_name:
             raise SystemdAdapterError("unit_name_not_allowed")
@@ -178,6 +266,27 @@ class LocalUserSystemdAdapter:
             raise SystemdAdapterError("systemctl_invocation_failed") from exc
         if result.returncode != 0 and not allow_failure:
             raise SystemdAdapterError("systemctl_operation_failed")
+
+    def _systemctl_show_allowed_properties(self, unit_name: str) -> dict[str, str]:
+        try:
+            result = subprocess.run(
+                [
+                    "systemctl",
+                    "--user",
+                    "show",
+                    self._checked_service_name(unit_name),
+                    *(f"--property={property_name}" for property_name in SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES),
+                ],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError as exc:
+            raise SystemdAdapterError("systemctl_invocation_failed") from exc
+        if result.returncode != 0:
+            raise SystemdAdapterError("systemctl_show_failed")
+        return parse_systemd_show_properties(result.stdout)
 
 
 def build_systemd_unit_plan(request: SystemdRolloutRequest) -> SystemdUnitPlan:
@@ -218,6 +327,29 @@ def build_systemd_unit_plan(request: SystemdRolloutRequest) -> SystemdUnitPlan:
         restart_policy="on-failure",
         restart_sec=10,
     )
+
+
+def run_systemd_diagnostic(
+    request: SystemdDiagnosticRequest,
+    *,
+    adapter: SystemdDiagnosticAdapter | None = None,
+) -> SystemdDiagnosticReport:
+    request_error = systemd_diagnostic_request_error(request)
+    if request_error is not None:
+        return _diagnostic_report(request, status="blocked", reason_code=request_error)
+
+    systemd = adapter or LocalUserSystemdAdapter(request.systemd_user_dir)
+    try:
+        state = systemd.diagnostic_state(request.service_name)
+    except SystemdAdapterError as exc:
+        return _diagnostic_report(
+            request,
+            status="failed",
+            reason_code=_diagnostic_adapter_reason_code(exc),
+        )
+
+    status, reason_code = _diagnostic_status_and_reason(state)
+    return _diagnostic_report(request, status=status, reason_code=reason_code, state=state)
 
 
 def run_systemd_rollout(
@@ -386,6 +518,18 @@ def systemd_rollout_request_error(request: SystemdRolloutRequest) -> str | None:
     return None
 
 
+def systemd_diagnostic_request_error(request: SystemdDiagnosticRequest) -> str | None:
+    if request.target != TARGET_MAINTENANCE_WORKER:
+        return "target_not_allowed"
+    if request.service_name != SERVICE_NAME:
+        return "service_name_not_allowed"
+    if not request.runtime_env_file.is_absolute():
+        return "runtime_env_file_not_absolute"
+    if not request.systemd_user_dir.is_absolute():
+        return "systemd_user_dir_not_absolute"
+    return None
+
+
 def _report(
     request: SystemdRolloutRequest,
     *,
@@ -442,6 +586,103 @@ def _report(
     )
 
 
+def _diagnostic_report(
+    request: SystemdDiagnosticRequest,
+    *,
+    status: str,
+    reason_code: str | None,
+    state: SystemdDiagnosticState | None = None,
+) -> SystemdDiagnosticReport:
+    restart_likely = _restart_likely(state)
+    exited_after_start_likely = _exited_after_start_likely(state)
+    return SystemdDiagnosticReport(
+        schema_version=DIAGNOSTIC_SCHEMA_VERSION,
+        target=request.target,
+        service_name=request.service_name,
+        status=status,
+        reason_code=reason_code,
+        service_file_present=bool(state.service_file_present) if state else False,
+        service_enabled=bool(state.service_enabled) if state else False,
+        service_active=bool(state.service_active) if state else False,
+        load_state=state.load_state if state else None,
+        active_state=state.active_state if state else None,
+        sub_state=state.sub_state if state else None,
+        result=state.result if state else None,
+        exec_main_code=state.exec_main_code if state else None,
+        exec_main_status=state.exec_main_status if state else None,
+        n_restarts=state.n_restarts if state else None,
+        unit_file_state=state.unit_file_state if state else None,
+        restart_likely=restart_likely,
+        exited_after_start_likely=exited_after_start_likely,
+        redactions_applied={
+            "runtime_env_path_omitted": True,
+            "runtime_env_values_omitted": True,
+            "secret_values_omitted": True,
+            "systemd_user_dir_omitted": True,
+            "unit_file_content_omitted": True,
+            "systemctl_stdout_limited_to_allowed_properties": True,
+            "systemctl_stderr_omitted": True,
+            "fragment_path_redacted_to_presence": True,
+            "journal_output_omitted": True,
+            "exception_body_omitted": True,
+        },
+    )
+
+
+def parse_systemd_show_properties(output: str) -> dict[str, str]:
+    properties: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        if "=" not in raw_line:
+            continue
+        key, value = raw_line.split("=", 1)
+        if key not in SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES:
+            continue
+        value = value.strip()
+        if key == "FragmentPath":
+            properties[key] = "present" if value else ""
+        else:
+            properties[key] = value
+    return properties
+
+
+def _service_file_present_from_properties(properties: dict[str, str]) -> bool:
+    return properties.get("LoadState") == "loaded" or properties.get("FragmentPath") == "present"
+
+
+def _diagnostic_status_and_reason(state: SystemdDiagnosticState) -> tuple[str, str | None]:
+    if not state.service_file_present:
+        return "blocked", "service_file_missing"
+    if not state.service_enabled:
+        return "blocked", "service_not_enabled"
+    if not state.service_active:
+        if _exited_after_start_likely(state):
+            return "blocked", "service_exited_after_start"
+        return "blocked", "service_not_active"
+    return "pass", None
+
+
+def _restart_likely(state: SystemdDiagnosticState | None) -> bool:
+    if state is None:
+        return False
+    if state.n_restarts is not None and state.n_restarts > 0:
+        return True
+    return state.sub_state == "auto-restart"
+
+
+def _exited_after_start_likely(state: SystemdDiagnosticState | None) -> bool:
+    if state is None or state.service_active or not state.service_file_present:
+        return False
+    if state.active_state in {"inactive", "failed"} and state.sub_state in {"dead", "failed", "auto-restart"}:
+        return True
+    if state.result and state.result != "success":
+        return True
+    if state.exec_main_code not in {None, 0}:
+        return True
+    if state.exec_main_status not in {None, 0}:
+        return True
+    return False
+
+
 def _systemd_value(value: Path) -> str:
     text = str(value)
     return _quote_systemd(text) if _needs_systemd_quotes(text) else text
@@ -460,6 +701,22 @@ def _quote_systemd(value: str) -> str:
     return f'"{escaped}"'
 
 
+def _blank_to_none(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _safe_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value.strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def _adapter_reason_code(exc: SystemdAdapterError) -> str:
     reason_code = str(exc)
     if reason_code in {
@@ -467,6 +724,18 @@ def _adapter_reason_code(exc: SystemdAdapterError) -> str:
         "unit_file_remove_failed",
         "systemctl_invocation_failed",
         "systemctl_operation_failed",
+        "systemctl_show_failed",
+        "unit_name_not_allowed",
+    }:
+        return reason_code
+    return "systemd_adapter_failed"
+
+
+def _diagnostic_adapter_reason_code(exc: SystemdAdapterError) -> str:
+    reason_code = str(exc)
+    if reason_code in {
+        "systemctl_invocation_failed",
+        "systemctl_show_failed",
         "unit_name_not_allowed",
     }:
         return reason_code

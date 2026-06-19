@@ -57,7 +57,9 @@ from .repositories import MaintenanceRepository
 from .service import MaintenanceService
 from .systemd_rollout import (
     SERVICE_NAME as SYSTEMD_ROLLOUT_SERVICE_NAME,
+    SystemdDiagnosticRequest,
     SystemdRolloutRequest,
+    run_systemd_diagnostic,
     run_systemd_rollout,
 )
 from .worker import DueRetryPromotionWorker, MaintenanceQueueWorker, ReplayQueueWorker
@@ -161,7 +163,11 @@ def build_parser() -> argparse.ArgumentParser:
     controlled_worker.add_argument("--env-file", required=True)
 
     systemd_rollout = subcommands.add_parser("systemd-rollout")
-    systemd_rollout.add_argument("--mode", choices=["plan", "install", "start", "proof", "rollback"], required=True)
+    systemd_rollout.add_argument(
+        "--mode",
+        choices=["plan", "install", "start", "proof", "rollback", "diagnose"],
+        required=True,
+    )
     systemd_rollout.add_argument("--target", required=True)
     systemd_rollout.add_argument("--confirm", choices=["install", "start", "rollback"], default=None)
     systemd_rollout.add_argument("--env-file", required=True)
@@ -1374,6 +1380,16 @@ async def _run_controlled_worker_operation(config: MaintenanceConfig, args: argp
 
 
 async def _run_systemd_rollout_operation(args: argparse.Namespace) -> int:
+    if args.mode == "diagnose":
+        request = _systemd_diagnostic_request(args)
+        report = run_systemd_diagnostic(request)
+        print(_to_json(asdict(report)))
+        if report.status == "pass":
+            return 0
+        if report.status == "failed":
+            return 1
+        return 2
+
     request = _systemd_rollout_request(args)
     report = run_systemd_rollout(request)
     print(_to_json(asdict(report)))
@@ -1382,6 +1398,17 @@ async def _run_systemd_rollout_operation(args: argparse.Namespace) -> int:
     if report.status == "failed":
         return 1
     return 2
+
+
+def _systemd_diagnostic_request(args: argparse.Namespace) -> SystemdDiagnosticRequest:
+    systemd_user_dir = _path_arg_or_default(args.systemd_user_dir, Path.home() / ".config/systemd/user")
+    runtime_env_file = Path(args.env_file).expanduser().resolve()
+    return SystemdDiagnosticRequest(
+        target=args.target,
+        runtime_env_file=runtime_env_file,
+        systemd_user_dir=systemd_user_dir,
+        service_name=SYSTEMD_ROLLOUT_SERVICE_NAME,
+    )
 
 
 def _systemd_rollout_request(args: argparse.Namespace) -> SystemdRolloutRequest:
