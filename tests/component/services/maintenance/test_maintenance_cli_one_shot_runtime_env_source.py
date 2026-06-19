@@ -212,6 +212,37 @@ async def test_missing_env_file_returns_sanitized_failure_without_config_load(mo
 
 
 @pytest.mark.asyncio
+async def test_foreground_smoke_missing_confirm_blocks_before_env_file_load(monkeypatch, tmp_path, capsys) -> None:
+    _clear_runtime_env(monkeypatch)
+    missing_env_file = tmp_path / "missing-runtime.env"
+    monkeypatch.setattr(maintenance_main.MaintenanceConfig, "from_env", classmethod(_fail_from_env))
+
+    exit_code = await maintenance_main._run(
+        [
+            "foreground-smoke",
+            "--mode",
+            "execute",
+            "--ticks",
+            "1",
+            "--max-messages",
+            "1",
+            "--env-file",
+            str(missing_env_file),
+        ]
+    )
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert exit_code == 2
+    assert payload["schema_version"] == "maintenance_foreground_smoke_report_v1"
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "run_confirm_missing"
+    assert payload["ticks_requested"] == 1
+    assert payload["ticks_completed"] == 0
+    _assert_no_secret_leaks(output, missing_env_file)
+
+
+@pytest.mark.asyncio
 async def test_env_file_without_runtime_keys_returns_sanitized_failure(monkeypatch, tmp_path, capsys) -> None:
     _clear_runtime_env(monkeypatch)
     env_file = tmp_path / "runtime.env"

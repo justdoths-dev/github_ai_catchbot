@@ -28,6 +28,12 @@ from .delivery_gate_preflight import (
 from .delivery_gate_preflight_invocation import run_delivery_gate_preflight_invocation_proof
 from .delivery_replay import REPLAY_REQUESTED_EVENT_TYPE
 from .delivery_retry import DELIVERY_RESULT_EVENT_TYPE
+from .foreground_smoke import (
+    ForegroundSmokeReport,
+    ForegroundSmokeRequest,
+    foreground_smoke_request_error,
+    run_foreground_smoke,
+)
 from .mvp_readiness import run_restricted_live_mvp_readiness
 from .redis_streams import RedisStreamConsumer
 from .restricted_queue_activation import (
@@ -125,6 +131,13 @@ def build_parser() -> argparse.ArgumentParser:
         once.add_argument("--max-messages", type=int, default=1)
         once.add_argument("--confirm", choices=["ack"], default=None)
         once.add_argument("--env-file", required=True)
+
+    foreground_smoke = subcommands.add_parser("foreground-smoke")
+    foreground_smoke.add_argument("--mode", choices=["execute"], required=True)
+    foreground_smoke.add_argument("--ticks", type=int, default=1)
+    foreground_smoke.add_argument("--max-messages", type=int, default=1)
+    foreground_smoke.add_argument("--confirm", choices=["run"], default=None)
+    foreground_smoke.add_argument("--env-file", required=True)
 
     gate = subcommands.add_parser("delivery-gate")
     gate.add_argument("--mode", choices=["restricted", "full"], required=True)
@@ -780,6 +793,7 @@ def _one_shot_command_uses_explicit_env_file(command: str, args: argparse.Namesp
         "queue-activate",
         "queue-group-bootstrap",
         "worker-once",
+        "foreground-smoke",
     } and bool(getattr(args, "env_file", None))
 
 
@@ -1194,6 +1208,73 @@ async def _run_worker_once_operation(config: MaintenanceConfig, args: argparse.N
         await engine.dispose()
 
 
+async def _run_foreground_smoke_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
+    request = _foreground_smoke_request(config, args)
+
+    from redis.asyncio import Redis  # type: ignore[import-not-found]
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
+
+    logger = _build_logger(config.log_level)
+    engine = create_async_engine(config.database_url, future=True)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    redis_client = Redis.from_url(config.redis_url, decode_responses=True)
+    maintenance_consumer = RedisStreamConsumer(
+        redis_client,
+        queue_name=config.maintenance_queue_name,
+        consumer_group=config.maintenance_consumer_group,
+        consumer_name=config.maintenance_consumer_name,
+        block_ms=config.block_ms,
+        batch_size=request.max_messages,
+    )
+    replay_consumer = RedisStreamConsumer(
+        redis_client,
+        queue_name=config.replay_queue_name,
+        consumer_group=config.replay_consumer_group,
+        consumer_name=config.replay_consumer_name,
+        block_ms=config.block_ms,
+        batch_size=request.max_messages,
+    )
+
+    class SessionBackedForegroundSmokeService:
+        async def handle_maintenance_trigger_event(self, trigger_event_id: UUID):
+            async with session_factory.begin() as session:
+                service = MaintenanceService(config, repository=MaintenanceRepository(session), logger=logger)
+                return await service.handle_maintenance_trigger_event(trigger_event_id)
+
+        async def handle_replay_trigger_event(self, trigger_event_id: UUID):
+            async with session_factory.begin() as session:
+                service = MaintenanceService(config, repository=MaintenanceRepository(session), logger=logger)
+                return await service.handle_replay_trigger_event(trigger_event_id)
+
+        async def promote_due_retries_once(self, limit: int | None = None) -> int:
+            async with session_factory.begin() as session:
+                service = MaintenanceService(config, repository=MaintenanceRepository(session), logger=logger)
+                return await service.promote_due_retries_once(limit=limit)
+
+    try:
+        report = await run_foreground_smoke(
+            request,
+            config=config,
+            maintenance_consumer=maintenance_consumer,
+            replay_consumer=replay_consumer,
+            service=SessionBackedForegroundSmokeService(),
+            logger=logger,
+        )
+        print(_to_json(asdict(report)))
+        if report.status == "pass":
+            return 0
+        if report.status == "failed":
+            return 1
+        return 2
+    finally:
+        close = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
+        if close is not None:
+            maybe_awaitable = close()
+            if asyncio.iscoroutine(maybe_awaitable):
+                await maybe_awaitable
+        await engine.dispose()
+
+
 def _queue_activate_request(config: MaintenanceConfig, args: argparse.Namespace) -> RestrictedQueueActivationRequest:
     if args.activation_queue == "maintenance":
         queue_name = config.maintenance_queue_name
@@ -1259,6 +1340,68 @@ def _worker_once_request_error(args: argparse.Namespace) -> str | None:
     if args.mode == "execute" and args.confirm != "ack":
         return "ack_confirm_missing"
     return None
+
+
+def _foreground_smoke_request(config: MaintenanceConfig, args: argparse.Namespace) -> ForegroundSmokeRequest:
+    return ForegroundSmokeRequest(
+        mode=args.mode,
+        ticks=int(args.ticks),
+        max_messages=int(args.max_messages),
+        confirm_run=args.mode == "execute" and args.confirm == "run",
+        maintenance_queue_name=config.maintenance_queue_name,
+        maintenance_consumer_group=config.maintenance_consumer_group,
+        replay_queue_name=config.replay_queue_name,
+        replay_consumer_group=config.replay_consumer_group,
+    )
+
+
+def _foreground_smoke_request_error(args: argparse.Namespace) -> str | None:
+    request = ForegroundSmokeRequest(
+        mode=args.mode,
+        ticks=int(args.ticks),
+        max_messages=int(args.max_messages),
+        confirm_run=args.mode == "execute" and args.confirm == "run",
+        maintenance_queue_name="q.maintenance",
+        maintenance_consumer_group="maintenance",
+        replay_queue_name="q.replay",
+        replay_consumer_group="maintenance-replay",
+    )
+    return foreground_smoke_request_error(request)
+
+
+def _foreground_smoke_blocked_report(args: argparse.Namespace, reason_code: str) -> ForegroundSmokeReport:
+    request = ForegroundSmokeRequest(
+        mode=args.mode,
+        ticks=int(args.ticks),
+        max_messages=int(args.max_messages),
+        confirm_run=args.mode == "execute" and args.confirm == "run",
+        maintenance_queue_name="q.maintenance",
+        maintenance_consumer_group="maintenance",
+        replay_queue_name="q.replay",
+        replay_consumer_group="maintenance-replay",
+    )
+    return ForegroundSmokeReport(
+        schema_version="maintenance_foreground_smoke_report_v1",
+        mode=request.mode,
+        status="blocked",
+        ticks_requested=request.ticks,
+        ticks_completed=0,
+        maintenance_processed_count=0,
+        maintenance_acked_count=0,
+        replay_processed_count=0,
+        replay_acked_count=0,
+        due_retry_action_count=0,
+        reason_code=reason_code,
+        redactions_applied={
+            "full_uuid_omitted": True,
+            "full_redis_message_id_omitted": True,
+            "payload_json_omitted": True,
+            "database_url_omitted": True,
+            "redis_url_omitted": True,
+            "runtime_env_values_omitted": True,
+            "exception_body_omitted": True,
+        },
+    )
 
 
 def _worker_once_blocked_report(args: argparse.Namespace, reason_code: str) -> WorkerOnceReport:
@@ -1513,6 +1656,11 @@ async def _run(argv: list[str] | None = None) -> int:
         if request_error is not None:
             print(_to_json(asdict(_worker_once_blocked_report(args, request_error))))
             return 2
+    if command == "foreground-smoke":
+        request_error = _foreground_smoke_request_error(args)
+        if request_error is not None:
+            print(_to_json(asdict(_foreground_smoke_blocked_report(args, request_error))))
+            return 2
     if command == "db-shape-preflight":
         return await _run_db_shape_preflight(args)
     if command == "delivery-gate-preflight":
@@ -1552,6 +1700,8 @@ async def _run(argv: list[str] | None = None) -> int:
         return await _run_worker(config)
     if command == "worker-once":
         return await _run_worker_once_operation(config, args)
+    if command == "foreground-smoke":
+        return await _run_foreground_smoke_operation(config, args)
     if command == "delivery-gate":
         return await _run_delivery_gate(config, args)
     if command == "mvp-readiness":
