@@ -10,6 +10,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - local validation fallback only
     sa = None
 
+from .eligibility import stale_resolution_exclusion_not_exists_sql
 from .models import OutboxEventRow
 
 
@@ -24,20 +25,21 @@ class OutboxRelayRepository:
     async def fetch_pending_batch(self, *, limit: int) -> list[OutboxEventRow]:
         result = await self._session.execute(
             _sql(
-                """
+                f"""
                 SELECT
-                    event_id,
-                    event_type,
-                    aggregate_type,
-                    aggregate_id,
-                    dedupe_key,
-                    payload_json,
-                    status,
-                    fail_count,
-                    created_at
-                FROM event_outbox
-                WHERE status = 'pending'::outbox_status_enum
-                ORDER BY created_at ASC, event_id ASC
+                    eo.event_id,
+                    eo.event_type,
+                    eo.aggregate_type,
+                    eo.aggregate_id,
+                    eo.dedupe_key,
+                    eo.payload_json,
+                    eo.status,
+                    eo.fail_count,
+                    eo.created_at
+                FROM event_outbox eo
+                WHERE eo.status = 'pending'::outbox_status_enum
+                  AND {stale_resolution_exclusion_not_exists_sql("eo")}
+                ORDER BY eo.created_at ASC, eo.event_id ASC
                 LIMIT :limit
                 """
             ),
