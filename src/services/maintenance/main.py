@@ -15,6 +15,12 @@ from uuid import UUID
 from .batch_recovery import prepare_delivery_replay_requests_for_selected_plans
 from .batch_recovery_tool import DeliveryBatchRecoveryTool
 from .config import MaintenanceConfig, MaintenanceConfigurationError
+from .controlled_worker_activation import (
+    ControlledWorkerActivationReport,
+    ControlledWorkerActivationRequest,
+    controlled_worker_activation_request_error,
+    run_controlled_worker_activation,
+)
 from .db_shape_preflight import (
     SCHEMA_VERSION as DB_SHAPE_PREFLIGHT_SCHEMA_VERSION,
     SqlAlchemyDbShapeIntrospectionRepository,
@@ -138,6 +144,15 @@ def build_parser() -> argparse.ArgumentParser:
     foreground_smoke.add_argument("--max-messages", type=int, default=1)
     foreground_smoke.add_argument("--confirm", choices=["run"], default=None)
     foreground_smoke.add_argument("--env-file", required=True)
+
+    controlled_worker = subcommands.add_parser("controlled-worker")
+    controlled_worker.add_argument("--mode", required=True)
+    controlled_worker.add_argument("--max-ticks", type=int, default=3)
+    controlled_worker.add_argument("--max-runtime-sec", type=int, default=30)
+    controlled_worker.add_argument("--max-messages", type=int, default=1)
+    controlled_worker.add_argument("--idle-sleep-ms", type=int, default=100)
+    controlled_worker.add_argument("--confirm", choices=["run"], default=None)
+    controlled_worker.add_argument("--env-file", required=True)
 
     gate = subcommands.add_parser("delivery-gate")
     gate.add_argument("--mode", choices=["restricted", "full"], required=True)
@@ -794,6 +809,7 @@ def _one_shot_command_uses_explicit_env_file(command: str, args: argparse.Namesp
         "queue-group-bootstrap",
         "worker-once",
         "foreground-smoke",
+        "controlled-worker",
     } and bool(getattr(args, "env_file", None))
 
 
@@ -1275,6 +1291,73 @@ async def _run_foreground_smoke_operation(config: MaintenanceConfig, args: argpa
         await engine.dispose()
 
 
+async def _run_controlled_worker_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
+    request = _controlled_worker_request(config, args)
+
+    from redis.asyncio import Redis  # type: ignore[import-not-found]
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
+
+    logger = _build_logger(config.log_level)
+    engine = create_async_engine(config.database_url, future=True)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    redis_client = Redis.from_url(config.redis_url, decode_responses=True)
+    maintenance_consumer = RedisStreamConsumer(
+        redis_client,
+        queue_name=config.maintenance_queue_name,
+        consumer_group=config.maintenance_consumer_group,
+        consumer_name=config.maintenance_consumer_name,
+        block_ms=config.block_ms,
+        batch_size=request.max_messages,
+    )
+    replay_consumer = RedisStreamConsumer(
+        redis_client,
+        queue_name=config.replay_queue_name,
+        consumer_group=config.replay_consumer_group,
+        consumer_name=config.replay_consumer_name,
+        block_ms=config.block_ms,
+        batch_size=request.max_messages,
+    )
+
+    class SessionBackedControlledWorkerService:
+        async def handle_maintenance_trigger_event(self, trigger_event_id: UUID):
+            async with session_factory.begin() as session:
+                service = MaintenanceService(config, repository=MaintenanceRepository(session), logger=logger)
+                return await service.handle_maintenance_trigger_event(trigger_event_id)
+
+        async def handle_replay_trigger_event(self, trigger_event_id: UUID):
+            async with session_factory.begin() as session:
+                service = MaintenanceService(config, repository=MaintenanceRepository(session), logger=logger)
+                return await service.handle_replay_trigger_event(trigger_event_id)
+
+        async def promote_due_retries_once(self, limit: int | None = None) -> int:
+            async with session_factory.begin() as session:
+                service = MaintenanceService(config, repository=MaintenanceRepository(session), logger=logger)
+                return await service.promote_due_retries_once(limit=limit)
+
+    try:
+        report = await run_controlled_worker_activation(
+            request,
+            config=config,
+            maintenance_consumer=maintenance_consumer,
+            replay_consumer=replay_consumer,
+            service=SessionBackedControlledWorkerService(),
+            logger=logger,
+        )
+        print(_to_json(asdict(report)))
+        if report.status == "pass":
+            return 0
+        if report.status == "failed":
+            return 1
+        return 2
+    finally:
+        close = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
+        if close is not None:
+            maybe_awaitable = close()
+            if asyncio.iscoroutine(maybe_awaitable):
+                await maybe_awaitable
+        await engine.dispose()
+
+
 def _queue_activate_request(config: MaintenanceConfig, args: argparse.Namespace) -> RestrictedQueueActivationRequest:
     if args.activation_queue == "maintenance":
         queue_name = config.maintenance_queue_name
@@ -1399,6 +1482,83 @@ def _foreground_smoke_blocked_report(args: argparse.Namespace, reason_code: str)
             "database_url_omitted": True,
             "redis_url_omitted": True,
             "runtime_env_values_omitted": True,
+            "exception_body_omitted": True,
+        },
+    )
+
+
+def _controlled_worker_request(config: MaintenanceConfig, args: argparse.Namespace) -> ControlledWorkerActivationRequest:
+    return ControlledWorkerActivationRequest(
+        mode=args.mode,
+        max_ticks=int(args.max_ticks),
+        max_runtime_sec=int(args.max_runtime_sec),
+        max_messages=int(args.max_messages),
+        idle_sleep_ms=int(args.idle_sleep_ms),
+        confirm_run=args.mode == "execute" and args.confirm == "run",
+        maintenance_queue_name=config.maintenance_queue_name,
+        maintenance_consumer_group=config.maintenance_consumer_group,
+        replay_queue_name=config.replay_queue_name,
+        replay_consumer_group=config.replay_consumer_group,
+    )
+
+
+def _controlled_worker_request_error(args: argparse.Namespace) -> str | None:
+    request = ControlledWorkerActivationRequest(
+        mode=args.mode,
+        max_ticks=int(args.max_ticks),
+        max_runtime_sec=int(args.max_runtime_sec),
+        max_messages=int(args.max_messages),
+        idle_sleep_ms=int(args.idle_sleep_ms),
+        confirm_run=args.mode == "execute" and args.confirm == "run",
+        maintenance_queue_name="q.maintenance",
+        maintenance_consumer_group="maintenance",
+        replay_queue_name="q.replay",
+        replay_consumer_group="maintenance-replay",
+    )
+    return controlled_worker_activation_request_error(request)
+
+
+def _controlled_worker_blocked_report(
+    args: argparse.Namespace,
+    reason_code: str,
+) -> ControlledWorkerActivationReport:
+    request = ControlledWorkerActivationRequest(
+        mode=args.mode,
+        max_ticks=int(args.max_ticks),
+        max_runtime_sec=int(args.max_runtime_sec),
+        max_messages=int(args.max_messages),
+        idle_sleep_ms=int(args.idle_sleep_ms),
+        confirm_run=args.mode == "execute" and args.confirm == "run",
+        maintenance_queue_name="q.maintenance",
+        maintenance_consumer_group="maintenance",
+        replay_queue_name="q.replay",
+        replay_consumer_group="maintenance-replay",
+    )
+    return ControlledWorkerActivationReport(
+        schema_version="maintenance_controlled_worker_activation_report_v1",
+        mode=request.mode,
+        status="blocked",
+        reason_code=reason_code,
+        ticks_requested=request.max_ticks,
+        ticks_completed=0,
+        runtime_limit_sec=request.max_runtime_sec,
+        elapsed_ms=0,
+        maintenance_processed_count=0,
+        maintenance_acked_count=0,
+        replay_processed_count=0,
+        replay_acked_count=0,
+        due_retry_action_count=0,
+        stop_reason="failed",
+        redactions_applied={
+            "full_uuid_omitted": True,
+            "full_redis_message_id_omitted": True,
+            "payload_json_omitted": True,
+            "database_url_omitted": True,
+            "redis_url_omitted": True,
+            "runtime_env_path_omitted": True,
+            "runtime_env_values_omitted": True,
+            "secret_values_omitted": True,
+            "raw_source_text_omitted": True,
             "exception_body_omitted": True,
         },
     )
@@ -1661,6 +1821,11 @@ async def _run(argv: list[str] | None = None) -> int:
         if request_error is not None:
             print(_to_json(asdict(_foreground_smoke_blocked_report(args, request_error))))
             return 2
+    if command == "controlled-worker":
+        request_error = _controlled_worker_request_error(args)
+        if request_error is not None:
+            print(_to_json(asdict(_controlled_worker_blocked_report(args, request_error))))
+            return 2
     if command == "db-shape-preflight":
         return await _run_db_shape_preflight(args)
     if command == "delivery-gate-preflight":
@@ -1702,6 +1867,8 @@ async def _run(argv: list[str] | None = None) -> int:
         return await _run_worker_once_operation(config, args)
     if command == "foreground-smoke":
         return await _run_foreground_smoke_operation(config, args)
+    if command == "controlled-worker":
+        return await _run_controlled_worker_operation(config, args)
     if command == "delivery-gate":
         return await _run_delivery_gate(config, args)
     if command == "mvp-readiness":

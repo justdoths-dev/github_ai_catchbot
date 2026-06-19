@@ -243,6 +243,76 @@ async def test_foreground_smoke_missing_confirm_blocks_before_env_file_load(monk
 
 
 @pytest.mark.asyncio
+async def test_controlled_worker_missing_confirm_blocks_before_env_file_load(monkeypatch, tmp_path, capsys) -> None:
+    _clear_runtime_env(monkeypatch)
+    missing_env_file = tmp_path / "missing-runtime.env"
+    monkeypatch.setattr(maintenance_main.MaintenanceConfig, "from_env", classmethod(_fail_from_env))
+
+    exit_code = await maintenance_main._run(
+        [
+            "controlled-worker",
+            "--mode",
+            "execute",
+            "--max-ticks",
+            "3",
+            "--max-runtime-sec",
+            "30",
+            "--max-messages",
+            "1",
+            "--idle-sleep-ms",
+            "100",
+            "--env-file",
+            str(missing_env_file),
+        ]
+    )
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert exit_code == 2
+    assert payload["schema_version"] == "maintenance_controlled_worker_activation_report_v1"
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "run_confirm_missing"
+    assert payload["ticks_requested"] == 3
+    assert payload["ticks_completed"] == 0
+    _assert_no_secret_leaks(output, missing_env_file)
+
+
+@pytest.mark.asyncio
+async def test_controlled_worker_invalid_bounds_block_before_env_file_load(monkeypatch, tmp_path, capsys) -> None:
+    _clear_runtime_env(monkeypatch)
+    missing_env_file = tmp_path / "missing-runtime.env"
+    monkeypatch.setattr(maintenance_main.MaintenanceConfig, "from_env", classmethod(_fail_from_env))
+
+    exit_code = await maintenance_main._run(
+        [
+            "controlled-worker",
+            "--mode",
+            "execute",
+            "--max-ticks",
+            "0",
+            "--max-runtime-sec",
+            "30",
+            "--max-messages",
+            "1",
+            "--idle-sleep-ms",
+            "100",
+            "--confirm",
+            "run",
+            "--env-file",
+            str(missing_env_file),
+        ]
+    )
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert exit_code == 2
+    assert payload["schema_version"] == "maintenance_controlled_worker_activation_report_v1"
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "max_ticks_not_allowed"
+    _assert_no_secret_leaks(output, missing_env_file)
+
+
+@pytest.mark.asyncio
 async def test_env_file_without_runtime_keys_returns_sanitized_failure(monkeypatch, tmp_path, capsys) -> None:
     _clear_runtime_env(monkeypatch)
     env_file = tmp_path / "runtime.env"
