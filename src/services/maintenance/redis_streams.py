@@ -94,7 +94,12 @@ class RedisStreamConsumer:
         await self._client.xack(self._queue_name, self._consumer_group, message_id)
 
     async def _load_group(self) -> dict[Any, Any] | None:
-        groups = await self._client.xinfo_groups(self._queue_name)
+        try:
+            groups = await self._client.xinfo_groups(self._queue_name)
+        except Exception as exc:
+            if "no such key" in str(exc).lower():
+                return None
+            raise
         for group in groups or []:
             if isinstance(group, dict) and _decode_value(_dict_get(group, "name")) == self._consumer_group:
                 return group

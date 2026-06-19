@@ -11,6 +11,7 @@ from services.maintenance.restricted_queue_activation import (
     RestrictedQueueActivationRequest,
     run_restricted_queue_activation,
 )
+from services.maintenance.redis_streams import RedisStreamConsumer
 
 
 class FakeConsumer:
@@ -79,6 +80,39 @@ class FakeService:
         return self.replay_result
 
 
+class FakeResponseError(Exception):
+    pass
+
+
+class MissingStreamRedisClient:
+    def __init__(self) -> None:
+        self.xinfo_groups_calls: list[str] = []
+        self.xgroup_create_calls: list[tuple[str, str]] = []
+        self.xreadgroup_calls = 0
+        self.xack_calls: list[tuple[str, str]] = []
+
+    async def xinfo_groups(self, name: str):
+        self.xinfo_groups_calls.append(name)
+        raise FakeResponseError("no such key")
+
+    async def xgroup_create(self, name: str, groupname: str, id: str = "$", mkstream: bool = False):
+        self.xgroup_create_calls.append((name, groupname))
+
+    async def xreadgroup(
+        self,
+        groupname: str,
+        consumername: str,
+        streams: dict[str, str],
+        count: int | None = None,
+        block: int | None = None,
+    ):
+        self.xreadgroup_calls += 1
+        return []
+
+    async def xack(self, name: str, groupname: str, *ids: str):
+        self.xack_calls.append((name, groupname))
+
+
 def _request(queue_name: str, *, mode: str = "plan") -> RestrictedQueueActivationRequest:
     return RestrictedQueueActivationRequest(
         queue_name=queue_name,
@@ -89,6 +123,17 @@ def _request(queue_name: str, *, mode: str = "plan") -> RestrictedQueueActivatio
         dry_run=mode != "execute",
         allow_create_group=False,
         expected_event_type=DELIVERY_RESULT_EVENT_TYPE if queue_name == "q.maintenance" else REPLAY_REQUESTED_EVENT_TYPE,
+    )
+
+
+def _redis_consumer(client: MissingStreamRedisClient, *, queue_name: str = "q.replay") -> RedisStreamConsumer:
+    return RedisStreamConsumer(
+        client,
+        queue_name=queue_name,
+        consumer_group="maintenance-replay" if queue_name == "q.replay" else "maintenance",
+        consumer_name="operator",
+        block_ms=1,
+        batch_size=1,
     )
 
 
@@ -108,6 +153,18 @@ def _message(event_id: UUID, *, message_id: str = "1740000000000-42", stream: st
         message_id=message_id,
         fields={"trigger_event_id": str(event_id), "payload_json": "must-not-be-used"},
     )
+
+
+@pytest.mark.asyncio
+async def test_redis_consumer_missing_stream_reports_group_absent_without_create() -> None:
+    client = MissingStreamRedisClient()
+    consumer = _redis_consumer(client)
+
+    group_exists = await consumer.ensure_group(allow_create=False)
+
+    assert group_exists is False
+    assert client.xinfo_groups_calls == ["q.replay"]
+    assert client.xgroup_create_calls == []
 
 
 @pytest.mark.asyncio
@@ -269,6 +326,30 @@ async def test_group_missing_is_reported_and_no_ack_happens() -> None:
     assert report.reason_code == "consumer_group_missing"
     assert report.processed_count == 0
     assert consumer.acked == []
+
+
+@pytest.mark.asyncio
+async def test_replay_missing_stream_is_sanitized_blocked_report_without_ack_or_create() -> None:
+    client = MissingStreamRedisClient()
+    consumer = _redis_consumer(client, queue_name="q.replay")
+    service = FakeService({})
+
+    report = await run_restricted_queue_activation(
+        _request("q.replay", mode="execute"),
+        consumer=consumer,
+        service=service,
+        mode="execute",
+    )
+
+    assert report.status == "blocked"
+    assert report.reason_code == "consumer_group_missing"
+    assert report.processed_count == 0
+    assert report.acked_count == 0
+    assert report.redactions_applied["exception_body_omitted"] is True
+    assert client.xgroup_create_calls == []
+    assert client.xreadgroup_calls == 0
+    assert client.xack_calls == []
+    assert service.replay_calls == []
 
 
 @pytest.mark.asyncio
