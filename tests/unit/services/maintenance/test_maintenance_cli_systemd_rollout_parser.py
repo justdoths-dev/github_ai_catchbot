@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+import pytest
+
+from services.maintenance.main import build_parser
+
+
+@pytest.mark.parametrize(
+    ("mode", "confirm"),
+    [
+        ("plan", None),
+        ("install", "install"),
+        ("start", "start"),
+        ("proof", None),
+        ("rollback", "rollback"),
+    ],
+)
+def test_parser_accepts_systemd_rollout_modes(mode: str, confirm: str | None) -> None:
+    argv = [
+        "systemd-rollout",
+        "--mode",
+        mode,
+        "--target",
+        "maintenance-worker",
+        "--env-file",
+        "/tmp/runtime.env",
+    ]
+    if confirm is not None:
+        argv.extend(["--confirm", confirm])
+
+    args = build_parser().parse_args(argv)
+
+    assert args.command == "systemd-rollout"
+    assert args.mode == mode
+    assert args.target == "maintenance-worker"
+    assert args.confirm == confirm
+    assert args.env_file == "/tmp/runtime.env"
+
+
+def test_parser_accepts_systemd_rollout_override_paths() -> None:
+    args = build_parser().parse_args(
+        [
+            "systemd-rollout",
+            "--mode",
+            "plan",
+            "--target",
+            "maintenance-worker",
+            "--env-file",
+            "/tmp/runtime.env",
+            "--repo-root",
+            "/tmp/repo",
+            "--python-executable",
+            "/tmp/repo/venv/bin/python",
+            "--systemd-user-dir",
+            "/tmp/user-units",
+        ]
+    )
+
+    assert args.repo_root == "/tmp/repo"
+    assert args.python_executable == "/tmp/repo/venv/bin/python"
+    assert args.systemd_user_dir == "/tmp/user-units"

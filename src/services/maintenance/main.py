@@ -5,6 +5,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -54,6 +55,11 @@ from .restricted_queue_group_bootstrap import (
 )
 from .repositories import MaintenanceRepository
 from .service import MaintenanceService
+from .systemd_rollout import (
+    SERVICE_NAME as SYSTEMD_ROLLOUT_SERVICE_NAME,
+    SystemdRolloutRequest,
+    run_systemd_rollout,
+)
 from .worker import DueRetryPromotionWorker, MaintenanceQueueWorker, ReplayQueueWorker
 from .worker_once import WorkerOnceReport, WorkerOnceRequest, run_worker_once
 
@@ -153,6 +159,15 @@ def build_parser() -> argparse.ArgumentParser:
     controlled_worker.add_argument("--idle-sleep-ms", type=int, default=100)
     controlled_worker.add_argument("--confirm", choices=["run"], default=None)
     controlled_worker.add_argument("--env-file", required=True)
+
+    systemd_rollout = subcommands.add_parser("systemd-rollout")
+    systemd_rollout.add_argument("--mode", choices=["plan", "install", "start", "proof", "rollback"], required=True)
+    systemd_rollout.add_argument("--target", required=True)
+    systemd_rollout.add_argument("--confirm", choices=["install", "start", "rollback"], default=None)
+    systemd_rollout.add_argument("--env-file", required=True)
+    systemd_rollout.add_argument("--repo-root")
+    systemd_rollout.add_argument("--python-executable")
+    systemd_rollout.add_argument("--systemd-user-dir")
 
     gate = subcommands.add_parser("delivery-gate")
     gate.add_argument("--mode", choices=["restricted", "full"], required=True)
@@ -1358,6 +1373,48 @@ async def _run_controlled_worker_operation(config: MaintenanceConfig, args: argp
         await engine.dispose()
 
 
+async def _run_systemd_rollout_operation(args: argparse.Namespace) -> int:
+    request = _systemd_rollout_request(args)
+    report = run_systemd_rollout(request)
+    print(_to_json(asdict(report)))
+    if report.status == "pass":
+        return 0
+    if report.status == "failed":
+        return 1
+    return 2
+
+
+def _systemd_rollout_request(args: argparse.Namespace) -> SystemdRolloutRequest:
+    repo_root = _path_arg_or_default(args.repo_root, _default_repo_root())
+    python_executable = _path_arg_or_default(args.python_executable, Path(sys.executable))
+    systemd_user_dir = _path_arg_or_default(args.systemd_user_dir, Path.home() / ".config/systemd/user")
+    runtime_env_file = Path(args.env_file).expanduser().resolve()
+    return SystemdRolloutRequest(
+        mode=args.mode,
+        target=args.target,
+        confirm_install=args.confirm == "install",
+        confirm_start=args.confirm == "start",
+        confirm_rollback=args.confirm == "rollback",
+        repo_root=repo_root,
+        python_executable=python_executable,
+        runtime_env_file=runtime_env_file,
+        systemd_user_dir=systemd_user_dir,
+        service_name=SYSTEMD_ROLLOUT_SERVICE_NAME,
+        timer_name=None,
+        dry_run=args.mode in {"plan", "proof"},
+    )
+
+
+def _path_arg_or_default(value: str | None, default: Path) -> Path:
+    if value:
+        return Path(value).expanduser().resolve()
+    return default.expanduser().resolve()
+
+
+def _default_repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
 def _queue_activate_request(config: MaintenanceConfig, args: argparse.Namespace) -> RestrictedQueueActivationRequest:
     if args.activation_queue == "maintenance":
         queue_name = config.maintenance_queue_name
@@ -1837,6 +1894,8 @@ async def _run(argv: list[str] | None = None) -> int:
             require_gate_status=args.require_gate_status,
             operator_review_passed=args.operator_review_passed,
         )
+    if command == "systemd-rollout":
+        return await _run_systemd_rollout_operation(args)
     runtime_env_overlay: dict[str, str] | None = None
     if _one_shot_command_uses_explicit_env_file(command, args):
         try:
