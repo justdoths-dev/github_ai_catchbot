@@ -43,6 +43,7 @@ from .restricted_queue_group_bootstrap import (
 from .repositories import MaintenanceRepository
 from .service import MaintenanceService
 from .worker import DueRetryPromotionWorker, MaintenanceQueueWorker, ReplayQueueWorker
+from .worker_once import WorkerOnceReport, WorkerOnceRequest, run_worker_once
 
 DB_SHAPE_PREFLIGHT_SOURCE_REASON_CODES = {
     "database_url_required",
@@ -115,6 +116,15 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command")
 
     subcommands.add_parser("worker")
+
+    worker_once = subcommands.add_parser("worker-once")
+    worker_once_subcommands = worker_once.add_subparsers(dest="worker_type", required=True)
+    for worker_type in ("maintenance", "replay"):
+        once = worker_once_subcommands.add_parser(worker_type)
+        once.add_argument("--mode", choices=["execute"], required=True)
+        once.add_argument("--max-messages", type=int, default=1)
+        once.add_argument("--confirm", choices=["ack"], default=None)
+        once.add_argument("--env-file", required=True)
 
     gate = subcommands.add_parser("delivery-gate")
     gate.add_argument("--mode", choices=["restricted", "full"], required=True)
@@ -769,6 +779,7 @@ def _one_shot_command_uses_explicit_env_file(command: str, args: argparse.Namesp
         "delivery-replay",
         "queue-activate",
         "queue-group-bootstrap",
+        "worker-once",
     } and bool(getattr(args, "env_file", None))
 
 
@@ -1124,6 +1135,65 @@ async def _run_queue_group_bootstrap_operation(config: MaintenanceConfig, args: 
                 await maybe_awaitable
 
 
+async def _run_worker_once_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
+    request = _worker_once_request(config, args)
+
+    from redis.asyncio import Redis  # type: ignore[import-not-found]
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
+
+    engine = create_async_engine(config.database_url, future=True)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    redis_client = Redis.from_url(config.redis_url, decode_responses=True)
+    consumer = RedisStreamConsumer(
+        redis_client,
+        queue_name=request.queue_name,
+        consumer_group=request.consumer_group,
+        consumer_name=_worker_once_consumer_name(config, args),
+        block_ms=config.block_ms,
+        batch_size=request.max_messages,
+    )
+
+    class SessionBackedWorkerOnceService:
+        async def handle_maintenance_trigger_event(self, trigger_event_id: UUID):
+            async with session_factory.begin() as session:
+                return await MaintenanceService(config, repository=MaintenanceRepository(session)).handle_maintenance_trigger_event(
+                    trigger_event_id
+                )
+
+        async def handle_replay_trigger_event(self, trigger_event_id: UUID):
+            async with session_factory.begin() as session:
+                return await MaintenanceService(config, repository=MaintenanceRepository(session)).handle_replay_trigger_event(
+                    trigger_event_id
+                )
+
+        async def promote_due_retries_once(self, limit: int | None = None) -> int:
+            async with session_factory.begin() as session:
+                return await MaintenanceService(config, repository=MaintenanceRepository(session)).promote_due_retries_once(
+                    limit=limit
+                )
+
+    try:
+        report = await run_worker_once(
+            request,
+            config=config,
+            consumer=consumer,
+            service=SessionBackedWorkerOnceService(),
+        )
+        print(_to_json(asdict(report)))
+        if report.status == "pass":
+            return 0
+        if report.status == "failed":
+            return 1
+        return 2
+    finally:
+        close = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
+        if close is not None:
+            maybe_awaitable = close()
+            if asyncio.iscoroutine(maybe_awaitable):
+                await maybe_awaitable
+        await engine.dispose()
+
+
 def _queue_activate_request(config: MaintenanceConfig, args: argparse.Namespace) -> RestrictedQueueActivationRequest:
     if args.activation_queue == "maintenance":
         queue_name = config.maintenance_queue_name
@@ -1160,6 +1230,63 @@ def _queue_activate_request_error(args: argparse.Namespace) -> str | None:
     if args.exact_trigger_event_id and _parse_uuid(args.exact_trigger_event_id) is None:
         return "exact_trigger_event_id_invalid"
     return None
+
+
+def _worker_once_request(config: MaintenanceConfig, args: argparse.Namespace) -> WorkerOnceRequest:
+    if args.worker_type == "maintenance":
+        queue_name = config.maintenance_queue_name
+        consumer_group = config.maintenance_consumer_group
+    else:
+        queue_name = config.replay_queue_name
+        consumer_group = config.replay_consumer_group
+    return WorkerOnceRequest(
+        worker_type=args.worker_type,
+        queue_name=queue_name,
+        consumer_group=consumer_group,
+        mode=args.mode,
+        max_messages=int(args.max_messages),
+        confirm_ack=args.mode == "execute" and args.confirm == "ack",
+    )
+
+
+def _worker_once_consumer_name(config: MaintenanceConfig, args: argparse.Namespace) -> str:
+    return config.maintenance_consumer_name if args.worker_type == "maintenance" else config.replay_consumer_name
+
+
+def _worker_once_request_error(args: argparse.Namespace) -> str | None:
+    if args.max_messages < 1 or args.max_messages > 10:
+        return "max_messages_not_allowed"
+    if args.mode == "execute" and args.confirm != "ack":
+        return "ack_confirm_missing"
+    return None
+
+
+def _worker_once_blocked_report(args: argparse.Namespace, reason_code: str) -> WorkerOnceReport:
+    if args.worker_type == "maintenance":
+        queue_name = "q.maintenance"
+        consumer_group = "maintenance"
+    else:
+        queue_name = "q.replay"
+        consumer_group = "maintenance-replay"
+    return WorkerOnceReport(
+        schema_version="maintenance_worker_once_report_v1",
+        worker_type=args.worker_type,
+        queue_name=queue_name,
+        consumer_group=consumer_group,
+        mode=args.mode,
+        status="blocked",
+        processed_count=0,
+        acked_count=0,
+        reason_code=reason_code,
+        redactions_applied={
+            "full_uuid_omitted": True,
+            "full_redis_message_id_omitted": True,
+            "payload_json_omitted": True,
+            "database_url_omitted": True,
+            "redis_url_omitted": True,
+            "exception_body_omitted": True,
+        },
+    )
 
 
 def _queue_group_bootstrap_request(
@@ -1381,6 +1508,11 @@ async def _run(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     command = args.command or "worker"
+    if command == "worker-once":
+        request_error = _worker_once_request_error(args)
+        if request_error is not None:
+            print(_to_json(asdict(_worker_once_blocked_report(args, request_error))))
+            return 2
     if command == "db-shape-preflight":
         return await _run_db_shape_preflight(args)
     if command == "delivery-gate-preflight":
@@ -1418,6 +1550,8 @@ async def _run(argv: list[str] | None = None) -> int:
         return 1
     if command == "worker":
         return await _run_worker(config)
+    if command == "worker-once":
+        return await _run_worker_once_operation(config, args)
     if command == "delivery-gate":
         return await _run_delivery_gate(config, args)
     if command == "mvp-readiness":

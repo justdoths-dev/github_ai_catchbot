@@ -17,6 +17,9 @@ async def test_delivery_gate_snapshot_generates_restricted_report() -> None:
     assert report.gate_status == "fail"
     assert report.blocking_reason_codes == ["delivery_gate_open_dlq_present"]
     assert [metric.metric_name for metric in report.metrics] == [
+        "enable_notification_send",
+        "notifier_telegram_dry_run",
+        "maintenance_retry_promotion",
         "success_rate_1h",
         "high_source_to_delivery_p95_sec",
         "due_retry_oldest_lag_sec",
