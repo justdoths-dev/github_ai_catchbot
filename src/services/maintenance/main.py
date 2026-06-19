@@ -8,6 +8,7 @@ import os
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -134,6 +135,25 @@ def build_parser() -> argparse.ArgumentParser:
     db_shape.add_argument("--format", choices=["json"], default="json")
     db_shape.add_argument("--database-url-file")
     db_shape.add_argument("--env-file")
+
+    delivery_result = subcommands.add_parser("delivery-result")
+    delivery_result.add_argument("--mode", choices=["plan", "execute", "proof"], required=True)
+    delivery_result.add_argument("--event-id-suffix", required=True)
+    delivery_result.add_argument("--confirm", choices=["write"], default=None)
+    delivery_result.add_argument("--env-file")
+
+    due_retry = subcommands.add_parser("due-retry")
+    due_retry.add_argument("--mode", choices=["plan", "execute", "proof"], required=True)
+    due_retry.add_argument("--limit", type=int, default=50)
+    due_retry.add_argument("--now-utc")
+    due_retry.add_argument("--confirm", choices=["write"], default=None)
+    due_retry.add_argument("--env-file")
+
+    delivery_replay = subcommands.add_parser("delivery-replay")
+    delivery_replay.add_argument("--mode", choices=["plan", "execute", "proof"], required=True)
+    delivery_replay.add_argument("--replay-request-id", required=True)
+    delivery_replay.add_argument("--confirm", choices=["write"], default=None)
+    delivery_replay.add_argument("--env-file")
 
     recovery = subcommands.add_parser("batch-recovery")
     recovery_subcommands = recovery.add_subparsers(dest="recovery_mode", required=True)
@@ -706,7 +726,14 @@ def _maintenance_one_shot_runtime_config_error_payload(reason_code: str) -> dict
 
 
 def _one_shot_command_uses_explicit_env_file(command: str, args: argparse.Namespace) -> bool:
-    return command in {"delivery-gate", "mvp-readiness", "batch-recovery"} and bool(getattr(args, "env_file", None))
+    return command in {
+        "delivery-gate",
+        "mvp-readiness",
+        "batch-recovery",
+        "delivery-result",
+        "due-retry",
+        "delivery-replay",
+    } and bool(getattr(args, "env_file", None))
 
 
 def _build_db_shape_preflight_session_factory(database_url: str):
@@ -764,6 +791,285 @@ async def _run_batch_recovery(config: MaintenanceConfig, args: argparse.Namespac
                 return await run_retry_selected_due_batch_recovery(config, args, repository)
     finally:
         await engine.dispose()
+
+
+async def _run_delivery_result_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
+    if args.mode == "execute" and args.confirm != "write":
+        print(_to_json(_operator_report("delivery-result", args.mode, "blocked", "db_write_approval_missing")))
+        return 2
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
+
+    engine = create_async_engine(config.database_url, future=True)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        if args.mode == "execute":
+            event_id: UUID | None = None
+            service_result = None
+            async with session_factory() as session:
+                async with session.begin():
+                    repository = MaintenanceRepository(session)
+                    events = await repository.load_delivery_result_event_by_suffix(args.event_id_suffix, for_update=True)
+                    target_error = _exact_target_error(events, "target_event_suffix")
+                    if target_error is not None:
+                        print(_to_json(_operator_report("delivery-result", args.mode, "blocked", target_error)))
+                        return 2
+                    event_id = events[0].event_id
+                    service_result = await MaintenanceService(config, repository=repository).handle_maintenance_trigger_event(
+                        event_id
+                    )
+            async with session_factory() as read_session:
+                read_repository = MaintenanceRepository(read_session)
+                receipt_exists = await read_repository.has_delivery_result_receipt(event_id)
+                relay_eligible = await read_repository.is_canonically_relay_eligible(event_id)
+            status = "pass" if service_result and service_result.processed and receipt_exists and not relay_eligible else "blocked"
+            reason_code = None if status == "pass" else "canonical_relay_exclusion_missing"
+            print(
+                _to_json(
+                    _operator_report(
+                        "delivery-result",
+                        args.mode,
+                        status,
+                        reason_code,
+                        event_id=event_id,
+                        service_result=service_result,
+                        receipt_exists=receipt_exists,
+                        relay_eligible=relay_eligible,
+                    )
+                )
+            )
+            return 0 if status == "pass" else 2
+
+        async with session_factory() as session:
+            repository = MaintenanceRepository(session)
+            events = await repository.load_delivery_result_event_by_suffix(args.event_id_suffix, for_update=False)
+            target_error = _exact_target_error(events, "target_event_suffix")
+            if target_error is not None:
+                print(_to_json(_operator_report("delivery-result", args.mode, "blocked", target_error)))
+                return 2
+            event_id = events[0].event_id
+            receipt_exists = await repository.has_delivery_result_receipt(event_id)
+            relay_eligible = await repository.is_canonically_relay_eligible(event_id)
+            if args.mode == "proof":
+                status = "pass" if receipt_exists and not relay_eligible else "blocked"
+                reason_code = None if status == "pass" else "canonical_relay_exclusion_missing"
+            else:
+                status = "pass"
+                reason_code = None
+            print(
+                _to_json(
+                    _operator_report(
+                        "delivery-result",
+                        args.mode,
+                        status,
+                        reason_code,
+                        event_id=event_id,
+                        receipt_exists=receipt_exists,
+                        relay_eligible=relay_eligible,
+                    )
+                )
+            )
+            return 0 if status == "pass" else 2
+    finally:
+        await engine.dispose()
+
+
+async def _run_due_retry_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
+    if args.limit < 1 or args.limit > 500:
+        print(_to_json(_operator_report("due-retry", args.mode, "blocked", "limit_not_allowed")))
+        return 2
+    if args.mode == "execute" and args.confirm != "write":
+        print(_to_json(_operator_report("due-retry", args.mode, "blocked", "db_write_approval_missing")))
+        return 2
+    now = _parse_now_utc(args.now_utc)
+    if now is None and args.now_utc:
+        print(_to_json(_operator_report("due-retry", args.mode, "blocked", "now_utc_invalid")))
+        return 2
+    now = now or datetime.now(timezone.utc)
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
+
+    engine = create_async_engine(config.database_url, future=True)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        if args.mode == "execute":
+            async with session_factory() as session:
+                async with session.begin():
+                    repository = MaintenanceRepository(session)
+                    service = MaintenanceService(config, repository=repository, now_fn=lambda: now)
+                    action_count = await service.promote_due_retries_once(limit=args.limit)
+            print(
+                _to_json(
+                    _operator_report(
+                        "due-retry",
+                        args.mode,
+                        "pass",
+                        None,
+                        action_count=action_count,
+                    )
+                )
+            )
+            return 0
+
+        async with session_factory() as session:
+            repository = MaintenanceRepository(session)
+            candidates = await repository.load_due_retry_candidates(limit=args.limit, now=now)
+            print(
+                _to_json(
+                    _operator_report(
+                        "due-retry",
+                        args.mode,
+                        "pass",
+                        None,
+                        candidate_count=len(candidates),
+                        plan_suffixes=[_safe_uuid_suffix(candidate.plan.notification_plan_id) for candidate in candidates],
+                        latest_delivery_suffixes=[
+                            _safe_uuid_suffix(candidate.latest_delivery.notification_delivery_record_id)
+                            for candidate in candidates
+                            if candidate.latest_delivery is not None
+                        ],
+                    )
+                )
+            )
+            return 0
+    finally:
+        await engine.dispose()
+
+
+async def _run_delivery_replay_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
+    replay_request_id = _parse_uuid(args.replay_request_id)
+    if replay_request_id is None:
+        print(_to_json(_operator_report("delivery-replay", args.mode, "blocked", "replay_request_id_invalid")))
+        return 2
+    if args.mode == "execute" and args.confirm != "write":
+        print(_to_json(_operator_report("delivery-replay", args.mode, "blocked", "db_write_approval_missing")))
+        return 2
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
+
+    engine = create_async_engine(config.database_url, future=True)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    try:
+        if args.mode == "execute":
+            decision = None
+            async with session_factory() as session:
+                async with session.begin():
+                    repository = MaintenanceRepository(session)
+                    decision = await MaintenanceService(config, repository=repository).dispatch_delivery_replay_request(
+                        replay_request_id
+                    )
+            async with session_factory() as read_session:
+                read_repository = MaintenanceRepository(read_session)
+                replay_request = await read_repository.load_replay_request(replay_request_id)
+            status = "pass" if decision is not None and replay_request is not None else "blocked"
+            reason_code = None if status == "pass" else "post_commit_readback_failed"
+            print(
+                _to_json(
+                    _operator_report(
+                        "delivery-replay",
+                        args.mode,
+                        status,
+                        reason_code,
+                        replay_request_id=replay_request_id,
+                        replay_request_status=replay_request.status if replay_request else None,
+                        replay_action=decision.action if decision else None,
+                        service_reason_code=decision.reason_code if decision else None,
+                    )
+                )
+            )
+            return 0 if status == "pass" else 2
+
+        async with session_factory() as session:
+            repository = MaintenanceRepository(session)
+            replay_request = await repository.load_replay_request(replay_request_id)
+            status = "pass" if replay_request is not None else "blocked"
+            reason_code = None if replay_request is not None else "replay_request_missing"
+            print(
+                _to_json(
+                    _operator_report(
+                        "delivery-replay",
+                        args.mode,
+                        status,
+                        reason_code,
+                        replay_request_id=replay_request_id,
+                        replay_request_status=replay_request.status if replay_request else None,
+                    )
+                )
+            )
+            return 0 if status == "pass" else 2
+    finally:
+        await engine.dispose()
+
+
+def _exact_target_error(rows: list, label: str) -> str | None:
+    if not rows:
+        return f"{label}_missing"
+    if len(rows) > 1:
+        return f"{label}_not_unique"
+    return None
+
+
+def _operator_report(
+    operation: str,
+    mode: str,
+    status: str,
+    reason_code: str | None,
+    **extra: object,
+) -> dict:
+    payload = {
+        "schema_version": "maintenance_delivery_operator_v1",
+        "operation": operation,
+        "mode": mode,
+        "status": status,
+        "ok": status == "pass" and reason_code is None,
+        "reason_code": reason_code,
+        "redactions_applied": {
+            "full_event_id_omitted": True,
+            "full_notification_plan_id_omitted": True,
+            "full_replay_request_id_omitted": True,
+            "payload_json_omitted": True,
+            "database_url_omitted": True,
+            "redis_url_omitted": True,
+            "exception_body_omitted": True,
+        },
+    }
+    if "event_id" in extra:
+        payload["event_id_suffix"] = _safe_uuid_suffix(extra.pop("event_id"))
+    if "replay_request_id" in extra:
+        payload["replay_request_id_suffix"] = _safe_uuid_suffix(extra.pop("replay_request_id"))
+    service_result = extra.pop("service_result", None)
+    if service_result is not None:
+        payload.update(
+            {
+                "service_result_processed": service_result.processed,
+                "service_result_classification": service_result.classification,
+                "service_result_action": service_result.action,
+                "service_result_reason_code": service_result.reason_code,
+            }
+        )
+    payload.update(extra)
+    return payload
+
+
+def _safe_uuid_suffix(value: object) -> str | None:
+    if value is None:
+        return None
+    return str(value)[-8:]
+
+
+def _parse_now_utc(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _detect_recovery_cli_surface(parser: argparse.ArgumentParser) -> dict[str, bool]:
@@ -859,6 +1165,12 @@ async def _run(argv: list[str] | None = None) -> int:
         return await _run_delivery_gate(config, args)
     if command == "mvp-readiness":
         return await _run_mvp_readiness(config, args)
+    if command == "delivery-result":
+        return await _run_delivery_result_operation(config, args)
+    if command == "due-retry":
+        return await _run_due_retry_operation(config, args)
+    if command == "delivery-replay":
+        return await _run_delivery_replay_operation(config, args)
     if command == "batch-recovery":
         return await _run_batch_recovery(config, args)
     parser.error(f"unsupported command: {command}")

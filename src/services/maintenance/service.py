@@ -10,6 +10,7 @@ from .delivery_result_worker import DeliveryResultWorker
 from .delivery_replay import REPLAY_REQUESTED_EVENT_TYPE, evaluate_delivery_replay
 from .delivery_retry import evaluate_retry_promotion
 from .models import (
+    DeliveryReplayDecision,
     DeliveryResultWorkerResult,
     LatestDeliveryRecord,
     NotificationPlanRecord,
@@ -26,6 +27,8 @@ class MaintenanceRepositoryProtocol(Protocol):
     async def load_outbox_event(self, event_id: UUID) -> OutboxEvent | None: ...
     async def load_notification_plan(self, notification_plan_id: UUID) -> NotificationPlanRecord | None: ...
     async def load_latest_delivery_record(self, notification_plan_id: UUID) -> LatestDeliveryRecord | None: ...
+    async def load_delivery_record(self, notification_delivery_record_id: UUID) -> LatestDeliveryRecord | None: ...
+    async def later_success_exists(self, *, notification_plan_id: UUID, exact_created_at: datetime) -> bool: ...
     async def count_delivery_attempts(self, notification_plan_id: UUID) -> int: ...
     async def load_due_retry_candidates(self, limit: int, now: datetime) -> list[RetryPromotionCandidate]: ...
     async def insert_plan_created_outbox(
@@ -51,22 +54,8 @@ class MaintenanceRepositoryProtocol(Protocol):
         attempt_status: str,
         error_code: str | None = None,
     ) -> None: ...
-    async def count_delivery_result_noop_job_attempts(self, notification_plan_id: UUID) -> int: ...
-    async def insert_delivery_result_noop_job_attempt(self, notification_plan_id: UUID) -> bool: ...
-    async def count_delivery_result_logical_noop_job_attempts(
-        self,
-        notification_plan_id: UUID,
-        *,
-        error_code: str,
-    ) -> int: ...
-    async def insert_delivery_result_logical_noop_job_attempt(
-        self,
-        notification_plan_id: UUID,
-        *,
-        error_code: str,
-    ) -> bool: ...
-    async def count_delivery_result_sent_success_job_attempts(self, notification_delivery_record_id: UUID) -> int: ...
-    async def insert_delivery_result_sent_success_job_attempt(self, notification_delivery_record_id: UUID) -> bool: ...
+    async def has_delivery_result_receipt(self, event_id: UUID, *, receipt_code: str | None = None) -> bool: ...
+    async def insert_delivery_result_receipt(self, *, event_id: UUID, receipt_code: str) -> bool: ...
 
 
 class MaintenanceService:
@@ -169,8 +158,18 @@ class MaintenanceService:
         replay_event = replay_requested_from_outbox(event)
         if replay_event is None:
             return
+        await self.dispatch_delivery_replay_request(
+            replay_event.replay_request_id,
+            replay_reason=replay_event.replay_reason,
+        )
 
-        replay_request = await self._repository.load_replay_request(replay_event.replay_request_id)
+    async def dispatch_delivery_replay_request(
+        self,
+        replay_request_id: UUID,
+        *,
+        replay_reason: str | None = None,
+    ) -> DeliveryReplayDecision | None:
+        replay_request = await self._repository.load_replay_request(replay_request_id)
         plan = None
         if replay_request is not None and replay_request.root_object_type == "notification_plan":
             plan = await self._repository.load_notification_plan(replay_request.root_object_id)
@@ -179,11 +178,11 @@ class MaintenanceService:
             config=self._config,
             replay_request=replay_request,
             plan=plan,
-            replay_reason=replay_event.replay_reason,
+            replay_reason=replay_reason,
         )
         async with self._repository.transaction():
             if replay_request is None:
-                return
+                return decision
             if decision.action == "emit_replay_intent" and plan is not None and decision.dedupe_key and decision.payload:
                 await self._repository.update_replay_request_status(replay_request.replay_request_id, "dispatched")
                 await self._repository.insert_plan_created_outbox(
@@ -209,6 +208,7 @@ class MaintenanceService:
                     status="failed_terminal",
                     error_code=decision.reason_code,
                 )
+        return decision
 
     async def _record_job_attempt(
         self,

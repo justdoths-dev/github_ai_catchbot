@@ -8,6 +8,14 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
+from ..outbox_relay.eligibility import (
+    DELIVERY_RESULT_EVENT_TYPE,
+    DELIVERY_RESULT_RECEIPT_CODES,
+    EVENT_OUTBOX_ROOT_OBJECT_TYPE,
+    MAINTENANCE_DELIVERY_RESULT_STAGE,
+    MAINTENANCE_QUEUE_NAME as RELAY_MAINTENANCE_QUEUE_NAME,
+    canonical_relay_eligible_sql,
+)
 from .delivery_retry import MAINTENANCE_QUEUE_NAME
 from .delivery_replay import REPLAY_QUEUE_NAME
 from .models import (
@@ -51,7 +59,7 @@ class MaintenanceRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT event_id, event_type, aggregate_type, aggregate_id, payload_json
+                SELECT event_id, event_type, aggregate_type, aggregate_id, payload_json, status
                 FROM event_outbox
                 WHERE event_id = CAST(:event_id AS uuid)
                 """
@@ -68,7 +76,47 @@ class MaintenanceRepository:
             aggregate_type=str(row["aggregate_type"]),
             aggregate_id=UUID(str(row["aggregate_id"])),
             payload_json=payload if isinstance(payload, dict) else {},
+            status=str(row["status"]),
         )
+
+    async def load_delivery_result_event_by_suffix(
+        self,
+        event_id_suffix: str,
+        *,
+        for_update: bool = False,
+    ) -> list[OutboxEvent]:
+        suffix = _normalize_uuid_suffix(event_id_suffix)
+        if suffix is None:
+            return []
+        lock_clause = "FOR UPDATE" if for_update else ""
+        result = await self._session.execute(
+            sa.text(
+                f"""
+                SELECT event_id, event_type, aggregate_type, aggregate_id, payload_json, status
+                FROM event_outbox
+                WHERE event_type = '{DELIVERY_RESULT_EVENT_TYPE}'
+                  AND replace(event_id::text, '-', '') LIKE :event_id_suffix
+                ORDER BY created_at ASC, event_id ASC
+                LIMIT 2
+                {lock_clause}
+                """
+            ),
+            {"event_id_suffix": f"%{suffix}"},
+        )
+        events: list[OutboxEvent] = []
+        for row in result.mappings().all():
+            payload = _json_loads(row["payload_json"])
+            events.append(
+                OutboxEvent(
+                    event_id=UUID(str(row["event_id"])),
+                    event_type=str(row["event_type"]),
+                    aggregate_type=str(row["aggregate_type"]),
+                    aggregate_id=UUID(str(row["aggregate_id"])),
+                    payload_json=payload if isinstance(payload, dict) else {},
+                    status=str(row["status"]),
+                )
+            )
+        return events
 
     async def load_notification_plan(self, notification_plan_id: UUID) -> NotificationPlanRecord | None:
         result = await self._session.execute(
@@ -117,6 +165,50 @@ class MaintenanceRepository:
         )
         row = result.mappings().first()
         return _latest_delivery_from_row(row) if row is not None else None
+
+    async def load_delivery_record(self, notification_delivery_record_id: UUID) -> LatestDeliveryRecord | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT notification_delivery_record_id, notification_plan_id, delivery_status,
+                       attempt_count, transport_error_code, transport_error_class,
+                       telegram_response_json, created_at
+                FROM notification_delivery_records
+                WHERE notification_delivery_record_id = CAST(:notification_delivery_record_id AS uuid)
+                """
+            ),
+            {"notification_delivery_record_id": str(notification_delivery_record_id)},
+        )
+        row = result.mappings().first()
+        return _latest_delivery_from_row(row) if row is not None else None
+
+    async def later_success_exists(
+        self,
+        *,
+        notification_plan_id: UUID,
+        exact_created_at: datetime,
+    ) -> bool:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM notification_delivery_records
+                    WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                      AND created_at > :exact_created_at
+                      AND delivery_status IN (
+                        'sent'::notification_status_enum,
+                        'edited'::notification_status_enum
+                      )
+                )
+                """
+            ),
+            {
+                "notification_plan_id": str(notification_plan_id),
+                "exact_created_at": exact_created_at,
+            },
+        )
+        return bool(result.scalar_one())
 
     async def load_due_retry_candidates(self, limit: int, now: datetime) -> list[RetryPromotionCandidate]:
         result = await self._session.execute(
@@ -387,6 +479,93 @@ class MaintenanceRepository:
                 "error_code": error_code,
             },
         )
+
+    async def has_delivery_result_receipt(self, event_id: UUID, *, receipt_code: str | None = None) -> bool:
+        codes = [receipt_code] if receipt_code is not None else sorted(DELIVERY_RESULT_RECEIPT_CODES)
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM job_attempts
+                    WHERE stage_name = :stage_name
+                      AND queue_name = :queue_name
+                      AND root_object_type = :root_object_type
+                      AND root_object_id = CAST(:event_id AS uuid)
+                      AND attempt_status = 'succeeded'::job_attempt_status_enum
+                      AND error_code = ANY(CAST(:receipt_codes AS text[]))
+                )
+                """
+            ),
+            {
+                "stage_name": MAINTENANCE_DELIVERY_RESULT_STAGE,
+                "queue_name": RELAY_MAINTENANCE_QUEUE_NAME,
+                "root_object_type": EVENT_OUTBOX_ROOT_OBJECT_TYPE,
+                "event_id": str(event_id),
+                "receipt_codes": codes,
+            },
+        )
+        return bool(result.scalar_one())
+
+    async def insert_delivery_result_receipt(self, *, event_id: UUID, receipt_code: str) -> bool:
+        if receipt_code not in DELIVERY_RESULT_RECEIPT_CODES:
+            raise ValueError("unsupported_delivery_result_receipt_code")
+        result = await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO job_attempts (
+                    stage_name, queue_name, root_object_type, root_object_id,
+                    attempt_no, started_at, finished_at, attempt_status, error_code, created_at
+                )
+                SELECT
+                    :stage_name,
+                    :queue_name,
+                    :root_object_type,
+                    CAST(:event_id AS uuid),
+                    1,
+                    now(),
+                    now(),
+                    'succeeded'::job_attempt_status_enum,
+                    :receipt_code,
+                    now()
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM job_attempts
+                    WHERE stage_name = :stage_name
+                      AND queue_name = :queue_name
+                      AND root_object_type = :root_object_type
+                      AND root_object_id = CAST(:event_id AS uuid)
+                      AND attempt_status = 'succeeded'::job_attempt_status_enum
+                      AND error_code = :receipt_code
+                )
+                RETURNING job_attempt_id
+                """
+            ),
+            {
+                "stage_name": MAINTENANCE_DELIVERY_RESULT_STAGE,
+                "queue_name": RELAY_MAINTENANCE_QUEUE_NAME,
+                "root_object_type": EVENT_OUTBOX_ROOT_OBJECT_TYPE,
+                "event_id": str(event_id),
+                "receipt_code": receipt_code,
+            },
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def is_canonically_relay_eligible(self, event_id: UUID) -> bool:
+        result = await self._session.execute(
+            sa.text(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM event_outbox eo
+                    WHERE eo.event_id = CAST(:event_id AS uuid)
+                      AND {canonical_relay_eligible_sql("eo")}
+                )
+                """
+            ),
+            {"event_id": str(event_id)},
+        )
+        return bool(result.scalar_one())
 
     async def count_delivery_result_noop_job_attempts(self, notification_plan_id: UUID) -> int:
         return await self.count_delivery_result_logical_noop_job_attempts(
@@ -950,6 +1129,17 @@ def _uuid_or_none(value: Any) -> UUID | None:
         return UUID(str(value))
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+def _normalize_uuid_suffix(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = value.strip().lower().replace("-", "")
+    if not text or len(text) > 32:
+        return None
+    if any(char not in "0123456789abcdef" for char in text):
+        return None
+    return text
 
 
 def _int_or_none(value: Any) -> int | None:

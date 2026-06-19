@@ -69,6 +69,53 @@ async def test_due_retry_dedupe_key_is_stable_across_repeated_execution() -> Non
 
 
 @pytest.mark.asyncio
+async def test_new_failed_retryable_attempt_state_allows_new_retry_intent() -> None:
+    now = datetime.now(timezone.utc)
+    repository = FakeRepository()
+    notification_plan = plan(send_after=now - timedelta(seconds=1))
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        attempt_count=1,
+    )
+    service = MaintenanceService(config(max_attempts=5), repository=repository, now_fn=lambda: now)
+
+    first = await service.promote_due_retries_once()
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        attempt_count=2,
+    )
+    second = await service.promote_due_retries_once()
+
+    assert first == 1
+    assert second == 1
+    assert len(repository.plan_created_outbox) == 2
+    assert repository.plan_created_outbox[0]["dedupe_key"] != repository.plan_created_outbox[1]["dedupe_key"]
+
+
+@pytest.mark.asyncio
+async def test_later_sent_state_blocks_retry_promotion() -> None:
+    now = datetime.now(timezone.utc)
+    repository = FakeRepository()
+    notification_plan = plan(send_after=now - timedelta(seconds=1))
+    repository.plans[notification_plan.notification_plan_id] = notification_plan
+    repository.latest_delivery_records[notification_plan.notification_plan_id] = latest_delivery_record(
+        notification_plan_id=notification_plan.notification_plan_id,
+        delivery_status="sent",
+        attempt_count=2,
+        transport_error_code=None,
+        transport_error_class=None,
+    )
+    service = MaintenanceService(config(max_attempts=5), repository=repository, now_fn=lambda: now)
+
+    processed = await service.promote_due_retries_once()
+
+    assert processed == 0
+    assert repository.plan_created_outbox == []
+    assert repository.dead_letters == []
+
+
+@pytest.mark.asyncio
 async def test_future_send_after_noops() -> None:
     now = datetime.now(timezone.utc)
     repository = FakeRepository()

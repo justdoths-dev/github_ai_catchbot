@@ -10,7 +10,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - local validation fallback only
     sa = None
 
-from .eligibility import stale_resolution_exclusion_not_exists_sql
+from .eligibility import canonical_relay_eligible_sql
 from .models import OutboxEventRow
 
 
@@ -37,8 +37,7 @@ class OutboxRelayRepository:
                     eo.fail_count,
                     eo.created_at
                 FROM event_outbox eo
-                WHERE eo.status = 'pending'::outbox_status_enum
-                  AND {stale_resolution_exclusion_not_exists_sql("eo")}
+                WHERE {canonical_relay_eligible_sql("eo")}
                 ORDER BY eo.created_at ASC, eo.event_id ASC
                 LIMIT :limit
                 """

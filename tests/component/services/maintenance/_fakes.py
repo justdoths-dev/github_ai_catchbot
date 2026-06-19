@@ -19,6 +19,11 @@ from services.maintenance.retry_policy import (
     DELIVERY_RESULT_SENT_SUCCESS_ERROR_CODE,
     DELIVERY_RESULT_SENT_SUCCESS_STAGE_NAME,
 )
+from services.outbox_relay.eligibility import (
+    EVENT_OUTBOX_ROOT_OBJECT_TYPE,
+    MAINTENANCE_DELIVERY_RESULT_STAGE,
+    MAINTENANCE_QUEUE_NAME,
+)
 
 
 PG_SCHEME = "postgresql+psycopg:" + "//"
@@ -37,6 +42,7 @@ class FakeRepository:
     def __init__(self) -> None:
         self.events: dict[UUID, OutboxEvent] = {}
         self.plans: dict[UUID, NotificationPlanRecord] = {}
+        self.delivery_records: dict[UUID, LatestDeliveryRecord] = {}
         self.latest_delivery_records: dict[UUID, LatestDeliveryRecord] = {}
         self.delivery_attempt_counts: dict[UUID, int] = {}
         self.plan_created_outbox: list[dict] = []
@@ -57,6 +63,23 @@ class FakeRepository:
 
     async def load_latest_delivery_record(self, notification_plan_id: UUID):
         return self.latest_delivery_records.get(notification_plan_id)
+
+    async def load_delivery_record(self, notification_delivery_record_id: UUID):
+        if notification_delivery_record_id in self.delivery_records:
+            return self.delivery_records[notification_delivery_record_id]
+        for record in self.latest_delivery_records.values():
+            if record.notification_delivery_record_id == notification_delivery_record_id:
+                return record
+        return None
+
+    async def later_success_exists(self, *, notification_plan_id: UUID, exact_created_at: datetime) -> bool:
+        records = list(self.delivery_records.values()) + list(self.latest_delivery_records.values())
+        return any(
+            record.notification_plan_id == notification_plan_id
+            and record.created_at > exact_created_at
+            and record.delivery_status in {"sent", "edited"}
+            for record in records
+        )
 
     async def count_delivery_attempts(self, notification_plan_id: UUID) -> int:
         return self.delivery_attempt_counts.get(notification_plan_id, 0)
@@ -160,6 +183,30 @@ class FakeRepository:
 
     async def insert_job_attempt(self, **kwargs) -> None:
         self.job_attempts.append(kwargs)
+
+    async def has_delivery_result_receipt(self, event_id: UUID, *, receipt_code: str | None = None) -> bool:
+        return any(
+            row["stage_name"] == MAINTENANCE_DELIVERY_RESULT_STAGE
+            and row["queue_name"] == MAINTENANCE_QUEUE_NAME
+            and row["root_object_type"] == EVENT_OUTBOX_ROOT_OBJECT_TYPE
+            and row["root_object_id"] == event_id
+            and row["attempt_status"] == "succeeded"
+            and (receipt_code is None or row["error_code"] == receipt_code)
+            for row in self.job_attempts
+        )
+
+    async def insert_delivery_result_receipt(self, *, event_id: UUID, receipt_code: str) -> bool:
+        if await self.has_delivery_result_receipt(event_id, receipt_code=receipt_code):
+            return False
+        await self.insert_job_attempt(
+            stage_name=MAINTENANCE_DELIVERY_RESULT_STAGE,
+            queue_name=MAINTENANCE_QUEUE_NAME,
+            root_object_type=EVENT_OUTBOX_ROOT_OBJECT_TYPE,
+            root_object_id=event_id,
+            attempt_status="succeeded",
+            error_code=receipt_code,
+        )
+        return True
 
     async def count_delivery_result_noop_job_attempts(self, notification_plan_id: UUID) -> int:
         return await self.count_delivery_result_logical_noop_job_attempts(
@@ -316,6 +363,7 @@ def latest_delivery_record(
     attempt_count: int = 1,
     transport_error_code: str | None = "telegram_retryable_error",
     transport_error_class: str | None = "retryable",
+    created_at: datetime | None = None,
 ) -> LatestDeliveryRecord:
     return LatestDeliveryRecord(
         notification_delivery_record_id=uuid4(),
@@ -325,7 +373,7 @@ def latest_delivery_record(
         transport_error_code=transport_error_code,
         transport_error_class=transport_error_class,
         telegram_response_json=None,
-        created_at=datetime.now(timezone.utc),
+        created_at=created_at or datetime.now(timezone.utc),
     )
 
 

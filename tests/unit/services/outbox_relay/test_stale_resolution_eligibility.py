@@ -6,8 +6,14 @@ from uuid import UUID, uuid4
 import pytest
 
 from src.services.outbox_relay.eligibility import (
+    DELIVERY_RESULT_FAILED_RETRYABLE_RECEIPT_CODE,
+    DELIVERY_RESULT_FAILED_TERMINAL_DLQ_RECEIPT_CODE,
+    DELIVERY_RESULT_SUPERSEDED_NOOP_RECEIPT_CODE,
+    DELIVERY_RESULT_SUPPRESSED_NOOP_RECEIPT_CODE,
+    DELIVERY_RESULT_TERMINAL_SUCCESS_RECEIPT_CODE,
     EVENT_OUTBOX_ROOT_OBJECT_TYPE,
     JUDGE_OUTPUT_READY_STALE_PROOF_ERROR_CODE,
+    MAINTENANCE_DELIVERY_RESULT_STAGE,
     MAINTENANCE_QUEUE_NAME,
     MAINTENANCE_STALE_OUTBOX_HYGIENE_STAGE,
     POLICY_APPLY_STALE_PROOF_ERROR_CODE,
@@ -78,22 +84,49 @@ def _proof(event_id: UUID, error_code: str, **overrides: object) -> dict[str, ob
     return proof
 
 
+def _delivery_proof(
+    event_id: UUID,
+    error_code: str = DELIVERY_RESULT_TERMINAL_SUCCESS_RECEIPT_CODE,
+    **overrides: object,
+) -> dict[str, object]:
+    proof = _proof(event_id, error_code, stage_name=MAINTENANCE_DELIVERY_RESULT_STAGE)
+    proof.update(overrides)
+    return proof
+
+
 def _canonical_relay_eligible(event: dict[str, object], proofs: list[dict[str, object]]) -> bool:
     if event["status"] != "pending":
         return False
-    expected_error = {
-        "judge.output.ready.v1": JUDGE_OUTPUT_READY_STALE_PROOF_ERROR_CODE,
-        "analysis.policy.apply.v1": POLICY_APPLY_STALE_PROOF_ERROR_CODE,
+    expected = {
+        "judge.output.ready.v1": (
+            MAINTENANCE_STALE_OUTBOX_HYGIENE_STAGE,
+            {JUDGE_OUTPUT_READY_STALE_PROOF_ERROR_CODE},
+        ),
+        "analysis.policy.apply.v1": (
+            MAINTENANCE_STALE_OUTBOX_HYGIENE_STAGE,
+            {POLICY_APPLY_STALE_PROOF_ERROR_CODE},
+        ),
+        "notification.delivery.result.v1": (
+            MAINTENANCE_DELIVERY_RESULT_STAGE,
+            {
+                DELIVERY_RESULT_TERMINAL_SUCCESS_RECEIPT_CODE,
+                DELIVERY_RESULT_SUPPRESSED_NOOP_RECEIPT_CODE,
+                DELIVERY_RESULT_SUPERSEDED_NOOP_RECEIPT_CODE,
+                DELIVERY_RESULT_FAILED_RETRYABLE_RECEIPT_CODE,
+                DELIVERY_RESULT_FAILED_TERMINAL_DLQ_RECEIPT_CODE,
+            },
+        ),
     }.get(event["event_type"])
-    if expected_error is None:
+    if expected is None:
         return True
+    expected_stage, expected_errors = expected
     return not any(
-        proof.get("stage_name") == MAINTENANCE_STALE_OUTBOX_HYGIENE_STAGE
+        proof.get("stage_name") == expected_stage
         and proof.get("queue_name") == MAINTENANCE_QUEUE_NAME
         and proof.get("root_object_type") == EVENT_OUTBOX_ROOT_OBJECT_TYPE
         and proof.get("root_object_id") == event["event_id"]
         and proof.get("attempt_status") == "succeeded"
-        and proof.get("error_code") == expected_error
+        and proof.get("error_code") in expected_errors
         for proof in proofs
     )
 
@@ -126,8 +159,10 @@ async def test_matching_maintenance_stale_resolution_proof_excludes_actual_relay
     assert after_ids == []
     assert "NOT EXISTS" in statement
     assert "maintenance_stale_outbox_hygiene" in statement
+    assert "maintenance_delivery_result" in statement
     assert "stale_outbox_judge_output_ready_already_handed_off_logical_noop" in statement
     assert "stale_outbox_policy_apply_already_analyzed_logical_noop" in statement
+    assert "delivery_result_terminal_success_handled" in statement
 
 
 @pytest.mark.asyncio
@@ -178,3 +213,53 @@ async def test_delivery_result_unknown_and_ordinary_pending_rows_remain_relay_el
     ids, _statement = await _fetch_ids(events, proofs)
 
     assert ids == [DELIVERY_EVENT_ID, UNKNOWN_EVENT_ID]
+
+
+@pytest.mark.asyncio
+async def test_exact_delivery_result_receipt_excludes_only_that_event_from_actual_relay_fetch() -> None:
+    other_delivery_event_id = _uuid("aaa5")
+    events = [
+        _event(DELIVERY_EVENT_ID, "notification.delivery.result.v1"),
+        _event(other_delivery_event_id, "notification.delivery.result.v1"),
+    ]
+
+    before_ids, _statement = await _fetch_ids(events)
+    after_ids, _statement = await _fetch_ids(events, [_delivery_proof(DELIVERY_EVENT_ID)])
+
+    assert before_ids == [DELIVERY_EVENT_ID, other_delivery_event_id]
+    assert after_ids == [other_delivery_event_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "proof",
+    [
+        _delivery_proof(DELIVERY_EVENT_ID, "wrong_error_code"),
+        _delivery_proof(DELIVERY_EVENT_ID, stage_name="wrong_stage"),
+        _delivery_proof(DELIVERY_EVENT_ID, queue_name="wrong_queue"),
+        _delivery_proof(DELIVERY_EVENT_ID, root_object_type="wrong_root"),
+        _delivery_proof(DELIVERY_EVENT_ID, root_object_id=_uuid("bad1")),
+        _delivery_proof(DELIVERY_EVENT_ID, attempt_status="failed_terminal"),
+        _proof(DELIVERY_EVENT_ID, DELIVERY_RESULT_TERMINAL_SUCCESS_RECEIPT_CODE),
+    ],
+)
+async def test_non_matching_delivery_result_receipts_do_not_exclude_delivery_event(proof: dict[str, object]) -> None:
+    ids, _statement = await _fetch_ids([_event(DELIVERY_EVENT_ID, "notification.delivery.result.v1")], [proof])
+
+    assert ids == [DELIVERY_EVENT_ID]
+
+
+@pytest.mark.asyncio
+async def test_delivery_result_receipt_cannot_exclude_judge_or_policy_events() -> None:
+    events = [
+        _event(JUDGE_EVENT_ID, "judge.output.ready.v1"),
+        _event(POLICY_EVENT_ID, "analysis.policy.apply.v1"),
+    ]
+    proofs = [
+        _delivery_proof(JUDGE_EVENT_ID),
+        _delivery_proof(POLICY_EVENT_ID),
+    ]
+
+    ids, _statement = await _fetch_ids(events, proofs)
+
+    assert ids == [JUDGE_EVENT_ID, POLICY_EVENT_ID]

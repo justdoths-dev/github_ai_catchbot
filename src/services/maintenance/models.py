@@ -18,16 +18,20 @@ RecoveryMode = Literal["replay-selected", "retry-selected-due"]
 DeliveryResultWorkerClassification = Literal[
     "ignored",
     "unsupported",
+    "identity_invalid",
     "terminal_success",
     "logical_noop_success",
+    "superseded_noop",
     "retryable_candidate",
     "terminal_failure",
 ]
 DeliveryResultWorkerAction = Literal[
     "ignored",
     "unsupported",
+    "fail_closed",
     "mark_terminal_success",
     "mark_logical_noop_success",
+    "mark_superseded_noop_success",
     "already_marked",
     "record_retryable_interpretation",
     "record_terminal_failure",
@@ -54,6 +58,7 @@ class OutboxEvent:
     aggregate_type: str
     aggregate_id: UUID
     payload_json: dict[str, Any]
+    status: str = "pending"
 
 
 @dataclass(slots=True, frozen=True)
