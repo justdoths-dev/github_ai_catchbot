@@ -35,6 +35,11 @@ from .restricted_queue_activation import (
     RestrictedQueueActivationRequest,
     run_restricted_queue_activation,
 )
+from .restricted_queue_group_bootstrap import (
+    RestrictedQueueGroupBootstrapReport,
+    RestrictedQueueGroupBootstrapRequest,
+    run_restricted_queue_group_bootstrap,
+)
 from .repositories import MaintenanceRepository
 from .service import MaintenanceService
 from .worker import DueRetryPromotionWorker, MaintenanceQueueWorker, ReplayQueueWorker
@@ -172,6 +177,17 @@ def build_parser() -> argparse.ArgumentParser:
         activate.add_argument("--allow-create-group", action="store_true")
         activate.add_argument("--exact-trigger-event-id")
         activate.add_argument("--env-file", required=True)
+
+    queue_group_bootstrap = subcommands.add_parser("queue-group-bootstrap")
+    queue_group_bootstrap_subcommands = queue_group_bootstrap.add_subparsers(
+        dest="bootstrap_queue",
+        required=True,
+    )
+    for queue_name in ("maintenance", "replay"):
+        bootstrap = queue_group_bootstrap_subcommands.add_parser(queue_name)
+        bootstrap.add_argument("--mode", choices=["plan", "execute", "proof"], required=True)
+        bootstrap.add_argument("--confirm", choices=["create-group"], default=None)
+        bootstrap.add_argument("--env-file", required=True)
 
     recovery = subcommands.add_parser("batch-recovery")
     recovery_subcommands = recovery.add_subparsers(dest="recovery_mode", required=True)
@@ -752,6 +768,7 @@ def _one_shot_command_uses_explicit_env_file(command: str, args: argparse.Namesp
         "due-retry",
         "delivery-replay",
         "queue-activate",
+        "queue-group-bootstrap",
     } and bool(getattr(args, "env_file", None))
 
 
@@ -1077,6 +1094,36 @@ async def _run_queue_activate_operation(config: MaintenanceConfig, args: argpars
         await engine.dispose()
 
 
+async def _run_queue_group_bootstrap_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
+    request_error = _queue_group_bootstrap_request_error(args)
+    request = _queue_group_bootstrap_request(config, args)
+    if request_error is not None:
+        print(_to_json(asdict(_queue_group_bootstrap_blocked_report(request, request_error))))
+        return 2
+
+    from redis.asyncio import Redis  # type: ignore[import-not-found]
+
+    redis_client = Redis.from_url(config.redis_url, decode_responses=True)
+    consumer = RedisStreamConsumer(
+        redis_client,
+        queue_name=request.queue_name,
+        consumer_group=request.consumer_group,
+        consumer_name=request.consumer_name,
+        block_ms=config.block_ms,
+        batch_size=1,
+    )
+    try:
+        report = await run_restricted_queue_group_bootstrap(request, consumer=consumer)
+        print(_to_json(asdict(report)))
+        return 0 if report.status == "pass" else 2
+    finally:
+        close = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
+        if close is not None:
+            maybe_awaitable = close()
+            if asyncio.iscoroutine(maybe_awaitable):
+                await maybe_awaitable
+
+
 def _queue_activate_request(config: MaintenanceConfig, args: argparse.Namespace) -> RestrictedQueueActivationRequest:
     if args.activation_queue == "maintenance":
         queue_name = config.maintenance_queue_name
@@ -1113,6 +1160,67 @@ def _queue_activate_request_error(args: argparse.Namespace) -> str | None:
     if args.exact_trigger_event_id and _parse_uuid(args.exact_trigger_event_id) is None:
         return "exact_trigger_event_id_invalid"
     return None
+
+
+def _queue_group_bootstrap_request(
+    config: MaintenanceConfig,
+    args: argparse.Namespace,
+) -> RestrictedQueueGroupBootstrapRequest:
+    if args.bootstrap_queue == "maintenance":
+        queue_name = config.maintenance_queue_name
+        consumer_group = config.maintenance_consumer_group
+        consumer_name = config.maintenance_consumer_name
+    else:
+        queue_name = config.replay_queue_name
+        consumer_group = config.replay_consumer_group
+        consumer_name = config.replay_consumer_name
+    return RestrictedQueueGroupBootstrapRequest(
+        queue_selector=args.bootstrap_queue,
+        queue_name=queue_name,
+        consumer_group=consumer_group,
+        consumer_name=consumer_name,
+        mode=args.mode,
+        confirm_create_group=args.mode == "execute" and args.confirm == "create-group",
+    )
+
+
+def _queue_group_bootstrap_request_error(args: argparse.Namespace) -> str | None:
+    if args.mode == "execute" and args.confirm != "create-group":
+        return "create_group_confirm_missing"
+    if args.mode != "execute" and args.confirm == "create-group":
+        return "create_group_confirm_not_allowed_for_read_only"
+    return None
+
+
+def _queue_group_bootstrap_blocked_report(
+    request: RestrictedQueueGroupBootstrapRequest,
+    reason_code: str,
+) -> RestrictedQueueGroupBootstrapReport:
+    return RestrictedQueueGroupBootstrapReport(
+        schema_version="restricted_queue_group_bootstrap_report_v1",
+        queue_selector=request.queue_selector,
+        queue_name=request.queue_name,
+        consumer_group=request.consumer_group,
+        consumer_name=request.consumer_name,
+        mode=request.mode,
+        status="blocked",
+        group_exists=False,
+        created=False,
+        already_exists=False,
+        xgroup_create_attempted=False,
+        stream_messages_read=False,
+        ack_attempted=False,
+        db_writes_attempted=False,
+        destructive_redis_commands_attempted=False,
+        reason_code=reason_code,
+        redactions_applied={
+            "full_redis_message_id_omitted": True,
+            "payload_json_omitted": True,
+            "database_url_omitted": True,
+            "redis_url_omitted": True,
+            "exception_body_omitted": True,
+        },
+    )
 
 
 def _queue_activate_blocked_report(
@@ -1322,6 +1430,8 @@ async def _run(argv: list[str] | None = None) -> int:
         return await _run_delivery_replay_operation(config, args)
     if command == "queue-activate":
         return await _run_queue_activate_operation(config, args)
+    if command == "queue-group-bootstrap":
+        return await _run_queue_group_bootstrap_operation(config, args)
     if command == "batch-recovery":
         return await _run_batch_recovery(config, args)
     parser.error(f"unsupported command: {command}")
