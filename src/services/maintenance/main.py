@@ -64,6 +64,18 @@ from .systemd_rollout import (
 )
 from .worker import DueRetryPromotionWorker, MaintenanceQueueWorker, ReplayQueueWorker
 from .worker_once import WorkerOnceReport, WorkerOnceRequest, run_worker_once
+from .worker_runtime_crash_probe import (
+    WorkerRuntimeCrashProbeReport,
+    WorkerRuntimeCrashProbeRequest,
+    WorkerRuntimeSetupError,
+    build_worker_runtime_components,
+    build_worker_runtime_crash_probe_blocked_report,
+    close_worker_runtime_resources,
+    run_labeled_worker_tasks,
+    run_worker_runtime_crash_probe,
+    worker_runtime_crash_probe_request_error,
+    worker_runtime_task_specs,
+)
 from .worker_startup_probe import (
     WorkerStartupProbeReport,
     WorkerStartupProbeRequest,
@@ -148,6 +160,12 @@ def build_parser() -> argparse.ArgumentParser:
     worker_startup_probe.add_argument("--mode", required=True)
     worker_startup_probe.add_argument("--confirm", default=None)
     worker_startup_probe.add_argument("--env-file", required=True)
+
+    worker_runtime_crash_probe = subcommands.add_parser("worker-runtime-crash-probe")
+    worker_runtime_crash_probe.add_argument("--mode", required=True)
+    worker_runtime_crash_probe.add_argument("--confirm", default=None)
+    worker_runtime_crash_probe.add_argument("--max-runtime-sec", type=int, default=10)
+    worker_runtime_crash_probe.add_argument("--env-file", required=True)
 
     worker_once = subcommands.add_parser("worker-once")
     worker_once_subcommands = worker_once.add_subparsers(dest="worker_type", required=True)
@@ -433,68 +451,72 @@ def _to_json(value: object) -> str:
 
 async def _run_worker(config: MaintenanceConfig) -> int:
     logger = _build_logger(config.log_level)
-
-    from redis.asyncio import Redis  # type: ignore[import-not-found]
-    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
-
-    engine = create_async_engine(config.database_url, future=True)
-    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    redis_client = Redis.from_url(config.redis_url, decode_responses=True)
-
-    maintenance_consumer = RedisStreamConsumer(
-        redis_client,
-        queue_name=config.maintenance_queue_name,
-        consumer_group=config.maintenance_consumer_group,
-        consumer_name=config.maintenance_consumer_name,
-        block_ms=config.block_ms,
-        batch_size=config.batch_size,
-    )
-    replay_consumer = RedisStreamConsumer(
-        redis_client,
-        queue_name=config.replay_queue_name,
-        consumer_group=config.replay_consumer_group,
-        consumer_name=config.replay_consumer_name,
-        block_ms=config.block_ms,
-        batch_size=config.batch_size,
-    )
-
-    class SessionBackedService:
-        async def handle_maintenance_trigger_event(self, trigger_event_id: str) -> None:
-            async with session_factory.begin() as session:
-                service = MaintenanceService(config, repository=MaintenanceRepository(session), logger=logger)
-                await service.handle_maintenance_trigger_event(trigger_event_id)
-
-        async def handle_replay_trigger_event(self, trigger_event_id: str) -> None:
-            async with session_factory.begin() as session:
-                service = MaintenanceService(config, repository=MaintenanceRepository(session), logger=logger)
-                await service.handle_replay_trigger_event(trigger_event_id)
-
-        async def promote_due_retries_once(self, limit: int | None = None) -> int:
-            async with session_factory.begin() as session:
-                service = MaintenanceService(config, repository=MaintenanceRepository(session), logger=logger)
-                return await service.promote_due_retries_once(limit=limit)
-
-    service = SessionBackedService()
-    maintenance_worker = MaintenanceQueueWorker(config, consumer=maintenance_consumer, service=service, logger=logger)
-    replay_worker = ReplayQueueWorker(config, consumer=replay_consumer, service=service, logger=logger)
-    due_retry_worker = DueRetryPromotionWorker(config, service=service, logger=logger)
+    components = None
+    cancelled = False
+    exit_code = 1
     try:
-        await asyncio.gather(
-            maintenance_worker.run_forever(),
-            replay_worker.run_forever(),
-            due_retry_worker.run_forever(),
+        components = build_worker_runtime_components(config=config, logger=logger)
+        result = await run_labeled_worker_tasks(worker_runtime_task_specs(components))
+        logger.error(
+            "maintenance_worker_runtime_failed",
+            extra={
+                "service": "maintenance",
+                "event": "maintenance_worker_runtime_failed",
+                "reason_code": result.reason_code,
+                "crashed_task": result.crashed_task,
+                "unexpected_return_task": result.unexpected_return_task,
+            },
         )
     except asyncio.CancelledError:
+        cancelled = True
         logger.info("maintenance_cancelled", extra={"service": "maintenance", "event": "cancelled"})
-        return 0
+    except WorkerRuntimeSetupError as exc:
+        logger.error(
+            "maintenance_worker_runtime_setup_failed",
+            extra={
+                "service": "maintenance",
+                "event": "maintenance_worker_runtime_setup_failed",
+                "reason_code": "worker_runtime_setup_failed",
+            },
+        )
+        cleanup_completed = await close_worker_runtime_resources(redis_client=exc.redis_client, engine=exc.engine)
+        if not cleanup_completed:
+            logger.error(
+                "maintenance_worker_runtime_cleanup_failed",
+                extra={
+                    "service": "maintenance",
+                    "event": "maintenance_worker_runtime_cleanup_failed",
+                    "reason_code": "cleanup_failed",
+                },
+            )
+    except Exception:
+        logger.error(
+            "maintenance_worker_runtime_error",
+            extra={
+                "service": "maintenance",
+                "event": "maintenance_worker_runtime_error",
+                "reason_code": "probe_runtime_error",
+            },
+        )
     finally:
-        close = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
-        if close is not None:
-            maybe_awaitable = close()
-            if asyncio.iscoroutine(maybe_awaitable):
-                await maybe_awaitable
-        await engine.dispose()
-    return 0
+        if components is not None:
+            cleanup_completed = await close_worker_runtime_resources(
+                redis_client=components.redis_client,
+                engine=components.engine,
+            )
+            if not cleanup_completed:
+                logger.error(
+                    "maintenance_worker_runtime_cleanup_failed",
+                    extra={
+                        "service": "maintenance",
+                        "event": "maintenance_worker_runtime_cleanup_failed",
+                        "reason_code": "cleanup_failed",
+                    },
+                )
+                cancelled = False
+    if cancelled:
+        exit_code = 0
+    return exit_code
 
 
 async def _run_delivery_gate(config: MaintenanceConfig, args: argparse.Namespace) -> int:
@@ -842,6 +864,7 @@ def _one_shot_command_uses_explicit_env_file(command: str, args: argparse.Namesp
         "queue-group-bootstrap",
         "worker-once",
         "worker-startup-probe",
+        "worker-runtime-crash-probe",
         "foreground-smoke",
         "controlled-worker",
     } and bool(getattr(args, "env_file", None))
@@ -1273,6 +1296,21 @@ async def _run_worker_startup_probe_operation(config: MaintenanceConfig, args: a
     return 2
 
 
+async def _run_worker_runtime_crash_probe_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
+    request = _worker_runtime_crash_probe_request(args)
+    report = await run_worker_runtime_crash_probe(
+        request,
+        config=config,
+        logger=_build_logger(config.log_level),
+    )
+    print(_to_json(asdict(report)))
+    if report.status == "pass":
+        return 0
+    if report.status == "failed":
+        return 1
+    return 2
+
+
 async def _run_foreground_smoke_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
     request = _foreground_smoke_request(config, args)
 
@@ -1554,6 +1592,31 @@ def _worker_startup_probe_config_reason_code(reason_code: str) -> str:
     if reason_code in {"env_file_missing", "env_file_no_runtime_config"}:
         return reason_code
     return "runtime_config_error"
+
+
+def _worker_runtime_crash_probe_request(args: argparse.Namespace) -> WorkerRuntimeCrashProbeRequest:
+    return WorkerRuntimeCrashProbeRequest(
+        mode=args.mode,
+        max_runtime_sec=int(args.max_runtime_sec),
+        confirm_run=args.mode == "execute" and args.confirm == "run",
+    )
+
+
+def _worker_runtime_crash_probe_request_error(args: argparse.Namespace) -> str | None:
+    return worker_runtime_crash_probe_request_error(_worker_runtime_crash_probe_request(args))
+
+
+def _worker_runtime_crash_probe_config_error_report(
+    args: argparse.Namespace,
+    reason_code: str,
+) -> WorkerRuntimeCrashProbeReport:
+    del reason_code
+    return build_worker_runtime_crash_probe_blocked_report(
+        mode=args.mode,
+        max_runtime_sec=int(args.max_runtime_sec),
+        status="failed",
+        reason_code="runtime_config_error",
+    )
 
 
 def _worker_once_request_error(args: argparse.Namespace) -> str | None:
@@ -1969,6 +2032,21 @@ async def _run(argv: list[str] | None = None) -> int:
                 )
             )
             return 2
+    if command == "worker-runtime-crash-probe":
+        request_error = _worker_runtime_crash_probe_request_error(args)
+        if request_error is not None:
+            print(
+                _to_json(
+                    asdict(
+                        build_worker_runtime_crash_probe_blocked_report(
+                            mode=args.mode,
+                            max_runtime_sec=int(args.max_runtime_sec),
+                            reason_code=request_error,
+                        )
+                    )
+                )
+            )
+            return 2
     if command == "foreground-smoke":
         request_error = _foreground_smoke_request_error(args)
         if request_error is not None:
@@ -2002,6 +2080,10 @@ async def _run(argv: list[str] | None = None) -> int:
                 report = _worker_startup_probe_config_error_report(args, reason_code)
                 print(_to_json(asdict(report)))
                 return 1 if report.status == "failed" else 2
+            if command == "worker-runtime-crash-probe":
+                report = _worker_runtime_crash_probe_config_error_report(args, reason_code)
+                print(_to_json(asdict(report)))
+                return 1 if report.status == "failed" else 2
             print(_to_json(_maintenance_one_shot_runtime_config_error_payload(reason_code)))
             return 1
     if command == "batch-recovery" and args.recovery_mode == "replay-selected" and (
@@ -2022,6 +2104,10 @@ async def _run(argv: list[str] | None = None) -> int:
             report = _worker_startup_probe_config_error_report(args, reason_code)
             print(_to_json(asdict(report)))
             return 1 if report.status == "failed" else 2
+        if command == "worker-runtime-crash-probe":
+            report = _worker_runtime_crash_probe_config_error_report(args, reason_code)
+            print(_to_json(asdict(report)))
+            return 1 if report.status == "failed" else 2
         print(_to_json(_maintenance_one_shot_runtime_config_error_payload(reason_code)))
         return 1
     if command == "worker":
@@ -2030,6 +2116,8 @@ async def _run(argv: list[str] | None = None) -> int:
         return await _run_worker_once_operation(config, args)
     if command == "worker-startup-probe":
         return await _run_worker_startup_probe_operation(config, args)
+    if command == "worker-runtime-crash-probe":
+        return await _run_worker_runtime_crash_probe_operation(config, args)
     if command == "foreground-smoke":
         return await _run_foreground_smoke_operation(config, args)
     if command == "controlled-worker":
