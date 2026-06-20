@@ -46,6 +46,8 @@ _RETURNED_REASON_CODES = {
 }
 _CANCEL_TIMEOUT_SEC = 5.0
 _FATAL_REPORT_ALLOWED_REASON_CODES = {
+    "worker_runtime_config_error",
+    "worker_command_pre_runtime_error",
     "worker_runtime_setup_failed",
     "worker_runtime_error",
     "probe_runtime_error",
@@ -119,9 +121,10 @@ class WorkerRuntimeTaskResult:
 class WorkerRuntimeFatalReport:
     schema_version: str
     reason_code: str
+    phase: str
     crashed_task: str | None
     unexpected_return_task: str | None
-    cleanup_completed: bool
+    cleanup_completed: bool | None
     tasks_started: list[str]
     broad_worker_run_started: bool
     created_at_utc: str
@@ -137,10 +140,12 @@ class WorkerRuntimeFatalReportReadback:
     report_present: bool
     report_schema_version: str | None
     latest_report_reason_code: str | None
+    latest_report_phase: str | None
     latest_report_crashed_task: str | None
     latest_report_unexpected_return_task: str | None
     latest_report_cleanup_completed: bool | None
     latest_report_tasks_started: list[str]
+    latest_report_broad_worker_run_started: bool | None
     raw_report_path_omitted: bool = True
     raw_exception_body_omitted: bool = True
     traceback_omitted: bool = True
@@ -194,9 +199,10 @@ def build_worker_runtime_crash_probe_blocked_report(
 def build_worker_runtime_fatal_report(
     *,
     reason_code: str,
+    phase: str = "runtime",
     crashed_task: str | None = None,
     unexpected_return_task: str | None = None,
-    cleanup_completed: bool,
+    cleanup_completed: bool | None,
     tasks_started: list[str] | tuple[str, ...] | None = None,
     broad_worker_run_started: bool = False,
     now_utc: datetime | None = None,
@@ -209,9 +215,10 @@ def build_worker_runtime_fatal_report(
     return WorkerRuntimeFatalReport(
         schema_version=FATAL_REPORT_SCHEMA_VERSION,
         reason_code=safe_reason_code,
+        phase=_safe_fatal_phase(phase),
         crashed_task=safe_crashed_task,
         unexpected_return_task=safe_unexpected_return_task,
-        cleanup_completed=bool(cleanup_completed),
+        cleanup_completed=_safe_bool_or_none(cleanup_completed),
         tasks_started=safe_tasks_started,
         broad_worker_run_started=bool(broad_worker_run_started and safe_tasks_started),
         created_at_utc=created_at.isoformat().replace("+00:00", "Z"),
@@ -232,15 +239,17 @@ def build_worker_runtime_fatal_report(
 def write_worker_runtime_fatal_report(
     *,
     reason_code: str,
+    phase: str = "runtime",
     crashed_task: str | None = None,
     unexpected_return_task: str | None = None,
-    cleanup_completed: bool,
+    cleanup_completed: bool | None,
     tasks_started: list[str] | tuple[str, ...] | None = None,
     broad_worker_run_started: bool = False,
     report_path: Path | None = None,
 ) -> WorkerRuntimeFatalReport:
     report = build_worker_runtime_fatal_report(
         reason_code=reason_code,
+        phase=phase,
         crashed_task=crashed_task,
         unexpected_return_task=unexpected_return_task,
         cleanup_completed=cleanup_completed,
@@ -296,10 +305,12 @@ def read_worker_runtime_fatal_report(*, report_path: Path | None = None) -> Work
         report_present=True,
         report_schema_version=FATAL_REPORT_SCHEMA_VERSION,
         latest_report_reason_code=latest_reason_code,
+        latest_report_phase=_safe_fatal_phase(raw.get("phase")),
         latest_report_crashed_task=_safe_worker_task_label(raw.get("crashed_task")),
         latest_report_unexpected_return_task=_safe_worker_task_label(raw.get("unexpected_return_task")),
         latest_report_cleanup_completed=_safe_bool_or_none(raw.get("cleanup_completed")),
         latest_report_tasks_started=_safe_worker_task_list(raw.get("tasks_started")),
+        latest_report_broad_worker_run_started=_safe_bool_or_none(raw.get("broad_worker_run_started")),
     )
 
 
@@ -681,6 +692,7 @@ def _fatal_report_to_dict(report: WorkerRuntimeFatalReport) -> dict[str, Any]:
     return {
         "schema_version": report.schema_version,
         "reason_code": report.reason_code,
+        "phase": report.phase,
         "crashed_task": report.crashed_task,
         "unexpected_return_task": report.unexpected_return_task,
         "cleanup_completed": report.cleanup_completed,
@@ -699,10 +711,12 @@ def _fatal_report_readback(
     report_present: bool,
     report_schema_version: str | None = None,
     latest_report_reason_code: str | None = None,
+    latest_report_phase: str | None = None,
     latest_report_crashed_task: str | None = None,
     latest_report_unexpected_return_task: str | None = None,
     latest_report_cleanup_completed: bool | None = None,
     latest_report_tasks_started: list[str] | None = None,
+    latest_report_broad_worker_run_started: bool | None = None,
 ) -> WorkerRuntimeFatalReportReadback:
     return WorkerRuntimeFatalReportReadback(
         schema_version=FATAL_REPORT_READBACK_SCHEMA_VERSION,
@@ -711,10 +725,12 @@ def _fatal_report_readback(
         report_present=report_present,
         report_schema_version=report_schema_version,
         latest_report_reason_code=latest_report_reason_code,
+        latest_report_phase=latest_report_phase,
         latest_report_crashed_task=latest_report_crashed_task,
         latest_report_unexpected_return_task=latest_report_unexpected_return_task,
         latest_report_cleanup_completed=latest_report_cleanup_completed,
         latest_report_tasks_started=list(latest_report_tasks_started or []),
+        latest_report_broad_worker_run_started=latest_report_broad_worker_run_started,
     )
 
 
@@ -739,6 +755,12 @@ def _safe_fatal_reason_code(value: object) -> str:
     if isinstance(value, str) and value in _FATAL_REPORT_ALLOWED_REASON_CODES:
         return value
     return "probe_runtime_error"
+
+
+def _safe_fatal_phase(value: object) -> str:
+    if isinstance(value, str) and value in {"config_load", "pre_worker", "runtime"}:
+        return value
+    return "runtime"
 
 
 def _safe_schema_version(value: object) -> str | None:

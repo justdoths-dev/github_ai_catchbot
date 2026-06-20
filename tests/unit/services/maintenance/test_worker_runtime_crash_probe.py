@@ -583,7 +583,8 @@ def test_shared_helper_maps_task_labels_to_bounded_reason_codes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_worker_returns_zero_only_on_cancellation(monkeypatch) -> None:
+async def test_run_worker_returns_zero_only_on_cancellation(monkeypatch, tmp_path: Path) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
     components = FakeComponents()
 
     def fake_build_worker_runtime_components(*args, **kwargs):
@@ -597,10 +598,152 @@ async def test_run_worker_returns_zero_only_on_cancellation(monkeypatch) -> None
     monkeypatch.setattr(maintenance_main, "build_worker_runtime_components", fake_build_worker_runtime_components)
     monkeypatch.setattr(maintenance_main, "worker_runtime_task_specs", lambda components_arg: [])
     monkeypatch.setattr(maintenance_main, "run_labeled_worker_tasks", fake_run_labeled_worker_tasks)
+    monkeypatch.setattr(
+        maintenance_main,
+        "write_worker_runtime_fatal_report",
+        lambda **kwargs: report_path.write_text(json.dumps(kwargs), encoding="utf-8"),
+    )
 
     assert await maintenance_main._run_worker(config()) == 0
     assert components.engine.dispose_called is True
     assert components.redis_client.closed is True
+    assert not report_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_worker_command_config_failure_writes_redacted_pre_runtime_fatal_report(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    _patch_worker_fatal_report_path(monkeypatch, report_path)
+    raw_exception = (
+        "Traceback DATABASE_URL REDIS_URL "
+        f"{RAW_DATABASE_URL} {RAW_REDIS_URL} /tmp/{RUNTIME_ENV_PATH_SENTINEL}.env"
+    )
+
+    def fail_config_load(cls):
+        del cls
+        raise maintenance_main.MaintenanceConfigurationError(raw_exception)
+
+    async def fail_worker(config_arg):
+        del config_arg
+        raise AssertionError("worker command config failure must block before _run_worker")
+
+    monkeypatch.setattr(maintenance_main.MaintenanceConfig, "from_env", classmethod(fail_config_load))
+    monkeypatch.setattr(maintenance_main, "_run_worker", fail_worker)
+
+    exit_code = await maintenance_main._run(["worker"])
+    output = capsys.readouterr().out
+    payload = _read_json(report_path)
+    serialized_report = json.dumps(payload, sort_keys=True)
+
+    assert exit_code == 1
+    assert output == ""
+    assert payload["schema_version"] == FATAL_REPORT_SCHEMA_VERSION
+    assert payload["reason_code"] == "worker_runtime_config_error"
+    assert payload["phase"] == "config_load"
+    assert payload["tasks_started"] == []
+    assert payload["broad_worker_run_started"] is False
+    assert payload["cleanup_completed"] is True
+    assert payload["redactions_applied"]["runtime_env_path_omitted"] is True
+    assert payload["redactions_applied"]["runtime_env_values_omitted"] is True
+    assert payload["redactions_applied"]["database_url_omitted"] is True
+    assert payload["redactions_applied"]["redis_url_omitted"] is True
+    assert payload["redactions_applied"]["raw_exception_body_omitted"] is True
+    assert payload["redactions_applied"]["traceback_omitted"] is True
+    assert payload["report_path_omitted"] is True
+    _assert_no_secret_leaks(
+        serialized_report,
+        raw_exception,
+        "DATABASE_URL",
+        "REDIS_URL",
+        report_path,
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_runtime_fatal_report_cli_reads_pre_runtime_config_report(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    _patch_worker_fatal_report_path(monkeypatch, report_path)
+    write_worker_runtime_fatal_report(
+        reason_code="worker_runtime_config_error",
+        phase="config_load",
+        cleanup_completed=True,
+        tasks_started=[],
+        broad_worker_run_started=False,
+        report_path=report_path,
+    )
+
+    def fail_config_load(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("fatal-report readback must not load runtime config")
+
+    monkeypatch.setattr(maintenance_main.MaintenanceConfig, "from_env", classmethod(fail_config_load))
+
+    exit_code = await maintenance_main._run(["worker-runtime-fatal-report", "--mode", "read"])
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert exit_code == 0
+    assert payload["status"] == "pass"
+    assert payload["latest_report_reason_code"] == "worker_runtime_config_error"
+    assert payload["latest_report_phase"] == "config_load"
+    assert payload["latest_report_cleanup_completed"] is True
+    assert payload["latest_report_tasks_started"] == []
+    assert payload["latest_report_broad_worker_run_started"] is False
+    _assert_no_secret_leaks(output, report_path)
+
+
+@pytest.mark.asyncio
+async def test_worker_command_unexpected_pre_runtime_error_writes_redacted_report(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    _patch_worker_fatal_report_path(monkeypatch, report_path)
+    raw_exception = (
+        "Traceback DATABASE_URL REDIS_URL "
+        f"{RAW_DATABASE_URL} {RAW_REDIS_URL} /tmp/{RUNTIME_ENV_PATH_SENTINEL}.env"
+    )
+
+    def fail_config_setup(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError(raw_exception)
+
+    async def fail_worker(config_arg):
+        del config_arg
+        raise AssertionError("unexpected pre-runtime failure must block before _run_worker")
+
+    monkeypatch.setattr(maintenance_main, "_load_maintenance_one_shot_runtime_config", fail_config_setup)
+    monkeypatch.setattr(maintenance_main, "_run_worker", fail_worker)
+
+    exit_code = await maintenance_main._run(["worker"])
+    output = capsys.readouterr().out
+    payload = _read_json(report_path)
+    serialized_report = json.dumps(payload, sort_keys=True)
+
+    assert exit_code == 1
+    assert output == ""
+    assert payload["reason_code"] == "worker_command_pre_runtime_error"
+    assert payload["phase"] == "pre_worker"
+    assert payload["tasks_started"] == []
+    assert payload["broad_worker_run_started"] is False
+    assert payload["cleanup_completed"] is None
+    _assert_no_secret_leaks(
+        serialized_report,
+        raw_exception,
+        "DATABASE_URL",
+        "REDIS_URL",
+        report_path,
+    )
 
 
 @pytest.mark.asyncio

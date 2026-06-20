@@ -1354,6 +1354,16 @@ async def _run_worker_runtime_fatal_report_operation(args: argparse.Namespace) -
     return 0 if report.status == "pass" else 2
 
 
+def _write_worker_pre_runtime_fatal_report(*, reason_code: str, phase: str) -> None:
+    write_worker_runtime_fatal_report(
+        reason_code=reason_code,
+        phase=phase,
+        cleanup_completed=True if phase == "config_load" else None,
+        tasks_started=[],
+        broad_worker_run_started=False,
+    )
+
+
 async def _run_foreground_smoke_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
     request = _foreground_smoke_request(config, args)
 
@@ -2171,6 +2181,12 @@ async def _run(argv: list[str] | None = None) -> int:
         config = _load_maintenance_one_shot_runtime_config(args, env_file_overlay=runtime_env_overlay)
     except _MaintenanceOneShotRuntimeConfigError as exc:
         reason_code = _one_shot_runtime_config_reason_code(exc)
+        if command == "worker":
+            _write_worker_pre_runtime_fatal_report(
+                reason_code="worker_runtime_config_error",
+                phase="config_load",
+            )
+            return 1
         if command == "worker-startup-probe":
             report = _worker_startup_probe_config_error_report(args, reason_code)
             print(_to_json(asdict(report)))
@@ -2181,6 +2197,22 @@ async def _run(argv: list[str] | None = None) -> int:
             return 1 if report.status == "failed" else 2
         print(_to_json(_maintenance_one_shot_runtime_config_error_payload(reason_code)))
         return 1
+    except (MaintenanceConfigurationError, ValueError, TypeError):
+        if command == "worker":
+            _write_worker_pre_runtime_fatal_report(
+                reason_code="worker_runtime_config_error",
+                phase="config_load",
+            )
+            return 1
+        raise
+    except Exception:
+        if command == "worker":
+            _write_worker_pre_runtime_fatal_report(
+                reason_code="worker_command_pre_runtime_error",
+                phase="pre_worker",
+            )
+            return 1
+        raise
     if command == "worker":
         return await _run_worker(config)
     if command == "worker-once":
