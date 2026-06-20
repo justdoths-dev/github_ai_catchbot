@@ -46,6 +46,8 @@ _RETURNED_REASON_CODES = {
 }
 _CANCEL_TIMEOUT_SEC = 5.0
 _FATAL_REPORT_ALLOWED_REASON_CODES = {
+    "worker_bootstrap_import_error",
+    "worker_bootstrap_main_error",
     "worker_runtime_config_error",
     "worker_command_pre_runtime_error",
     "worker_runtime_setup_failed",
@@ -758,7 +760,13 @@ def _safe_fatal_reason_code(value: object) -> str:
 
 
 def _safe_fatal_phase(value: object) -> str:
-    if isinstance(value, str) and value in {"config_load", "pre_worker", "runtime"}:
+    if isinstance(value, str) and value in {
+        "bootstrap_import",
+        "bootstrap_main",
+        "config_load",
+        "pre_worker",
+        "runtime",
+    }:
         return value
     return "runtime"
 

@@ -979,6 +979,7 @@ def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tm
             {
                 "schema_version": FATAL_REPORT_SCHEMA_VERSION,
                 "reason_code": "sentinel-secret-reason",
+                "phase": "sentinel-secret-phase",
                 "crashed_task": "Traceback sentinel-secret",
                 "unexpected_return_task": RAW_DATABASE_URL,
                 "cleanup_completed": True,
@@ -996,10 +997,11 @@ def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tm
     assert report.status == "blocked"
     assert report.reason_code == "fatal_report_unknown_reason_code"
     assert report.latest_report_reason_code == "probe_runtime_error"
+    assert report.latest_report_phase == "runtime"
     assert report.latest_report_crashed_task is None
     assert report.latest_report_unexpected_return_task is None
     assert report.latest_report_tasks_started == [MAINTENANCE_QUEUE_WORKER_LABEL]
-    _assert_no_secret_leaks(output, "sentinel-secret-reason", "Traceback sentinel-secret")
+    _assert_no_secret_leaks(output, "sentinel-secret-reason", "sentinel-secret-phase", "Traceback sentinel-secret")
 
 
 @pytest.mark.asyncio

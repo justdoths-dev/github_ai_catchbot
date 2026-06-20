@@ -117,6 +117,7 @@ def _request(
     maintenance_dir = repo_root / "src/services/maintenance"
     maintenance_dir.mkdir(parents=True, exist_ok=True)
     (maintenance_dir / "main.py").write_text("# maintenance entrypoint\n", encoding="utf-8")
+    (maintenance_dir / "worker_bootstrap.py").write_text("# maintenance bootstrap entrypoint\n", encoding="utf-8")
     python_executable = tmp_path / "venv/bin/python"
     python_executable.parent.mkdir(parents=True, exist_ok=True)
     python_executable.write_text("# python shim\n", encoding="utf-8")
@@ -176,8 +177,7 @@ def test_plan_builds_deterministic_service_unit_without_writes(tmp_path: Path) -
     assert plan.exec_start_argv == (
         str(request.python_executable),
         "-m",
-        "src.services.maintenance.main",
-        "worker",
+        "src.services.maintenance.worker_bootstrap",
     )
     assert plan.service_unit_content == "\n".join(
         [
@@ -190,7 +190,7 @@ def test_plan_builds_deterministic_service_unit_without_writes(tmp_path: Path) -
             "Type=simple",
             f"WorkingDirectory={request.repo_root}",
             f"EnvironmentFile={request.runtime_env_file}",
-            f"ExecStart={request.python_executable} -m src.services.maintenance.main worker",
+            f"ExecStart={request.python_executable} -m src.services.maintenance.worker_bootstrap",
             "Restart=on-failure",
             "RestartSec=10",
             "",
@@ -410,12 +410,17 @@ def test_service_unit_uses_environment_file_without_shell_or_broad_permissions(t
     assert "PYTHONPATH=" not in plan.service_unit_content
     assert "ExecStart=" in plan.service_unit_content
     assert "/bin/sh" not in plan.service_unit_content
+    assert "/bin/bash" not in plan.service_unit_content
+    assert "bash -c" not in plan.service_unit_content
     assert " source " not in plan.service_unit_content
     assert " cat " not in plan.service_unit_content
     assert " export " not in plan.service_unit_content
     assert "printenv" not in plan.service_unit_content
     assert "chmod" not in plan.service_unit_content
     assert "chown" not in plan.service_unit_content
+    assert "journalctl" not in plan.service_unit_content
+    assert "src.services.maintenance.worker_bootstrap" in plan.service_unit_content
+    assert "src.services.maintenance.main worker" not in plan.service_unit_content
     assert "User=" not in plan.service_unit_content
     assert "Group=" not in plan.service_unit_content
 
@@ -574,6 +579,36 @@ def test_context_proof_rejects_shell_wrapped_expected_exec_start(tmp_path: Path)
     assert report.mismatched_context_fields == ["exec_start_matches_expected"]
     assert "ExecStart=" not in output
     assert "/bin/sh" not in output
+    assert str(request.python_executable) not in output
+
+
+def test_context_proof_rejects_direct_main_worker_exec_start(tmp_path: Path) -> None:
+    request = _context_request(tmp_path)
+    adapter = FakeContextProofAdapter(
+        SystemdContextState(
+            service_file_present=True,
+            service_enabled=True,
+            service_active=False,
+            service_name_matches_expected=True,
+            unit_load_state="loaded",
+            unit_file_state="enabled",
+            exec_start=f"{request.python_executable} -m src.services.maintenance.main worker",
+            working_directory=str(request.repo_root),
+            environment_file=str(request.runtime_env_file),
+            restart_policy="on-failure",
+            restart_sec="10s",
+        )
+    )
+
+    report = run_systemd_context_proof(request, adapter=adapter)
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "unit_context_mismatch"
+    assert report.exec_start_matches_expected is False
+    assert report.unit_context_matches_expected is False
+    assert report.mismatched_context_fields == ["exec_start_matches_expected"]
+    assert "src.services.maintenance.main" not in output
     assert str(request.python_executable) not in output
 
 
@@ -765,7 +800,7 @@ def test_parse_systemd_context_properties_allows_only_context_properties_and_red
             "ActiveState=activating",
             "UnitFileState=enabled",
             "FragmentPath=/home/dev/private/github-ai-catchbot-maintenance.service",
-            "ExecStart=/home/dev/private/python -m src.services.maintenance.main worker",
+            "ExecStart=/home/dev/private/python -m src.services.maintenance.worker_bootstrap",
             "WorkingDirectory=/home/dev/private/repo",
             "EnvironmentFiles=/home/dev/private/runtime.env (ignore_errors=no)",
             "Restart=on-failure",
@@ -792,7 +827,7 @@ def test_parse_service_unit_directives_reads_only_service_context() -> None:
             "[Service]",
             "WorkingDirectory=/repo",
             "EnvironmentFile=/runtime.env",
-            "ExecStart=/python -m src.services.maintenance.main worker",
+            "ExecStart=/python -m src.services.maintenance.worker_bootstrap",
             "Restart=on-failure",
             "RestartSec=10",
             "[Install]",
@@ -803,7 +838,7 @@ def test_parse_service_unit_directives_reads_only_service_context() -> None:
     assert parse_service_unit_directives(content) == {
         "WorkingDirectory": "/repo",
         "EnvironmentFile": "/runtime.env",
-        "ExecStart": "/python -m src.services.maintenance.main worker",
+        "ExecStart": "/python -m src.services.maintenance.worker_bootstrap",
         "Restart": "on-failure",
         "RestartSec": "10",
     }

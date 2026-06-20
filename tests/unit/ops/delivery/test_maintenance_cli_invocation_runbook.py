@@ -13,7 +13,8 @@ def _read_runbook(name: str) -> str:
 def test_maintenance_cli_invocation_documents_one_shot_compose_and_confirm() -> None:
     text = _read_runbook("maintenance_cli_invocation.md")
 
-    assert "python -m src.services.maintenance.main worker" in text
+    assert "python -m src.services.maintenance.worker_bootstrap" in text
+    assert "python -m src.services.maintenance.main worker" not in text
     assert "docker compose run --rm maintenance" in text
     assert "docker compose up" in text
     assert "Never run batch-recovery via `docker compose up`" in text
