@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -45,9 +46,45 @@ def test_bootstrap_top_level_imports_are_stdlib_only() -> None:
         elif isinstance(node, ast.ImportFrom):
             imported_roots.add(node.module.split(".", 1)[0] if node.module else "")
 
-    assert imported_roots <= {"__future__", "asyncio", "importlib", "json", "datetime", "pathlib"}
+    assert imported_roots <= {"__future__", "asyncio", "importlib", "json", "sys", "datetime", "pathlib"}
     assert "from .worker_runtime_crash_probe" not in source
     assert "from services.maintenance" not in source
+
+
+def test_bootstrap_exit_status_reason_codes_are_bounded() -> None:
+    assert worker_bootstrap.BOOTSTRAP_EXIT_STATUS_REASON_CODES == {
+        21: "worker_bootstrap_import_error",
+        22: "worker_bootstrap_main_error",
+        23: "worker_bootstrap_report_write_failed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_adds_repo_root_for_direct_script_import(monkeypatch, tmp_path: Path) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    script_dir = str(worker_bootstrap.REPO_ROOT / "src/services/maintenance")
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [script_dir])
+    observed_path: list[str] = []
+
+    class FakeMaintenanceMain:
+        async def _run(self, argv: list[str]) -> int:
+            assert argv == ["worker"]
+            return 0
+
+    def import_with_repo_root(module_name: str):
+        assert module_name == worker_bootstrap.MAINTENANCE_MAIN_MODULE
+        observed_path.extend(sys.path)
+        return FakeMaintenanceMain()
+
+    exit_code = await worker_bootstrap.run_bootstrap(
+        import_module=import_with_repo_root,
+        report_path=report_path,
+    )
+
+    assert exit_code == 0
+    assert observed_path[0] == str(worker_bootstrap.REPO_ROOT)
+    assert observed_path.count(str(worker_bootstrap.REPO_ROOT)) == 1
+    assert not report_path.exists()
 
 
 @pytest.mark.asyncio
@@ -64,7 +101,7 @@ async def test_bootstrap_import_failure_writes_redacted_fatal_report(tmp_path: P
     payload = _read_json(report_path)
     serialized = json.dumps(payload, sort_keys=True)
 
-    assert exit_code == 1
+    assert exit_code == worker_bootstrap.EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR
     assert output == ""
     assert payload["schema_version"] == worker_bootstrap.FATAL_REPORT_SCHEMA_VERSION
     assert payload["reason_code"] == "worker_bootstrap_import_error"
@@ -97,7 +134,7 @@ async def test_bootstrap_main_failure_writes_redacted_fatal_report(tmp_path: Pat
     payload = _read_json(report_path)
     serialized = json.dumps(payload, sort_keys=True)
 
-    assert exit_code == 1
+    assert exit_code == worker_bootstrap.EXIT_WORKER_BOOTSTRAP_MAIN_ERROR
     assert output == ""
     assert observed_argv == ["worker"]
     assert payload["schema_version"] == worker_bootstrap.FATAL_REPORT_SCHEMA_VERSION
@@ -130,7 +167,9 @@ async def test_bootstrap_returns_main_worker_exit_code_without_fatal_report(tmp_
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_nonzero_main_exit_writes_report_only_when_app_report_missing(tmp_path: Path) -> None:
+async def test_bootstrap_nonzero_main_exit_returns_bootstrap_main_status_when_app_report_missing(
+    tmp_path: Path,
+) -> None:
     report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
 
     class FakeMaintenanceMain:
@@ -144,7 +183,7 @@ async def test_bootstrap_nonzero_main_exit_writes_report_only_when_app_report_mi
     )
     payload = _read_json(report_path)
 
-    assert exit_code == 1
+    assert exit_code == worker_bootstrap.EXIT_WORKER_BOOTSTRAP_MAIN_ERROR
     assert payload["reason_code"] == "worker_bootstrap_main_error"
     assert payload["phase"] == "bootstrap_main"
 
@@ -164,7 +203,7 @@ async def test_bootstrap_nonzero_main_exit_preserves_existing_app_level_report(t
     class FakeMaintenanceMain:
         async def _run(self, argv: list[str]) -> int:
             assert argv == ["worker"]
-            return 1
+            return 7
 
     exit_code = await worker_bootstrap.run_bootstrap(
         import_module=lambda module_name: FakeMaintenanceMain(),
@@ -172,9 +211,32 @@ async def test_bootstrap_nonzero_main_exit_preserves_existing_app_level_report(t
     )
     payload = _read_json(report_path)
 
-    assert exit_code == 1
+    assert exit_code == 7
     assert payload["reason_code"] == "worker_runtime_config_error"
     assert payload["phase"] == "config_load"
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_report_write_failure_returns_bounded_status_without_leaks(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    parent_file = tmp_path / "sentinel-secret-report-parent"
+    parent_file.write_text("not a directory\n", encoding="utf-8")
+    report_path = parent_file / "worker-runtime-fatal-report.json"
+    raw_exception = f"Traceback {RAW_DATABASE_URL} {RAW_REDIS_URL} {RAW_RUNTIME_ENV_PATH}"
+
+    def fail_import(module_name: str):
+        assert module_name == worker_bootstrap.MAINTENANCE_MAIN_MODULE
+        raise RuntimeError(raw_exception)
+
+    exit_code = await worker_bootstrap.run_bootstrap(import_module=fail_import, report_path=report_path)
+    output = capsys.readouterr().out
+
+    assert exit_code == worker_bootstrap.EXIT_WORKER_BOOTSTRAP_REPORT_WRITE_FAILED
+    assert output == ""
+    assert not report_path.exists()
+    _assert_no_secret_leaks(output, raw_exception, report_path, parent_file)
 
 
 @pytest.mark.parametrize(

@@ -3,15 +3,23 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 FATAL_REPORT_SCHEMA_VERSION = "maintenance_worker_runtime_fatal_report_v1"
-WORKER_RUNTIME_FATAL_REPORT_PATH = (
-    Path(__file__).resolve().parents[3] / "state/maintenance/worker-runtime-fatal-report.json"
-)
+REPO_ROOT = Path(__file__).resolve().parents[3]
+WORKER_RUNTIME_FATAL_REPORT_PATH = REPO_ROOT / "state/maintenance/worker-runtime-fatal-report.json"
 MAINTENANCE_MAIN_MODULE = "src.services.maintenance.main"
+EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR = 21
+EXIT_WORKER_BOOTSTRAP_MAIN_ERROR = 22
+EXIT_WORKER_BOOTSTRAP_REPORT_WRITE_FAILED = 23
+BOOTSTRAP_EXIT_STATUS_REASON_CODES = {
+    EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR: "worker_bootstrap_import_error",
+    EXIT_WORKER_BOOTSTRAP_MAIN_ERROR: "worker_bootstrap_main_error",
+    EXIT_WORKER_BOOTSTRAP_REPORT_WRITE_FAILED: "worker_bootstrap_report_write_failed",
+}
 
 _BOOTSTRAP_REASON_CODES = {
     "worker_bootstrap_import_error",
@@ -62,15 +70,15 @@ def write_worker_bootstrap_fatal_report(
     reason_code: str,
     phase: str,
     report_path: Path | None = None,
-) -> dict[str, object]:
+) -> bool:
     report = build_worker_bootstrap_fatal_report(reason_code=reason_code, phase=phase)
     path = report_path or WORKER_RUNTIME_FATAL_REPORT_PATH
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(report, sort_keys=True) + "\n", encoding="utf-8")
     except OSError:
-        pass
-    return report
+        return False
+    return True
 
 
 async def run_bootstrap(
@@ -78,31 +86,36 @@ async def run_bootstrap(
     import_module=importlib.import_module,
     report_path: Path | None = None,
 ) -> int:
+    _ensure_repo_root_on_sys_path()
     try:
         maintenance_main = import_module(MAINTENANCE_MAIN_MODULE)
     except Exception:
-        write_worker_bootstrap_fatal_report(
+        if not write_worker_bootstrap_fatal_report(
             reason_code="worker_bootstrap_import_error",
             phase="bootstrap_import",
             report_path=report_path,
-        )
-        return 1
+        ):
+            return EXIT_WORKER_BOOTSTRAP_REPORT_WRITE_FAILED
+        return EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR
 
     try:
         exit_code = int(await maintenance_main._run(["worker"]))
     except Exception:
-        write_worker_bootstrap_fatal_report(
+        if not write_worker_bootstrap_fatal_report(
             reason_code="worker_bootstrap_main_error",
             phase="bootstrap_main",
             report_path=report_path,
-        )
-        return 1
+        ):
+            return EXIT_WORKER_BOOTSTRAP_REPORT_WRITE_FAILED
+        return EXIT_WORKER_BOOTSTRAP_MAIN_ERROR
     if exit_code != 0 and not _fatal_report_exists(report_path):
-        write_worker_bootstrap_fatal_report(
+        if not write_worker_bootstrap_fatal_report(
             reason_code="worker_bootstrap_main_error",
             phase="bootstrap_main",
             report_path=report_path,
-        )
+        ):
+            return EXIT_WORKER_BOOTSTRAP_REPORT_WRITE_FAILED
+        return EXIT_WORKER_BOOTSTRAP_MAIN_ERROR
     return exit_code
 
 
@@ -124,6 +137,12 @@ def _fatal_report_exists(report_path: Path | None = None) -> bool:
         return path.is_file()
     except OSError:
         return False
+
+
+def _ensure_repo_root_on_sys_path() -> None:
+    repo_root = str(REPO_ROOT)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
 
 
 def main() -> None:

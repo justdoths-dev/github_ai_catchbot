@@ -7,7 +7,7 @@ Stage 44 keeps maintenance worker runtime separate from one-shot delivery contro
 Run the long-lived maintenance workers with:
 
 ```bash
-python -m src.services.maintenance.worker_bootstrap
+python /path/to/github_ai_catchbot/src/services/maintenance/worker_bootstrap.py
 ```
 
 This is the service startup mode. It owns retry promotion and replay orchestration workers only.

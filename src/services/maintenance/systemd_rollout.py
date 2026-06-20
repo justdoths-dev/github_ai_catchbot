@@ -12,7 +12,7 @@ CONTEXT_PROOF_SCHEMA_VERSION = "maintenance_systemd_context_proof_report_v1"
 TARGET_MAINTENANCE_WORKER = "maintenance-worker"
 SERVICE_NAME = "github-ai-catchbot-maintenance.service"
 TIMER_NAME = "github-ai-catchbot-maintenance.timer"
-WORKER_BOOTSTRAP_MODULE = "src.services.maintenance.worker_bootstrap"
+WORKER_BOOTSTRAP_SCRIPT = Path("src/services/maintenance/worker_bootstrap.py")
 
 SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES = (
     "LoadState",
@@ -416,8 +416,7 @@ class LocalUserSystemdAdapter:
 def build_systemd_unit_plan(request: SystemdRolloutRequest) -> SystemdUnitPlan:
     exec_start = (
         str(request.python_executable),
-        "-m",
-        WORKER_BOOTSTRAP_MODULE,
+        str(request.repo_root / WORKER_BOOTSTRAP_SCRIPT),
     )
     service_content = "\n".join(
         [
@@ -669,7 +668,7 @@ def systemd_rollout_request_error(request: SystemdRolloutRequest) -> str | None:
         return "systemd_user_dir_not_absolute"
     if not request.repo_root.is_dir():
         return "repo_root_missing"
-    if not (request.repo_root / "src/services/maintenance/worker_bootstrap.py").is_file():
+    if not (request.repo_root / WORKER_BOOTSTRAP_SCRIPT).is_file():
         return "maintenance_entrypoint_missing"
     if not request.python_executable.is_file():
         return "python_executable_missing"
