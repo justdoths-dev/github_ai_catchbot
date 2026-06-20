@@ -64,6 +64,13 @@ from .systemd_rollout import (
 )
 from .worker import DueRetryPromotionWorker, MaintenanceQueueWorker, ReplayQueueWorker
 from .worker_once import WorkerOnceReport, WorkerOnceRequest, run_worker_once
+from .worker_startup_probe import (
+    WorkerStartupProbeReport,
+    WorkerStartupProbeRequest,
+    build_worker_startup_probe_blocked_report,
+    run_worker_startup_probe,
+    worker_startup_probe_request_error,
+)
 
 DB_SHAPE_PREFLIGHT_SOURCE_REASON_CODES = {
     "database_url_required",
@@ -136,6 +143,11 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command")
 
     subcommands.add_parser("worker")
+
+    worker_startup_probe = subcommands.add_parser("worker-startup-probe")
+    worker_startup_probe.add_argument("--mode", required=True)
+    worker_startup_probe.add_argument("--confirm", default=None)
+    worker_startup_probe.add_argument("--env-file", required=True)
 
     worker_once = subcommands.add_parser("worker-once")
     worker_once_subcommands = worker_once.add_subparsers(dest="worker_type", required=True)
@@ -829,6 +841,7 @@ def _one_shot_command_uses_explicit_env_file(command: str, args: argparse.Namesp
         "queue-activate",
         "queue-group-bootstrap",
         "worker-once",
+        "worker-startup-probe",
         "foreground-smoke",
         "controlled-worker",
     } and bool(getattr(args, "env_file", None))
@@ -1245,6 +1258,21 @@ async def _run_worker_once_operation(config: MaintenanceConfig, args: argparse.N
         await engine.dispose()
 
 
+async def _run_worker_startup_probe_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
+    request = _worker_startup_probe_request(args)
+    report = await run_worker_startup_probe(
+        request,
+        config=config,
+        logger=_build_logger(config.log_level),
+    )
+    print(_to_json(asdict(report)))
+    if report.status == "pass":
+        return 0
+    if report.status == "failed":
+        return 1
+    return 2
+
+
 async def _run_foreground_smoke_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
     request = _foreground_smoke_request(config, args)
 
@@ -1499,6 +1527,33 @@ def _worker_once_request(config: MaintenanceConfig, args: argparse.Namespace) ->
 
 def _worker_once_consumer_name(config: MaintenanceConfig, args: argparse.Namespace) -> str:
     return config.maintenance_consumer_name if args.worker_type == "maintenance" else config.replay_consumer_name
+
+
+def _worker_startup_probe_request(args: argparse.Namespace) -> WorkerStartupProbeRequest:
+    return WorkerStartupProbeRequest(
+        mode=args.mode,
+        confirm_run=args.mode == "execute" and args.confirm == "run",
+    )
+
+
+def _worker_startup_probe_request_error(args: argparse.Namespace) -> str | None:
+    return worker_startup_probe_request_error(_worker_startup_probe_request(args))
+
+
+def _worker_startup_probe_config_error_report(args: argparse.Namespace, reason_code: str) -> WorkerStartupProbeReport:
+    probe_reason_code = _worker_startup_probe_config_reason_code(reason_code)
+    status = "blocked" if probe_reason_code in {"env_file_missing", "env_file_no_runtime_config"} else "failed"
+    return build_worker_startup_probe_blocked_report(
+        mode=args.mode,
+        status=status,
+        reason_code=probe_reason_code,
+    )
+
+
+def _worker_startup_probe_config_reason_code(reason_code: str) -> str:
+    if reason_code in {"env_file_missing", "env_file_no_runtime_config"}:
+        return reason_code
+    return "runtime_config_error"
 
 
 def _worker_once_request_error(args: argparse.Namespace) -> str | None:
@@ -1900,6 +1955,20 @@ async def _run(argv: list[str] | None = None) -> int:
         if request_error is not None:
             print(_to_json(asdict(_worker_once_blocked_report(args, request_error))))
             return 2
+    if command == "worker-startup-probe":
+        request_error = _worker_startup_probe_request_error(args)
+        if request_error is not None:
+            print(
+                _to_json(
+                    asdict(
+                        build_worker_startup_probe_blocked_report(
+                            mode=args.mode,
+                            reason_code=request_error,
+                        )
+                    )
+                )
+            )
+            return 2
     if command == "foreground-smoke":
         request_error = _foreground_smoke_request_error(args)
         if request_error is not None:
@@ -1929,6 +1998,10 @@ async def _run(argv: list[str] | None = None) -> int:
             runtime_env_overlay = _resolve_one_shot_runtime_env_file_overlay(args.env_file)
         except _MaintenanceOneShotRuntimeConfigError as exc:
             reason_code = _one_shot_runtime_config_reason_code(exc)
+            if command == "worker-startup-probe":
+                report = _worker_startup_probe_config_error_report(args, reason_code)
+                print(_to_json(asdict(report)))
+                return 1 if report.status == "failed" else 2
             print(_to_json(_maintenance_one_shot_runtime_config_error_payload(reason_code)))
             return 1
     if command == "batch-recovery" and args.recovery_mode == "replay-selected" and (
@@ -1945,12 +2018,18 @@ async def _run(argv: list[str] | None = None) -> int:
         config = _load_maintenance_one_shot_runtime_config(args, env_file_overlay=runtime_env_overlay)
     except _MaintenanceOneShotRuntimeConfigError as exc:
         reason_code = _one_shot_runtime_config_reason_code(exc)
+        if command == "worker-startup-probe":
+            report = _worker_startup_probe_config_error_report(args, reason_code)
+            print(_to_json(asdict(report)))
+            return 1 if report.status == "failed" else 2
         print(_to_json(_maintenance_one_shot_runtime_config_error_payload(reason_code)))
         return 1
     if command == "worker":
         return await _run_worker(config)
     if command == "worker-once":
         return await _run_worker_once_operation(config, args)
+    if command == "worker-startup-probe":
+        return await _run_worker_startup_probe_operation(config, args)
     if command == "foreground-smoke":
         return await _run_foreground_smoke_operation(config, args)
     if command == "controlled-worker":
