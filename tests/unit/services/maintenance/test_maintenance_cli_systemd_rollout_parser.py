@@ -14,6 +14,7 @@ from services.maintenance.main import build_parser
         ("proof", None),
         ("rollback", "rollback"),
         ("diagnose", None),
+        ("context-proof", None),
     ],
 )
 def test_parser_accepts_systemd_rollout_modes(mode: str, confirm: str | None) -> None:
@@ -60,3 +61,23 @@ def test_parser_accepts_systemd_rollout_override_paths() -> None:
     assert args.repo_root == "/tmp/repo"
     assert args.python_executable == "/tmp/repo/venv/bin/python"
     assert args.systemd_user_dir == "/tmp/user-units"
+
+
+def test_parser_accepts_worker_runtime_fatal_report_readback_mode() -> None:
+    args = build_parser().parse_args(["worker-runtime-fatal-report", "--mode", "read"])
+
+    assert args.command == "worker-runtime-fatal-report"
+    assert args.mode == "read"
+
+
+def test_worker_runtime_fatal_report_readback_rejects_arbitrary_path_input() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "worker-runtime-fatal-report",
+                "--mode",
+                "read",
+                "--path",
+                "/tmp/other-report.json",
+            ]
+        )

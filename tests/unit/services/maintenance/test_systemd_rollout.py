@@ -8,16 +8,22 @@ import pytest
 
 from services.maintenance.systemd_rollout import (
     SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES,
+    SYSTEMD_CONTEXT_ALLOWED_PROPERTIES,
     SERVICE_NAME,
     LocalUserSystemdAdapter,
     SystemdAdapterError,
+    SystemdContextProofRequest,
+    SystemdContextState,
     SystemdDiagnosticRequest,
     SystemdDiagnosticState,
     SystemdReadback,
     SystemdRolloutRequest,
     SystemdUnitPlan,
     build_systemd_unit_plan,
+    parse_service_unit_directives,
+    parse_systemd_context_properties,
     parse_systemd_show_properties,
+    run_systemd_context_proof,
     run_systemd_diagnostic,
     run_systemd_rollout,
 )
@@ -82,6 +88,16 @@ class FakeDiagnosticAdapter:
         return self.state
 
 
+class FakeContextProofAdapter:
+    def __init__(self, state: SystemdContextState) -> None:
+        self.state = state
+        self.calls: list[str] = []
+
+    def context_state(self, plan: SystemdUnitPlan) -> SystemdContextState:
+        self.calls.append(plan.service_name)
+        return self.state
+
+
 class FailingDiagnosticAdapter:
     def diagnostic_state(self, unit_name: str) -> SystemdDiagnosticState:
         raise SystemdAdapterError("systemctl_show_failed")
@@ -133,6 +149,17 @@ def _diagnostic_request(tmp_path: Path, *, target: str = "maintenance-worker") -
         target=target,
         runtime_env_file=runtime_env_file.resolve(),
         systemd_user_dir=systemd_user_dir.resolve(),
+    )
+
+
+def _context_request(tmp_path: Path, *, target: str = "maintenance-worker") -> SystemdContextProofRequest:
+    request = _request(tmp_path, mode="plan", target=target)
+    return SystemdContextProofRequest(
+        target=target,
+        repo_root=request.repo_root,
+        python_executable=request.python_executable,
+        runtime_env_file=request.runtime_env_file,
+        systemd_user_dir=request.systemd_user_dir,
     )
 
 
@@ -414,6 +441,225 @@ def test_diagnostic_invalid_target_blocks_before_env_file_checks(tmp_path: Path)
     assert "sentinel-runtime-secret" not in output
 
 
+def test_context_proof_invalid_target_blocks_before_path_checks(tmp_path: Path) -> None:
+    request = _context_request(tmp_path, target="other-target")
+    missing_env = request.runtime_env_file.parent / "sentinel-missing-runtime.env"
+    request = SystemdContextProofRequest(
+        target=request.target,
+        repo_root=request.repo_root,
+        python_executable=request.python_executable,
+        runtime_env_file=missing_env,
+        systemd_user_dir=request.systemd_user_dir,
+    )
+    adapter = FakeContextProofAdapter(
+        SystemdContextState(
+            service_file_present=True,
+            service_enabled=True,
+            service_active=True,
+            service_name_matches_expected=True,
+        )
+    )
+
+    report = run_systemd_context_proof(request, adapter=adapter)
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.schema_version == "maintenance_systemd_context_proof_report_v1"
+    assert report.status == "blocked"
+    assert report.reason_code == "target_not_allowed"
+    assert adapter.calls == []
+    assert str(missing_env) not in output
+    assert "sentinel-missing-runtime" not in output
+
+
+def test_context_proof_compares_expected_unit_context_without_raw_path_output(tmp_path: Path) -> None:
+    request = _context_request(tmp_path)
+    rollout_request = _request(tmp_path, mode="plan")
+    plan = build_systemd_unit_plan(rollout_request)
+    adapter = FakeContextProofAdapter(
+        SystemdContextState(
+            service_file_present=True,
+            service_enabled=True,
+            service_active=False,
+            service_name_matches_expected=True,
+            unit_load_state="loaded",
+            unit_file_state="enabled",
+            exec_start=" ".join(plan.exec_start_argv),
+            working_directory=str(request.repo_root),
+            environment_file=str(request.runtime_env_file),
+            restart_policy="on-failure",
+            restart_sec="10s",
+        )
+    )
+
+    report = run_systemd_context_proof(request, adapter=adapter)
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "pass"
+    assert report.unit_context_matches_expected is True
+    assert report.mismatched_context_fields == []
+    assert report.service_name_matches_expected is True
+    assert report.service_file_present is True
+    assert report.service_enabled is True
+    assert report.service_active is False
+    assert report.exec_start_matches_expected is True
+    assert report.working_directory_matches_expected is True
+    assert report.environment_file_matches_expected is True
+    assert report.restart_policy_matches_expected is True
+    assert report.restart_sec_matches_expected is True
+    assert report.raw_unit_content_omitted is True
+    assert report.raw_exec_start_omitted is True
+    assert report.raw_paths_omitted is True
+    assert str(request.repo_root) not in output
+    assert str(request.runtime_env_file) not in output
+    assert str(request.python_executable) not in output
+    assert "EnvironmentFile=" not in output
+    assert "ExecStart=" not in output
+
+
+def test_context_proof_accepts_exact_systemd_show_argv_equality(tmp_path: Path) -> None:
+    request = _context_request(tmp_path)
+    plan = build_systemd_unit_plan(_request(tmp_path, mode="plan"))
+    adapter = FakeContextProofAdapter(
+        SystemdContextState(
+            service_file_present=True,
+            service_enabled=True,
+            service_active=False,
+            service_name_matches_expected=True,
+            unit_load_state="loaded",
+            unit_file_state="enabled",
+            exec_start="{ path=/redacted ; argv[]="
+            + " ".join(plan.exec_start_argv)
+            + " ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }",
+            working_directory=str(request.repo_root),
+            environment_file=str(request.runtime_env_file),
+            restart_policy="on-failure",
+            restart_sec="10s",
+        )
+    )
+
+    report = run_systemd_context_proof(request, adapter=adapter)
+
+    assert report.status == "pass"
+    assert report.exec_start_matches_expected is True
+    assert report.unit_context_matches_expected is True
+    assert report.mismatched_context_fields == []
+
+
+def test_context_proof_rejects_shell_wrapped_expected_exec_start(tmp_path: Path) -> None:
+    request = _context_request(tmp_path)
+    plan = build_systemd_unit_plan(_request(tmp_path, mode="plan"))
+    adapter = FakeContextProofAdapter(
+        SystemdContextState(
+            service_file_present=True,
+            service_enabled=True,
+            service_active=False,
+            service_name_matches_expected=True,
+            unit_load_state="loaded",
+            unit_file_state="enabled",
+            exec_start='/bin/sh -c "' + " ".join(plan.exec_start_argv) + '"',
+            working_directory=str(request.repo_root),
+            environment_file=str(request.runtime_env_file),
+            restart_policy="on-failure",
+            restart_sec="10s",
+        )
+    )
+
+    report = run_systemd_context_proof(request, adapter=adapter)
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "unit_context_mismatch"
+    assert report.exec_start_matches_expected is False
+    assert report.unit_context_matches_expected is False
+    assert report.mismatched_context_fields == ["exec_start_matches_expected"]
+    assert "ExecStart=" not in output
+    assert "/bin/sh" not in output
+    assert str(request.python_executable) not in output
+
+
+@pytest.mark.parametrize(
+    "placement, systemd_show",
+    [
+        ("prefix", False),
+        ("suffix", False),
+        ("prefix", True),
+        ("suffix", True),
+    ],
+)
+def test_context_proof_rejects_extra_prefix_or_suffix_exec_start_tokens(
+    tmp_path: Path,
+    placement: str,
+    systemd_show: bool,
+) -> None:
+    request = _context_request(tmp_path)
+    plan = build_systemd_unit_plan(_request(tmp_path, mode="plan"))
+    expected = " ".join(plan.exec_start_argv)
+    observed = f"/usr/bin/env {expected}" if placement == "prefix" else f"{expected} --unexpected"
+    exec_start = f"{{ path=/redacted ; argv[]={observed} ; ignore_errors=no }}" if systemd_show else observed
+    adapter = FakeContextProofAdapter(
+        SystemdContextState(
+            service_file_present=True,
+            service_enabled=True,
+            service_active=False,
+            service_name_matches_expected=True,
+            unit_load_state="loaded",
+            unit_file_state="enabled",
+            exec_start=exec_start,
+            working_directory=str(request.repo_root),
+            environment_file=str(request.runtime_env_file),
+            restart_policy="on-failure",
+            restart_sec="10s",
+        )
+    )
+
+    report = run_systemd_context_proof(request, adapter=adapter)
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "unit_context_mismatch"
+    assert report.exec_start_matches_expected is False
+    assert report.unit_context_matches_expected is False
+    assert report.mismatched_context_fields == ["exec_start_matches_expected"]
+    assert "ExecStart=" not in output
+    assert str(request.python_executable) not in output
+
+
+def test_context_proof_mismatch_reports_field_names_only(tmp_path: Path) -> None:
+    request = _context_request(tmp_path)
+    adapter = FakeContextProofAdapter(
+        SystemdContextState(
+            service_file_present=True,
+            service_enabled=True,
+            service_active=False,
+            service_name_matches_expected=True,
+            unit_load_state="loaded",
+            unit_file_state="enabled",
+            exec_start="/sentinel/private/python -m wrong.module sentinel-secret",
+            working_directory="/sentinel/private/repo",
+            environment_file="/sentinel/private/runtime.env",
+            restart_policy="always",
+            restart_sec="20s",
+        )
+    )
+
+    report = run_systemd_context_proof(request, adapter=adapter)
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "unit_context_mismatch"
+    assert report.unit_context_matches_expected is False
+    assert report.mismatched_context_fields == [
+        "exec_start_matches_expected",
+        "working_directory_matches_expected",
+        "environment_file_matches_expected",
+        "restart_policy_matches_expected",
+        "restart_sec_matches_expected",
+    ]
+    assert "/sentinel/private" not in output
+    assert "sentinel-secret" not in output
+    assert "wrong.module" not in output
+
+
 def test_diagnostic_reads_exact_service_only_and_reports_active_state(tmp_path: Path) -> None:
     state = SystemdDiagnosticState(
         service_file_present=True,
@@ -512,6 +758,57 @@ def test_parse_systemd_show_properties_allows_only_safe_properties_and_redacts_f
     assert "journal body sentinel" not in serialized
 
 
+def test_parse_systemd_context_properties_allows_only_context_properties_and_redacts_fragment_path() -> None:
+    output = "\n".join(
+        [
+            "LoadState=loaded",
+            "ActiveState=activating",
+            "UnitFileState=enabled",
+            "FragmentPath=/home/dev/private/github-ai-catchbot-maintenance.service",
+            "ExecStart=/home/dev/private/python -m src.services.maintenance.main worker",
+            "WorkingDirectory=/home/dev/private/repo",
+            "EnvironmentFiles=/home/dev/private/runtime.env (ignore_errors=no)",
+            "Restart=on-failure",
+            "RestartUSec=10s",
+            "Environment=DATABASE_URL=sentinel-secret",
+            "StatusText=journal body sentinel",
+        ]
+    )
+
+    properties = parse_systemd_context_properties(output)
+    serialized = json.dumps(properties, sort_keys=True)
+
+    assert set(properties) == set(SYSTEMD_CONTEXT_ALLOWED_PROPERTIES)
+    assert properties["FragmentPath"] == "present"
+    assert "DATABASE_URL=sentinel-secret" not in serialized
+    assert "journal body sentinel" not in serialized
+
+
+def test_parse_service_unit_directives_reads_only_service_context() -> None:
+    content = "\n".join(
+        [
+            "[Unit]",
+            "Description=sentinel",
+            "[Service]",
+            "WorkingDirectory=/repo",
+            "EnvironmentFile=/runtime.env",
+            "ExecStart=/python -m src.services.maintenance.main worker",
+            "Restart=on-failure",
+            "RestartSec=10",
+            "[Install]",
+            "WantedBy=default.target",
+        ]
+    )
+
+    assert parse_service_unit_directives(content) == {
+        "WorkingDirectory": "/repo",
+        "EnvironmentFile": "/runtime.env",
+        "ExecStart": "/python -m src.services.maintenance.main worker",
+        "Restart": "on-failure",
+        "RestartSec": "10",
+    }
+
+
 def test_local_diagnostic_uses_exact_user_systemctl_show_allowlist(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
 
@@ -550,6 +847,52 @@ def test_local_diagnostic_uses_exact_user_systemctl_show_allowlist(monkeypatch, 
         "show",
         SERVICE_NAME,
         *(f"--property={property_name}" for property_name in SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES),
+    ]
+    assert calls[1] == ["systemctl", "--user", "is-enabled", SERVICE_NAME]
+    assert calls[2] == ["systemctl", "--user", "is-active", SERVICE_NAME]
+
+
+def test_local_context_proof_uses_exact_user_systemctl_show_allowlist(monkeypatch, tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+    request = _request(tmp_path, mode="plan")
+    plan = build_systemd_unit_plan(request)
+    plan.service_unit_path.write_text(plan.service_unit_content, encoding="utf-8")
+
+    def fake_run(args, check, stdout, stderr, text):
+        del check, stdout, stderr, text
+        calls.append(list(args))
+
+        class Result:
+            returncode = 0
+            stdout = "\n".join(
+                [
+                    "LoadState=loaded",
+                    "ActiveState=active",
+                    "UnitFileState=enabled",
+                    "FragmentPath=/redacted/path",
+                    f"ExecStart={' '.join(plan.exec_start_argv)}",
+                    f"WorkingDirectory={request.repo_root}",
+                    f"EnvironmentFiles={request.runtime_env_file} (ignore_errors=no)",
+                    "Restart=on-failure",
+                    "RestartUSec=10s",
+                    "Environment=DATABASE_URL=sentinel-secret",
+                ]
+            )
+
+        return Result()
+
+    monkeypatch.setattr("services.maintenance.systemd_rollout.subprocess.run", fake_run)
+    adapter = LocalUserSystemdAdapter(tmp_path)
+
+    state = adapter.context_state(plan)
+
+    assert state.service_file_present is True
+    assert calls[0] == [
+        "systemctl",
+        "--user",
+        "show",
+        SERVICE_NAME,
+        *(f"--property={property_name}" for property_name in SYSTEMD_CONTEXT_ALLOWED_PROPERTIES),
     ]
     assert calls[1] == ["systemctl", "--user", "is-enabled", SERVICE_NAME]
     assert calls[2] == ["systemctl", "--user", "is-active", SERVICE_NAME]

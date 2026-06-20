@@ -57,8 +57,10 @@ from .repositories import MaintenanceRepository
 from .service import MaintenanceService
 from .systemd_rollout import (
     SERVICE_NAME as SYSTEMD_ROLLOUT_SERVICE_NAME,
+    SystemdContextProofRequest,
     SystemdDiagnosticRequest,
     SystemdRolloutRequest,
+    run_systemd_context_proof,
     run_systemd_diagnostic,
     run_systemd_rollout,
 )
@@ -71,8 +73,10 @@ from .worker_runtime_crash_probe import (
     build_worker_runtime_components,
     build_worker_runtime_crash_probe_blocked_report,
     close_worker_runtime_resources,
+    read_worker_runtime_fatal_report,
     run_labeled_worker_tasks,
     run_worker_runtime_crash_probe,
+    write_worker_runtime_fatal_report,
     worker_runtime_crash_probe_request_error,
     worker_runtime_task_specs,
 )
@@ -167,6 +171,9 @@ def build_parser() -> argparse.ArgumentParser:
     worker_runtime_crash_probe.add_argument("--max-runtime-sec", type=int, default=10)
     worker_runtime_crash_probe.add_argument("--env-file", required=True)
 
+    worker_runtime_fatal_report = subcommands.add_parser("worker-runtime-fatal-report")
+    worker_runtime_fatal_report.add_argument("--mode", choices=["read"], required=True)
+
     worker_once = subcommands.add_parser("worker-once")
     worker_once_subcommands = worker_once.add_subparsers(dest="worker_type", required=True)
     for worker_type in ("maintenance", "replay"):
@@ -195,7 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
     systemd_rollout = subcommands.add_parser("systemd-rollout")
     systemd_rollout.add_argument(
         "--mode",
-        choices=["plan", "install", "start", "proof", "rollback", "diagnose"],
+        choices=["plan", "install", "start", "proof", "rollback", "diagnose", "context-proof"],
         required=True,
     )
     systemd_rollout.add_argument("--target", required=True)
@@ -454,18 +461,27 @@ async def _run_worker(config: MaintenanceConfig) -> int:
     components = None
     cancelled = False
     exit_code = 1
+    task_result = None
     try:
         components = build_worker_runtime_components(config=config, logger=logger)
-        result = await run_labeled_worker_tasks(worker_runtime_task_specs(components))
+        task_result = await run_labeled_worker_tasks(worker_runtime_task_specs(components))
         logger.error(
             "maintenance_worker_runtime_failed",
             extra={
                 "service": "maintenance",
                 "event": "maintenance_worker_runtime_failed",
-                "reason_code": result.reason_code,
-                "crashed_task": result.crashed_task,
-                "unexpected_return_task": result.unexpected_return_task,
+                "reason_code": task_result.reason_code,
+                "crashed_task": task_result.crashed_task,
+                "unexpected_return_task": task_result.unexpected_return_task,
             },
+        )
+        write_worker_runtime_fatal_report(
+            reason_code=task_result.reason_code or "probe_runtime_error",
+            crashed_task=task_result.crashed_task,
+            unexpected_return_task=task_result.unexpected_return_task,
+            cleanup_completed=True,
+            tasks_started=task_result.tasks_started,
+            broad_worker_run_started=bool(task_result.tasks_started),
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -480,6 +496,12 @@ async def _run_worker(config: MaintenanceConfig) -> int:
             },
         )
         cleanup_completed = await close_worker_runtime_resources(redis_client=exc.redis_client, engine=exc.engine)
+        write_worker_runtime_fatal_report(
+            reason_code="worker_runtime_setup_failed" if cleanup_completed else "cleanup_failed",
+            cleanup_completed=cleanup_completed,
+            tasks_started=[],
+            broad_worker_run_started=False,
+        )
         if not cleanup_completed:
             logger.error(
                 "maintenance_worker_runtime_cleanup_failed",
@@ -498,6 +520,12 @@ async def _run_worker(config: MaintenanceConfig) -> int:
                 "reason_code": "probe_runtime_error",
             },
         )
+        write_worker_runtime_fatal_report(
+            reason_code="worker_runtime_error",
+            cleanup_completed=False,
+            tasks_started=[],
+            broad_worker_run_started=False,
+        )
     finally:
         if components is not None:
             cleanup_completed = await close_worker_runtime_resources(
@@ -505,6 +533,14 @@ async def _run_worker(config: MaintenanceConfig) -> int:
                 engine=components.engine,
             )
             if not cleanup_completed:
+                write_worker_runtime_fatal_report(
+                    reason_code="cleanup_failed",
+                    crashed_task=task_result.crashed_task if task_result is not None else None,
+                    unexpected_return_task=task_result.unexpected_return_task if task_result is not None else None,
+                    cleanup_completed=False,
+                    tasks_started=task_result.tasks_started if task_result is not None else [],
+                    broad_worker_run_started=bool(task_result and task_result.tasks_started),
+                )
                 logger.error(
                     "maintenance_worker_runtime_cleanup_failed",
                     extra={
@@ -1311,6 +1347,13 @@ async def _run_worker_runtime_crash_probe_operation(config: MaintenanceConfig, a
     return 2
 
 
+async def _run_worker_runtime_fatal_report_operation(args: argparse.Namespace) -> int:
+    del args
+    report = read_worker_runtime_fatal_report()
+    print(_to_json(asdict(report)))
+    return 0 if report.status == "pass" else 2
+
+
 async def _run_foreground_smoke_operation(config: MaintenanceConfig, args: argparse.Namespace) -> int:
     request = _foreground_smoke_request(config, args)
 
@@ -1446,6 +1489,16 @@ async def _run_controlled_worker_operation(config: MaintenanceConfig, args: argp
 
 
 async def _run_systemd_rollout_operation(args: argparse.Namespace) -> int:
+    if args.mode == "context-proof":
+        request = _systemd_context_proof_request(args)
+        report = run_systemd_context_proof(request)
+        print(_to_json(asdict(report)))
+        if report.status == "pass":
+            return 0
+        if report.status == "failed":
+            return 1
+        return 2
+
     if args.mode == "diagnose":
         request = _systemd_diagnostic_request(args)
         report = run_systemd_diagnostic(request)
@@ -1474,6 +1527,22 @@ def _systemd_diagnostic_request(args: argparse.Namespace) -> SystemdDiagnosticRe
         runtime_env_file=runtime_env_file,
         systemd_user_dir=systemd_user_dir,
         service_name=SYSTEMD_ROLLOUT_SERVICE_NAME,
+    )
+
+
+def _systemd_context_proof_request(args: argparse.Namespace) -> SystemdContextProofRequest:
+    repo_root = _path_arg_or_default(args.repo_root, _default_repo_root())
+    python_executable = _path_arg_or_default(args.python_executable, Path(sys.executable))
+    systemd_user_dir = _path_arg_or_default(args.systemd_user_dir, Path.home() / ".config/systemd/user")
+    runtime_env_file = Path(args.env_file).expanduser().resolve()
+    return SystemdContextProofRequest(
+        target=args.target,
+        repo_root=repo_root,
+        python_executable=python_executable,
+        runtime_env_file=runtime_env_file,
+        systemd_user_dir=systemd_user_dir,
+        service_name=SYSTEMD_ROLLOUT_SERVICE_NAME,
+        timer_name=None,
     )
 
 
@@ -2070,6 +2139,8 @@ async def _run(argv: list[str] | None = None) -> int:
         )
     if command == "systemd-rollout":
         return await _run_systemd_rollout_operation(args)
+    if command == "worker-runtime-fatal-report":
+        return await _run_worker_runtime_fatal_report_operation(args)
     runtime_env_overlay: dict[str, str] | None = None
     if _one_shot_command_uses_explicit_env_file(command, args):
         try:

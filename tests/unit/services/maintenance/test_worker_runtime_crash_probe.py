@@ -11,12 +11,15 @@ from services.maintenance import main as maintenance_main
 from services.maintenance import worker_runtime_crash_probe
 from services.maintenance.worker_runtime_crash_probe import (
     DUE_RETRY_PROMOTION_WORKER_LABEL,
+    FATAL_REPORT_SCHEMA_VERSION,
     MAINTENANCE_QUEUE_WORKER_LABEL,
     REPLAY_QUEUE_WORKER_LABEL,
     WORKER_TASK_LABELS,
     WorkerRuntimeCrashProbeRequest,
     WorkerRuntimeTaskResult,
+    read_worker_runtime_fatal_report,
     run_worker_runtime_crash_probe,
+    write_worker_runtime_fatal_report,
     worker_task_failed_reason_code,
     worker_task_returned_reason_code,
 )
@@ -174,6 +177,25 @@ def _assert_no_secret_leaks(output: str, *extra_values: object) -> None:
 def _clear_runtime_env(monkeypatch) -> None:
     for key in maintenance_main.ONE_SHOT_RUNTIME_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
+
+
+def _patch_worker_fatal_report_path(monkeypatch, report_path: Path) -> None:
+    original_write = worker_runtime_crash_probe.write_worker_runtime_fatal_report
+    original_read = worker_runtime_crash_probe.read_worker_runtime_fatal_report
+
+    def write_to_tmp(**kwargs):
+        return original_write(**kwargs, report_path=report_path)
+
+    def read_from_tmp(**kwargs):
+        del kwargs
+        return original_read(report_path=report_path)
+
+    monkeypatch.setattr(maintenance_main, "write_worker_runtime_fatal_report", write_to_tmp)
+    monkeypatch.setattr(maintenance_main, "read_worker_runtime_fatal_report", read_from_tmp)
+
+
+def _read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def test_parser_accepts_worker_runtime_crash_probe_execute_shape() -> None:
@@ -582,7 +604,11 @@ async def test_run_worker_returns_zero_only_on_cancellation(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
-async def test_run_worker_returns_nonzero_on_worker_crash(monkeypatch) -> None:
+async def test_run_worker_returns_nonzero_on_worker_crash(monkeypatch, tmp_path: Path) -> None:
+    _patch_worker_fatal_report_path(
+        monkeypatch,
+        tmp_path / "state/maintenance/worker-runtime-fatal-report.json",
+    )
     components = FakeComponents()
 
     def fake_build_worker_runtime_components(*args, **kwargs):
@@ -609,3 +635,258 @@ async def test_run_worker_returns_nonzero_on_worker_crash(monkeypatch) -> None:
     assert await maintenance_main._run_worker(config()) == 1
     assert components.engine.dispose_called is True
     assert components.redis_client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_run_worker_setup_failure_writes_redacted_fatal_report(monkeypatch, tmp_path: Path) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    _patch_worker_fatal_report_path(monkeypatch, report_path)
+
+    def fake_build_worker_runtime_components(*args, **kwargs):
+        del args, kwargs
+        raise worker_runtime_crash_probe.WorkerRuntimeSetupError(engine=FakeEngine(), redis_client=FakeRedis())
+
+    monkeypatch.setattr(maintenance_main, "build_worker_runtime_components", fake_build_worker_runtime_components)
+
+    assert await maintenance_main._run_worker(_config()) == 1
+    payload = _read_json(report_path)
+    output = json.dumps(payload, sort_keys=True)
+
+    assert payload["schema_version"] == FATAL_REPORT_SCHEMA_VERSION
+    assert payload["reason_code"] == "worker_runtime_setup_failed"
+    assert payload["tasks_started"] == []
+    assert payload["broad_worker_run_started"] is False
+    assert payload["cleanup_completed"] is True
+    assert payload["report_path_omitted"] is True
+    _assert_no_secret_leaks(output, report_path)
+
+
+@pytest.mark.asyncio
+async def test_run_worker_task_crash_writes_redacted_fatal_report_with_crashed_task(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    _patch_worker_fatal_report_path(monkeypatch, report_path)
+    components = FakeComponents()
+
+    def fake_build_worker_runtime_components(*args, **kwargs):
+        del args, kwargs
+        return components
+
+    async def fake_run_labeled_worker_tasks(task_specs):
+        del task_specs
+        return WorkerRuntimeTaskResult(
+            status="failed",
+            reason_code="maintenance_queue_worker_failed",
+            elapsed_ms=1,
+            tasks_started=list(WORKER_TASK_LABELS),
+            crashed_task=MAINTENANCE_QUEUE_WORKER_LABEL,
+            unexpected_return_task=None,
+            timeout_reached=False,
+            cancelled_remaining_tasks=True,
+        )
+
+    monkeypatch.setattr(maintenance_main, "build_worker_runtime_components", fake_build_worker_runtime_components)
+    monkeypatch.setattr(maintenance_main, "worker_runtime_task_specs", lambda components_arg: [])
+    monkeypatch.setattr(maintenance_main, "run_labeled_worker_tasks", fake_run_labeled_worker_tasks)
+
+    assert await maintenance_main._run_worker(_config()) == 1
+    payload = _read_json(report_path)
+    output = json.dumps(payload, sort_keys=True)
+
+    assert payload["reason_code"] == "maintenance_queue_worker_failed"
+    assert payload["crashed_task"] == MAINTENANCE_QUEUE_WORKER_LABEL
+    assert payload["unexpected_return_task"] is None
+    assert payload["tasks_started"] == list(WORKER_TASK_LABELS)
+    assert payload["broad_worker_run_started"] is True
+    assert payload["cleanup_completed"] is True
+    _assert_no_secret_leaks(output)
+
+
+@pytest.mark.asyncio
+async def test_run_worker_unexpected_task_return_writes_redacted_fatal_report(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    _patch_worker_fatal_report_path(monkeypatch, report_path)
+    components = FakeComponents()
+
+    def fake_build_worker_runtime_components(*args, **kwargs):
+        del args, kwargs
+        return components
+
+    async def fake_run_labeled_worker_tasks(task_specs):
+        del task_specs
+        return WorkerRuntimeTaskResult(
+            status="failed",
+            reason_code="replay_queue_worker_returned",
+            elapsed_ms=1,
+            tasks_started=list(WORKER_TASK_LABELS),
+            crashed_task=None,
+            unexpected_return_task=REPLAY_QUEUE_WORKER_LABEL,
+            timeout_reached=False,
+            cancelled_remaining_tasks=True,
+        )
+
+    monkeypatch.setattr(maintenance_main, "build_worker_runtime_components", fake_build_worker_runtime_components)
+    monkeypatch.setattr(maintenance_main, "worker_runtime_task_specs", lambda components_arg: [])
+    monkeypatch.setattr(maintenance_main, "run_labeled_worker_tasks", fake_run_labeled_worker_tasks)
+
+    assert await maintenance_main._run_worker(_config()) == 1
+    payload = _read_json(report_path)
+
+    assert payload["reason_code"] == "replay_queue_worker_returned"
+    assert payload["crashed_task"] is None
+    assert payload["unexpected_return_task"] == REPLAY_QUEUE_WORKER_LABEL
+    assert payload["cleanup_completed"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_worker_cleanup_failure_overwrites_fatal_report_with_cleanup_false(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    _patch_worker_fatal_report_path(monkeypatch, report_path)
+    components = FakeComponents()
+    components.engine = FakeEngine(dispose_raises=True)
+    components.redis_client = FakeRedis(close_raises=True)
+
+    def fake_build_worker_runtime_components(*args, **kwargs):
+        del args, kwargs
+        return components
+
+    async def fake_run_labeled_worker_tasks(task_specs):
+        del task_specs
+        return WorkerRuntimeTaskResult(
+            status="failed",
+            reason_code="due_retry_promotion_worker_failed",
+            elapsed_ms=1,
+            tasks_started=list(WORKER_TASK_LABELS),
+            crashed_task=DUE_RETRY_PROMOTION_WORKER_LABEL,
+            unexpected_return_task=None,
+            timeout_reached=False,
+            cancelled_remaining_tasks=True,
+        )
+
+    monkeypatch.setattr(maintenance_main, "build_worker_runtime_components", fake_build_worker_runtime_components)
+    monkeypatch.setattr(maintenance_main, "worker_runtime_task_specs", lambda components_arg: [])
+    monkeypatch.setattr(maintenance_main, "run_labeled_worker_tasks", fake_run_labeled_worker_tasks)
+
+    assert await maintenance_main._run_worker(_config()) == 1
+    payload = _read_json(report_path)
+    output = json.dumps(payload, sort_keys=True)
+
+    assert payload["reason_code"] == "cleanup_failed"
+    assert payload["crashed_task"] == DUE_RETRY_PROMOTION_WORKER_LABEL
+    assert payload["cleanup_completed"] is False
+    _assert_no_secret_leaks(output, "sentinel-dispose-secret", "sentinel-redis-close-secret")
+
+
+def test_worker_runtime_fatal_report_readback_blocks_when_missing(tmp_path: Path) -> None:
+    report = read_worker_runtime_fatal_report(report_path=tmp_path / "state/maintenance/missing.json")
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "fatal_report_missing"
+    assert report.report_present is False
+    assert report.raw_report_path_omitted is True
+    _assert_no_secret_leaks(output, tmp_path)
+
+
+def test_worker_runtime_fatal_report_readback_returns_pass_with_redacted_fields(tmp_path: Path) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    write_worker_runtime_fatal_report(
+        reason_code="maintenance_queue_worker_failed",
+        crashed_task=MAINTENANCE_QUEUE_WORKER_LABEL,
+        cleanup_completed=True,
+        tasks_started=list(WORKER_TASK_LABELS),
+        broad_worker_run_started=True,
+        report_path=report_path,
+    )
+
+    report = read_worker_runtime_fatal_report(report_path=report_path)
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "pass"
+    assert report.reason_code is None
+    assert report.report_present is True
+    assert report.report_schema_version == FATAL_REPORT_SCHEMA_VERSION
+    assert report.latest_report_reason_code == "maintenance_queue_worker_failed"
+    assert report.latest_report_crashed_task == MAINTENANCE_QUEUE_WORKER_LABEL
+    assert report.latest_report_unexpected_return_task is None
+    assert report.latest_report_cleanup_completed is True
+    assert report.latest_report_tasks_started == list(WORKER_TASK_LABELS)
+    assert report.raw_report_path_omitted is True
+    assert report.raw_exception_body_omitted is True
+    assert report.traceback_omitted is True
+    assert report.database_url_omitted is True
+    assert report.redis_url_omitted is True
+    assert report.runtime_env_values_omitted is True
+    _assert_no_secret_leaks(output, report_path)
+
+
+def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tmp_path: Path) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "schema_version": FATAL_REPORT_SCHEMA_VERSION,
+                "reason_code": "sentinel-secret-reason",
+                "crashed_task": "Traceback sentinel-secret",
+                "unexpected_return_task": RAW_DATABASE_URL,
+                "cleanup_completed": True,
+                "tasks_started": [RAW_REDIS_URL, MAINTENANCE_QUEUE_WORKER_LABEL],
+                "broad_worker_run_started": True,
+                "created_at_utc": "2026-06-20T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = read_worker_runtime_fatal_report(report_path=report_path)
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "fatal_report_unknown_reason_code"
+    assert report.latest_report_reason_code == "probe_runtime_error"
+    assert report.latest_report_crashed_task is None
+    assert report.latest_report_unexpected_return_task is None
+    assert report.latest_report_tasks_started == [MAINTENANCE_QUEUE_WORKER_LABEL]
+    _assert_no_secret_leaks(output, "sentinel-secret-reason", "Traceback sentinel-secret")
+
+
+@pytest.mark.asyncio
+async def test_worker_runtime_fatal_report_cli_readback_does_not_load_config_or_env(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    _patch_worker_fatal_report_path(monkeypatch, report_path)
+    write_worker_runtime_fatal_report(
+        reason_code="maintenance_queue_worker_returned",
+        unexpected_return_task=MAINTENANCE_QUEUE_WORKER_LABEL,
+        cleanup_completed=True,
+        tasks_started=[MAINTENANCE_QUEUE_WORKER_LABEL],
+        broad_worker_run_started=True,
+        report_path=report_path,
+    )
+
+    def fail_config_load(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("fatal-report readback must not load runtime config")
+
+    monkeypatch.setattr(maintenance_main.MaintenanceConfig, "from_env", classmethod(fail_config_load))
+
+    exit_code = await maintenance_main._run(["worker-runtime-fatal-report", "--mode", "read"])
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert exit_code == 0
+    assert payload["status"] == "pass"
+    assert payload["latest_report_unexpected_return_task"] == MAINTENANCE_QUEUE_WORKER_LABEL
+    _assert_no_secret_leaks(output, report_path)

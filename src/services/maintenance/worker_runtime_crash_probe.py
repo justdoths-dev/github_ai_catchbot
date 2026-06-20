@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Literal
 
 from .config import MaintenanceConfig
@@ -16,6 +19,11 @@ from .worker import DueRetryPromotionWorker, MaintenanceQueueWorker, ReplayQueue
 
 
 SCHEMA_VERSION = "maintenance_worker_runtime_crash_probe_report_v1"
+FATAL_REPORT_SCHEMA_VERSION = "maintenance_worker_runtime_fatal_report_v1"
+FATAL_REPORT_READBACK_SCHEMA_VERSION = "maintenance_worker_runtime_fatal_report_readback_v1"
+WORKER_RUNTIME_FATAL_REPORT_PATH = (
+    Path(__file__).resolve().parents[3] / "state/maintenance/worker-runtime-fatal-report.json"
+)
 
 MAINTENANCE_QUEUE_WORKER_LABEL = "maintenance_queue_worker"
 REPLAY_QUEUE_WORKER_LABEL = "replay_queue_worker"
@@ -37,6 +45,15 @@ _RETURNED_REASON_CODES = {
     DUE_RETRY_PROMOTION_WORKER_LABEL: "due_retry_promotion_worker_returned",
 }
 _CANCEL_TIMEOUT_SEC = 5.0
+_FATAL_REPORT_ALLOWED_REASON_CODES = {
+    "worker_runtime_setup_failed",
+    "worker_runtime_error",
+    "probe_runtime_error",
+    "cleanup_failed",
+    "cancellation_failed",
+    *_FAILED_REASON_CODES.values(),
+    *_RETURNED_REASON_CODES.values(),
+}
 
 WorkerRuntimeCrashProbeStatus = Literal["pass", "blocked", "failed"]
 
@@ -98,6 +115,40 @@ class WorkerRuntimeTaskResult:
     cancelled_remaining_tasks: bool
 
 
+@dataclass(frozen=True, slots=True)
+class WorkerRuntimeFatalReport:
+    schema_version: str
+    reason_code: str
+    crashed_task: str | None
+    unexpected_return_task: str | None
+    cleanup_completed: bool
+    tasks_started: list[str]
+    broad_worker_run_started: bool
+    created_at_utc: str
+    redactions_applied: dict[str, bool]
+    report_path_omitted: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRuntimeFatalReportReadback:
+    schema_version: str
+    status: str
+    reason_code: str | None
+    report_present: bool
+    report_schema_version: str | None
+    latest_report_reason_code: str | None
+    latest_report_crashed_task: str | None
+    latest_report_unexpected_return_task: str | None
+    latest_report_cleanup_completed: bool | None
+    latest_report_tasks_started: list[str]
+    raw_report_path_omitted: bool = True
+    raw_exception_body_omitted: bool = True
+    traceback_omitted: bool = True
+    database_url_omitted: bool = True
+    redis_url_omitted: bool = True
+    runtime_env_values_omitted: bool = True
+
+
 @dataclass(slots=True)
 class WorkerRuntimeComponents:
     engine: Any
@@ -137,6 +188,118 @@ def build_worker_runtime_crash_probe_blocked_report(
         status=status,
         reason_code=reason_code,
         cleanup_completed=True,
+    )
+
+
+def build_worker_runtime_fatal_report(
+    *,
+    reason_code: str,
+    crashed_task: str | None = None,
+    unexpected_return_task: str | None = None,
+    cleanup_completed: bool,
+    tasks_started: list[str] | tuple[str, ...] | None = None,
+    broad_worker_run_started: bool = False,
+    now_utc: datetime | None = None,
+) -> WorkerRuntimeFatalReport:
+    safe_tasks_started = _safe_worker_task_list(tasks_started or [])
+    safe_crashed_task = _safe_worker_task_label(crashed_task)
+    safe_unexpected_return_task = _safe_worker_task_label(unexpected_return_task)
+    safe_reason_code = _safe_fatal_reason_code(reason_code)
+    created_at = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    return WorkerRuntimeFatalReport(
+        schema_version=FATAL_REPORT_SCHEMA_VERSION,
+        reason_code=safe_reason_code,
+        crashed_task=safe_crashed_task,
+        unexpected_return_task=safe_unexpected_return_task,
+        cleanup_completed=bool(cleanup_completed),
+        tasks_started=safe_tasks_started,
+        broad_worker_run_started=bool(broad_worker_run_started and safe_tasks_started),
+        created_at_utc=created_at.isoformat().replace("+00:00", "Z"),
+        redactions_applied={
+            "runtime_env_path_omitted": True,
+            "runtime_env_values_omitted": True,
+            "database_url_omitted": True,
+            "redis_url_omitted": True,
+            "raw_exception_body_omitted": True,
+            "traceback_omitted": True,
+            "redis_message_id_omitted": True,
+            "payload_json_omitted": True,
+            "report_path_omitted": True,
+        },
+    )
+
+
+def write_worker_runtime_fatal_report(
+    *,
+    reason_code: str,
+    crashed_task: str | None = None,
+    unexpected_return_task: str | None = None,
+    cleanup_completed: bool,
+    tasks_started: list[str] | tuple[str, ...] | None = None,
+    broad_worker_run_started: bool = False,
+    report_path: Path | None = None,
+) -> WorkerRuntimeFatalReport:
+    report = build_worker_runtime_fatal_report(
+        reason_code=reason_code,
+        crashed_task=crashed_task,
+        unexpected_return_task=unexpected_return_task,
+        cleanup_completed=cleanup_completed,
+        tasks_started=tasks_started,
+        broad_worker_run_started=broad_worker_run_started,
+    )
+    path = report_path or WORKER_RUNTIME_FATAL_REPORT_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_fatal_report_to_dict(report), sort_keys=True) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    return report
+
+
+def read_worker_runtime_fatal_report(*, report_path: Path | None = None) -> WorkerRuntimeFatalReportReadback:
+    path = report_path or WORKER_RUNTIME_FATAL_REPORT_PATH
+    if not path.is_file():
+        return _fatal_report_readback(
+            status="blocked",
+            reason_code="fatal_report_missing",
+            report_present=False,
+        )
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return _fatal_report_readback(
+            status="blocked",
+            reason_code="fatal_report_unreadable",
+            report_present=True,
+        )
+    if not isinstance(raw, dict):
+        return _fatal_report_readback(
+            status="blocked",
+            reason_code="fatal_report_unreadable",
+            report_present=True,
+        )
+    schema_version = raw.get("schema_version")
+    if schema_version != FATAL_REPORT_SCHEMA_VERSION:
+        return _fatal_report_readback(
+            status="blocked",
+            reason_code="fatal_report_schema_mismatch",
+            report_present=True,
+            report_schema_version=_safe_schema_version(schema_version),
+        )
+
+    latest_reason_code = _safe_fatal_reason_code(raw.get("reason_code"))
+    status = "pass" if latest_reason_code == raw.get("reason_code") else "blocked"
+    reason_code = None if status == "pass" else "fatal_report_unknown_reason_code"
+    return _fatal_report_readback(
+        status=status,
+        reason_code=reason_code,
+        report_present=True,
+        report_schema_version=FATAL_REPORT_SCHEMA_VERSION,
+        latest_report_reason_code=latest_reason_code,
+        latest_report_crashed_task=_safe_worker_task_label(raw.get("crashed_task")),
+        latest_report_unexpected_return_task=_safe_worker_task_label(raw.get("unexpected_return_task")),
+        latest_report_cleanup_completed=_safe_bool_or_none(raw.get("cleanup_completed")),
+        latest_report_tasks_started=_safe_worker_task_list(raw.get("tasks_started")),
     )
 
 
@@ -512,6 +675,82 @@ async def _close_resource(resource: Any, *, close_names: tuple[str, ...]) -> boo
             return False
         return True
     return True
+
+
+def _fatal_report_to_dict(report: WorkerRuntimeFatalReport) -> dict[str, Any]:
+    return {
+        "schema_version": report.schema_version,
+        "reason_code": report.reason_code,
+        "crashed_task": report.crashed_task,
+        "unexpected_return_task": report.unexpected_return_task,
+        "cleanup_completed": report.cleanup_completed,
+        "tasks_started": list(report.tasks_started),
+        "broad_worker_run_started": report.broad_worker_run_started,
+        "created_at_utc": report.created_at_utc,
+        "redactions_applied": dict(report.redactions_applied),
+        "report_path_omitted": report.report_path_omitted,
+    }
+
+
+def _fatal_report_readback(
+    *,
+    status: str,
+    reason_code: str | None,
+    report_present: bool,
+    report_schema_version: str | None = None,
+    latest_report_reason_code: str | None = None,
+    latest_report_crashed_task: str | None = None,
+    latest_report_unexpected_return_task: str | None = None,
+    latest_report_cleanup_completed: bool | None = None,
+    latest_report_tasks_started: list[str] | None = None,
+) -> WorkerRuntimeFatalReportReadback:
+    return WorkerRuntimeFatalReportReadback(
+        schema_version=FATAL_REPORT_READBACK_SCHEMA_VERSION,
+        status=status,
+        reason_code=reason_code,
+        report_present=report_present,
+        report_schema_version=report_schema_version,
+        latest_report_reason_code=latest_report_reason_code,
+        latest_report_crashed_task=latest_report_crashed_task,
+        latest_report_unexpected_return_task=latest_report_unexpected_return_task,
+        latest_report_cleanup_completed=latest_report_cleanup_completed,
+        latest_report_tasks_started=list(latest_report_tasks_started or []),
+    )
+
+
+def _safe_worker_task_label(value: object) -> str | None:
+    if isinstance(value, str) and value in WORKER_TASK_LABELS:
+        return value
+    return None
+
+
+def _safe_worker_task_list(value: object) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    tasks: list[str] = []
+    for item in value:
+        label = _safe_worker_task_label(item)
+        if label is not None:
+            tasks.append(label)
+    return tasks
+
+
+def _safe_fatal_reason_code(value: object) -> str:
+    if isinstance(value, str) and value in _FATAL_REPORT_ALLOWED_REASON_CODES:
+        return value
+    return "probe_runtime_error"
+
+
+def _safe_schema_version(value: object) -> str | None:
+    if isinstance(value, str) and value == FATAL_REPORT_SCHEMA_VERSION:
+        return value
+    return None
+
+
+def _safe_bool_or_none(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
 
 
 def _mark_constructed(callback: Callable[[str], None] | None, stage: str) -> None:
