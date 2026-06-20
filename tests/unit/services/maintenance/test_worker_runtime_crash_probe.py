@@ -985,6 +985,10 @@ def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tm
                 "cleanup_completed": True,
                 "tasks_started": [RAW_REDIS_URL, MAINTENANCE_QUEUE_WORKER_LABEL],
                 "broad_worker_run_started": True,
+                "import_stage": "sentinel-secret-import-stage",
+                "import_stage_status": "sentinel-secret-import-stage-status",
+                "import_stage_reason_code": "sentinel-secret-import-stage-reason",
+                "import_stage_index": "sentinel-secret-import-stage-index",
                 "created_at_utc": "2026-06-20T00:00:00Z",
             }
         ),
@@ -1001,7 +1005,20 @@ def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tm
     assert report.latest_report_crashed_task is None
     assert report.latest_report_unexpected_return_task is None
     assert report.latest_report_tasks_started == [MAINTENANCE_QUEUE_WORKER_LABEL]
-    _assert_no_secret_leaks(output, "sentinel-secret-reason", "sentinel-secret-phase", "Traceback sentinel-secret")
+    assert report.import_stage is None
+    assert report.import_stage_status is None
+    assert report.import_stage_reason_code is None
+    assert report.import_stage_index is None
+    _assert_no_secret_leaks(
+        output,
+        "sentinel-secret-reason",
+        "sentinel-secret-phase",
+        "Traceback sentinel-secret",
+        "sentinel-secret-import-stage",
+        "sentinel-secret-import-stage-status",
+        "sentinel-secret-import-stage-reason",
+        "sentinel-secret-import-stage-index",
+    )
 
 
 @pytest.mark.asyncio

@@ -58,6 +58,21 @@ _FATAL_REPORT_ALLOWED_REASON_CODES = {
     *_FAILED_REASON_CODES.values(),
     *_RETURNED_REASON_CODES.values(),
 }
+_BOOTSTRAP_IMPORT_STAGE_LABELS = (
+    "bootstrap_repo_root_path_ready",
+    "stdlib_ready",
+    "maintenance_package_ready",
+    "maintenance_config_import",
+    "maintenance_redis_streams_import",
+    "maintenance_repositories_import",
+    "maintenance_service_import",
+    "maintenance_worker_import",
+    "maintenance_main_import",
+)
+_BOOTSTRAP_IMPORT_STAGE_REASON_CODES = {
+    "repo_root_path_unavailable",
+    "stage_import_error",
+}
 
 WorkerRuntimeCrashProbeStatus = Literal["pass", "blocked", "failed"]
 
@@ -148,6 +163,10 @@ class WorkerRuntimeFatalReportReadback:
     latest_report_cleanup_completed: bool | None
     latest_report_tasks_started: list[str]
     latest_report_broad_worker_run_started: bool | None
+    import_stage: str | None = None
+    import_stage_status: str | None = None
+    import_stage_reason_code: str | None = None
+    import_stage_index: int | None = None
     raw_report_path_omitted: bool = True
     raw_exception_body_omitted: bool = True
     traceback_omitted: bool = True
@@ -313,6 +332,10 @@ def read_worker_runtime_fatal_report(*, report_path: Path | None = None) -> Work
         latest_report_cleanup_completed=_safe_bool_or_none(raw.get("cleanup_completed")),
         latest_report_tasks_started=_safe_worker_task_list(raw.get("tasks_started")),
         latest_report_broad_worker_run_started=_safe_bool_or_none(raw.get("broad_worker_run_started")),
+        import_stage=_safe_bootstrap_import_stage(raw.get("import_stage")),
+        import_stage_status=_safe_bootstrap_import_stage_status(raw.get("import_stage_status")),
+        import_stage_reason_code=_safe_bootstrap_import_stage_reason_code(raw.get("import_stage_reason_code")),
+        import_stage_index=_safe_bootstrap_import_stage_index(raw.get("import_stage"), raw.get("import_stage_index")),
     )
 
 
@@ -719,6 +742,10 @@ def _fatal_report_readback(
     latest_report_cleanup_completed: bool | None = None,
     latest_report_tasks_started: list[str] | None = None,
     latest_report_broad_worker_run_started: bool | None = None,
+    import_stage: str | None = None,
+    import_stage_status: str | None = None,
+    import_stage_reason_code: str | None = None,
+    import_stage_index: int | None = None,
 ) -> WorkerRuntimeFatalReportReadback:
     return WorkerRuntimeFatalReportReadback(
         schema_version=FATAL_REPORT_READBACK_SCHEMA_VERSION,
@@ -733,6 +760,10 @@ def _fatal_report_readback(
         latest_report_cleanup_completed=latest_report_cleanup_completed,
         latest_report_tasks_started=list(latest_report_tasks_started or []),
         latest_report_broad_worker_run_started=latest_report_broad_worker_run_started,
+        import_stage=import_stage,
+        import_stage_status=import_stage_status,
+        import_stage_reason_code=import_stage_reason_code,
+        import_stage_index=import_stage_index,
     )
 
 
@@ -769,6 +800,34 @@ def _safe_fatal_phase(value: object) -> str:
     }:
         return value
     return "runtime"
+
+
+def _safe_bootstrap_import_stage(value: object) -> str | None:
+    if isinstance(value, str) and value in _BOOTSTRAP_IMPORT_STAGE_LABELS:
+        return value
+    return None
+
+
+def _safe_bootstrap_import_stage_status(value: object) -> str | None:
+    if value == "failed":
+        return "failed"
+    return None
+
+
+def _safe_bootstrap_import_stage_reason_code(value: object) -> str | None:
+    if isinstance(value, str) and value in _BOOTSTRAP_IMPORT_STAGE_REASON_CODES:
+        return value
+    return None
+
+
+def _safe_bootstrap_import_stage_index(import_stage: object, value: object) -> int | None:
+    safe_stage = _safe_bootstrap_import_stage(import_stage)
+    if safe_stage is None or not isinstance(value, int):
+        return None
+    expected_index = _BOOTSTRAP_IMPORT_STAGE_LABELS.index(safe_stage)
+    if value == expected_index:
+        return value
+    return None
 
 
 def _safe_schema_version(value: object) -> str | None:
