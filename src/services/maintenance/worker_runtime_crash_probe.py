@@ -93,6 +93,7 @@ _BOOTSTRAP_IMPORT_STAGE_REASON_CODES = {
 _VENV_CONTEXT_SOURCES = {
     "sys_prefix",
     "executable_pyvenv_cfg",
+    "repo_local_pyvenv_cfg",
     "unavailable",
 }
 

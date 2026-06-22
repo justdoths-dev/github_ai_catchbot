@@ -63,6 +63,7 @@ SQLALCHEMY_DISTRIBUTION_NAME = "SQLAlchemy"
 VENV_CONTEXT_SOURCES = {
     "sys_prefix",
     "executable_pyvenv_cfg",
+    "repo_local_pyvenv_cfg",
     "unavailable",
 }
 BOOTSTRAP_EXIT_STATUS_REASON_CODES = {
@@ -368,6 +369,10 @@ def _candidate_venv_root() -> tuple[Path | None, str, bool]:
         if root is not None:
             return root, "executable_pyvenv_cfg", active
 
+    root = _validated_repo_local_pyvenv_root(REPO_ROOT / "venv")
+    if root is not None:
+        return root, "repo_local_pyvenv_cfg", active
+
     return None, "unavailable", active
 
 
@@ -380,6 +385,33 @@ def _validated_pyvenv_root(root: Path) -> Path | None:
         return root.resolve()
     except OSError:
         return None
+
+
+def _validated_repo_local_pyvenv_root(root: Path) -> Path | None:
+    try:
+        repo_root = REPO_ROOT.resolve()
+        resolved_root = root.resolve()
+    except OSError:
+        return None
+    if not resolved_root.is_absolute():
+        return None
+    try:
+        resolved_root.relative_to(repo_root)
+    except ValueError:
+        return None
+    if resolved_root != (repo_root / "venv").resolve():
+        return None
+    python_executable = resolved_root / "bin" / "python"
+    try:
+        if not (resolved_root / "pyvenv.cfg").is_file():
+            return None
+        if not python_executable.is_file():
+            return None
+    except OSError:
+        return None
+    if not os.access(python_executable, os.R_OK | os.X_OK):
+        return None
+    return resolved_root
 
 
 def _validated_venv_site_paths(root: Path) -> list[Path]:

@@ -167,7 +167,12 @@ def _make_pyvenv(tmp_path: Path) -> tuple[Path, Path, Path]:
     platlib.mkdir(parents=True)
     (venv_root / "pyvenv.cfg").write_text("home = /redacted\n", encoding="utf-8")
     (venv_root / "bin/python").write_text("# python\n", encoding="utf-8")
+    (venv_root / "bin/python").chmod(0o755)
     return venv_root.resolve(), purelib.resolve(), platlib.resolve()
+
+
+def _make_repo_local_pyvenv(repo_root: Path) -> tuple[Path, Path, Path]:
+    return _make_pyvenv(repo_root)
 
 
 def _patch_sysconfig_paths(monkeypatch, *, venv_root: Path, purelib: object, platlib: object) -> None:
@@ -187,6 +192,12 @@ def _patch_sys_prefix_venv(monkeypatch, *, venv_root: Path) -> None:
     monkeypatch.setattr(worker_bootstrap.sys, "prefix", str(venv_root))
     monkeypatch.setattr(worker_bootstrap.sys, "base_prefix", str(venv_root.parent / "base-python"))
     monkeypatch.setattr(worker_bootstrap.sys, "executable", str(venv_root / "bin/python"))
+
+
+def _patch_base_interpreter_context(monkeypatch, *, tmp_path: Path) -> None:
+    monkeypatch.setattr(worker_bootstrap.sys, "prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(worker_bootstrap.sys, "base_prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(worker_bootstrap.sys, "executable", str(tmp_path / "base-python/bin/python"))
 
 
 def _patch_sqlalchemy_distribution_unknown(monkeypatch) -> None:
@@ -336,13 +347,17 @@ def test_venv_site_path_repair_rejects_executable_adjacent_root_without_pyvenv_c
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
     executable = tmp_path / "venv/bin/python"
     executable.parent.mkdir(parents=True)
     executable.write_text("# python\n", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setattr(worker_bootstrap, "REPO_ROOT", repo_root)
     monkeypatch.setattr(worker_bootstrap.sys, "prefix", str(tmp_path / "base-python"))
     monkeypatch.setattr(worker_bootstrap.sys, "base_prefix", str(tmp_path / "base-python"))
     monkeypatch.setattr(worker_bootstrap.sys, "executable", str(executable))
-    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(worker_bootstrap.REPO_ROOT)])
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(repo_root)])
     monkeypatch.setattr(
         worker_bootstrap.sysconfig,
         "get_path",
@@ -354,7 +369,175 @@ def test_venv_site_path_repair_rejects_executable_adjacent_root_without_pyvenv_c
 
     assert context["venv_context_source"] == "unavailable"
     assert context["venv_site_candidate_present"] is False
-    assert sys.path == [str(worker_bootstrap.REPO_ROOT)]
+    assert sys.path == [str(repo_root)]
+
+
+@pytest.mark.asyncio
+async def test_repo_local_pyvenv_fallback_repairs_site_paths_and_imports_sqlalchemy(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    venv_root, purelib, platlib = _make_repo_local_pyvenv(repo_root)
+    (purelib / "sqlalchemy").mkdir()
+    (purelib / "sqlalchemy/__init__.py").write_text("SENTINEL = 'repo-local-venv'\n", encoding="utf-8")
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    stdlib_entry = str(tmp_path / "stdlib")
+    imported_modules: list[str] = []
+    observed_path_at_sqlalchemy_import: list[str] = []
+    for module_name in list(sys.modules):
+        if module_name == "sqlalchemy" or module_name.startswith("sqlalchemy."):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+    monkeypatch.setattr(worker_bootstrap, "REPO_ROOT", repo_root)
+    _patch_base_interpreter_context(monkeypatch, tmp_path=tmp_path)
+    _patch_sysconfig_paths(monkeypatch, venv_root=venv_root, purelib=str(purelib), platlib=str(platlib))
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(repo_root), stdlib_entry])
+
+    context = worker_bootstrap._repair_venv_site_paths()
+    sqlalchemy = importlib.import_module("sqlalchemy")
+
+    assert context["venv_context_source"] == "repo_local_pyvenv_cfg"
+    assert context["venv_context_active"] is False
+    assert context["venv_site_candidate_present"] is True
+    assert context["venv_site_path_repaired"] is True
+    assert context["venv_site_on_sys_path_after"] is True
+    assert context["import_caches_invalidated"] is True
+    assert sqlalchemy.SENTINEL == "repo-local-venv"
+    assert sys.path[:3] == [str(repo_root), str(purelib), str(platlib)]
+    assert sys.path.count(str(repo_root)) == 1
+    monkeypatch.delitem(sys.modules, "sqlalchemy", raising=False)
+
+    class FakeMaintenanceMain:
+        async def _run(self, argv: list[str]) -> int:
+            assert argv == ["worker"]
+            return 0
+
+    def import_module(module_name: str):
+        imported_modules.append(module_name)
+        if module_name == "sqlalchemy":
+            observed_path_at_sqlalchemy_import.extend(sys.path)
+            return importlib.import_module(module_name)
+        if module_name == worker_bootstrap.MAINTENANCE_MAIN_MODULE:
+            return FakeMaintenanceMain()
+        return object()
+
+    exit_code = await worker_bootstrap.run_bootstrap(
+        import_module=import_module,
+        find_spec=lambda module_name: object(),
+        report_path=report_path,
+    )
+
+    assert exit_code == 0
+    assert imported_modules.index("sqlalchemy") < imported_modules.index("src.services.outbox_relay.eligibility")
+    assert observed_path_at_sqlalchemy_import[:3] == [str(repo_root), str(purelib), str(platlib)]
+    assert not report_path.exists()
+
+
+def test_repo_local_pyvenv_fallback_rejects_missing_pyvenv_cfg(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    python_executable = repo_root / "venv/bin/python"
+    python_executable.parent.mkdir(parents=True)
+    python_executable.write_text("# python\n", encoding="utf-8")
+    python_executable.chmod(0o755)
+    monkeypatch.setattr(worker_bootstrap, "REPO_ROOT", repo_root)
+    _patch_base_interpreter_context(monkeypatch, tmp_path=tmp_path)
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(repo_root)])
+    monkeypatch.setattr(
+        worker_bootstrap.sysconfig,
+        "get_path",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sysconfig must not be called")),
+    )
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+
+    context = worker_bootstrap._repair_venv_site_paths()
+
+    assert context["venv_context_source"] == "unavailable"
+    assert context["venv_site_candidate_present"] is False
+    assert sys.path == [str(repo_root)]
+
+
+@pytest.mark.parametrize("python_state", ["missing", "non_executable"])
+def test_repo_local_pyvenv_fallback_rejects_missing_or_non_executable_python(
+    monkeypatch,
+    tmp_path: Path,
+    python_state: str,
+) -> None:
+    repo_root = tmp_path / "repo"
+    venv_root = repo_root / "venv"
+    (venv_root / "bin").mkdir(parents=True)
+    (venv_root / "pyvenv.cfg").write_text("home = /redacted\n", encoding="utf-8")
+    if python_state == "non_executable":
+        (venv_root / "bin/python").write_text("# python\n", encoding="utf-8")
+        (venv_root / "bin/python").chmod(0o644)
+    monkeypatch.setattr(worker_bootstrap, "REPO_ROOT", repo_root)
+    _patch_base_interpreter_context(monkeypatch, tmp_path=tmp_path)
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(repo_root)])
+    monkeypatch.setattr(
+        worker_bootstrap.sysconfig,
+        "get_path",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sysconfig must not be called")),
+    )
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+
+    context = worker_bootstrap._repair_venv_site_paths()
+
+    assert context["venv_context_source"] == "unavailable"
+    assert context["venv_site_candidate_present"] is False
+    assert sys.path == [str(repo_root)]
+
+
+def test_repo_local_pyvenv_fallback_rejects_outside_site_paths(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    venv_root, _purelib, _platlib = _make_repo_local_pyvenv(repo_root)
+    outside = tmp_path / "outside-site"
+    outside.mkdir()
+    monkeypatch.setattr(worker_bootstrap, "REPO_ROOT", repo_root)
+    _patch_base_interpreter_context(monkeypatch, tmp_path=tmp_path)
+    _patch_sysconfig_paths(monkeypatch, venv_root=venv_root, purelib=str(outside), platlib=str(outside))
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(repo_root)])
+
+    context = worker_bootstrap._repair_venv_site_paths()
+
+    assert context["venv_context_source"] == "repo_local_pyvenv_cfg"
+    assert context["venv_site_candidate_present"] is False
+    assert context["venv_site_path_repaired"] is False
+    assert str(outside.resolve()) not in sys.path
+    assert sys.path == [str(repo_root)]
+
+
+def test_repo_local_pyvenv_fallback_does_not_accept_arbitrary_outside_root(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    outside_root, _purelib, _platlib = _make_pyvenv(tmp_path / "outside")
+    monkeypatch.setattr(worker_bootstrap, "REPO_ROOT", repo_root)
+    monkeypatch.setattr(worker_bootstrap.sys, "prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(worker_bootstrap.sys, "base_prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(worker_bootstrap.sys, "executable", str(outside_root / "Scripts/python"))
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(repo_root)])
+    monkeypatch.setattr(
+        worker_bootstrap.sysconfig,
+        "get_path",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sysconfig must not be called")),
+    )
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+
+    context = worker_bootstrap._repair_venv_site_paths()
+
+    assert context["venv_context_source"] == "unavailable"
+    assert context["venv_site_candidate_present"] is False
+    assert sys.path == [str(repo_root)]
 
 
 @pytest.mark.asyncio
@@ -796,7 +979,7 @@ def test_bootstrap_fatal_report_context_fields_round_trip_without_raw_values(tmp
             "maintenance_repositories_sqlalchemy_import"
         ),
         venv_context={
-            "venv_context_source": "sys_prefix",
+            "venv_context_source": "repo_local_pyvenv_cfg",
             "venv_context_active": True,
             "venv_site_candidate_present": True,
             "venv_site_on_sys_path_before": False,
@@ -815,7 +998,7 @@ def test_bootstrap_fatal_report_context_fields_round_trip_without_raw_values(tmp
     output = json.dumps(asdict(report), sort_keys=True)
     serialized_payload = json.dumps(payload, sort_keys=True)
 
-    assert payload["venv_context_source"] == "sys_prefix"
+    assert payload["venv_context_source"] == "repo_local_pyvenv_cfg"
     assert payload["venv_context_active"] is True
     assert payload["venv_site_candidate_present"] is True
     assert payload["venv_site_on_sys_path_before"] is False
@@ -823,7 +1006,7 @@ def test_bootstrap_fatal_report_context_fields_round_trip_without_raw_values(tmp
     assert payload["venv_site_on_sys_path_after"] is True
     assert payload["import_caches_invalidated"] is True
     assert payload["sqlalchemy_distribution_present"] is True
-    assert report.venv_context_source == "sys_prefix"
+    assert report.venv_context_source == "repo_local_pyvenv_cfg"
     assert report.venv_context_active is True
     assert report.venv_site_candidate_present is True
     assert report.venv_site_on_sys_path_before is False
