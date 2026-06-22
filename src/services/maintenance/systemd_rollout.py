@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -13,6 +15,7 @@ TARGET_MAINTENANCE_WORKER = "maintenance-worker"
 SERVICE_NAME = "github-ai-catchbot-maintenance.service"
 TIMER_NAME = "github-ai-catchbot-maintenance.timer"
 WORKER_BOOTSTRAP_SCRIPT = Path("src/services/maintenance/worker_bootstrap.py")
+START_STABILITY_INTERVAL_SEC = 2.0
 
 SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES = (
     "LoadState",
@@ -416,6 +419,7 @@ class LocalUserSystemdAdapter:
 def build_systemd_unit_plan(request: SystemdRolloutRequest) -> SystemdUnitPlan:
     exec_start = (
         str(request.python_executable),
+        "-I",
         str(request.repo_root / WORKER_BOOTSTRAP_SCRIPT),
     )
     service_content = "\n".join(
@@ -515,6 +519,7 @@ def run_systemd_rollout(
     request: SystemdRolloutRequest,
     *,
     adapter: SystemdRolloutAdapter | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> SystemdRolloutReport:
     request_error = systemd_rollout_request_error(request)
     if request_error is not None:
@@ -559,14 +564,26 @@ def run_systemd_rollout(
         if request.mode == "start":
             systemd.start_unit(plan.service_name)
             readback = systemd.readback(plan)
-            status = "pass" if readback.service_active else "blocked"
+            if not readback.service_active:
+                return _report(
+                    request,
+                    status="blocked",
+                    reason_code="service_not_active",
+                    unit_plan_created=True,
+                    start_attempted=True,
+                    readback=readback,
+                )
+
+            sleeper(START_STABILITY_INTERVAL_SEC)
+            stable_readback = systemd.readback(plan)
+            status = "pass" if stable_readback.service_active else "blocked"
             return _report(
                 request,
                 status=status,
-                reason_code=None if status == "pass" else "service_not_active",
+                reason_code=None if status == "pass" else "service_exited_after_start",
                 unit_plan_created=True,
                 start_attempted=True,
-                readback=readback,
+                readback=stable_readback,
             )
 
         if request.mode == "proof":

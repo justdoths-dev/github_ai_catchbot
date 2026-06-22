@@ -24,6 +24,11 @@ BOOTSTRAP_SPEC_READY_STAGES = frozenset(
         "maintenance_repositories_spec_ready",
     }
 )
+BOOTSTRAP_IMPORT_SPEC_CHECK_STAGES = frozenset(
+    {
+        "maintenance_repositories_sqlalchemy_import",
+    }
+)
 BOOTSTRAP_IMPORT_STAGE_SEQUENCE = (
     ("bootstrap_repo_root_path_ready", None),
     ("stdlib_ready", "json"),
@@ -249,6 +254,21 @@ def _import_maintenance_main_with_stage_classifier(
                     import_stage_index=index,
                 )
             continue
+        if stage in BOOTSTRAP_IMPORT_SPEC_CHECK_STAGES:
+            try:
+                spec = find_spec(module_name)
+            except Exception:
+                return None, _import_stage_failure(
+                    import_stage=stage,
+                    import_stage_reason_code="stage_import_error",
+                    import_stage_index=index,
+                )
+            if spec is None:
+                return None, _import_stage_failure(
+                    import_stage=stage,
+                    import_stage_reason_code="stage_spec_unavailable",
+                    import_stage_index=index,
+                )
         try:
             module = import_module(module_name)
         except Exception:

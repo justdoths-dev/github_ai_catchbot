@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from services.maintenance.systemd_rollout import (
+    START_STABILITY_INTERVAL_SEC,
     SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES,
     SYSTEMD_CONTEXT_ALLOWED_PROPERTIES,
     SERVICE_NAME,
@@ -35,6 +36,7 @@ class FakeSystemdAdapter:
         self.calls: list[tuple[str, str | None]] = []
         self.enabled: set[str] = set()
         self.active: set[str] = set()
+        self.readback_service_active_overrides: list[bool] = []
 
     def write_unit_file(self, unit_name: str, content: str) -> None:
         self.calls.append(("write_unit_file", unit_name))
@@ -73,7 +75,9 @@ class FakeSystemdAdapter:
             service_file_present=service_file_present,
             timer_file_present=timer_file_present,
             service_enabled=plan.service_name in self.enabled,
-            service_active=plan.service_name in self.active,
+            service_active=self.readback_service_active_overrides.pop(0)
+            if self.readback_service_active_overrides
+            else plan.service_name in self.active,
             rollback_plan_available=service_file_present or timer_file_present,
         )
 
@@ -177,8 +181,10 @@ def test_plan_builds_deterministic_service_unit_without_writes(tmp_path: Path) -
     bootstrap_script = request.repo_root / "src/services/maintenance/worker_bootstrap.py"
     assert plan.exec_start_argv == (
         str(request.python_executable),
+        "-I",
         str(bootstrap_script),
     )
+    assert "-m" not in plan.exec_start_argv
     assert plan.service_unit_content == "\n".join(
         [
             "[Unit]",
@@ -190,7 +196,7 @@ def test_plan_builds_deterministic_service_unit_without_writes(tmp_path: Path) -
             "Type=simple",
             f"WorkingDirectory={request.repo_root}",
             f"EnvironmentFile={request.runtime_env_file}",
-            f"ExecStart={request.python_executable} {bootstrap_script}",
+            f"ExecStart={request.python_executable} -I {bootstrap_script}",
             "Restart=on-failure",
             "RestartSec=10",
             "",
@@ -332,20 +338,69 @@ def test_install_writes_only_exact_service_file_and_enables(tmp_path: Path) -> N
     ]
 
 
-def test_start_records_only_exact_start_operation(tmp_path: Path) -> None:
+def test_start_records_exact_start_and_stable_active_readback(tmp_path: Path) -> None:
     request = _request(tmp_path, mode="start", confirm_start=True)
     adapter = FakeSystemdAdapter(request.systemd_user_dir)
     plan = build_systemd_unit_plan(request)
     adapter.write_unit_file(plan.service_name, plan.service_unit_content)
     adapter.calls.clear()
+    sleeps: list[float] = []
 
-    report = run_systemd_rollout(request, adapter=adapter)
+    report = run_systemd_rollout(request, adapter=adapter, sleeper=sleeps.append)
 
     assert report.status == "pass"
+    assert report.reason_code is None
     assert report.start_attempted is True
     assert report.service_active is True
+    assert sleeps == [START_STABILITY_INTERVAL_SEC]
     assert adapter.calls == [
         ("start_unit", SERVICE_NAME),
+        ("readback", SERVICE_NAME),
+        ("readback", SERVICE_NAME),
+    ]
+
+
+def test_start_blocks_when_immediate_readback_inactive(tmp_path: Path) -> None:
+    request = _request(tmp_path, mode="start", confirm_start=True)
+    adapter = FakeSystemdAdapter(request.systemd_user_dir)
+    plan = build_systemd_unit_plan(request)
+    adapter.write_unit_file(plan.service_name, plan.service_unit_content)
+    adapter.readback_service_active_overrides = [False]
+    adapter.calls.clear()
+    sleeps: list[float] = []
+
+    report = run_systemd_rollout(request, adapter=adapter, sleeper=sleeps.append)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "service_not_active"
+    assert report.start_attempted is True
+    assert report.service_active is False
+    assert sleeps == []
+    assert adapter.calls == [
+        ("start_unit", SERVICE_NAME),
+        ("readback", SERVICE_NAME),
+    ]
+
+
+def test_start_blocks_when_service_exits_after_immediate_active_readback(tmp_path: Path) -> None:
+    request = _request(tmp_path, mode="start", confirm_start=True)
+    adapter = FakeSystemdAdapter(request.systemd_user_dir)
+    plan = build_systemd_unit_plan(request)
+    adapter.write_unit_file(plan.service_name, plan.service_unit_content)
+    adapter.readback_service_active_overrides = [True, False]
+    adapter.calls.clear()
+    sleeps: list[float] = []
+
+    report = run_systemd_rollout(request, adapter=adapter, sleeper=sleeps.append)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "service_exited_after_start"
+    assert report.start_attempted is True
+    assert report.service_active is False
+    assert sleeps == [START_STABILITY_INTERVAL_SEC]
+    assert adapter.calls == [
+        ("start_unit", SERVICE_NAME),
+        ("readback", SERVICE_NAME),
         ("readback", SERVICE_NAME),
     ]
 
@@ -409,6 +464,7 @@ def test_service_unit_uses_environment_file_without_shell_or_broad_permissions(t
     assert "Environment=PYTHONPATH=" not in plan.service_unit_content
     assert "PYTHONPATH=" not in plan.service_unit_content
     assert "ExecStart=" in plan.service_unit_content
+    assert f"{plan.exec_start_argv[0]} -I {plan.exec_start_argv[2]}" in plan.service_unit_content
     assert "/bin/sh" not in plan.service_unit_content
     assert "/bin/bash" not in plan.service_unit_content
     assert "bash -c" not in plan.service_unit_content
@@ -420,6 +476,8 @@ def test_service_unit_uses_environment_file_without_shell_or_broad_permissions(t
     assert "chown" not in plan.service_unit_content
     assert "journalctl" not in plan.service_unit_content
     assert "src/services/maintenance/worker_bootstrap.py" in plan.service_unit_content
+    assert "-I" in plan.exec_start_argv
+    assert "-m" not in plan.exec_start_argv
     assert "-m src.services.maintenance.worker_bootstrap" not in plan.service_unit_content
     assert "src.services.maintenance.main worker" not in plan.service_unit_content
     assert "User=" not in plan.service_unit_content
@@ -610,6 +668,37 @@ def test_context_proof_rejects_direct_main_worker_exec_start(tmp_path: Path) -> 
     assert report.unit_context_matches_expected is False
     assert report.mismatched_context_fields == ["exec_start_matches_expected"]
     assert "src.services.maintenance.main" not in output
+    assert str(request.python_executable) not in output
+
+
+def test_context_proof_rejects_direct_script_exec_start_without_isolated_mode(tmp_path: Path) -> None:
+    request = _context_request(tmp_path)
+    bootstrap_script = request.repo_root / "src/services/maintenance/worker_bootstrap.py"
+    adapter = FakeContextProofAdapter(
+        SystemdContextState(
+            service_file_present=True,
+            service_enabled=True,
+            service_active=False,
+            service_name_matches_expected=True,
+            unit_load_state="loaded",
+            unit_file_state="enabled",
+            exec_start=f"{request.python_executable} {bootstrap_script}",
+            working_directory=str(request.repo_root),
+            environment_file=str(request.runtime_env_file),
+            restart_policy="on-failure",
+            restart_sec="10s",
+        )
+    )
+
+    report = run_systemd_context_proof(request, adapter=adapter)
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "unit_context_mismatch"
+    assert report.exec_start_matches_expected is False
+    assert report.unit_context_matches_expected is False
+    assert report.mismatched_context_fields == ["exec_start_matches_expected"]
+    assert "worker_bootstrap.py" not in output
     assert str(request.python_executable) not in output
 
 
@@ -862,7 +951,7 @@ def test_parse_systemd_context_properties_allows_only_context_properties_and_red
             "ActiveState=activating",
             "UnitFileState=enabled",
             "FragmentPath=/home/dev/private/github-ai-catchbot-maintenance.service",
-            "ExecStart=/home/dev/private/python /home/dev/private/repo/src/services/maintenance/worker_bootstrap.py",
+            "ExecStart=/home/dev/private/python -I /home/dev/private/repo/src/services/maintenance/worker_bootstrap.py",
             "WorkingDirectory=/home/dev/private/repo",
             "EnvironmentFiles=/home/dev/private/runtime.env (ignore_errors=no)",
             "Restart=on-failure",
@@ -889,7 +978,7 @@ def test_parse_service_unit_directives_reads_only_service_context() -> None:
             "[Service]",
             "WorkingDirectory=/repo",
             "EnvironmentFile=/runtime.env",
-            "ExecStart=/python /repo/src/services/maintenance/worker_bootstrap.py",
+            "ExecStart=/python -I /repo/src/services/maintenance/worker_bootstrap.py",
             "Restart=on-failure",
             "RestartSec=10",
             "[Install]",
@@ -900,7 +989,7 @@ def test_parse_service_unit_directives_reads_only_service_context() -> None:
     assert parse_service_unit_directives(content) == {
         "WorkingDirectory": "/repo",
         "EnvironmentFile": "/runtime.env",
-        "ExecStart": "/python /repo/src/services/maintenance/worker_bootstrap.py",
+        "ExecStart": "/python -I /repo/src/services/maintenance/worker_bootstrap.py",
         "Restart": "on-failure",
         "RestartSec": "10",
     }
