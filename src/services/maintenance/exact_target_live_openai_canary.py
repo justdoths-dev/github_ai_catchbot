@@ -530,18 +530,22 @@ class SqlExactTargetCanaryRepository:
         judge_output_id: UUID | None = None,
     ) -> list[Mapping[str, Any]]:
         judge_output_filter = ""
-        params: dict[str, Any] = {"event_type": event_type, "judge_run_id": str(judge_run_id)}
+        params: dict[str, Any] = {
+            "event_type": event_type,
+            "judge_run_id_uuid": str(judge_run_id),
+            "judge_run_id_text": str(judge_run_id),
+        }
         if judge_output_id is not None:
-            judge_output_filter = "AND payload_json->>'judge_output_id' = :judge_output_id"
-            params["judge_output_id"] = str(judge_output_id)
+            judge_output_filter = "AND payload_json->>'judge_output_id' = :judge_output_id_text"
+            params["judge_output_id_text"] = str(judge_output_id)
         return await self._rows(
             f"""
             SELECT event_id, payload_json
             FROM event_outbox
             WHERE event_type = :event_type
               AND aggregate_type = 'judge_run'
-              AND aggregate_id = CAST(:judge_run_id AS uuid)
-              AND payload_json->>'judge_run_id' = :judge_run_id
+              AND aggregate_id = CAST(:judge_run_id_uuid AS uuid)
+              AND payload_json->>'judge_run_id' = :judge_run_id_text
               {judge_output_filter}
             ORDER BY created_at ASC, event_id ASC
             """,

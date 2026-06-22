@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -61,6 +62,23 @@ class _Tx:
 
     async def __aexit__(self, exc_type, exc, tb) -> bool:
         return False
+
+
+class _EmptyRowsResult:
+    def mappings(self) -> "_EmptyRowsResult":
+        return self
+
+    def all(self) -> list[dict[str, Any]]:
+        return []
+
+
+class _CaptureExecuteSession:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def execute(self, statement: Any, params: dict[str, Any]) -> _EmptyRowsResult:
+        self.calls.append((str(statement), dict(params)))
+        return _EmptyRowsResult()
 
 
 class _FakeOpenAIClient:
@@ -1314,6 +1332,35 @@ async def test_openai_failure_mapping_is_sanitized(tmp_path: Path) -> None:
     assert report.judge_status == "failed_terminal"
     assert report.validator_attempted is False
     assert private_exception_body not in rendered
+
+
+@pytest.mark.asyncio
+async def test_event_rows_for_run_uses_distinct_uuid_cast_and_json_text_binds() -> None:
+    session = _CaptureExecuteSession()
+    repository = canary.SqlExactTargetCanaryRepository(session)
+    judge_run_id = uuid4()
+    judge_output_id = uuid4()
+
+    rows = await repository._event_rows_for_run(
+        event_type="analysis.policy.apply.v1",
+        judge_run_id=judge_run_id,
+        judge_output_id=judge_output_id,
+    )
+
+    assert rows == []
+    assert len(session.calls) == 1
+    sql, params = session.calls[0]
+    uuid_cast_binds = set(re.findall(r"CAST\(:([A-Za-z0-9_]+)\s+AS\s+uuid\)", sql))
+    json_text_binds = set(re.findall(r"payload_json->>'[^']+'\s*=\s*:([A-Za-z0-9_]+)", sql))
+    assert uuid_cast_binds.isdisjoint(json_text_binds)
+    assert uuid_cast_binds == {"judge_run_id_uuid"}
+    assert {"judge_run_id_text", "judge_output_id_text"}.issubset(json_text_binds)
+    assert params == {
+        "event_type": "analysis.policy.apply.v1",
+        "judge_run_id_uuid": str(judge_run_id),
+        "judge_run_id_text": str(judge_run_id),
+        "judge_output_id_text": str(judge_output_id),
+    }
 
 
 @pytest.mark.asyncio
