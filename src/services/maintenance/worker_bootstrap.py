@@ -14,9 +14,16 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKER_RUNTIME_FATAL_REPORT_PATH = REPO_ROOT / "state/maintenance/worker-runtime-fatal-report.json"
 MAINTENANCE_PACKAGE_MODULE = "src.services.maintenance"
 MAINTENANCE_MAIN_MODULE = "src.services.maintenance.main"
+MAINTENANCE_REPOSITORIES_MODULE = "src.services.maintenance.repositories"
 EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR = 21
 EXIT_WORKER_BOOTSTRAP_MAIN_ERROR = 22
 EXIT_WORKER_BOOTSTRAP_REPORT_WRITE_FAILED = 23
+BOOTSTRAP_SPEC_READY_STAGES = frozenset(
+    {
+        "maintenance_package_ready",
+        "maintenance_repositories_spec_ready",
+    }
+)
 BOOTSTRAP_IMPORT_STAGE_SEQUENCE = (
     ("bootstrap_repo_root_path_ready", None),
     ("stdlib_ready", "json"),
@@ -24,7 +31,15 @@ BOOTSTRAP_IMPORT_STAGE_SEQUENCE = (
     ("maintenance_package_init_import", MAINTENANCE_PACKAGE_MODULE),
     ("maintenance_config_import", "src.services.maintenance.config"),
     ("maintenance_redis_streams_import", "src.services.maintenance.redis_streams"),
-    ("maintenance_repositories_import", "src.services.maintenance.repositories"),
+    ("maintenance_repositories_import", None),
+    ("maintenance_repositories_spec_ready", MAINTENANCE_REPOSITORIES_MODULE),
+    ("maintenance_repositories_sqlalchemy_import", "sqlalchemy"),
+    ("maintenance_repositories_outbox_eligibility_import", "src.services.outbox_relay.eligibility"),
+    ("maintenance_repositories_models_import", "src.services.maintenance.models"),
+    ("maintenance_repositories_delivery_retry_import", "src.services.maintenance.delivery_retry"),
+    ("maintenance_repositories_delivery_replay_import", "src.services.maintenance.delivery_replay"),
+    ("maintenance_repositories_retry_policy_import", "src.services.maintenance.retry_policy"),
+    ("maintenance_repositories_module_import", MAINTENANCE_REPOSITORIES_MODULE),
     ("maintenance_service_import", "src.services.maintenance.service"),
     ("maintenance_worker_import", "src.services.maintenance.worker"),
     ("maintenance_main_import", MAINTENANCE_MAIN_MODULE),
@@ -216,7 +231,9 @@ def _import_maintenance_main_with_stage_classifier(
                     import_stage_index=index,
                 )
             continue
-        if stage == "maintenance_package_ready":
+        if module_name is None:
+            continue
+        if stage in BOOTSTRAP_SPEC_READY_STAGES:
             try:
                 spec = find_spec(module_name)
             except Exception:

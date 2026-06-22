@@ -19,6 +19,11 @@ RAW_RUNTIME_ENV_PATH = "/tmp/sentinel-runtime-secret.env"
 RAW_MODULE_FILE_PATH = "/tmp/sentinel-module-file/src/services/maintenance/main.py"
 RAW_SYSTEMD_OUTPUT = "sentinel-systemd-stdout-stderr"
 RAW_JOURNAL_OUTPUT = "sentinel-journal-output"
+ACTIONABLE_BOOTSTRAP_IMPORT_STAGE_LABELS = tuple(
+    stage
+    for stage, module_name in worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_SEQUENCE
+    if stage == "bootstrap_repo_root_path_ready" or module_name is not None
+)
 
 
 def _read_json(path: Path) -> dict:
@@ -73,6 +78,22 @@ def test_maintenance_package_import_is_side_effect_free(monkeypatch) -> None:
     assert "src.services.maintenance.worker" not in sys.modules
 
 
+def test_maintenance_repositories_import_is_side_effect_safe(monkeypatch, tmp_path: Path) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    for module_name in list(sys.modules):
+        if module_name == "src.services.maintenance" or module_name.startswith("src.services.maintenance."):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    repositories = importlib.import_module("src.services.maintenance.repositories")
+
+    assert repositories.MaintenanceRepository.__name__ == "MaintenanceRepository"
+    assert not report_path.exists()
+    assert "src.services.maintenance.main" not in sys.modules
+    assert "src.services.maintenance.service" not in sys.modules
+    assert "src.services.maintenance.worker" not in sys.modules
+    assert "src.services.maintenance.redis_streams" not in sys.modules
+
+
 def test_bootstrap_exit_status_reason_codes_are_bounded() -> None:
     assert worker_bootstrap.BOOTSTRAP_EXIT_STATUS_REASON_CODES == {
         21: "worker_bootstrap_import_error",
@@ -90,6 +111,14 @@ def test_bootstrap_import_stage_labels_are_fixed_allowlist() -> None:
         "maintenance_config_import",
         "maintenance_redis_streams_import",
         "maintenance_repositories_import",
+        "maintenance_repositories_spec_ready",
+        "maintenance_repositories_sqlalchemy_import",
+        "maintenance_repositories_outbox_eligibility_import",
+        "maintenance_repositories_models_import",
+        "maintenance_repositories_delivery_retry_import",
+        "maintenance_repositories_delivery_replay_import",
+        "maintenance_repositories_retry_policy_import",
+        "maintenance_repositories_module_import",
         "maintenance_service_import",
         "maintenance_worker_import",
         "maintenance_main_import",
@@ -102,6 +131,12 @@ def test_bootstrap_import_stage_labels_are_fixed_allowlist() -> None:
         "stage_import_error",
         "stage_spec_unavailable",
     }
+    assert worker_bootstrap.BOOTSTRAP_SPEC_READY_STAGES == frozenset(
+        {
+            "maintenance_package_ready",
+            "maintenance_repositories_spec_ready",
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -138,10 +173,13 @@ async def test_bootstrap_adds_repo_root_for_direct_script_import(monkeypatch, tm
     expected_modules = [
         module_name
         for stage, module_name in worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_SEQUENCE
-        if module_name and stage != "maintenance_package_ready"
+        if module_name and stage not in worker_bootstrap.BOOTSTRAP_SPEC_READY_STAGES
     ]
     assert exit_code == 0
-    assert found_specs == [worker_bootstrap.MAINTENANCE_PACKAGE_MODULE]
+    assert found_specs == [
+        worker_bootstrap.MAINTENANCE_PACKAGE_MODULE,
+        worker_bootstrap.MAINTENANCE_REPOSITORIES_MODULE,
+    ]
     assert imported_modules == expected_modules
     assert observed_path[0] == str(worker_bootstrap.REPO_ROOT)
     assert observed_path.count(str(worker_bootstrap.REPO_ROOT)) == 1
@@ -149,7 +187,7 @@ async def test_bootstrap_adds_repo_root_for_direct_script_import(monkeypatch, tm
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failed_stage", worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS)
+@pytest.mark.parametrize("failed_stage", ACTIONABLE_BOOTSTRAP_IMPORT_STAGE_LABELS)
 async def test_bootstrap_import_classifier_reports_exact_failing_allowlisted_stage(
     monkeypatch,
     tmp_path: Path,
@@ -167,13 +205,13 @@ async def test_bootstrap_import_classifier_reports_exact_failing_allowlisted_sta
 
     def fail_import(module_name: str):
         imported_modules.append(module_name)
-        if module_name == stage_modules[failed_stage]:
+        if failed_stage not in worker_bootstrap.BOOTSTRAP_SPEC_READY_STAGES and module_name == stage_modules[failed_stage]:
             raise RuntimeError(raw_exception)
         return object()
 
     def fail_find_spec(module_name: str):
         found_specs.append(module_name)
-        if failed_stage == "maintenance_package_ready":
+        if failed_stage in worker_bootstrap.BOOTSTRAP_SPEC_READY_STAGES and module_name == stage_modules[failed_stage]:
             raise RuntimeError(raw_exception)
         return object()
 
@@ -214,12 +252,129 @@ async def test_bootstrap_import_classifier_reports_exact_failing_allowlisted_sta
     if failed_stage == "bootstrap_repo_root_path_ready":
         assert imported_modules == []
         assert found_specs == []
-    elif failed_stage == "maintenance_package_ready":
-        assert found_specs == [worker_bootstrap.MAINTENANCE_PACKAGE_MODULE]
-        assert imported_modules == ["json"]
+    elif failed_stage in worker_bootstrap.BOOTSTRAP_SPEC_READY_STAGES:
+        assert found_specs[-1] == stage_modules[failed_stage]
+        assert stage_modules[failed_stage] not in imported_modules
+        if failed_stage == "maintenance_package_ready":
+            assert imported_modules == ["json"]
+        if failed_stage == "maintenance_repositories_spec_ready":
+            assert found_specs == [
+                worker_bootstrap.MAINTENANCE_PACKAGE_MODULE,
+                worker_bootstrap.MAINTENANCE_REPOSITORIES_MODULE,
+            ]
+            assert worker_bootstrap.MAINTENANCE_REPOSITORIES_MODULE not in imported_modules
+            assert imported_modules[-1] == "src.services.maintenance.redis_streams"
     else:
         assert imported_modules[-1] == stage_modules[failed_stage]
     _assert_no_secret_leaks(serialized, raw_exception, report_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failed_stage",
+    [
+        "maintenance_repositories_sqlalchemy_import",
+        "maintenance_repositories_outbox_eligibility_import",
+        "maintenance_repositories_models_import",
+        "maintenance_repositories_delivery_retry_import",
+        "maintenance_repositories_delivery_replay_import",
+        "maintenance_repositories_retry_policy_import",
+        "maintenance_repositories_module_import",
+    ],
+)
+async def test_repository_import_classifier_reports_exact_dependency_substage(
+    tmp_path: Path,
+    failed_stage: str,
+) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    stage_modules = dict(worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_SEQUENCE)
+
+    def fail_import(module_name: str):
+        if module_name == stage_modules[failed_stage]:
+            raise RuntimeError(f"Traceback {RAW_DATABASE_URL} {RAW_REDIS_URL} {RAW_MODULE_FILE_PATH}")
+        return object()
+
+    exit_code = await worker_bootstrap.run_bootstrap(
+        import_module=fail_import,
+        find_spec=lambda module_name: object(),
+        report_path=report_path,
+    )
+    payload = _read_json(report_path)
+    serialized = json.dumps(payload, sort_keys=True)
+
+    assert exit_code == worker_bootstrap.EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR
+    assert payload["reason_code"] == "worker_bootstrap_import_error"
+    assert payload["phase"] == "bootstrap_import"
+    assert payload["import_stage"] == failed_stage
+    assert payload["import_stage_status"] == "failed"
+    assert payload["import_stage_reason_code"] == "stage_import_error"
+    assert payload["import_stage_index"] == worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS.index(failed_stage)
+    assert payload["tasks_started"] == []
+    assert payload["broad_worker_run_started"] is False
+    _assert_no_secret_leaks(serialized, RAW_DATABASE_URL, RAW_REDIS_URL, RAW_MODULE_FILE_PATH, report_path)
+
+
+@pytest.mark.asyncio
+async def test_repository_spec_unavailable_reports_safe_dependency_stage(tmp_path: Path) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+
+    def find_spec(module_name: str):
+        if module_name == worker_bootstrap.MAINTENANCE_REPOSITORIES_MODULE:
+            return None
+        return object()
+
+    exit_code = await worker_bootstrap.run_bootstrap(
+        import_module=lambda module_name: object(),
+        find_spec=find_spec,
+        report_path=report_path,
+    )
+    payload = _read_json(report_path)
+
+    assert exit_code == worker_bootstrap.EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR
+    assert payload["reason_code"] == "worker_bootstrap_import_error"
+    assert payload["phase"] == "bootstrap_import"
+    assert payload["import_stage"] == "maintenance_repositories_spec_ready"
+    assert payload["import_stage_status"] == "failed"
+    assert payload["import_stage_reason_code"] == "stage_spec_unavailable"
+    assert payload["import_stage_index"] == worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS.index(
+        "maintenance_repositories_spec_ready"
+    )
+
+
+def test_readback_accepts_repository_import_substages_without_leaks(tmp_path: Path) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    for stage in [
+        "maintenance_repositories_import",
+        "maintenance_repositories_spec_ready",
+        "maintenance_repositories_sqlalchemy_import",
+        "maintenance_repositories_outbox_eligibility_import",
+        "maintenance_repositories_models_import",
+        "maintenance_repositories_delivery_retry_import",
+        "maintenance_repositories_delivery_replay_import",
+        "maintenance_repositories_retry_policy_import",
+        "maintenance_repositories_module_import",
+    ]:
+        worker_bootstrap.write_worker_bootstrap_fatal_report(
+            reason_code="worker_bootstrap_import_error",
+            phase="bootstrap_import",
+            import_stage=stage,
+            import_stage_status="failed",
+            import_stage_reason_code="stage_import_error",
+            import_stage_index=worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS.index(stage),
+            report_path=report_path,
+        )
+        report = read_worker_runtime_fatal_report(report_path=report_path)
+        output = json.dumps(asdict(report), sort_keys=True)
+
+        assert report.status == "pass"
+        assert report.reason_code is None
+        assert report.latest_report_reason_code == "worker_bootstrap_import_error"
+        assert report.latest_report_phase == "bootstrap_import"
+        assert report.import_stage == stage
+        assert report.import_stage_status == "failed"
+        assert report.import_stage_reason_code == "stage_import_error"
+        assert report.import_stage_index == worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS.index(stage)
+        _assert_no_secret_leaks(output, report_path)
 
 
 @pytest.mark.asyncio
