@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -24,6 +26,9 @@ FATAL_REPORT_READBACK_SCHEMA_VERSION = "maintenance_worker_runtime_fatal_report_
 WORKER_RUNTIME_FATAL_REPORT_PATH = (
     Path(__file__).resolve().parents[3] / "state/maintenance/worker-runtime-fatal-report.json"
 )
+INVOCATION_ID_ENV_KEY = "INVOCATION_ID"
+INVOCATION_ID_HEX_LENGTH = 32
+INVOCATION_FINGERPRINT_LENGTH = 16
 
 MAINTENANCE_QUEUE_WORKER_LABEL = "maintenance_queue_worker"
 REPLAY_QUEUE_WORKER_LABEL = "replay_queue_worker"
@@ -81,6 +86,8 @@ _BOOTSTRAP_IMPORT_STAGE_LABELS = (
 _BOOTSTRAP_IMPORT_STAGE_REASON_CODES = {
     "repo_root_path_unavailable",
     "stage_import_error",
+    "stage_dependency_unavailable",
+    "stage_module_unavailable",
     "stage_spec_unavailable",
 }
 
@@ -155,8 +162,10 @@ class WorkerRuntimeFatalReport:
     tasks_started: list[str]
     broad_worker_run_started: bool
     created_at_utc: str
+    invocation_fingerprint: str | None
     redactions_applied: dict[str, bool]
     report_path_omitted: bool = True
+    raw_invocation_id_omitted: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +182,8 @@ class WorkerRuntimeFatalReportReadback:
     latest_report_cleanup_completed: bool | None
     latest_report_tasks_started: list[str]
     latest_report_broad_worker_run_started: bool | None
+    latest_report_invocation_fingerprint: str | None = None
+    latest_report_created_at_utc: str | None = None
     import_stage: str | None = None
     import_stage_status: str | None = None
     import_stage_reason_code: str | None = None
@@ -183,6 +194,7 @@ class WorkerRuntimeFatalReportReadback:
     database_url_omitted: bool = True
     redis_url_omitted: bool = True
     runtime_env_values_omitted: bool = True
+    raw_invocation_id_omitted: bool = True
 
 
 @dataclass(slots=True)
@@ -243,6 +255,7 @@ def build_worker_runtime_fatal_report(
     safe_unexpected_return_task = _safe_worker_task_label(unexpected_return_task)
     safe_reason_code = _safe_fatal_reason_code(reason_code)
     created_at = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    invocation_fingerprint = _current_invocation_fingerprint()
     return WorkerRuntimeFatalReport(
         schema_version=FATAL_REPORT_SCHEMA_VERSION,
         reason_code=safe_reason_code,
@@ -253,6 +266,7 @@ def build_worker_runtime_fatal_report(
         tasks_started=safe_tasks_started,
         broad_worker_run_started=bool(broad_worker_run_started and safe_tasks_started),
         created_at_utc=created_at.isoformat().replace("+00:00", "Z"),
+        invocation_fingerprint=invocation_fingerprint,
         redactions_applied={
             "runtime_env_path_omitted": True,
             "runtime_env_values_omitted": True,
@@ -263,6 +277,7 @@ def build_worker_runtime_fatal_report(
             "redis_message_id_omitted": True,
             "payload_json_omitted": True,
             "report_path_omitted": True,
+            "raw_invocation_id_omitted": True,
         },
     )
 
@@ -342,6 +357,8 @@ def read_worker_runtime_fatal_report(*, report_path: Path | None = None) -> Work
         latest_report_cleanup_completed=_safe_bool_or_none(raw.get("cleanup_completed")),
         latest_report_tasks_started=_safe_worker_task_list(raw.get("tasks_started")),
         latest_report_broad_worker_run_started=_safe_bool_or_none(raw.get("broad_worker_run_started")),
+        latest_report_invocation_fingerprint=_safe_invocation_fingerprint(raw.get("invocation_fingerprint")),
+        latest_report_created_at_utc=_safe_created_at_utc(raw.get("created_at_utc")),
         import_stage=_safe_bootstrap_import_stage(raw.get("import_stage")),
         import_stage_status=_safe_bootstrap_import_stage_status(raw.get("import_stage_status")),
         import_stage_reason_code=_safe_bootstrap_import_stage_reason_code(raw.get("import_stage_reason_code")),
@@ -734,8 +751,10 @@ def _fatal_report_to_dict(report: WorkerRuntimeFatalReport) -> dict[str, Any]:
         "tasks_started": list(report.tasks_started),
         "broad_worker_run_started": report.broad_worker_run_started,
         "created_at_utc": report.created_at_utc,
+        "invocation_fingerprint": report.invocation_fingerprint,
         "redactions_applied": dict(report.redactions_applied),
         "report_path_omitted": report.report_path_omitted,
+        "raw_invocation_id_omitted": report.raw_invocation_id_omitted,
     }
 
 
@@ -752,6 +771,8 @@ def _fatal_report_readback(
     latest_report_cleanup_completed: bool | None = None,
     latest_report_tasks_started: list[str] | None = None,
     latest_report_broad_worker_run_started: bool | None = None,
+    latest_report_invocation_fingerprint: str | None = None,
+    latest_report_created_at_utc: str | None = None,
     import_stage: str | None = None,
     import_stage_status: str | None = None,
     import_stage_reason_code: str | None = None,
@@ -770,6 +791,8 @@ def _fatal_report_readback(
         latest_report_cleanup_completed=latest_report_cleanup_completed,
         latest_report_tasks_started=list(latest_report_tasks_started or []),
         latest_report_broad_worker_run_started=latest_report_broad_worker_run_started,
+        latest_report_invocation_fingerprint=latest_report_invocation_fingerprint,
+        latest_report_created_at_utc=latest_report_created_at_utc,
         import_stage=import_stage,
         import_stage_status=import_stage_status,
         import_stage_reason_code=import_stage_reason_code,
@@ -844,6 +867,49 @@ def _safe_schema_version(value: object) -> str | None:
     if isinstance(value, str) and value == FATAL_REPORT_SCHEMA_VERSION:
         return value
     return None
+
+
+def _current_invocation_fingerprint() -> str | None:
+    return invocation_fingerprint(os.environ.get(INVOCATION_ID_ENV_KEY))
+
+
+def invocation_fingerprint(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if len(normalized) != INVOCATION_ID_HEX_LENGTH:
+        return None
+    if not all(char in "0123456789abcdef" for char in normalized):
+        return None
+    return hashlib.sha256(normalized.encode("ascii")).hexdigest()[:INVOCATION_FINGERPRINT_LENGTH]
+
+
+def _safe_invocation_fingerprint(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if len(value) != INVOCATION_FINGERPRINT_LENGTH:
+        return None
+    if not all(char in "0123456789abcdef" for char in value):
+        return None
+    return value
+
+
+def _safe_created_at_utc(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if len(text) > 40 or not text.endswith("Z"):
+        return None
+    try:
+        parsed = datetime.fromisoformat(text[:-1] + "+00:00")
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    normalized = parsed.astimezone(timezone.utc)
+    if normalized.year < 2000 or normalized.year > 2100:
+        return None
+    return normalized.isoformat().replace("+00:00", "Z")
 
 
 def _safe_bool_or_none(value: object) -> bool | None:

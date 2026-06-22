@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -29,6 +30,7 @@ from tests.component.services.maintenance._fakes import config
 RAW_DATABASE_URL = "sentinel-database-secret-value"
 RAW_REDIS_URL = "sentinel-redis-secret-value"
 RUNTIME_ENV_PATH_SENTINEL = "sentinel-runtime-path"
+SAFE_INVOCATION_ID = "0123456789abcdef0123456789abcdef"
 
 
 class FakeEngine:
@@ -962,13 +964,92 @@ def test_worker_runtime_fatal_report_readback_returns_pass_with_redacted_fields(
     assert report.latest_report_unexpected_return_task is None
     assert report.latest_report_cleanup_completed is True
     assert report.latest_report_tasks_started == list(WORKER_TASK_LABELS)
+    assert report.latest_report_created_at_utc is not None
+    assert report.latest_report_invocation_fingerprint is None
     assert report.raw_report_path_omitted is True
     assert report.raw_exception_body_omitted is True
     assert report.traceback_omitted is True
     assert report.database_url_omitted is True
     assert report.redis_url_omitted is True
     assert report.runtime_env_values_omitted is True
+    assert report.raw_invocation_id_omitted is True
     _assert_no_secret_leaks(output, report_path)
+
+
+def test_worker_runtime_fatal_report_uses_bounded_invocation_fingerprint(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    monkeypatch.setenv("INVOCATION_ID", SAFE_INVOCATION_ID)
+    expected = hashlib.sha256(SAFE_INVOCATION_ID.encode("ascii")).hexdigest()[:16]
+
+    report = write_worker_runtime_fatal_report(
+        reason_code="worker_runtime_config_error",
+        phase="config_load",
+        cleanup_completed=True,
+        report_path=report_path,
+    )
+    payload = _read_json(report_path)
+    readback = read_worker_runtime_fatal_report(report_path=report_path)
+    serialized = json.dumps(payload, sort_keys=True)
+
+    assert report.invocation_fingerprint == expected
+    assert payload["invocation_fingerprint"] == expected
+    assert payload["raw_invocation_id_omitted"] is True
+    assert payload["redactions_applied"]["raw_invocation_id_omitted"] is True
+    assert readback.latest_report_invocation_fingerprint == expected
+    assert readback.raw_invocation_id_omitted is True
+    assert SAFE_INVOCATION_ID not in serialized
+
+
+@pytest.mark.parametrize("raw_invocation_id", [None, "", "not-hex", "f" * 31, "g" * 32])
+def test_worker_runtime_fatal_report_ignores_missing_or_malformed_invocation_id(
+    monkeypatch,
+    raw_invocation_id: str | None,
+) -> None:
+    if raw_invocation_id is None:
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+    else:
+        monkeypatch.setenv("INVOCATION_ID", raw_invocation_id)
+
+    report = worker_runtime_crash_probe.build_worker_runtime_fatal_report(
+        reason_code="worker_runtime_config_error",
+        phase="config_load",
+        cleanup_completed=True,
+    )
+
+    assert report.invocation_fingerprint is None
+    assert report.raw_invocation_id_omitted is True
+
+
+def test_worker_runtime_fatal_report_readback_accepts_historical_report_without_invocation_fingerprint(
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps(
+            {
+                "schema_version": FATAL_REPORT_SCHEMA_VERSION,
+                "reason_code": "worker_runtime_config_error",
+                "phase": "config_load",
+                "crashed_task": None,
+                "unexpected_return_task": None,
+                "cleanup_completed": True,
+                "tasks_started": [],
+                "broad_worker_run_started": False,
+                "created_at_utc": "2026-06-20T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = read_worker_runtime_fatal_report(report_path=report_path)
+
+    assert report.status == "pass"
+    assert report.latest_report_invocation_fingerprint is None
+    assert report.latest_report_created_at_utc == "2026-06-20T00:00:00Z"
 
 
 def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tmp_path: Path) -> None:
@@ -989,7 +1070,8 @@ def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tm
                 "import_stage_status": "sentinel-secret-import-stage-status",
                 "import_stage_reason_code": "sentinel-secret-import-stage-reason",
                 "import_stage_index": "sentinel-secret-import-stage-index",
-                "created_at_utc": "2026-06-20T00:00:00Z",
+                "created_at_utc": "sentinel-secret-created-at",
+                "invocation_fingerprint": "sentinel-secret-invocation-fingerprint",
             }
         ),
         encoding="utf-8",
@@ -1009,6 +1091,8 @@ def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tm
     assert report.import_stage_status is None
     assert report.import_stage_reason_code is None
     assert report.import_stage_index is None
+    assert report.latest_report_invocation_fingerprint is None
+    assert report.latest_report_created_at_utc is None
     _assert_no_secret_leaks(
         output,
         "sentinel-secret-reason",
@@ -1018,6 +1102,8 @@ def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tm
         "sentinel-secret-import-stage-status",
         "sentinel-secret-import-stage-reason",
         "sentinel-secret-import-stage-index",
+        "sentinel-secret-created-at",
+        "sentinel-secret-invocation-fingerprint",
     )
 
 

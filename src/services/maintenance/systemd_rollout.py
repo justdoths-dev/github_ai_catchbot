@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import time
 from collections.abc import Callable
@@ -16,6 +17,8 @@ SERVICE_NAME = "github-ai-catchbot-maintenance.service"
 TIMER_NAME = "github-ai-catchbot-maintenance.timer"
 WORKER_BOOTSTRAP_SCRIPT = Path("src/services/maintenance/worker_bootstrap.py")
 START_STABILITY_INTERVAL_SEC = 2.0
+INVOCATION_ID_HEX_LENGTH = 32
+INVOCATION_FINGERPRINT_LENGTH = 16
 
 SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES = (
     "LoadState",
@@ -27,6 +30,7 @@ SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES = (
     "NRestarts",
     "UnitFileState",
     "FragmentPath",
+    "InvocationID",
 )
 SYSTEMD_CONTEXT_ALLOWED_PROPERTIES = (
     "LoadState",
@@ -138,6 +142,7 @@ class SystemdDiagnosticState:
     exec_main_status: int | None = None
     n_restarts: int | None = None
     unit_file_state: str | None = None
+    current_invocation_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,8 +178,10 @@ class SystemdDiagnosticReport:
     exec_main_status: int | None
     n_restarts: int | None
     unit_file_state: str | None
+    current_invocation_fingerprint: str | None
     restart_likely: bool
     exited_after_start_likely: bool
+    raw_invocation_id_omitted: bool = True
     redactions_applied: dict[str, bool] = field(default_factory=dict)
 
 
@@ -291,6 +298,7 @@ class LocalUserSystemdAdapter:
             exec_main_status=_safe_int(properties.get("ExecMainStatus")),
             n_restarts=_safe_int(properties.get("NRestarts")),
             unit_file_state=_blank_to_none(properties.get("UnitFileState")),
+            current_invocation_fingerprint=_blank_to_none(properties.get("InvocationID")),
         )
 
     def context_state(self, plan: SystemdUnitPlan) -> SystemdContextState:
@@ -848,8 +856,10 @@ def _diagnostic_report(
         exec_main_status=state.exec_main_status if state else None,
         n_restarts=state.n_restarts if state else None,
         unit_file_state=state.unit_file_state if state else None,
+        current_invocation_fingerprint=state.current_invocation_fingerprint if state else None,
         restart_likely=restart_likely,
         exited_after_start_likely=exited_after_start_likely,
+        raw_invocation_id_omitted=True,
         redactions_applied={
             "runtime_env_path_omitted": True,
             "runtime_env_values_omitted": True,
@@ -861,6 +871,7 @@ def _diagnostic_report(
             "fragment_path_redacted_to_presence": True,
             "journal_output_omitted": True,
             "exception_body_omitted": True,
+            "raw_invocation_id_omitted": True,
         },
     )
 
@@ -955,6 +966,8 @@ def parse_systemd_show_properties(output: str) -> dict[str, str]:
         value = value.strip()
         if key == "FragmentPath":
             properties[key] = "present" if value else ""
+        elif key == "InvocationID":
+            properties[key] = invocation_fingerprint(value) or ""
         else:
             properties[key] = value
     return properties
@@ -1127,6 +1140,17 @@ def _safe_systemd_state(value: str | None) -> str | None:
     if text and all(char.isalnum() or char in {"-", "_"} for char in text):
         return text
     return "redacted"
+
+
+def invocation_fingerprint(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if len(normalized) != INVOCATION_ID_HEX_LENGTH:
+        return None
+    if not all(char in "0123456789abcdef" for char in normalized):
+        return None
+    return hashlib.sha256(normalized.encode("ascii")).hexdigest()[:INVOCATION_FINGERPRINT_LENGTH]
 
 
 def _dedupe_preserving_order(values: list[str]) -> list[str]:

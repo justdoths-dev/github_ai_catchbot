@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import importlib.util
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,11 +24,6 @@ BOOTSTRAP_SPEC_READY_STAGES = frozenset(
     {
         "maintenance_package_ready",
         "maintenance_repositories_spec_ready",
-    }
-)
-BOOTSTRAP_IMPORT_SPEC_CHECK_STAGES = frozenset(
-    {
-        "maintenance_repositories_sqlalchemy_import",
     }
 )
 BOOTSTRAP_IMPORT_STAGE_SEQUENCE = (
@@ -53,8 +50,13 @@ BOOTSTRAP_IMPORT_STAGE_LABELS = tuple(stage for stage, _module_name in BOOTSTRAP
 BOOTSTRAP_IMPORT_STAGE_REASON_CODES = {
     "repo_root_path_unavailable",
     "stage_import_error",
+    "stage_dependency_unavailable",
+    "stage_module_unavailable",
     "stage_spec_unavailable",
 }
+INVOCATION_ID_ENV_KEY = "INVOCATION_ID"
+INVOCATION_ID_HEX_LENGTH = 32
+INVOCATION_FINGERPRINT_LENGTH = 16
 BOOTSTRAP_EXIT_STATUS_REASON_CODES = {
     EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR: "worker_bootstrap_import_error",
     EXIT_WORKER_BOOTSTRAP_MAIN_ERROR: "worker_bootstrap_main_error",
@@ -83,6 +85,7 @@ def build_worker_bootstrap_fatal_report(
 ) -> dict[str, object]:
     created_at = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
     safe_import_stage = _safe_import_stage(import_stage)
+    invocation_fingerprint = _current_invocation_fingerprint()
     return {
         "schema_version": FATAL_REPORT_SCHEMA_VERSION,
         "reason_code": _safe_reason_code(reason_code),
@@ -97,6 +100,7 @@ def build_worker_bootstrap_fatal_report(
         "tasks_started": [],
         "broad_worker_run_started": False,
         "created_at_utc": created_at.isoformat().replace("+00:00", "Z"),
+        "invocation_fingerprint": invocation_fingerprint,
         "redactions_applied": {
             "runtime_env_path_omitted": True,
             "runtime_env_values_omitted": True,
@@ -109,8 +113,10 @@ def build_worker_bootstrap_fatal_report(
             "report_path_omitted": True,
             "systemd_stdout_stderr_omitted": True,
             "journal_output_omitted": True,
+            "raw_invocation_id_omitted": True,
         },
         "report_path_omitted": True,
+        "raw_invocation_id_omitted": True,
     }
 
 
@@ -254,27 +260,12 @@ def _import_maintenance_main_with_stage_classifier(
                     import_stage_index=index,
                 )
             continue
-        if stage in BOOTSTRAP_IMPORT_SPEC_CHECK_STAGES:
-            try:
-                spec = find_spec(module_name)
-            except Exception:
-                return None, _import_stage_failure(
-                    import_stage=stage,
-                    import_stage_reason_code="stage_import_error",
-                    import_stage_index=index,
-                )
-            if spec is None:
-                return None, _import_stage_failure(
-                    import_stage=stage,
-                    import_stage_reason_code="stage_spec_unavailable",
-                    import_stage_index=index,
-                )
         try:
             module = import_module(module_name)
-        except Exception:
+        except Exception as exc:
             return None, _import_stage_failure(
                 import_stage=stage,
-                import_stage_reason_code="stage_import_error",
+                import_stage_reason_code=_import_failure_reason_code(exc, target_module_name=module_name),
                 import_stage_index=index,
             )
         if module_name == MAINTENANCE_MAIN_MODULE:
@@ -307,6 +298,31 @@ def _ensure_repo_root_on_sys_path() -> None:
     repo_root = str(REPO_ROOT)
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
+
+
+def _import_failure_reason_code(exc: Exception, *, target_module_name: str) -> str:
+    if isinstance(exc, ModuleNotFoundError):
+        missing_name = getattr(exc, "name", None)
+        if missing_name == target_module_name:
+            return "stage_module_unavailable"
+        if isinstance(missing_name, str) and missing_name:
+            return "stage_dependency_unavailable"
+    return "stage_import_error"
+
+
+def _current_invocation_fingerprint() -> str | None:
+    return _invocation_fingerprint(os.environ.get(INVOCATION_ID_ENV_KEY))
+
+
+def _invocation_fingerprint(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    if len(normalized) != INVOCATION_ID_HEX_LENGTH:
+        return None
+    if not all(char in "0123456789abcdef" for char in normalized):
+        return None
+    return hashlib.sha256(normalized.encode("ascii")).hexdigest()[:INVOCATION_FINGERPRINT_LENGTH]
 
 
 def main() -> None:

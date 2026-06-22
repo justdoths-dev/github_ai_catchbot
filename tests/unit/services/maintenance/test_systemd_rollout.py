@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
 
 import pytest
 
+from services.maintenance import worker_bootstrap, worker_runtime_crash_probe
 from services.maintenance.systemd_rollout import (
     START_STABILITY_INTERVAL_SEC,
     SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES,
@@ -28,6 +30,9 @@ from services.maintenance.systemd_rollout import (
     run_systemd_diagnostic,
     run_systemd_rollout,
 )
+
+
+SAFE_INVOCATION_ID = "0123456789abcdef0123456789abcdef"
 
 
 class FakeSystemdAdapter:
@@ -816,6 +821,7 @@ def test_context_proof_mismatch_reports_field_names_only(tmp_path: Path) -> None
 
 
 def test_diagnostic_reads_exact_service_only_and_reports_active_state(tmp_path: Path) -> None:
+    expected_fingerprint = hashlib.sha256(SAFE_INVOCATION_ID.encode("ascii")).hexdigest()[:16]
     state = SystemdDiagnosticState(
         service_file_present=True,
         service_enabled=True,
@@ -828,10 +834,12 @@ def test_diagnostic_reads_exact_service_only_and_reports_active_state(tmp_path: 
         exec_main_status=0,
         n_restarts=0,
         unit_file_state="enabled",
+        current_invocation_fingerprint=expected_fingerprint,
     )
     adapter = FakeDiagnosticAdapter(state)
 
     report = run_systemd_diagnostic(_diagnostic_request(tmp_path), adapter=adapter)
+    output = json.dumps(asdict(report), sort_keys=True)
 
     assert report.status == "pass"
     assert report.reason_code is None
@@ -841,9 +849,13 @@ def test_diagnostic_reads_exact_service_only_and_reports_active_state(tmp_path: 
     assert report.service_active is True
     assert report.load_state == "loaded"
     assert report.active_state == "active"
+    assert report.current_invocation_fingerprint == expected_fingerprint
+    assert report.raw_invocation_id_omitted is True
+    assert report.redactions_applied["raw_invocation_id_omitted"] is True
     assert report.restart_likely is False
     assert report.exited_after_start_likely is False
     assert adapter.calls == [SERVICE_NAME]
+    assert SAFE_INVOCATION_ID not in output
 
 
 def test_diagnostic_flags_service_that_exited_after_start(tmp_path: Path) -> None:
@@ -917,6 +929,7 @@ def test_diagnostic_redacts_systemctl_failure_output_paths_and_journal_text(tmp_
 
 
 def test_parse_systemd_show_properties_allows_only_safe_properties_and_redacts_fragment_path() -> None:
+    expected_fingerprint = hashlib.sha256(SAFE_INVOCATION_ID.encode("ascii")).hexdigest()[:16]
     output = "\n".join(
         [
             "LoadState=loaded",
@@ -928,6 +941,7 @@ def test_parse_systemd_show_properties_allows_only_safe_properties_and_redacts_f
             "NRestarts=2",
             "UnitFileState=enabled",
             "FragmentPath=/home/dev/private/github-ai-catchbot-maintenance.service",
+            f"InvocationID={SAFE_INVOCATION_ID}",
             "Environment=DATABASE_URL=sentinel-secret",
             "ExecStart=/bin/sh -c sentinel-secret",
             "StatusText=journal body sentinel",
@@ -939,9 +953,26 @@ def test_parse_systemd_show_properties_allows_only_safe_properties_and_redacts_f
 
     assert set(properties) == set(SYSTEMD_DIAGNOSTIC_ALLOWED_PROPERTIES)
     assert properties["FragmentPath"] == "present"
+    assert properties["InvocationID"] == expected_fingerprint
     assert "/home/dev/private" not in serialized
+    assert SAFE_INVOCATION_ID not in serialized
     assert "sentinel-secret" not in serialized
     assert "journal body sentinel" not in serialized
+
+
+def test_parse_systemd_show_properties_drops_malformed_invocation_id() -> None:
+    properties = parse_systemd_show_properties(
+        "\n".join(
+            [
+                "LoadState=loaded",
+                "InvocationID=sentinel-secret-invocation-id",
+            ]
+        )
+    )
+    serialized = json.dumps(properties, sort_keys=True)
+
+    assert properties["InvocationID"] == ""
+    assert "sentinel-secret-invocation-id" not in serialized
 
 
 def test_parse_systemd_context_properties_allows_only_context_properties_and_redacts_fragment_path() -> None:
@@ -997,6 +1028,7 @@ def test_parse_service_unit_directives_reads_only_service_context() -> None:
 
 def test_local_diagnostic_uses_exact_user_systemctl_show_allowlist(monkeypatch, tmp_path: Path) -> None:
     calls: list[list[str]] = []
+    expected_fingerprint = hashlib.sha256(SAFE_INVOCATION_ID.encode("ascii")).hexdigest()[:16]
 
     def fake_run(args, check, stdout, stderr, text):
         del check, stdout, stderr, text
@@ -1015,6 +1047,7 @@ def test_local_diagnostic_uses_exact_user_systemctl_show_allowlist(monkeypatch, 
                     "NRestarts=0",
                     "UnitFileState=enabled",
                     "FragmentPath=/redacted/path",
+                    f"InvocationID={SAFE_INVOCATION_ID}",
                     "Environment=DATABASE_URL=sentinel-secret",
                 ]
             )
@@ -1027,6 +1060,7 @@ def test_local_diagnostic_uses_exact_user_systemctl_show_allowlist(monkeypatch, 
     state = adapter.diagnostic_state(SERVICE_NAME)
 
     assert state.service_file_present is True
+    assert state.current_invocation_fingerprint == expected_fingerprint
     assert calls[0] == [
         "systemctl",
         "--user",
@@ -1036,6 +1070,40 @@ def test_local_diagnostic_uses_exact_user_systemctl_show_allowlist(monkeypatch, 
     ]
     assert calls[1] == ["systemctl", "--user", "is-enabled", SERVICE_NAME]
     assert calls[2] == ["systemctl", "--user", "is-active", SERVICE_NAME]
+
+
+def test_invocation_fingerprint_contract_matches_bootstrap_runtime_and_systemd(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("INVOCATION_ID", SAFE_INVOCATION_ID)
+    expected = hashlib.sha256(SAFE_INVOCATION_ID.encode("ascii")).hexdigest()[:16]
+    bootstrap_report = worker_bootstrap.build_worker_bootstrap_fatal_report(
+        reason_code="worker_bootstrap_main_error",
+        phase="bootstrap_main",
+    )
+    runtime_report = worker_runtime_crash_probe.build_worker_runtime_fatal_report(
+        reason_code="worker_runtime_config_error",
+        phase="config_load",
+        cleanup_completed=True,
+    )
+    diagnostic_report = run_systemd_diagnostic(
+        _diagnostic_request(tmp_path),
+        adapter=FakeDiagnosticAdapter(
+            SystemdDiagnosticState(
+                service_file_present=True,
+                service_enabled=True,
+                service_active=True,
+                current_invocation_fingerprint=parse_systemd_show_properties(
+                    f"InvocationID={SAFE_INVOCATION_ID}"
+                )["InvocationID"],
+            )
+        ),
+    )
+
+    assert bootstrap_report["invocation_fingerprint"] == expected
+    assert runtime_report.invocation_fingerprint == expected
+    assert diagnostic_report.current_invocation_fingerprint == expected
 
 
 def test_local_context_proof_uses_exact_user_systemctl_show_allowlist(monkeypatch, tmp_path: Path) -> None:

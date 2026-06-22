@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib
 import json
 import sys
@@ -20,6 +21,7 @@ RAW_MODULE_FILE_PATH = "/tmp/sentinel-module-file/src/services/maintenance/main.
 RAW_SYS_PATH_ENTRY = "/tmp/sentinel-pythonpath-contamination"
 RAW_SYSTEMD_OUTPUT = "sentinel-systemd-stdout-stderr"
 RAW_JOURNAL_OUTPUT = "sentinel-journal-output"
+SAFE_INVOCATION_ID = "0123456789abcdef0123456789abcdef"
 ACTIONABLE_BOOTSTRAP_IMPORT_STAGE_LABELS = tuple(
     stage
     for stage, module_name in worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_SEQUENCE
@@ -62,7 +64,17 @@ def test_bootstrap_top_level_imports_are_stdlib_only() -> None:
         elif isinstance(node, ast.ImportFrom):
             imported_roots.add(node.module.split(".", 1)[0] if node.module else "")
 
-    assert imported_roots <= {"__future__", "asyncio", "importlib", "json", "sys", "datetime", "pathlib"}
+    assert imported_roots <= {
+        "__future__",
+        "asyncio",
+        "hashlib",
+        "importlib",
+        "json",
+        "os",
+        "sys",
+        "datetime",
+        "pathlib",
+    }
     assert "from .worker_runtime_crash_probe" not in source
     assert "from services.maintenance" not in source
 
@@ -133,17 +145,14 @@ def test_bootstrap_import_stage_labels_are_fixed_allowlist() -> None:
     assert worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_REASON_CODES == {
         "repo_root_path_unavailable",
         "stage_import_error",
+        "stage_dependency_unavailable",
+        "stage_module_unavailable",
         "stage_spec_unavailable",
     }
     assert worker_bootstrap.BOOTSTRAP_SPEC_READY_STAGES == frozenset(
         {
             "maintenance_package_ready",
             "maintenance_repositories_spec_ready",
-        }
-    )
-    assert worker_bootstrap.BOOTSTRAP_IMPORT_SPEC_CHECK_STAGES == frozenset(
-        {
-            "maintenance_repositories_sqlalchemy_import",
         }
     )
 
@@ -188,7 +197,6 @@ async def test_bootstrap_adds_repo_root_for_direct_script_import(monkeypatch, tm
     assert found_specs == [
         worker_bootstrap.MAINTENANCE_PACKAGE_MODULE,
         worker_bootstrap.MAINTENANCE_REPOSITORIES_MODULE,
-        "sqlalchemy",
     ]
     assert imported_modules == expected_modules
     assert observed_path[0] == str(worker_bootstrap.REPO_ROOT)
@@ -352,42 +360,70 @@ async def test_repository_spec_unavailable_reports_safe_dependency_stage(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_sqlalchemy_spec_unavailable_reports_existing_sqlalchemy_stage(tmp_path: Path) -> None:
+async def test_sqlalchemy_import_succeeds_when_injected_spec_is_unavailable(tmp_path: Path) -> None:
     report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    imported_modules: list[str] = []
 
     def find_spec(module_name: str):
         if module_name == "sqlalchemy":
-            return None
+            raise AssertionError("sqlalchemy spec must not gate the real import")
+        return object()
+
+    class FakeMaintenanceMain:
+        async def _run(self, argv: list[str]) -> int:
+            assert argv == ["worker"]
+            return 0
+
+    def import_module(module_name: str):
+        imported_modules.append(module_name)
+        if module_name == worker_bootstrap.MAINTENANCE_MAIN_MODULE:
+            return FakeMaintenanceMain()
         return object()
 
     exit_code = await worker_bootstrap.run_bootstrap(
-        import_module=lambda module_name: object(),
+        import_module=import_module,
         find_spec=find_spec,
         report_path=report_path,
     )
-    payload = _read_json(report_path)
-    serialized = json.dumps(payload, sort_keys=True)
 
-    assert exit_code == worker_bootstrap.EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR
-    assert payload["reason_code"] == "worker_bootstrap_import_error"
-    assert payload["phase"] == "bootstrap_import"
-    assert payload["import_stage"] == "maintenance_repositories_sqlalchemy_import"
-    assert payload["import_stage_status"] == "failed"
-    assert payload["import_stage_reason_code"] == "stage_spec_unavailable"
-    assert payload["import_stage_index"] == worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS.index(
-        "maintenance_repositories_sqlalchemy_import"
-    )
-    _assert_no_secret_leaks(serialized, report_path)
+    assert exit_code == 0
+    assert "sqlalchemy" in imported_modules
+    assert imported_modules.index("sqlalchemy") < imported_modules.index("src.services.outbox_relay.eligibility")
+    assert not report_path.exists()
 
 
 @pytest.mark.asyncio
-async def test_sqlalchemy_spec_present_import_failure_reports_existing_import_error(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("exception", "expected_reason_code", "raw_exception_name"),
+    [
+        (
+            ModuleNotFoundError("No module named 'sqlalchemy'", name="sqlalchemy"),
+            "stage_module_unavailable",
+            None,
+        ),
+        (
+            ModuleNotFoundError("No module named 'greenlet'", name="greenlet"),
+            "stage_dependency_unavailable",
+            "greenlet",
+        ),
+        (
+            RuntimeError(f"Traceback sys.path={RAW_SYS_PATH_ENTRY} {RAW_DATABASE_URL} {RAW_REDIS_URL}"),
+            "stage_import_error",
+            None,
+        ),
+    ],
+)
+async def test_sqlalchemy_import_failure_reports_safe_reason_code(
+    tmp_path: Path,
+    exception: Exception,
+    expected_reason_code: str,
+    raw_exception_name: str | None,
+) -> None:
     report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
-    raw_exception = f"Traceback sys.path={RAW_SYS_PATH_ENTRY} {RAW_DATABASE_URL} {RAW_REDIS_URL}"
 
     def fail_sqlalchemy_import(module_name: str):
         if module_name == "sqlalchemy":
-            raise RuntimeError(raw_exception)
+            raise exception
         return object()
 
     exit_code = await worker_bootstrap.run_bootstrap(
@@ -403,11 +439,12 @@ async def test_sqlalchemy_spec_present_import_failure_reports_existing_import_er
     assert payload["phase"] == "bootstrap_import"
     assert payload["import_stage"] == "maintenance_repositories_sqlalchemy_import"
     assert payload["import_stage_status"] == "failed"
-    assert payload["import_stage_reason_code"] == "stage_import_error"
+    assert payload["import_stage_reason_code"] == expected_reason_code
     assert payload["import_stage_index"] == worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS.index(
         "maintenance_repositories_sqlalchemy_import"
     )
-    _assert_no_secret_leaks(serialized, raw_exception, report_path)
+    assert "No module named" not in serialized
+    _assert_no_secret_leaks(serialized, raw_exception_name, exception, report_path)
 
 
 def test_readback_accepts_repository_import_substages_without_leaks(tmp_path: Path) -> None:
@@ -446,7 +483,7 @@ def test_readback_accepts_repository_import_substages_without_leaks(tmp_path: Pa
         _assert_no_secret_leaks(output, report_path)
 
 
-def test_readback_distinguishes_sqlalchemy_spec_unavailable_without_leaks(tmp_path: Path) -> None:
+def test_readback_accepts_historical_sqlalchemy_spec_unavailable_without_leaks(tmp_path: Path) -> None:
     report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
     worker_bootstrap.write_worker_bootstrap_fatal_report(
         reason_code="worker_bootstrap_import_error",
@@ -474,6 +511,40 @@ def test_readback_distinguishes_sqlalchemy_spec_unavailable_without_leaks(tmp_pa
         "maintenance_repositories_sqlalchemy_import"
     )
     _assert_no_secret_leaks(output, report_path)
+
+
+def test_bootstrap_fatal_report_uses_bounded_invocation_fingerprint(monkeypatch) -> None:
+    monkeypatch.setenv("INVOCATION_ID", SAFE_INVOCATION_ID)
+    report = worker_bootstrap.build_worker_bootstrap_fatal_report(
+        reason_code="worker_bootstrap_main_error",
+        phase="bootstrap_main",
+    )
+    serialized = json.dumps(report, sort_keys=True)
+    expected = hashlib.sha256(SAFE_INVOCATION_ID.encode("ascii")).hexdigest()[:16]
+
+    assert report["invocation_fingerprint"] == expected
+    assert report["raw_invocation_id_omitted"] is True
+    assert report["redactions_applied"]["raw_invocation_id_omitted"] is True
+    assert SAFE_INVOCATION_ID not in serialized
+
+
+@pytest.mark.parametrize("raw_invocation_id", [None, "", "not-hex", "f" * 31, "g" * 32])
+def test_bootstrap_fatal_report_ignores_missing_or_malformed_invocation_id(
+    monkeypatch,
+    raw_invocation_id: str | None,
+) -> None:
+    if raw_invocation_id is None:
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+    else:
+        monkeypatch.setenv("INVOCATION_ID", raw_invocation_id)
+
+    report = worker_bootstrap.build_worker_bootstrap_fatal_report(
+        reason_code="worker_bootstrap_main_error",
+        phase="bootstrap_main",
+    )
+
+    assert report["invocation_fingerprint"] is None
+    assert report["raw_invocation_id_omitted"] is True
 
 
 @pytest.mark.asyncio
