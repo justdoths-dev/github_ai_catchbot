@@ -25,7 +25,7 @@ class AnalysisValidatorRepositoryProtocol(Protocol):
     async def load_bundle_context(self, bundle_id: UUID) -> BundleValidationContext | None: ...
     async def update_judge_run_status(self, **kwargs) -> None: ...
     async def insert_state_transition(self, **kwargs) -> None: ...
-    async def insert_analysis_policy_apply_outbox(self, **kwargs) -> None: ...
+    async def insert_analysis_policy_apply_outbox(self, **kwargs) -> bool: ...
 
 
 class AnalysisValidatorService:
@@ -128,18 +128,20 @@ class AnalysisValidatorService:
             return
 
         async with self._repository.transaction():
+            inserted_policy_event = await self._repository.insert_analysis_policy_apply_outbox(
+                judge_run_id=judge_run.judge_run_id,
+                judge_output_id=judge_output.judge_output_id,
+                candidate_group_id=judge_output.candidate_group_id,
+                bundle_id=judge_run.bundle_id,
+            )
+            if inserted_policy_event is not True:
+                return
             await self._repository.insert_state_transition(
                 object_type="judge_run",
                 object_id=judge_run.judge_run_id,
                 from_state=judge_run.status,
                 to_state="analysis_validated",
                 reason_code="validator_passed",
-            )
-            await self._repository.insert_analysis_policy_apply_outbox(
-                judge_run_id=judge_run.judge_run_id,
-                judge_output_id=judge_output.judge_output_id,
-                candidate_group_id=judge_output.candidate_group_id,
-                bundle_id=judge_run.bundle_id,
             )
 
     async def _missing_judge_run(self, job: JudgeOutputReadyJob) -> None:

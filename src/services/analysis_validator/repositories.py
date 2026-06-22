@@ -211,14 +211,14 @@ class AnalysisValidatorRepository:
         judge_output_id: UUID,
         candidate_group_id: UUID,
         bundle_id: UUID,
-    ) -> None:
+    ) -> bool:
         payload = {
             "judge_run_id": str(judge_run_id),
             "judge_output_id": str(judge_output_id),
             "candidate_group_id": str(candidate_group_id),
             "bundle_id": str(bundle_id),
         }
-        await self._session.execute(
+        result = await self._session.execute(
             sa.text(
                 """
                 INSERT INTO event_outbox (
@@ -234,6 +234,7 @@ class AnalysisValidatorRepository:
                     now()
                 )
                 ON CONFLICT (dedupe_key) DO NOTHING
+                RETURNING event_id
                 """
             ),
             {
@@ -242,6 +243,7 @@ class AnalysisValidatorRepository:
                 "payload_json": _jsonb_dumps(payload),
             },
         )
+        return result.scalar_one_or_none() is not None
 
 
 def _uuid_or_none(value: Any) -> UUID | None:

@@ -137,10 +137,11 @@ class _ValidatorPolicyLedger:
     def rows_of_type(self, event_type: str) -> list[OutboxEventRow]:
         return [row for row in self.event_outbox if row.event_type == event_type]
 
-    def append_outbox_once(self, row: OutboxEventRow) -> None:
+    def append_outbox_once(self, row: OutboxEventRow) -> bool:
         if any(existing.dedupe_key == row.dedupe_key for existing in self.event_outbox):
-            return
+            return False
         self.event_outbox.append(row)
+        return True
 
 
 class _ValidatorRepository:
@@ -218,14 +219,14 @@ class _ValidatorRepository:
         judge_output_id: UUID,
         candidate_group_id: UUID,
         bundle_id: UUID,
-    ) -> None:
+    ) -> bool:
         payload = {
             "judge_run_id": str(judge_run_id),
             "judge_output_id": str(judge_output_id),
             "candidate_group_id": str(candidate_group_id),
             "bundle_id": str(bundle_id),
         }
-        self.ledger.append_outbox_once(
+        return self.ledger.append_outbox_once(
             OutboxEventRow(
                 event_id=uuid4(),
                 event_type="analysis.policy.apply.v1",
@@ -414,6 +415,19 @@ async def test_validator_policy_notification_queue_send_worthy_thin_e2e() -> Non
 
     policy_apply_events = ledger.rows_of_type("analysis.policy.apply.v1")
     assert len(policy_apply_events) == 1
+    assert [
+        transition
+        for transition in ledger.state_transitions
+        if transition["object_type"] == "judge_run" and transition["to_state"] == "analysis_validated"
+    ] == [
+        {
+            "object_type": "judge_run",
+            "object_id": ledger.judge_run_id,
+            "from_state": "succeeded",
+            "to_state": "analysis_validated",
+            "reason_code": "validator_passed",
+        }
+    ]
     assert policy_apply_events[0].payload_json == {
         "judge_run_id": str(ledger.judge_run_id),
         "judge_output_id": str(ledger.judge_output_id),
@@ -668,6 +682,7 @@ async def test_duplicate_validator_and_policy_trigger_dedupes_terminal_handoffs(
 
     policy_apply_events = ledger.rows_of_type("analysis.policy.apply.v1")
     assert len(policy_apply_events) == 1
+    assert len([row for row in ledger.state_transitions if row["to_state"] == "analysis_validated"]) == 1
 
     await policy_service.handle_trigger_event(policy_apply_events[0].event_id)
     await policy_service.handle_trigger_event(policy_apply_events[0].event_id)

@@ -60,10 +60,10 @@ class FakeRepository:
     async def insert_state_transition(self, **kwargs) -> None:
         self.state_transitions.append(kwargs)
 
-    async def insert_analysis_policy_apply_outbox(self, **kwargs) -> None:
+    async def insert_analysis_policy_apply_outbox(self, **kwargs) -> bool:
         dedupe_key = f"analysis-policy-apply:{kwargs['judge_run_id']}:{kwargs['judge_output_id']}"
         if dedupe_key in self._outbox_dedupe_keys:
-            return
+            return False
         self._outbox_dedupe_keys.add(dedupe_key)
         self.outbox.append(
             {
@@ -75,6 +75,7 @@ class FakeRepository:
                 "status": "pending",
             }
         )
+        return True
 
 
 class FakeConsumer:
@@ -456,3 +457,4 @@ async def test_duplicate_event_outbox_dedupe_does_not_create_duplicate_policy_ap
     await _handle(repository, job)
 
     assert len(repository.outbox) == 1
+    assert len([row for row in repository.state_transitions if row["to_state"] == "analysis_validated"]) == 1
