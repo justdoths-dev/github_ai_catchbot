@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import importlib.metadata
 import importlib.util
 import json
 import os
 import sys
+import sysconfig
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -57,6 +59,12 @@ BOOTSTRAP_IMPORT_STAGE_REASON_CODES = {
 INVOCATION_ID_ENV_KEY = "INVOCATION_ID"
 INVOCATION_ID_HEX_LENGTH = 32
 INVOCATION_FINGERPRINT_LENGTH = 16
+SQLALCHEMY_DISTRIBUTION_NAME = "SQLAlchemy"
+VENV_CONTEXT_SOURCES = {
+    "sys_prefix",
+    "executable_pyvenv_cfg",
+    "unavailable",
+}
 BOOTSTRAP_EXIT_STATUS_REASON_CODES = {
     EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR: "worker_bootstrap_import_error",
     EXIT_WORKER_BOOTSTRAP_MAIN_ERROR: "worker_bootstrap_main_error",
@@ -81,6 +89,7 @@ def build_worker_bootstrap_fatal_report(
     import_stage_status: str | None = None,
     import_stage_reason_code: str | None = None,
     import_stage_index: int | None = None,
+    venv_context: dict[str, object] | None = None,
     now_utc: datetime | None = None,
 ) -> dict[str, object]:
     created_at = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -117,6 +126,7 @@ def build_worker_bootstrap_fatal_report(
         },
         "report_path_omitted": True,
         "raw_invocation_id_omitted": True,
+        **_safe_venv_context_for_report(venv_context),
     }
 
 
@@ -128,6 +138,7 @@ def write_worker_bootstrap_fatal_report(
     import_stage_status: str | None = None,
     import_stage_reason_code: str | None = None,
     import_stage_index: int | None = None,
+    venv_context: dict[str, object] | None = None,
     report_path: Path | None = None,
 ) -> bool:
     report = build_worker_bootstrap_fatal_report(
@@ -137,6 +148,7 @@ def write_worker_bootstrap_fatal_report(
         import_stage_status=import_stage_status,
         import_stage_reason_code=import_stage_reason_code,
         import_stage_index=import_stage_index,
+        venv_context=venv_context,
     )
     path = report_path or WORKER_RUNTIME_FATAL_REPORT_PATH
     try:
@@ -154,6 +166,7 @@ async def run_bootstrap(
     report_path: Path | None = None,
 ) -> int:
     _ensure_repo_root_on_sys_path()
+    venv_context = _repair_venv_site_paths()
     maintenance_main, import_failure = _import_maintenance_main_with_stage_classifier(import_module, find_spec)
     if import_failure is not None:
         if not write_worker_bootstrap_fatal_report(
@@ -163,6 +176,7 @@ async def run_bootstrap(
             import_stage_status="failed",
             import_stage_reason_code=import_failure["import_stage_reason_code"],
             import_stage_index=import_failure["import_stage_index"],
+            venv_context=venv_context,
             report_path=report_path,
         ):
             return EXIT_WORKER_BOOTSTRAP_REPORT_WRITE_FAILED
@@ -174,6 +188,7 @@ async def run_bootstrap(
         if not write_worker_bootstrap_fatal_report(
             reason_code="worker_bootstrap_main_error",
             phase="bootstrap_main",
+            venv_context=venv_context,
             report_path=report_path,
         ):
             return EXIT_WORKER_BOOTSTRAP_REPORT_WRITE_FAILED
@@ -182,6 +197,7 @@ async def run_bootstrap(
         if not write_worker_bootstrap_fatal_report(
             reason_code="worker_bootstrap_main_error",
             phase="bootstrap_main",
+            venv_context=venv_context,
             report_path=report_path,
         ):
             return EXIT_WORKER_BOOTSTRAP_REPORT_WRITE_FAILED
@@ -296,8 +312,151 @@ def _fatal_report_exists(report_path: Path | None = None) -> bool:
 
 def _ensure_repo_root_on_sys_path() -> None:
     repo_root = str(REPO_ROOT)
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
+    sys.path[:] = [entry for entry in sys.path if entry != repo_root]
+    sys.path.insert(0, repo_root)
+
+
+def _repair_venv_site_paths() -> dict[str, object]:
+    root, source, active = _candidate_venv_root()
+    site_paths = _validated_venv_site_paths(root) if root is not None else []
+    site_path_strings = [str(path) for path in site_paths]
+    on_sys_path_before = bool(site_path_strings) and all(path in sys.path for path in site_path_strings)
+    repaired = False
+
+    if site_path_strings:
+        _ensure_repo_root_on_sys_path()
+        repo_root = str(REPO_ROOT)
+        normalized_path = [
+            repo_root,
+            *site_path_strings,
+            *[entry for entry in sys.path[1:] if entry not in site_path_strings and entry != repo_root],
+        ]
+        if sys.path != normalized_path:
+            sys.path[:] = normalized_path
+            repaired = True
+
+    on_sys_path_after = bool(site_path_strings) and all(path in sys.path for path in site_path_strings)
+    caches_invalidated = False
+    try:
+        importlib.invalidate_caches()
+        caches_invalidated = True
+    except Exception:
+        caches_invalidated = False
+
+    return {
+        "venv_context_source": source,
+        "venv_context_active": active,
+        "venv_site_candidate_present": bool(site_path_strings),
+        "venv_site_on_sys_path_before": on_sys_path_before,
+        "venv_site_path_repaired": repaired,
+        "venv_site_on_sys_path_after": on_sys_path_after,
+        "import_caches_invalidated": caches_invalidated,
+        "sqlalchemy_distribution_present": _sqlalchemy_distribution_present(),
+    }
+
+
+def _candidate_venv_root() -> tuple[Path | None, str, bool]:
+    active = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    if active:
+        root = _validated_pyvenv_root(Path(sys.prefix))
+        if root is not None:
+            return root, "sys_prefix", True
+
+    executable = Path(sys.executable)
+    if executable.name == "python" and executable.parent.name == "bin":
+        root = _validated_pyvenv_root(executable.parent.parent)
+        if root is not None:
+            return root, "executable_pyvenv_cfg", active
+
+    return None, "unavailable", active
+
+
+def _validated_pyvenv_root(root: Path) -> Path | None:
+    if not root.is_absolute():
+        return None
+    try:
+        if not (root / "pyvenv.cfg").is_file():
+            return None
+        return root.resolve()
+    except OSError:
+        return None
+
+
+def _validated_venv_site_paths(root: Path) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    scheme_vars = {"base": str(root), "platbase": str(root)}
+    for path_name in ("purelib", "platlib"):
+        try:
+            raw_path = sysconfig.get_path(path_name, scheme="venv", vars=scheme_vars)
+        except Exception:
+            continue
+        site_path = _validated_venv_site_path(raw_path, root)
+        if site_path is None or site_path in seen:
+            continue
+        paths.append(site_path)
+        seen.add(site_path)
+    return paths
+
+
+def _validated_venv_site_path(raw_path: object, root: Path) -> Path | None:
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    path = Path(raw_path)
+    if not path.is_absolute():
+        return None
+    try:
+        resolved_path = path.resolve()
+        resolved_path.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    if not resolved_path.is_dir():
+        return None
+    if not os.access(resolved_path, os.R_OK | os.X_OK):
+        return None
+    return resolved_path
+
+
+def _sqlalchemy_distribution_present() -> bool | None:
+    try:
+        importlib.metadata.distribution(SQLALCHEMY_DISTRIBUTION_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    except Exception:
+        return None
+    return True
+
+
+def _safe_venv_context_for_report(context: dict[str, object] | None) -> dict[str, object]:
+    context = context if isinstance(context, dict) else {}
+    return {
+        "venv_context_source": _safe_venv_context_source(context.get("venv_context_source"), default="unavailable"),
+        "venv_context_active": _safe_bool(context.get("venv_context_active"), default=False),
+        "venv_site_candidate_present": _safe_bool(context.get("venv_site_candidate_present"), default=False),
+        "venv_site_on_sys_path_before": _safe_bool(context.get("venv_site_on_sys_path_before"), default=False),
+        "venv_site_path_repaired": _safe_bool(context.get("venv_site_path_repaired"), default=False),
+        "venv_site_on_sys_path_after": _safe_bool(context.get("venv_site_on_sys_path_after"), default=False),
+        "import_caches_invalidated": _safe_bool(context.get("import_caches_invalidated"), default=False),
+        "sqlalchemy_distribution_present": _safe_optional_bool(context.get("sqlalchemy_distribution_present")),
+    }
+
+
+def _safe_venv_context_source(value: object, *, default: str | None = None) -> str | None:
+    if isinstance(value, str) and value in VENV_CONTEXT_SOURCES:
+        return value
+    return default
+
+
+def _safe_bool(value: object, *, default: bool | None = None) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return default
+
+
+def _safe_optional_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
 
 
 def _import_failure_reason_code(exc: Exception, *, target_module_name: str) -> str:

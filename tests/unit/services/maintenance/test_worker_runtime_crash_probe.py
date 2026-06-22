@@ -169,6 +169,8 @@ def _assert_no_secret_leaks(output: str, *extra_values: object) -> None:
         "sentinel-redis-host",
         RUNTIME_ENV_PATH_SENTINEL,
         "Traceback",
+        "sys.path",
+        "InvocationID",
         *[str(value) for value in extra_values],
     ]
     for value in forbidden:
@@ -1050,6 +1052,14 @@ def test_worker_runtime_fatal_report_readback_accepts_historical_report_without_
     assert report.status == "pass"
     assert report.latest_report_invocation_fingerprint is None
     assert report.latest_report_created_at_utc == "2026-06-20T00:00:00Z"
+    assert report.venv_context_source is None
+    assert report.venv_context_active is None
+    assert report.venv_site_candidate_present is None
+    assert report.venv_site_on_sys_path_before is None
+    assert report.venv_site_path_repaired is None
+    assert report.venv_site_on_sys_path_after is None
+    assert report.import_caches_invalidated is None
+    assert report.sqlalchemy_distribution_present is None
 
 
 def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tmp_path: Path) -> None:
@@ -1070,6 +1080,14 @@ def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tm
                 "import_stage_status": "sentinel-secret-import-stage-status",
                 "import_stage_reason_code": "sentinel-secret-import-stage-reason",
                 "import_stage_index": "sentinel-secret-import-stage-index",
+                "venv_context_source": "sentinel-secret-context-source",
+                "venv_context_active": "sentinel-secret-context-active",
+                "venv_site_candidate_present": "sentinel-secret-candidate-present",
+                "venv_site_on_sys_path_before": "sentinel-secret-before-path",
+                "venv_site_path_repaired": "sentinel-secret-repaired",
+                "venv_site_on_sys_path_after": "sentinel-secret-after-path",
+                "import_caches_invalidated": "sentinel-secret-cache-invalidated",
+                "sqlalchemy_distribution_present": "SQLAlchemy==2.0.sentinel-secret",
                 "created_at_utc": "sentinel-secret-created-at",
                 "invocation_fingerprint": "sentinel-secret-invocation-fingerprint",
             }
@@ -1091,6 +1109,14 @@ def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tm
     assert report.import_stage_status is None
     assert report.import_stage_reason_code is None
     assert report.import_stage_index is None
+    assert report.venv_context_source is None
+    assert report.venv_context_active is None
+    assert report.venv_site_candidate_present is None
+    assert report.venv_site_on_sys_path_before is None
+    assert report.venv_site_path_repaired is None
+    assert report.venv_site_on_sys_path_after is None
+    assert report.import_caches_invalidated is None
+    assert report.sqlalchemy_distribution_present is None
     assert report.latest_report_invocation_fingerprint is None
     assert report.latest_report_created_at_utc is None
     _assert_no_secret_leaks(
@@ -1102,6 +1128,14 @@ def test_worker_runtime_fatal_report_readback_sanitizes_corrupt_secret_values(tm
         "sentinel-secret-import-stage-status",
         "sentinel-secret-import-stage-reason",
         "sentinel-secret-import-stage-index",
+        "sentinel-secret-context-source",
+        "sentinel-secret-context-active",
+        "sentinel-secret-candidate-present",
+        "sentinel-secret-before-path",
+        "sentinel-secret-repaired",
+        "sentinel-secret-after-path",
+        "sentinel-secret-cache-invalidated",
+        "SQLAlchemy==2.0.sentinel-secret",
         "sentinel-secret-created-at",
         "sentinel-secret-invocation-fingerprint",
     )

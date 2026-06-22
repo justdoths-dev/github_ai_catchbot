@@ -90,6 +90,11 @@ _BOOTSTRAP_IMPORT_STAGE_REASON_CODES = {
     "stage_module_unavailable",
     "stage_spec_unavailable",
 }
+_VENV_CONTEXT_SOURCES = {
+    "sys_prefix",
+    "executable_pyvenv_cfg",
+    "unavailable",
+}
 
 WorkerRuntimeCrashProbeStatus = Literal["pass", "blocked", "failed"]
 
@@ -188,6 +193,14 @@ class WorkerRuntimeFatalReportReadback:
     import_stage_status: str | None = None
     import_stage_reason_code: str | None = None
     import_stage_index: int | None = None
+    venv_context_source: str | None = None
+    venv_context_active: bool | None = None
+    venv_site_candidate_present: bool | None = None
+    venv_site_on_sys_path_before: bool | None = None
+    venv_site_path_repaired: bool | None = None
+    venv_site_on_sys_path_after: bool | None = None
+    import_caches_invalidated: bool | None = None
+    sqlalchemy_distribution_present: bool | None = None
     raw_report_path_omitted: bool = True
     raw_exception_body_omitted: bool = True
     traceback_omitted: bool = True
@@ -363,6 +376,14 @@ def read_worker_runtime_fatal_report(*, report_path: Path | None = None) -> Work
         import_stage_status=_safe_bootstrap_import_stage_status(raw.get("import_stage_status")),
         import_stage_reason_code=_safe_bootstrap_import_stage_reason_code(raw.get("import_stage_reason_code")),
         import_stage_index=_safe_bootstrap_import_stage_index(raw.get("import_stage"), raw.get("import_stage_index")),
+        venv_context_source=_safe_venv_context_source(raw.get("venv_context_source")),
+        venv_context_active=_safe_bool_or_none(raw.get("venv_context_active")),
+        venv_site_candidate_present=_safe_bool_or_none(raw.get("venv_site_candidate_present")),
+        venv_site_on_sys_path_before=_safe_bool_or_none(raw.get("venv_site_on_sys_path_before")),
+        venv_site_path_repaired=_safe_bool_or_none(raw.get("venv_site_path_repaired")),
+        venv_site_on_sys_path_after=_safe_bool_or_none(raw.get("venv_site_on_sys_path_after")),
+        import_caches_invalidated=_safe_bool_or_none(raw.get("import_caches_invalidated")),
+        sqlalchemy_distribution_present=_safe_bool_or_none(raw.get("sqlalchemy_distribution_present")),
     )
 
 
@@ -777,6 +798,14 @@ def _fatal_report_readback(
     import_stage_status: str | None = None,
     import_stage_reason_code: str | None = None,
     import_stage_index: int | None = None,
+    venv_context_source: str | None = None,
+    venv_context_active: bool | None = None,
+    venv_site_candidate_present: bool | None = None,
+    venv_site_on_sys_path_before: bool | None = None,
+    venv_site_path_repaired: bool | None = None,
+    venv_site_on_sys_path_after: bool | None = None,
+    import_caches_invalidated: bool | None = None,
+    sqlalchemy_distribution_present: bool | None = None,
 ) -> WorkerRuntimeFatalReportReadback:
     return WorkerRuntimeFatalReportReadback(
         schema_version=FATAL_REPORT_READBACK_SCHEMA_VERSION,
@@ -797,6 +826,14 @@ def _fatal_report_readback(
         import_stage_status=import_stage_status,
         import_stage_reason_code=import_stage_reason_code,
         import_stage_index=import_stage_index,
+        venv_context_source=venv_context_source,
+        venv_context_active=venv_context_active,
+        venv_site_candidate_present=venv_site_candidate_present,
+        venv_site_on_sys_path_before=venv_site_on_sys_path_before,
+        venv_site_path_repaired=venv_site_path_repaired,
+        venv_site_on_sys_path_after=venv_site_on_sys_path_after,
+        import_caches_invalidated=import_caches_invalidated,
+        sqlalchemy_distribution_present=sqlalchemy_distribution_present,
     )
 
 
@@ -859,6 +896,12 @@ def _safe_bootstrap_import_stage_index(import_stage: object, value: object) -> i
         return None
     expected_index = _BOOTSTRAP_IMPORT_STAGE_LABELS.index(safe_stage)
     if value == expected_index:
+        return value
+    return None
+
+
+def _safe_venv_context_source(value: object) -> str | None:
+    if isinstance(value, str) and value in _VENV_CONTEXT_SOURCES:
         return value
     return None
 

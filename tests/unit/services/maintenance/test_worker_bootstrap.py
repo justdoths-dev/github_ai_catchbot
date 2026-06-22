@@ -72,6 +72,7 @@ def test_bootstrap_top_level_imports_are_stdlib_only() -> None:
         "json",
         "os",
         "sys",
+        "sysconfig",
         "datetime",
         "pathlib",
     }
@@ -155,6 +156,274 @@ def test_bootstrap_import_stage_labels_are_fixed_allowlist() -> None:
             "maintenance_repositories_spec_ready",
         }
     )
+
+
+def _make_pyvenv(tmp_path: Path) -> tuple[Path, Path, Path]:
+    venv_root = tmp_path / "venv"
+    purelib = venv_root / "lib/python3.12/site-packages"
+    platlib = venv_root / "lib64/python3.12/site-packages"
+    (venv_root / "bin").mkdir(parents=True)
+    purelib.mkdir(parents=True)
+    platlib.mkdir(parents=True)
+    (venv_root / "pyvenv.cfg").write_text("home = /redacted\n", encoding="utf-8")
+    (venv_root / "bin/python").write_text("# python\n", encoding="utf-8")
+    return venv_root.resolve(), purelib.resolve(), platlib.resolve()
+
+
+def _patch_sysconfig_paths(monkeypatch, *, venv_root: Path, purelib: object, platlib: object) -> None:
+    def fake_get_path(path_name: str, *, scheme: str | None = None, vars: dict[str, str] | None = None):
+        assert scheme == "venv"
+        assert vars == {"base": str(venv_root), "platbase": str(venv_root)}
+        if path_name == "purelib":
+            return purelib
+        if path_name == "platlib":
+            return platlib
+        raise AssertionError(f"unexpected sysconfig path name {path_name}")
+
+    monkeypatch.setattr(worker_bootstrap.sysconfig, "get_path", fake_get_path)
+
+
+def _patch_sys_prefix_venv(monkeypatch, *, venv_root: Path) -> None:
+    monkeypatch.setattr(worker_bootstrap.sys, "prefix", str(venv_root))
+    monkeypatch.setattr(worker_bootstrap.sys, "base_prefix", str(venv_root.parent / "base-python"))
+    monkeypatch.setattr(worker_bootstrap.sys, "executable", str(venv_root / "bin/python"))
+
+
+def _patch_sqlalchemy_distribution_unknown(monkeypatch) -> None:
+    monkeypatch.setattr(worker_bootstrap, "_sqlalchemy_distribution_present", lambda: None)
+
+
+def test_venv_site_path_repair_places_validated_paths_after_unique_repo_root(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    venv_root, purelib, platlib = _make_pyvenv(tmp_path)
+    stdlib_entry = str(tmp_path / "stdlib")
+    arbitrary_entry = str(tmp_path / "arbitrary-pythonpath-like-entry")
+    _patch_sys_prefix_venv(monkeypatch, venv_root=venv_root)
+    _patch_sysconfig_paths(monkeypatch, venv_root=venv_root, purelib=str(purelib), platlib=str(platlib))
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+    monkeypatch.setattr(
+        worker_bootstrap.sys,
+        "path",
+        [stdlib_entry, str(worker_bootstrap.REPO_ROOT), str(purelib), str(worker_bootstrap.REPO_ROOT), arbitrary_entry],
+    )
+
+    context = worker_bootstrap._repair_venv_site_paths()
+
+    assert context == {
+        "venv_context_source": "sys_prefix",
+        "venv_context_active": True,
+        "venv_site_candidate_present": True,
+        "venv_site_on_sys_path_before": False,
+        "venv_site_path_repaired": True,
+        "venv_site_on_sys_path_after": True,
+        "import_caches_invalidated": True,
+        "sqlalchemy_distribution_present": None,
+    }
+    assert sys.path[:3] == [str(worker_bootstrap.REPO_ROOT), str(purelib), str(platlib)]
+    assert sys.path.count(str(worker_bootstrap.REPO_ROOT)) == 1
+    assert sys.path.count(str(purelib)) == 1
+    assert sys.path.count(str(platlib)) == 1
+    assert stdlib_entry in sys.path
+    assert arbitrary_entry in sys.path
+
+
+def test_venv_site_path_repair_deduplicates_equal_purelib_and_platlib(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    venv_root, purelib, _platlib = _make_pyvenv(tmp_path)
+    stdlib_entry = str(tmp_path / "stdlib")
+    _patch_sys_prefix_venv(monkeypatch, venv_root=venv_root)
+    _patch_sysconfig_paths(monkeypatch, venv_root=venv_root, purelib=str(purelib), platlib=str(purelib))
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(worker_bootstrap.REPO_ROOT), stdlib_entry])
+
+    context = worker_bootstrap._repair_venv_site_paths()
+
+    assert context["venv_site_candidate_present"] is True
+    assert context["venv_site_on_sys_path_after"] is True
+    assert sys.path[:2] == [str(worker_bootstrap.REPO_ROOT), str(purelib)]
+    assert sys.path.count(str(purelib)) == 1
+    assert stdlib_entry in sys.path
+
+
+def test_venv_site_path_repair_does_not_duplicate_existing_validated_entries(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    venv_root, purelib, platlib = _make_pyvenv(tmp_path)
+    stdlib_entry = str(tmp_path / "stdlib")
+    _patch_sys_prefix_venv(monkeypatch, venv_root=venv_root)
+    _patch_sysconfig_paths(monkeypatch, venv_root=venv_root, purelib=str(purelib), platlib=str(platlib))
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+    monkeypatch.setattr(
+        worker_bootstrap.sys,
+        "path",
+        [str(worker_bootstrap.REPO_ROOT), str(purelib), str(platlib), stdlib_entry],
+    )
+
+    context = worker_bootstrap._repair_venv_site_paths()
+
+    assert context["venv_site_on_sys_path_before"] is True
+    assert context["venv_site_path_repaired"] is False
+    assert context["venv_site_on_sys_path_after"] is True
+    assert sys.path == [str(worker_bootstrap.REPO_ROOT), str(purelib), str(platlib), stdlib_entry]
+
+
+@pytest.mark.parametrize(
+    ("label", "purelib_factory", "access_allowed"),
+    [
+        ("outside_venv_root", lambda tmp_path, venv_root: tmp_path / "outside-site", True),
+        ("relative_path", lambda tmp_path, venv_root: Path("relative-site-packages"), True),
+        ("missing_directory", lambda tmp_path, venv_root: venv_root / "missing-site-packages", True),
+        ("unreadable_directory", lambda tmp_path, venv_root: venv_root / "unreadable-site-packages", False),
+        ("base_interpreter_path", lambda tmp_path, venv_root: tmp_path / "base-python/site-packages", True),
+        ("user_site_path", lambda tmp_path, venv_root: tmp_path / "home/.local/lib/python/site-packages", True),
+    ],
+)
+def test_venv_site_path_repair_rejects_unvalidated_site_paths(
+    monkeypatch,
+    tmp_path: Path,
+    label: str,
+    purelib_factory,
+    access_allowed: bool,
+) -> None:
+    del label
+    venv_root, _purelib, _platlib = _make_pyvenv(tmp_path)
+    candidate = purelib_factory(tmp_path, venv_root)
+    if access_allowed and candidate.is_absolute() and "missing" not in candidate.name:
+        candidate.mkdir(parents=True, exist_ok=True)
+    if not access_allowed:
+        candidate.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(worker_bootstrap.os, "access", lambda path, mode: False)
+    stdlib_entry = str(tmp_path / "stdlib")
+    _patch_sys_prefix_venv(monkeypatch, venv_root=venv_root)
+    _patch_sysconfig_paths(monkeypatch, venv_root=venv_root, purelib=str(candidate), platlib=str(candidate))
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(worker_bootstrap.REPO_ROOT), stdlib_entry])
+
+    context = worker_bootstrap._repair_venv_site_paths()
+
+    assert context["venv_site_candidate_present"] is False
+    assert context["venv_site_path_repaired"] is False
+    assert context["venv_site_on_sys_path_after"] is False
+    assert str(candidate) not in sys.path
+    assert sys.path == [str(worker_bootstrap.REPO_ROOT), stdlib_entry]
+
+
+def test_venv_site_path_repair_uses_executable_adjacent_pyvenv_fallback(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    venv_root, purelib, platlib = _make_pyvenv(tmp_path)
+    _patch_sysconfig_paths(monkeypatch, venv_root=venv_root, purelib=str(purelib), platlib=str(platlib))
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+    monkeypatch.setattr(worker_bootstrap.sys, "prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(worker_bootstrap.sys, "base_prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(worker_bootstrap.sys, "executable", str(venv_root / "bin/python"))
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(worker_bootstrap.REPO_ROOT)])
+
+    context = worker_bootstrap._repair_venv_site_paths()
+
+    assert context["venv_context_source"] == "executable_pyvenv_cfg"
+    assert context["venv_context_active"] is False
+    assert sys.path[:3] == [str(worker_bootstrap.REPO_ROOT), str(purelib), str(platlib)]
+
+
+def test_venv_site_path_repair_rejects_executable_adjacent_root_without_pyvenv_cfg(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "venv/bin/python"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("# python\n", encoding="utf-8")
+    monkeypatch.setattr(worker_bootstrap.sys, "prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(worker_bootstrap.sys, "base_prefix", str(tmp_path / "base-python"))
+    monkeypatch.setattr(worker_bootstrap.sys, "executable", str(executable))
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(worker_bootstrap.REPO_ROOT)])
+    monkeypatch.setattr(
+        worker_bootstrap.sysconfig,
+        "get_path",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("sysconfig must not be called")),
+    )
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+
+    context = worker_bootstrap._repair_venv_site_paths()
+
+    assert context["venv_context_source"] == "unavailable"
+    assert context["venv_site_candidate_present"] is False
+    assert sys.path == [str(worker_bootstrap.REPO_ROOT)]
+
+
+@pytest.mark.asyncio
+async def test_sqlalchemy_import_succeeds_after_validated_venv_site_path_repair(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    venv_root, purelib, platlib = _make_pyvenv(tmp_path)
+    (purelib / "sqlalchemy").mkdir()
+    (purelib / "sqlalchemy/__init__.py").write_text("SENTINEL = 'from-validated-venv'\n", encoding="utf-8")
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    stdlib_entry = str(tmp_path / "stdlib")
+    imported_modules: list[str] = []
+    observed_path_at_sqlalchemy_import: list[str] = []
+    for module_name in list(sys.modules):
+        if module_name == "sqlalchemy" or module_name.startswith("sqlalchemy."):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+    _patch_sys_prefix_venv(monkeypatch, venv_root=venv_root)
+    _patch_sysconfig_paths(monkeypatch, venv_root=venv_root, purelib=str(purelib), platlib=str(platlib))
+    _patch_sqlalchemy_distribution_unknown(monkeypatch)
+    monkeypatch.setattr(worker_bootstrap.sys, "path", [str(worker_bootstrap.REPO_ROOT), stdlib_entry])
+
+    assert importlib.util.find_spec("sqlalchemy") is None
+
+    class FakeMaintenanceMain:
+        async def _run(self, argv: list[str]) -> int:
+            assert argv == ["worker"]
+            return 0
+
+    def import_module(module_name: str):
+        imported_modules.append(module_name)
+        if module_name == "sqlalchemy":
+            observed_path_at_sqlalchemy_import.extend(sys.path)
+            return importlib.import_module(module_name)
+        if module_name == worker_bootstrap.MAINTENANCE_MAIN_MODULE:
+            return FakeMaintenanceMain()
+        return object()
+
+    exit_code = await worker_bootstrap.run_bootstrap(
+        import_module=import_module,
+        find_spec=lambda module_name: object(),
+        report_path=report_path,
+    )
+
+    assert exit_code == 0
+    assert imported_modules.index("sqlalchemy") < imported_modules.index("src.services.outbox_relay.eligibility")
+    assert observed_path_at_sqlalchemy_import[:3] == [
+        str(worker_bootstrap.REPO_ROOT),
+        str(purelib),
+        str(platlib),
+    ]
+    assert observed_path_at_sqlalchemy_import.count(str(worker_bootstrap.REPO_ROOT)) == 1
+    assert observed_path_at_sqlalchemy_import.count(str(purelib)) == 1
+    assert observed_path_at_sqlalchemy_import.count(str(platlib)) == 1
+    assert not report_path.exists()
+
+
+def test_bootstrap_source_does_not_use_forbidden_path_or_activation_mechanisms() -> None:
+    source = Path(worker_bootstrap.__file__).read_text(encoding="utf-8")
+
+    assert "site.addsitedir" not in source
+    assert "PYTHONPATH" not in source
+    assert " source " not in source
+    assert " export " not in source
+    assert "printenv" not in source
+    assert " -m " not in source
+    assert "pip install" not in source
+    assert "poetry install" not in source
+    assert "uv pip" not in source
 
 
 @pytest.mark.asyncio
@@ -511,6 +780,59 @@ def test_readback_accepts_historical_sqlalchemy_spec_unavailable_without_leaks(t
         "maintenance_repositories_sqlalchemy_import"
     )
     _assert_no_secret_leaks(output, report_path)
+
+
+def test_bootstrap_fatal_report_context_fields_round_trip_without_raw_values(tmp_path: Path) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    raw_venv_path = "/tmp/sentinel-venv-secret/lib/python3.12/site-packages"
+    raw_package_version = "SQLAlchemy==2.0.sentinel-secret"
+    worker_bootstrap.write_worker_bootstrap_fatal_report(
+        reason_code="worker_bootstrap_import_error",
+        phase="bootstrap_import",
+        import_stage="maintenance_repositories_sqlalchemy_import",
+        import_stage_status="failed",
+        import_stage_reason_code="stage_module_unavailable",
+        import_stage_index=worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS.index(
+            "maintenance_repositories_sqlalchemy_import"
+        ),
+        venv_context={
+            "venv_context_source": "sys_prefix",
+            "venv_context_active": True,
+            "venv_site_candidate_present": True,
+            "venv_site_on_sys_path_before": False,
+            "venv_site_path_repaired": True,
+            "venv_site_on_sys_path_after": True,
+            "import_caches_invalidated": True,
+            "sqlalchemy_distribution_present": True,
+            "raw_path": raw_venv_path,
+            "package_version": raw_package_version,
+        },
+        report_path=report_path,
+    )
+
+    payload = _read_json(report_path)
+    report = read_worker_runtime_fatal_report(report_path=report_path)
+    output = json.dumps(asdict(report), sort_keys=True)
+    serialized_payload = json.dumps(payload, sort_keys=True)
+
+    assert payload["venv_context_source"] == "sys_prefix"
+    assert payload["venv_context_active"] is True
+    assert payload["venv_site_candidate_present"] is True
+    assert payload["venv_site_on_sys_path_before"] is False
+    assert payload["venv_site_path_repaired"] is True
+    assert payload["venv_site_on_sys_path_after"] is True
+    assert payload["import_caches_invalidated"] is True
+    assert payload["sqlalchemy_distribution_present"] is True
+    assert report.venv_context_source == "sys_prefix"
+    assert report.venv_context_active is True
+    assert report.venv_site_candidate_present is True
+    assert report.venv_site_on_sys_path_before is False
+    assert report.venv_site_path_repaired is True
+    assert report.venv_site_on_sys_path_after is True
+    assert report.import_caches_invalidated is True
+    assert report.sqlalchemy_distribution_present is True
+    _assert_no_secret_leaks(serialized_payload, raw_venv_path, raw_package_version)
+    _assert_no_secret_leaks(output, raw_venv_path, raw_package_version, report_path)
 
 
 def test_bootstrap_fatal_report_uses_bounded_invocation_fingerprint(monkeypatch) -> None:
