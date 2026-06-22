@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 import sys
 from dataclasses import asdict
@@ -57,6 +58,21 @@ def test_bootstrap_top_level_imports_are_stdlib_only() -> None:
     assert "from services.maintenance" not in source
 
 
+def test_maintenance_package_import_is_side_effect_free(monkeypatch) -> None:
+    for module_name in list(sys.modules):
+        if module_name == "src.services.maintenance" or module_name.startswith("src.services.maintenance."):
+            monkeypatch.delitem(sys.modules, module_name, raising=False)
+
+    package = importlib.import_module("src.services.maintenance")
+
+    assert package.__all__ == ["MaintenanceConfig", "MaintenanceService"]
+    assert "src.services.maintenance.config" not in sys.modules
+    assert "src.services.maintenance.service" not in sys.modules
+    assert "src.services.maintenance.redis_streams" not in sys.modules
+    assert "src.services.maintenance.repositories" not in sys.modules
+    assert "src.services.maintenance.worker" not in sys.modules
+
+
 def test_bootstrap_exit_status_reason_codes_are_bounded() -> None:
     assert worker_bootstrap.BOOTSTRAP_EXIT_STATUS_REASON_CODES == {
         21: "worker_bootstrap_import_error",
@@ -70,6 +86,7 @@ def test_bootstrap_import_stage_labels_are_fixed_allowlist() -> None:
         "bootstrap_repo_root_path_ready",
         "stdlib_ready",
         "maintenance_package_ready",
+        "maintenance_package_init_import",
         "maintenance_config_import",
         "maintenance_redis_streams_import",
         "maintenance_repositories_import",
@@ -83,6 +100,7 @@ def test_bootstrap_import_stage_labels_are_fixed_allowlist() -> None:
     assert worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_REASON_CODES == {
         "repo_root_path_unavailable",
         "stage_import_error",
+        "stage_spec_unavailable",
     }
 
 
@@ -92,6 +110,7 @@ async def test_bootstrap_adds_repo_root_for_direct_script_import(monkeypatch, tm
     script_dir = str(worker_bootstrap.REPO_ROOT / "src/services/maintenance")
     monkeypatch.setattr(worker_bootstrap.sys, "path", [script_dir])
     observed_path: list[str] = []
+    found_specs: list[str] = []
     imported_modules: list[str] = []
 
     class FakeMaintenanceMain:
@@ -106,15 +125,23 @@ async def test_bootstrap_adds_repo_root_for_direct_script_import(monkeypatch, tm
             return FakeMaintenanceMain()
         return object()
 
+    def find_package_spec(module_name: str):
+        found_specs.append(module_name)
+        return object()
+
     exit_code = await worker_bootstrap.run_bootstrap(
         import_module=import_with_repo_root,
+        find_spec=find_package_spec,
         report_path=report_path,
     )
 
     expected_modules = [
-        module_name for _stage, module_name in worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_SEQUENCE if module_name
+        module_name
+        for stage, module_name in worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_SEQUENCE
+        if module_name and stage != "maintenance_package_ready"
     ]
     assert exit_code == 0
+    assert found_specs == [worker_bootstrap.MAINTENANCE_PACKAGE_MODULE]
     assert imported_modules == expected_modules
     assert observed_path[0] == str(worker_bootstrap.REPO_ROOT)
     assert observed_path.count(str(worker_bootstrap.REPO_ROOT)) == 1
@@ -135,6 +162,7 @@ async def test_bootstrap_import_classifier_reports_exact_failing_allowlisted_sta
         f"{RAW_MODULE_FILE_PATH} {RAW_SYSTEMD_OUTPUT} {RAW_JOURNAL_OUTPUT}"
     )
     stage_modules = dict(worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_SEQUENCE)
+    found_specs: list[str] = []
     imported_modules: list[str] = []
 
     def fail_import(module_name: str):
@@ -143,12 +171,22 @@ async def test_bootstrap_import_classifier_reports_exact_failing_allowlisted_sta
             raise RuntimeError(raw_exception)
         return object()
 
+    def fail_find_spec(module_name: str):
+        found_specs.append(module_name)
+        if failed_stage == "maintenance_package_ready":
+            raise RuntimeError(raw_exception)
+        return object()
+
     if failed_stage == "bootstrap_repo_root_path_ready":
         not_a_directory = tmp_path / "sentinel-repo-root-file"
         not_a_directory.write_text("not a directory\n", encoding="utf-8")
         monkeypatch.setattr(worker_bootstrap, "REPO_ROOT", not_a_directory)
 
-    exit_code = await worker_bootstrap.run_bootstrap(import_module=fail_import, report_path=report_path)
+    exit_code = await worker_bootstrap.run_bootstrap(
+        import_module=fail_import,
+        find_spec=fail_find_spec,
+        report_path=report_path,
+    )
     output = capsys.readouterr().out
     payload = _read_json(report_path)
     serialized = json.dumps(payload, sort_keys=True)
@@ -175,9 +213,79 @@ async def test_bootstrap_import_classifier_reports_exact_failing_allowlisted_sta
     assert payload["report_path_omitted"] is True
     if failed_stage == "bootstrap_repo_root_path_ready":
         assert imported_modules == []
+        assert found_specs == []
+    elif failed_stage == "maintenance_package_ready":
+        assert found_specs == [worker_bootstrap.MAINTENANCE_PACKAGE_MODULE]
+        assert imported_modules == ["json"]
     else:
         assert imported_modules[-1] == stage_modules[failed_stage]
     _assert_no_secret_leaks(serialized, raw_exception, report_path)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_package_init_failure_reports_safe_package_init_stage(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    raw_exception = (
+        f"Traceback {RAW_DATABASE_URL} {RAW_REDIS_URL} {RAW_RUNTIME_ENV_PATH} "
+        f"{RAW_MODULE_FILE_PATH} {RAW_SYSTEMD_OUTPUT} {RAW_JOURNAL_OUTPUT}"
+    )
+
+    def import_with_package_init_failure(module_name: str):
+        if module_name == worker_bootstrap.MAINTENANCE_PACKAGE_MODULE:
+            raise RuntimeError(raw_exception)
+        return object()
+
+    exit_code = await worker_bootstrap.run_bootstrap(
+        import_module=import_with_package_init_failure,
+        find_spec=lambda module_name: object(),
+        report_path=report_path,
+    )
+    output = capsys.readouterr().out
+    payload = _read_json(report_path)
+    serialized = json.dumps(payload, sort_keys=True)
+
+    assert exit_code == worker_bootstrap.EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR
+    assert output == ""
+    assert payload["reason_code"] == "worker_bootstrap_import_error"
+    assert payload["phase"] == "bootstrap_import"
+    assert payload["import_stage"] == "maintenance_package_init_import"
+    assert payload["import_stage_status"] == "failed"
+    assert payload["import_stage_reason_code"] == "stage_import_error"
+    assert payload["import_stage_index"] == worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS.index(
+        "maintenance_package_init_import"
+    )
+    assert payload["tasks_started"] == []
+    assert payload["broad_worker_run_started"] is False
+    _assert_no_secret_leaks(serialized, raw_exception, report_path)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_package_spec_unavailable_reports_safe_stage(tmp_path: Path, capsys) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+
+    exit_code = await worker_bootstrap.run_bootstrap(
+        import_module=lambda module_name: object(),
+        find_spec=lambda module_name: None,
+        report_path=report_path,
+    )
+    output = capsys.readouterr().out
+    payload = _read_json(report_path)
+    serialized = json.dumps(payload, sort_keys=True)
+
+    assert exit_code == worker_bootstrap.EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR
+    assert output == ""
+    assert payload["reason_code"] == "worker_bootstrap_import_error"
+    assert payload["phase"] == "bootstrap_import"
+    assert payload["import_stage"] == "maintenance_package_ready"
+    assert payload["import_stage_status"] == "failed"
+    assert payload["import_stage_reason_code"] == "stage_spec_unavailable"
+    assert payload["import_stage_index"] == worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS.index(
+        "maintenance_package_ready"
+    )
+    _assert_no_secret_leaks(serialized, report_path)
 
 
 @pytest.mark.asyncio
@@ -354,4 +462,32 @@ def test_readback_accepts_bootstrap_report_reason_and_phase(
         assert report.import_stage_status is None
         assert report.import_stage_reason_code is None
         assert report.import_stage_index is None
+    _assert_no_secret_leaks(output, report_path)
+
+
+def test_readback_accepts_package_init_import_stage_without_leaks(tmp_path: Path) -> None:
+    report_path = tmp_path / "state/maintenance/worker-runtime-fatal-report.json"
+    worker_bootstrap.write_worker_bootstrap_fatal_report(
+        reason_code="worker_bootstrap_import_error",
+        phase="bootstrap_import",
+        import_stage="maintenance_package_init_import",
+        import_stage_status="failed",
+        import_stage_reason_code="stage_import_error",
+        import_stage_index=worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS.index("maintenance_package_init_import"),
+        report_path=report_path,
+    )
+
+    report = read_worker_runtime_fatal_report(report_path=report_path)
+    output = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "pass"
+    assert report.reason_code is None
+    assert report.latest_report_reason_code == "worker_bootstrap_import_error"
+    assert report.latest_report_phase == "bootstrap_import"
+    assert report.import_stage == "maintenance_package_init_import"
+    assert report.import_stage_status == "failed"
+    assert report.import_stage_reason_code == "stage_import_error"
+    assert report.import_stage_index == worker_bootstrap.BOOTSTRAP_IMPORT_STAGE_LABELS.index(
+        "maintenance_package_init_import"
+    )
     _assert_no_secret_leaks(output, report_path)

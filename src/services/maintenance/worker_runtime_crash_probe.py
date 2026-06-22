@@ -62,6 +62,7 @@ _BOOTSTRAP_IMPORT_STAGE_LABELS = (
     "bootstrap_repo_root_path_ready",
     "stdlib_ready",
     "maintenance_package_ready",
+    "maintenance_package_init_import",
     "maintenance_config_import",
     "maintenance_redis_streams_import",
     "maintenance_repositories_import",
@@ -72,6 +73,7 @@ _BOOTSTRAP_IMPORT_STAGE_LABELS = (
 _BOOTSTRAP_IMPORT_STAGE_REASON_CODES = {
     "repo_root_path_unavailable",
     "stage_import_error",
+    "stage_spec_unavailable",
 }
 
 WorkerRuntimeCrashProbeStatus = Literal["pass", "blocked", "failed"]

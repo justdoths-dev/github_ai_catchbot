@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.util
 import json
 import sys
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from pathlib import Path
 FATAL_REPORT_SCHEMA_VERSION = "maintenance_worker_runtime_fatal_report_v1"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKER_RUNTIME_FATAL_REPORT_PATH = REPO_ROOT / "state/maintenance/worker-runtime-fatal-report.json"
+MAINTENANCE_PACKAGE_MODULE = "src.services.maintenance"
 MAINTENANCE_MAIN_MODULE = "src.services.maintenance.main"
 EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR = 21
 EXIT_WORKER_BOOTSTRAP_MAIN_ERROR = 22
@@ -18,7 +20,8 @@ EXIT_WORKER_BOOTSTRAP_REPORT_WRITE_FAILED = 23
 BOOTSTRAP_IMPORT_STAGE_SEQUENCE = (
     ("bootstrap_repo_root_path_ready", None),
     ("stdlib_ready", "json"),
-    ("maintenance_package_ready", "src.services.maintenance"),
+    ("maintenance_package_ready", MAINTENANCE_PACKAGE_MODULE),
+    ("maintenance_package_init_import", MAINTENANCE_PACKAGE_MODULE),
     ("maintenance_config_import", "src.services.maintenance.config"),
     ("maintenance_redis_streams_import", "src.services.maintenance.redis_streams"),
     ("maintenance_repositories_import", "src.services.maintenance.repositories"),
@@ -30,6 +33,7 @@ BOOTSTRAP_IMPORT_STAGE_LABELS = tuple(stage for stage, _module_name in BOOTSTRAP
 BOOTSTRAP_IMPORT_STAGE_REASON_CODES = {
     "repo_root_path_unavailable",
     "stage_import_error",
+    "stage_spec_unavailable",
 }
 BOOTSTRAP_EXIT_STATUS_REASON_CODES = {
     EXIT_WORKER_BOOTSTRAP_IMPORT_ERROR: "worker_bootstrap_import_error",
@@ -120,10 +124,11 @@ def write_worker_bootstrap_fatal_report(
 async def run_bootstrap(
     *,
     import_module=importlib.import_module,
+    find_spec=importlib.util.find_spec,
     report_path: Path | None = None,
 ) -> int:
     _ensure_repo_root_on_sys_path()
-    maintenance_main, import_failure = _import_maintenance_main_with_stage_classifier(import_module)
+    maintenance_main, import_failure = _import_maintenance_main_with_stage_classifier(import_module, find_spec)
     if import_failure is not None:
         if not write_worker_bootstrap_fatal_report(
             reason_code="worker_bootstrap_import_error",
@@ -197,7 +202,10 @@ def _safe_import_stage_index(import_stage: str | None, value: object) -> int | N
     return None
 
 
-def _import_maintenance_main_with_stage_classifier(import_module) -> tuple[object | None, dict[str, object] | None]:
+def _import_maintenance_main_with_stage_classifier(
+    import_module,
+    find_spec,
+) -> tuple[object | None, dict[str, object] | None]:
     maintenance_main = None
     for index, (stage, module_name) in enumerate(BOOTSTRAP_IMPORT_STAGE_SEQUENCE):
         if stage == "bootstrap_repo_root_path_ready":
@@ -205,6 +213,22 @@ def _import_maintenance_main_with_stage_classifier(import_module) -> tuple[objec
                 return None, _import_stage_failure(
                     import_stage=stage,
                     import_stage_reason_code="repo_root_path_unavailable",
+                    import_stage_index=index,
+                )
+            continue
+        if stage == "maintenance_package_ready":
+            try:
+                spec = find_spec(module_name)
+            except Exception:
+                return None, _import_stage_failure(
+                    import_stage=stage,
+                    import_stage_reason_code="stage_import_error",
+                    import_stage_index=index,
+                )
+            if spec is None:
+                return None, _import_stage_failure(
+                    import_stage=stage,
+                    import_stage_reason_code="stage_spec_unavailable",
                     import_stage_index=index,
                 )
             continue
