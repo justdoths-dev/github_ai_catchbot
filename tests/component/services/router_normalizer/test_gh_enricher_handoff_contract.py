@@ -86,6 +86,9 @@ async def test_router_normalizer_enrich_payload_rehydrates_as_gh_enricher_job() 
             {
                 "event_id": trigger_event_id,
                 "event_type": "artifact.enrich.requested.v1",
+                "aggregate_type": "artifact",
+                "aggregate_id": artifact_id,
+                "status": "published",
                 "payload_json": payload,
             }
         )

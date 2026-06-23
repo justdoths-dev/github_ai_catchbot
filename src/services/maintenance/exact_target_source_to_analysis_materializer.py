@@ -1,0 +1,1390 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import re
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+from typing import Any, AsyncIterator, Protocol
+from uuid import UUID
+
+import sqlalchemy as sa
+
+from ..collector_telegram.operator_supplied_source import (
+    OperatorSourceIngestResult,
+    OperatorSuppliedSourceAdapter,
+    OperatorSuppliedSourceError,
+    OperatorSuppliedTelegramSourcePacket,
+    TelegramRegistryTarget,
+    build_source_projection,
+    fingerprint_value,
+    load_operator_source_packet,
+)
+from ..evidence_assembler.config import EvidenceAssemblerConfig
+from ..router_normalizer.canonicalizer import build_text_idea_artifact
+from ..router_normalizer.config import RouterNormalizerConfig
+from ..router_normalizer.models import RedisNormalizeMessage, SourceMessageSnapshot
+from ..router_normalizer.text_surfaces import build_text_surfaces
+from ..router_normalizer.trigger_rules import evaluate_triggers
+from ..router_normalizer.url_extraction import extract_urls
+
+
+SCHEMA_VERSION = "exact_target_source_to_analysis_materializer_report_v1"
+CONFIRM_TOKEN = "materialize-source-analysis"
+PLACEHOLDER_REDIS_URL = "redis_locator_not_attempted"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+RUNTIME_VALUE_KEYS = {
+    "APP_ENV",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "ROUTER_NORMALIZER_QUEUE",
+    "ROUTER_NORMALIZER_CONSUMER_GROUP",
+    "ROUTER_NORMALIZER_CONSUMER_NAME",
+    "ROUTER_NORMALIZER_BLOCK_MS",
+    "ROUTER_NORMALIZER_BATCH_SIZE",
+    "ROUTER_NORMALIZER_VERSION",
+    "ROUTER_NORMALIZER_SHORT_URL_ALLOWLIST",
+    "ROUTER_NORMALIZER_SHORT_URL_HOP_LIMIT",
+    "ROUTER_NORMALIZER_SHORT_URL_TIMEOUT_SECONDS",
+    "EVIDENCE_ASSEMBLER_QUEUE_NAME",
+    "EVIDENCE_ASSEMBLER_CONSUMER_GROUP",
+    "EVIDENCE_ASSEMBLER_CONSUMER_NAME",
+    "EVIDENCE_ASSEMBLER_BATCH_SIZE",
+    "EVIDENCE_ASSEMBLER_BLOCK_MS",
+    "EVIDENCE_ASSEMBLER_BUNDLE_PROFILE_VERSION",
+    "EVIDENCE_ASSEMBLER_ENABLE_TEXT_IDEA",
+    "EVIDENCE_ASSEMBLER_ENABLE_REROOT",
+    "LOG_LEVEL",
+}
+RUNTIME_FILE_KEYS = {"DATABASE_URL_FILE"}
+RUNTIME_ENV_KEYS = RUNTIME_VALUE_KEYS | RUNTIME_FILE_KEYS
+
+
+class ExactTargetSourceToAnalysisConfigError(ValueError):
+    pass
+
+
+class SilentArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:  # pragma: no cover - argparse calls this
+        del message
+        raise ExactTargetSourceToAnalysisConfigError("invalid_cli_arguments")
+
+
+@dataclass(slots=True, frozen=True)
+class ExactTargetSourceToAnalysisReport:
+    schema_version: str
+    mode: str
+    status: str
+    reason_code: str
+    source_packet_fingerprint: str | None
+    source_ref_fingerprint: str | None
+    source_message_fingerprint: str | None
+    source_event_fingerprint: str | None
+    artifact_fingerprint: str | None
+    candidate_group_fingerprint: str | None
+    refresh_event_fingerprint: str | None
+    bundle_fingerprint: str | None
+    analysis_request_fingerprint: str | None
+    preflight_passed: bool
+    source_ingest_attempted: bool
+    normalization_attempted: bool
+    bundle_refresh_attempted: bool
+    assembler_attempted: bool
+    source_message_created: bool
+    source_version_created: bool
+    candidate_created: bool
+    text_idea_snapshot_created: bool
+    bundle_created: bool
+    analysis_request_created: bool
+    openai_attempted: bool
+    redis_attempted: bool
+    telegram_live_read_attempted: bool
+    telegram_send_attempted: bool
+    external_network_attempted: bool
+    redactions_applied: bool
+    bounded_counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
+class ExactTargetSourceToAnalysisRequest:
+    mode: str
+    packet: OperatorSuppliedTelegramSourcePacket
+
+
+@dataclass(slots=True, frozen=True)
+class RuntimeConfigBundle:
+    database_url: str
+    values: Mapping[str, str]
+    router_config: RouterNormalizerConfig
+    assembler_config: EvidenceAssemblerConfig
+
+
+@dataclass(slots=True, frozen=True)
+class LocalTextIdeaPlan:
+    signal_detected: bool
+    candidate_eligible: bool
+    predicted_candidate_count: int
+    primary_artifact_type: str | None
+    artifact_fingerprint: str | None
+    external_url_count: int
+    enrichment_request_count: int
+    reason_code: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.reason_code is None
+
+
+@dataclass(slots=True, frozen=True)
+class NormalizationReadback:
+    normalization_runs: int
+    candidate_groups: int
+    primary_members: int
+    primary_artifact_type: str | None
+    primary_artifact_id: UUID | None
+    candidate_group_id: UUID | None
+    enrichment_requests: int
+
+
+@dataclass(slots=True, frozen=True)
+class RefreshEventRecord:
+    event_id: UUID
+    created: bool
+
+
+@dataclass(slots=True, frozen=True)
+class FinalReadback:
+    source_messages: int = 0
+    source_message_versions: int = 0
+    source_created_events: int = 0
+    telegram_raw_updates: int = 0
+    normalization_runs: int = 0
+    candidate_groups: int = 0
+    primary_text_idea_members: int = 0
+    external_enrichment_requests: int = 0
+    text_idea_snapshots: int = 0
+    ready_current_bundles: int = 0
+    candidate_evidence_members: int = 0
+    analysis_requested_events: int = 0
+    judge_runs: int = 0
+    judge_call_requested_events: int = 0
+    bundle_id: UUID | None = None
+    analysis_request_event_id: UUID | None = None
+
+    def to_counts(self) -> dict[str, int]:
+        return {
+            "source_messages": self.source_messages,
+            "source_message_versions": self.source_message_versions,
+            "source_created_events": self.source_created_events,
+            "telegram_raw_updates": self.telegram_raw_updates,
+            "normalization_runs": self.normalization_runs,
+            "candidate_groups": self.candidate_groups,
+            "primary_text_idea_members": self.primary_text_idea_members,
+            "external_enrichment_requests": self.external_enrichment_requests,
+            "text_idea_snapshots": self.text_idea_snapshots,
+            "ready_current_bundles": self.ready_current_bundles,
+            "candidate_evidence_members": self.candidate_evidence_members,
+            "analysis_requested_events": self.analysis_requested_events,
+            "judge_runs": self.judge_runs,
+            "judge_call_requested_events": self.judge_call_requested_events,
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class PreflightSnapshot:
+    registry_target: TelegramRegistryTarget | None = None
+    source_content_hash: str | None = None
+    source_message_id: str | None = None
+    local_plan: LocalTextIdeaPlan | None = None
+    reason_code: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.reason_code is None
+
+
+class MaterializerRepositoryProtocol(Protocol):
+    async def load_normalization_readback(
+        self,
+        *,
+        source_message_id: UUID,
+        source_version_no: int,
+    ) -> NormalizationReadback: ...
+
+    async def insert_candidate_bundle_refresh_event(
+        self,
+        *,
+        candidate_group_id: UUID,
+        source_message_id: UUID,
+        source_version_no: int,
+        packet_fingerprint: str,
+    ) -> RefreshEventRecord: ...
+
+    async def load_final_readback(
+        self,
+        *,
+        source_message_id: UUID,
+        source_version_no: int,
+        source_content_hash: str,
+        chat_id: int,
+        message_id: int,
+        candidate_group_id: UUID,
+    ) -> FinalReadback: ...
+
+
+class StageComponentsProtocol(Protocol):
+    collector_repository: Any
+    source_adapter: OperatorSuppliedSourceAdapter
+    materializer_repository: MaterializerRepositoryProtocol
+    normalizer_service: Any
+    assembler_service: Any
+
+    async def commit(self) -> None: ...
+
+
+class StageFactoryProtocol(Protocol):
+    def stage(self, stage_name: str) -> AsyncIterator[StageComponentsProtocol]: ...
+
+
+class NoNetworkShortUrlResolver:
+    async def resolve(self, url: Any) -> Any:
+        del url
+        raise OperatorSuppliedSourceError("external_enrichment_required")
+
+
+class SqlExactTargetSourceToAnalysisRepository:
+    def __init__(self, session: Any) -> None:
+        self._session = session
+
+    async def load_normalization_readback(
+        self,
+        *,
+        source_message_id: UUID,
+        source_version_no: int,
+    ) -> NormalizationReadback:
+        normalization_runs = await self._count(
+            """
+            SELECT count(*)
+            FROM normalization_runs
+            WHERE source_message_id = CAST(:source_message_id AS uuid)
+              AND source_version_no = :source_version_no
+              AND signal_detected IS TRUE
+              AND candidate_eligible IS TRUE
+            """,
+            {
+                "source_message_id": str(source_message_id),
+                "source_version_no": source_version_no,
+            },
+        )
+        candidate_groups = await self._count(
+            """
+            SELECT count(*)
+            FROM candidate_group_proposals
+            WHERE source_message_id = CAST(:source_message_id AS uuid)
+              AND source_version_no = :source_version_no
+            """,
+            {
+                "source_message_id": str(source_message_id),
+                "source_version_no": source_version_no,
+            },
+        )
+        primary_rows = await self._rows(
+            """
+            SELECT cgp.candidate_group_id, ar.artifact_id, ar.artifact_type
+            FROM candidate_group_proposals cgp
+            JOIN candidate_group_members cgm
+              ON cgm.candidate_group_id = cgp.candidate_group_id
+             AND cgm.member_role = 'primary'
+            JOIN artifact_registry ar ON ar.artifact_id = cgm.artifact_id
+            WHERE cgp.source_message_id = CAST(:source_message_id AS uuid)
+              AND cgp.source_version_no = :source_version_no
+            ORDER BY cgp.created_at ASC, cgp.candidate_group_id ASC
+            LIMIT 2
+            """,
+            {
+                "source_message_id": str(source_message_id),
+                "source_version_no": source_version_no,
+            },
+        )
+        enrichment_requests = await self._count(
+            """
+            SELECT count(*)
+            FROM event_outbox
+            WHERE event_type = 'artifact.enrich.requested.v1'
+              AND payload_json->>'source_message_id' = :source_message_id
+              AND payload_json->>'source_version_no' = :source_version_no_text
+            """,
+            {
+                "source_message_id": str(source_message_id),
+                "source_version_no_text": str(source_version_no),
+            },
+        )
+        first = primary_rows[0] if primary_rows else None
+        return NormalizationReadback(
+            normalization_runs=normalization_runs,
+            candidate_groups=candidate_groups,
+            primary_members=len(primary_rows),
+            primary_artifact_type=None if first is None else str(first["artifact_type"]),
+            primary_artifact_id=None if first is None else UUID(str(first["artifact_id"])),
+            candidate_group_id=None if first is None else UUID(str(first["candidate_group_id"])),
+            enrichment_requests=enrichment_requests,
+        )
+
+    async def insert_candidate_bundle_refresh_event(
+        self,
+        *,
+        candidate_group_id: UUID,
+        source_message_id: UUID,
+        source_version_no: int,
+        packet_fingerprint: str,
+    ) -> RefreshEventRecord:
+        dedupe_key = (
+            "bundle-refresh:operator-source:"
+            f"{candidate_group_id}:{source_message_id}:{source_version_no}:{packet_fingerprint}"
+        )
+        payload = {
+            "candidate_group_id": str(candidate_group_id),
+            "trigger_kind": "operator_supplied_source_canary",
+            "trigger_object_type": "source_message",
+            "trigger_object_id": str(source_message_id),
+            "source_version_no": source_version_no,
+            "refresh_reason": "operator_supplied_canary",
+        }
+        rows = await self._rows(
+            """
+            WITH inserted AS (
+                INSERT INTO event_outbox (
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    dedupe_key,
+                    payload_json,
+                    status,
+                    created_at
+                ) VALUES (
+                    'candidate.bundle.refresh.v1',
+                    'candidate_group',
+                    CAST(:candidate_group_id AS uuid),
+                    :dedupe_key,
+                    CAST(:payload_json AS jsonb),
+                    'pending'::outbox_status_enum,
+                    now()
+                )
+                ON CONFLICT (dedupe_key) DO NOTHING
+                RETURNING event_id, TRUE AS created
+            )
+            SELECT event_id, created FROM inserted
+            UNION ALL
+            SELECT event_id, FALSE AS created
+            FROM event_outbox
+            WHERE dedupe_key = :dedupe_key
+            LIMIT 1
+            """,
+            {
+                "candidate_group_id": str(candidate_group_id),
+                "dedupe_key": dedupe_key,
+                "payload_json": _jsonb_dumps(payload),
+            },
+        )
+        if not rows:
+            raise OperatorSuppliedSourceError("refresh_event_not_created")
+        return RefreshEventRecord(
+            event_id=UUID(str(rows[0]["event_id"])),
+            created=bool(rows[0]["created"]),
+        )
+
+    async def load_final_readback(
+        self,
+        *,
+        source_message_id: UUID,
+        source_version_no: int,
+        source_content_hash: str,
+        chat_id: int,
+        message_id: int,
+        candidate_group_id: UUID,
+    ) -> FinalReadback:
+        bundle_id = await self._uuid_or_none(
+            """
+            SELECT ceb.bundle_id
+            FROM candidate_group_proposals cgp
+            JOIN candidate_evidence_bundles ceb
+              ON ceb.bundle_id = cgp.current_bundle_id
+            WHERE cgp.candidate_group_id = CAST(:candidate_group_id AS uuid)
+              AND ceb.ready_for_analysis IS TRUE
+            LIMIT 2
+            """,
+            {"candidate_group_id": str(candidate_group_id)},
+        )
+        analysis_rows: list[Mapping[str, Any]] = []
+        if bundle_id is not None:
+            analysis_rows = await self._rows(
+                """
+                SELECT event_id
+                FROM event_outbox
+                WHERE event_type = 'analysis.requested.v1'
+                  AND aggregate_type = 'candidate_group'
+                  AND aggregate_id = CAST(:candidate_group_id AS uuid)
+                  AND payload_json->>'bundle_id' = :bundle_id
+                ORDER BY created_at ASC, event_id ASC
+                LIMIT 2
+                """,
+                {
+                    "candidate_group_id": str(candidate_group_id),
+                    "bundle_id": str(bundle_id),
+                },
+            )
+        return FinalReadback(
+            source_messages=await self._count(
+                "SELECT count(*) FROM source_messages WHERE source_message_id = CAST(:source_message_id AS uuid)",
+                {"source_message_id": str(source_message_id)},
+            ),
+            source_message_versions=await self._count(
+                """
+                SELECT count(*)
+                FROM source_message_versions
+                WHERE source_message_id = CAST(:source_message_id AS uuid)
+                  AND version_no = :source_version_no
+                  AND content_hash = :source_content_hash
+                """,
+                {
+                    "source_message_id": str(source_message_id),
+                    "source_version_no": source_version_no,
+                    "source_content_hash": source_content_hash,
+                },
+            ),
+            source_created_events=await self._count(
+                """
+                SELECT count(*)
+                FROM event_outbox
+                WHERE event_type = 'source_message.created.v1'
+                  AND aggregate_type = 'source_message'
+                  AND aggregate_id = CAST(:source_message_id AS uuid)
+                """,
+                {"source_message_id": str(source_message_id)},
+            ),
+            telegram_raw_updates=await self._count(
+                """
+                SELECT count(*)
+                FROM telegram_raw_updates
+                WHERE chat_id = :chat_id AND message_id = :message_id
+                """,
+                {"chat_id": chat_id, "message_id": message_id},
+            ),
+            normalization_runs=await self._count(
+                """
+                SELECT count(*)
+                FROM normalization_runs
+                WHERE source_message_id = CAST(:source_message_id AS uuid)
+                  AND source_version_no = :source_version_no
+                  AND signal_detected IS TRUE
+                  AND candidate_eligible IS TRUE
+                """,
+                {
+                    "source_message_id": str(source_message_id),
+                    "source_version_no": source_version_no,
+                },
+            ),
+            candidate_groups=await self._count(
+                """
+                SELECT count(*)
+                FROM candidate_group_proposals
+                WHERE candidate_group_id = CAST(:candidate_group_id AS uuid)
+                  AND source_message_id = CAST(:source_message_id AS uuid)
+                  AND source_version_no = :source_version_no
+                """,
+                {
+                    "candidate_group_id": str(candidate_group_id),
+                    "source_message_id": str(source_message_id),
+                    "source_version_no": source_version_no,
+                },
+            ),
+            primary_text_idea_members=await self._count(
+                """
+                SELECT count(*)
+                FROM candidate_group_members cgm
+                JOIN artifact_registry ar ON ar.artifact_id = cgm.artifact_id
+                WHERE cgm.candidate_group_id = CAST(:candidate_group_id AS uuid)
+                  AND cgm.member_role = 'primary'
+                  AND ar.artifact_type = 'text_idea'
+                """,
+                {"candidate_group_id": str(candidate_group_id)},
+            ),
+            external_enrichment_requests=await self._count(
+                """
+                SELECT count(*)
+                FROM event_outbox
+                WHERE event_type = 'artifact.enrich.requested.v1'
+                  AND payload_json->>'source_message_id' = :source_message_id
+                  AND payload_json->>'source_version_no' = :source_version_no_text
+                """,
+                {
+                    "source_message_id": str(source_message_id),
+                    "source_version_no_text": str(source_version_no),
+                },
+            ),
+            text_idea_snapshots=await self._count(
+                """
+                SELECT count(*)
+                FROM artifact_snapshot_text_idea asti
+                JOIN artifact_snapshots aps ON aps.snapshot_id = asti.snapshot_id
+                JOIN candidate_group_members cgm ON cgm.artifact_id = aps.artifact_id
+                WHERE cgm.candidate_group_id = CAST(:candidate_group_id AS uuid)
+                  AND asti.source_message_id = CAST(:source_message_id AS uuid)
+                  AND asti.source_version_no = :source_version_no
+                  AND aps.provider = 'local_text_idea'
+                """,
+                {
+                    "candidate_group_id": str(candidate_group_id),
+                    "source_message_id": str(source_message_id),
+                    "source_version_no": source_version_no,
+                },
+            ),
+            ready_current_bundles=await self._count(
+                """
+                SELECT count(*)
+                FROM candidate_group_proposals cgp
+                JOIN candidate_evidence_bundles ceb
+                  ON ceb.bundle_id = cgp.current_bundle_id
+                WHERE cgp.candidate_group_id = CAST(:candidate_group_id AS uuid)
+                  AND ceb.ready_for_analysis IS TRUE
+                """,
+                {"candidate_group_id": str(candidate_group_id)},
+            ),
+            candidate_evidence_members=(
+                0
+                if bundle_id is None
+                else await self._count(
+                    """
+                    SELECT count(*)
+                    FROM candidate_evidence_members
+                    WHERE bundle_id = CAST(:bundle_id AS uuid)
+                    """,
+                    {"bundle_id": str(bundle_id)},
+                )
+            ),
+            analysis_requested_events=len(analysis_rows),
+            judge_runs=(
+                0
+                if bundle_id is None
+                else await self._count(
+                    "SELECT count(*) FROM judge_runs WHERE bundle_id = CAST(:bundle_id AS uuid)",
+                    {"bundle_id": str(bundle_id)},
+                )
+            ),
+            judge_call_requested_events=(
+                0
+                if bundle_id is None
+                else await self._count(
+                    """
+                    SELECT count(*)
+                    FROM event_outbox
+                    WHERE event_type = 'judge.call.requested.v1'
+                      AND payload_json->>'bundle_id' = :bundle_id
+                    """,
+                    {"bundle_id": str(bundle_id)},
+                )
+            ),
+            bundle_id=bundle_id,
+            analysis_request_event_id=(
+                None if not analysis_rows else UUID(str(analysis_rows[0]["event_id"]))
+            ),
+        )
+
+    async def _uuid_or_none(self, query: str, params: Mapping[str, Any]) -> UUID | None:
+        rows = await self._rows(query, params)
+        if len(rows) != 1:
+            return None
+        return UUID(str(next(iter(rows[0].values()))))
+
+    async def _count(self, query: str, params: Mapping[str, Any]) -> int:
+        result = await self._session.execute(sa.text(query), dict(params))
+        return int(result.scalar_one())
+
+    async def _rows(self, query: str, params: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+        result = await self._session.execute(sa.text(query), dict(params))
+        return list(result.mappings().all())
+
+
+class SqlStageComponents:
+    def __init__(self, session: Any, runtime: RuntimeConfigBundle) -> None:
+        from ..collector_telegram.repositories import CollectorRepository
+        from ..evidence_assembler.repositories import EvidenceAssemblerRepository
+        from ..evidence_assembler.service import EvidenceAssemblerService
+        from ..router_normalizer.repositories import RouterNormalizerRepository
+        from ..router_normalizer.service import RouterNormalizerService
+
+        self._session = session
+        self.collector_repository = CollectorRepository(session)
+        self.source_adapter = OperatorSuppliedSourceAdapter()
+        self.materializer_repository = SqlExactTargetSourceToAnalysisRepository(session)
+        self.normalizer_service = RouterNormalizerService(
+            runtime.router_config,
+            repository=RouterNormalizerRepository(session),
+            short_url_resolver=NoNetworkShortUrlResolver(),
+        )
+        self.assembler_service = EvidenceAssemblerService(
+            runtime.assembler_config,
+            repository=EvidenceAssemblerRepository(session),
+        )
+
+    async def commit(self) -> None:
+        await self._session.commit()
+
+
+class SqlStageFactory:
+    def __init__(self, runtime: RuntimeConfigBundle) -> None:
+        self._runtime = runtime
+        self._engine: Any = None
+        self._session_factory: Any = None
+
+    async def __aenter__(self) -> "SqlStageFactory":
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+        self._engine = create_async_engine(self._runtime.database_url, future=True)
+        self._session_factory = async_sessionmaker(
+            self._engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._engine is not None:
+            await self._engine.dispose()
+
+    @asynccontextmanager
+    async def stage(self, stage_name: str) -> AsyncIterator[SqlStageComponents]:
+        del stage_name
+        async with self._session_factory() as session:
+            components = SqlStageComponents(session, self._runtime)
+            try:
+                yield components
+            except Exception:
+                if session.in_transaction():
+                    await session.rollback()
+                raise
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = SilentArgumentParser(prog="exact-target-source-to-analysis-materializer")
+    parser.add_argument("--mode")
+    parser.add_argument("--source-packet-json", action="append", default=[])
+    parser.add_argument("--env-file")
+    parser.add_argument("--confirm", default=None)
+    return parser
+
+
+async def run_cli(
+    argv: Sequence[str] | None = None,
+    *,
+    emit_json: Callable[[str], None] = print,
+    runtime_config_loader: Callable[[str], RuntimeConfigBundle] | None = None,
+    stage_factory_builder: Callable[[RuntimeConfigBundle], Any] | None = None,
+    repo_root: Path = REPO_ROOT,
+) -> int:
+    try:
+        args = build_parser().parse_args(list(argv) if argv is not None else None)
+    except ExactTargetSourceToAnalysisConfigError as exc:
+        emit_json(_compact_json(asdict(_report(mode="unknown", status="blocked", reason_code=str(exc)))))
+        return 2
+
+    validation_error = _cli_request_error(args)
+    mode = str(args.mode) if args.mode in {"plan", "execute"} else "unknown"
+    if validation_error is not None:
+        emit_json(_compact_json(asdict(_report(mode=mode, status="blocked", reason_code=validation_error))))
+        return 2
+
+    if args.mode == "execute" and args.confirm != CONFIRM_TOKEN:
+        emit_json(
+            _compact_json(
+                asdict(
+                    _report(
+                        mode=args.mode,
+                        status="blocked",
+                        reason_code="materialize_source_analysis_confirm_missing",
+                    )
+                )
+            )
+        )
+        return 2
+    if args.mode == "plan" and args.confirm is not None:
+        emit_json(
+            _compact_json(
+                asdict(
+                    _report(
+                        mode=args.mode,
+                        status="blocked",
+                        reason_code="confirm_not_allowed_for_plan",
+                    )
+                )
+            )
+        )
+        return 2
+
+    try:
+        packet = load_operator_source_packet(args.source_packet_json[0], repo_root=repo_root)
+    except OperatorSuppliedSourceError as exc:
+        emit_json(
+            _compact_json(
+                asdict(
+                    _report(
+                        mode=args.mode,
+                        status="blocked",
+                        reason_code=exc.reason_code,
+                    )
+                )
+            )
+        )
+        return 2
+
+    try:
+        runtime = (runtime_config_loader or load_runtime_config)(str(args.env_file))
+    except ExactTargetSourceToAnalysisConfigError as exc:
+        emit_json(
+            _compact_json(
+                asdict(
+                    _report(
+                        mode=args.mode,
+                        status="blocked",
+                        reason_code=_safe_reason_code(exc),
+                        packet=packet,
+                    )
+                )
+            )
+        )
+        return 2
+
+    builder = stage_factory_builder or (lambda runtime_config: SqlStageFactory(runtime_config))
+    async with builder(runtime) as stage_factory:
+        report = await run_exact_target_source_to_analysis_materializer(
+            ExactTargetSourceToAnalysisRequest(mode=args.mode, packet=packet),
+            stage_factory=stage_factory,
+        )
+    emit_json(_compact_json(asdict(report)))
+    return 0 if report.status == "pass" else 2
+
+
+async def run_exact_target_source_to_analysis_materializer(
+    request: ExactTargetSourceToAnalysisRequest,
+    *,
+    stage_factory: StageFactoryProtocol,
+) -> ExactTargetSourceToAnalysisReport:
+    report = _report(
+        mode=request.mode,
+        status="failed",
+        reason_code="unhandled_error",
+        packet=request.packet,
+    )
+    try:
+        async with stage_factory.stage("preflight") as components:
+            preflight = await _load_preflight(components, request.packet)
+        report = _apply_preflight(report, preflight)
+        if not preflight.passed:
+            return replace(
+                report,
+                status="blocked",
+                reason_code=preflight.reason_code or "preflight_blocked",
+            )
+        if request.mode == "plan":
+            return replace(report, status="pass", reason_code="plan_ready", preflight_passed=True)
+
+        assert preflight.registry_target is not None
+        assert preflight.source_content_hash is not None
+
+        report = replace(report, source_ingest_attempted=True)
+        async with stage_factory.stage("source_ingest") as components:
+            ingest = await components.source_adapter.ingest_source(
+                components.collector_repository,
+                packet=request.packet,
+                registry_target=preflight.registry_target,
+            )
+            if ingest.duplicate:
+                return replace(
+                    _apply_ingest(report, ingest),
+                    status="blocked",
+                    reason_code="source_packet_already_materialized",
+                )
+            await components.commit()
+        report = _apply_ingest(report, ingest)
+        if (
+            ingest.source_message_id is None
+            or ingest.source_version_no is None
+            or ingest.source_event_id is None
+        ):
+            return replace(report, status="failed", reason_code="source_ingest_readback_invalid")
+
+        source_message_id = UUID(ingest.source_message_id)
+        source_version_no = int(ingest.source_version_no)
+        source_event_id = UUID(ingest.source_event_id)
+
+        report = replace(report, normalization_attempted=True)
+        async with stage_factory.stage("normalization") as components:
+            await components.normalizer_service.process_stream_message(
+                RedisNormalizeMessage(
+                    job_id=str(source_event_id),
+                    stage_name="normalize",
+                    root_object_type="source_message",
+                    root_object_id=str(source_message_id),
+                    idempotency_key=f"operator-source:{request.packet.packet_fingerprint}",
+                    trigger_event_id=str(source_event_id),
+                )
+            )
+            await components.commit()
+
+        async with stage_factory.stage("normalization_readback") as components:
+            normalization = await components.materializer_repository.load_normalization_readback(
+                source_message_id=source_message_id,
+                source_version_no=source_version_no,
+            )
+        report = _apply_normalization_readback(report, normalization)
+        normalization_error = _normalization_error(normalization)
+        if normalization_error is not None:
+            return replace(report, status="failed", reason_code=normalization_error)
+        assert normalization.candidate_group_id is not None
+
+        report = replace(report, bundle_refresh_attempted=True)
+        async with stage_factory.stage("refresh_event") as components:
+            refresh = await components.materializer_repository.insert_candidate_bundle_refresh_event(
+                candidate_group_id=normalization.candidate_group_id,
+                source_message_id=source_message_id,
+                source_version_no=source_version_no,
+                packet_fingerprint=request.packet.packet_fingerprint,
+            )
+            if not refresh.created:
+                return replace(report, status="blocked", reason_code="refresh_event_already_exists")
+            await components.commit()
+        report = replace(report, refresh_event_fingerprint=_fingerprint(refresh.event_id))
+
+        report = replace(report, assembler_attempted=True)
+        async with stage_factory.stage("assembler") as components:
+            await components.assembler_service.handle_trigger_event(refresh.event_id)
+            await components.commit()
+
+        async with stage_factory.stage("final_readback") as components:
+            final = await components.materializer_repository.load_final_readback(
+                source_message_id=source_message_id,
+                source_version_no=source_version_no,
+                source_content_hash=preflight.source_content_hash,
+                chat_id=preflight.registry_target.chat_id,
+                message_id=request.packet.parsed_ref.message_id,
+                candidate_group_id=normalization.candidate_group_id,
+            )
+        report = _apply_final_readback(report, final)
+        final_error = _final_readback_error(final)
+        if final_error is not None:
+            return replace(report, status="failed", reason_code=final_error)
+
+        return replace(
+            report,
+            status="pass",
+            reason_code="analysis_request_materialized",
+            preflight_passed=True,
+            source_message_created=True,
+            source_version_created=True,
+            candidate_created=True,
+            text_idea_snapshot_created=True,
+            bundle_created=True,
+            analysis_request_created=True,
+        )
+    except OperatorSuppliedSourceError as exc:
+        return replace(report, status="blocked", reason_code=exc.reason_code)
+    except ExactTargetSourceToAnalysisConfigError as exc:
+        return replace(report, status="blocked", reason_code=_safe_reason_code(exc))
+    except Exception:
+        return replace(report, status="failed", reason_code="unhandled_error")
+
+
+def load_runtime_config(env_file: str) -> RuntimeConfigBundle:
+    values = _read_runtime_env_file(env_file)
+    resolved_values = dict(values)
+    database_url = _resolve_file_indirection(
+        resolved_values,
+        value_key="DATABASE_URL",
+        file_key="DATABASE_URL_FILE",
+        missing_reason_code="database_url_missing",
+        file_missing_reason_code="database_url_file_missing",
+        file_empty_reason_code="database_url_file_empty",
+    )
+    redis_url = _read(resolved_values, "REDIS_URL", PLACEHOLDER_REDIS_URL) or PLACEHOLDER_REDIS_URL
+    try:
+        router_config = RouterNormalizerConfig(
+            app_env=_read(resolved_values, "APP_ENV", "dev").lower(),
+            database_url=database_url,
+            redis_url=redis_url,
+            queue_name=_read(resolved_values, "ROUTER_NORMALIZER_QUEUE", "q.source.normalize"),
+            consumer_group=_read(
+                resolved_values,
+                "ROUTER_NORMALIZER_CONSUMER_GROUP",
+                "router-normalizer",
+            ),
+            consumer_name=_read(
+                resolved_values,
+                "ROUTER_NORMALIZER_CONSUMER_NAME",
+                "router-normalizer-1",
+            ),
+            block_ms=int(_read(resolved_values, "ROUTER_NORMALIZER_BLOCK_MS", "5000")),
+            batch_size=int(_read(resolved_values, "ROUTER_NORMALIZER_BATCH_SIZE", "10")),
+            normalizer_version=_read(
+                resolved_values,
+                "ROUTER_NORMALIZER_VERSION",
+                "router-normalizer-v1",
+            ),
+            short_url_allowlist=tuple(
+                host.strip().lower()
+                for host in _read(
+                    resolved_values,
+                    "ROUTER_NORMALIZER_SHORT_URL_ALLOWLIST",
+                    "",
+                ).split(",")
+                if host.strip()
+            ),
+            short_url_hop_limit=int(
+                _read(resolved_values, "ROUTER_NORMALIZER_SHORT_URL_HOP_LIMIT", "1")
+            ),
+            short_url_timeout_seconds=float(
+                _read(resolved_values, "ROUTER_NORMALIZER_SHORT_URL_TIMEOUT_SECONDS", "0.1")
+            ),
+            log_level=_read(resolved_values, "LOG_LEVEL", "INFO").upper(),
+        )
+        router_config.validate()
+        assembler_config = EvidenceAssemblerConfig(
+            app_env=_read(resolved_values, "APP_ENV", "dev").lower(),
+            database_url=database_url,
+            redis_url=redis_url,
+            queue_name=_read(
+                resolved_values,
+                "EVIDENCE_ASSEMBLER_QUEUE_NAME",
+                "q.candidate.bundle",
+            ),
+            consumer_group=_read(
+                resolved_values,
+                "EVIDENCE_ASSEMBLER_CONSUMER_GROUP",
+                "evidence-assembler",
+            ),
+            consumer_name=_read(
+                resolved_values,
+                "EVIDENCE_ASSEMBLER_CONSUMER_NAME",
+                "evidence-assembler-1",
+            ),
+            batch_size=int(_read(resolved_values, "EVIDENCE_ASSEMBLER_BATCH_SIZE", "10")),
+            block_ms=int(_read(resolved_values, "EVIDENCE_ASSEMBLER_BLOCK_MS", "5000")),
+            bundle_profile_version=_read(
+                resolved_values,
+                "EVIDENCE_ASSEMBLER_BUNDLE_PROFILE_VERSION",
+                "bundle_profile_v1",
+            ),
+            enable_text_idea=_bool_value(
+                _read(resolved_values, "EVIDENCE_ASSEMBLER_ENABLE_TEXT_IDEA", "true")
+            ),
+            enable_reroot=_bool_value(
+                _read(resolved_values, "EVIDENCE_ASSEMBLER_ENABLE_REROOT", "true")
+            ),
+            log_level=_read(resolved_values, "LOG_LEVEL", "INFO").upper(),
+        )
+        assembler_config.validate()
+    except (TypeError, ValueError):
+        raise ExactTargetSourceToAnalysisConfigError("runtime_config_invalid") from None
+    return RuntimeConfigBundle(
+        database_url=database_url,
+        values=resolved_values,
+        router_config=router_config,
+        assembler_config=assembler_config,
+    )
+
+
+async def _load_preflight(
+    components: StageComponentsProtocol,
+    packet: OperatorSuppliedTelegramSourcePacket,
+) -> PreflightSnapshot:
+    registry_target = await components.source_adapter.resolve_registry_target(
+        components.collector_repository,
+        packet,
+    )
+    projection = build_source_projection(packet=packet, registry_target=registry_target)
+    local_plan = _plan_local_text_idea(packet=packet, registry_target=registry_target)
+    if not local_plan.passed:
+        return PreflightSnapshot(
+            registry_target=registry_target,
+            source_content_hash=projection.content_hash,
+            local_plan=local_plan,
+            reason_code=local_plan.reason_code,
+        )
+    existing = await components.source_adapter.inspect_existing_source(
+        components.collector_repository,
+        packet=packet,
+        registry_target=registry_target,
+    )
+    if existing is not None:
+        return PreflightSnapshot(
+            registry_target=registry_target,
+            source_content_hash=projection.content_hash,
+            source_message_id=existing.source_message_id,
+            local_plan=local_plan,
+            reason_code="source_packet_already_materialized",
+        )
+    return PreflightSnapshot(
+        registry_target=registry_target,
+        source_content_hash=projection.content_hash,
+        local_plan=local_plan,
+    )
+
+
+def _plan_local_text_idea(
+    *,
+    packet: OperatorSuppliedTelegramSourcePacket,
+    registry_target: TelegramRegistryTarget,
+) -> LocalTextIdeaPlan:
+    projection = build_source_projection(packet=packet, registry_target=registry_target)
+    snapshot = SourceMessageSnapshot(
+        source_message_id=UUID("00000000-0000-0000-0000-000000000000"),
+        source_version_no=1,
+        text_body=projection.text_body,
+        caption_text=projection.caption_text,
+        text_surface=projection.text_surface,
+        entities_json=projection.entities_json,
+        url_surface_json=projection.url_surface_json,
+        raw_message_json=projection.raw_message_json,
+    )
+    surfaces = build_text_surfaces(snapshot)
+    extracted_urls = extract_urls(snapshot, surfaces)
+    if extracted_urls:
+        return LocalTextIdeaPlan(
+            signal_detected=False,
+            candidate_eligible=False,
+            predicted_candidate_count=0,
+            primary_artifact_type=None,
+            artifact_fingerprint=None,
+            external_url_count=len(extracted_urls),
+            enrichment_request_count=len(extracted_urls),
+            reason_code="external_enrichment_required",
+        )
+    evaluation = evaluate_triggers(surfaces, [])
+    if not evaluation.signal_detected:
+        return LocalTextIdeaPlan(
+            signal_detected=False,
+            candidate_eligible=False,
+            predicted_candidate_count=0,
+            primary_artifact_type=None,
+            artifact_fingerprint=None,
+            external_url_count=0,
+            enrichment_request_count=0,
+            reason_code="signal_not_detected",
+        )
+    if not evaluation.candidate_eligible:
+        return LocalTextIdeaPlan(
+            signal_detected=True,
+            candidate_eligible=False,
+            predicted_candidate_count=0,
+            primary_artifact_type=None,
+            artifact_fingerprint=None,
+            external_url_count=0,
+            enrichment_request_count=0,
+            reason_code="candidate_not_eligible",
+        )
+    artifact = build_text_idea_artifact(surfaces)
+    return LocalTextIdeaPlan(
+        signal_detected=True,
+        candidate_eligible=True,
+        predicted_candidate_count=1,
+        primary_artifact_type=artifact.artifact_type,
+        artifact_fingerprint=fingerprint_value(artifact.canonical_id),
+        external_url_count=0,
+        enrichment_request_count=0,
+    )
+
+
+def _apply_preflight(
+    report: ExactTargetSourceToAnalysisReport,
+    preflight: PreflightSnapshot,
+) -> ExactTargetSourceToAnalysisReport:
+    counts: dict[str, int] = {}
+    if preflight.local_plan is not None:
+        counts.update(
+            {
+                "predicted_candidates": preflight.local_plan.predicted_candidate_count,
+                "predicted_external_urls": preflight.local_plan.external_url_count,
+                "predicted_enrichment_requests": preflight.local_plan.enrichment_request_count,
+            }
+        )
+    return replace(
+        _with_counts(report, counts),
+        source_message_fingerprint=(
+            _fingerprint(preflight.source_message_id)
+            if preflight.source_message_id is not None
+            else report.source_message_fingerprint
+        ),
+        artifact_fingerprint=(
+            preflight.local_plan.artifact_fingerprint
+            if preflight.local_plan and preflight.local_plan.artifact_fingerprint
+            else report.artifact_fingerprint
+        ),
+        preflight_passed=preflight.passed,
+    )
+
+
+def _apply_ingest(
+    report: ExactTargetSourceToAnalysisReport,
+    ingest: OperatorSourceIngestResult,
+) -> ExactTargetSourceToAnalysisReport:
+    return replace(
+        report,
+        source_message_fingerprint=_fingerprint(ingest.source_message_id),
+        source_event_fingerprint=_fingerprint(ingest.source_event_id),
+        source_message_created=ingest.source_message_created,
+        source_version_created=ingest.source_version_created,
+    )
+
+
+def _apply_normalization_readback(
+    report: ExactTargetSourceToAnalysisReport,
+    readback: NormalizationReadback,
+) -> ExactTargetSourceToAnalysisReport:
+    return replace(
+        _with_counts(
+            report,
+            {
+                "normalization_runs": readback.normalization_runs,
+                "candidate_groups": readback.candidate_groups,
+                "primary_members": readback.primary_members,
+                "external_enrichment_requests": readback.enrichment_requests,
+            },
+        ),
+        candidate_group_fingerprint=_fingerprint(readback.candidate_group_id),
+        artifact_fingerprint=_fingerprint(readback.primary_artifact_id),
+        candidate_created=readback.candidate_groups == 1,
+    )
+
+
+def _apply_final_readback(
+    report: ExactTargetSourceToAnalysisReport,
+    readback: FinalReadback,
+) -> ExactTargetSourceToAnalysisReport:
+    return replace(
+        _with_counts(report, readback.to_counts()),
+        bundle_fingerprint=_fingerprint(readback.bundle_id),
+        analysis_request_fingerprint=_fingerprint(readback.analysis_request_event_id),
+        text_idea_snapshot_created=readback.text_idea_snapshots == 1,
+        bundle_created=readback.ready_current_bundles == 1,
+        analysis_request_created=readback.analysis_requested_events == 1,
+    )
+
+
+def _normalization_error(readback: NormalizationReadback) -> str | None:
+    if readback.normalization_runs != 1:
+        return "normalization_run_cardinality_invalid"
+    if readback.candidate_groups != 1:
+        return "candidate_group_cardinality_invalid"
+    if readback.primary_members != 1:
+        return "primary_member_cardinality_invalid"
+    if readback.primary_artifact_type != "text_idea":
+        return "primary_artifact_type_not_text_idea"
+    if readback.enrichment_requests != 0:
+        return "external_enrichment_required"
+    return None
+
+
+def _final_readback_error(readback: FinalReadback) -> str | None:
+    expected_one = {
+        "source_messages": readback.source_messages,
+        "source_message_versions": readback.source_message_versions,
+        "source_created_events": readback.source_created_events,
+        "normalization_runs": readback.normalization_runs,
+        "candidate_groups": readback.candidate_groups,
+        "primary_text_idea_members": readback.primary_text_idea_members,
+        "text_idea_snapshots": readback.text_idea_snapshots,
+        "ready_current_bundles": readback.ready_current_bundles,
+        "analysis_requested_events": readback.analysis_requested_events,
+    }
+    for key, value in expected_one.items():
+        if value != 1:
+            return f"{key}_cardinality_invalid"
+    expected_zero = {
+        "telegram_raw_updates": readback.telegram_raw_updates,
+        "external_enrichment_requests": readback.external_enrichment_requests,
+        "judge_runs": readback.judge_runs,
+        "judge_call_requested_events": readback.judge_call_requested_events,
+    }
+    for key, value in expected_zero.items():
+        if value != 0:
+            return f"{key}_unexpected"
+    if readback.candidate_evidence_members < 1:
+        return "candidate_evidence_members_missing"
+    if readback.bundle_id is None:
+        return "bundle_missing"
+    if readback.analysis_request_event_id is None:
+        return "analysis_request_missing"
+    return None
+
+
+def _report(
+    *,
+    mode: str,
+    status: str,
+    reason_code: str,
+    packet: OperatorSuppliedTelegramSourcePacket | None = None,
+) -> ExactTargetSourceToAnalysisReport:
+    return ExactTargetSourceToAnalysisReport(
+        schema_version=SCHEMA_VERSION,
+        mode=mode,
+        status=status,
+        reason_code=reason_code,
+        source_packet_fingerprint=None if packet is None else packet.packet_fingerprint,
+        source_ref_fingerprint=None if packet is None else packet.source_ref_fingerprint,
+        source_message_fingerprint=None,
+        source_event_fingerprint=None,
+        artifact_fingerprint=None,
+        candidate_group_fingerprint=None,
+        refresh_event_fingerprint=None,
+        bundle_fingerprint=None,
+        analysis_request_fingerprint=None,
+        preflight_passed=False,
+        source_ingest_attempted=False,
+        normalization_attempted=False,
+        bundle_refresh_attempted=False,
+        assembler_attempted=False,
+        source_message_created=False,
+        source_version_created=False,
+        candidate_created=False,
+        text_idea_snapshot_created=False,
+        bundle_created=False,
+        analysis_request_created=False,
+        openai_attempted=False,
+        redis_attempted=False,
+        telegram_live_read_attempted=False,
+        telegram_send_attempted=False,
+        external_network_attempted=False,
+        redactions_applied=True,
+        bounded_counts={},
+    )
+
+
+def _cli_request_error(args: argparse.Namespace) -> str | None:
+    if args.mode not in {"plan", "execute"}:
+        return "mode_required"
+    if len(args.source_packet_json) != 1:
+        return "exactly_one_source_packet_json_required"
+    if not args.env_file:
+        return "env_file_required"
+    return None
+
+
+def _read_runtime_env_file(env_file: str) -> dict[str, str]:
+    path = Path(env_file)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        raise ExactTargetSourceToAnalysisConfigError("env_file_missing") from None
+    except OSError:
+        raise ExactTargetSourceToAnalysisConfigError("env_file_unreadable") from None
+
+    values: dict[str, str] = {}
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in RUNTIME_ENV_KEYS:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        values[key] = value
+    if not values:
+        raise ExactTargetSourceToAnalysisConfigError("env_file_no_runtime_config")
+    return values
+
+
+def _resolve_file_indirection(
+    values: dict[str, str],
+    *,
+    value_key: str,
+    file_key: str,
+    missing_reason_code: str,
+    file_missing_reason_code: str,
+    file_empty_reason_code: str,
+) -> str:
+    direct = values.get(value_key, "").strip()
+    if direct:
+        return direct
+    file_path = values.get(file_key, "").strip()
+    if not file_path:
+        raise ExactTargetSourceToAnalysisConfigError(missing_reason_code)
+    path = Path(file_path)
+    if not path.is_file():
+        raise ExactTargetSourceToAnalysisConfigError(file_missing_reason_code)
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        raise ExactTargetSourceToAnalysisConfigError(file_missing_reason_code) from None
+    if not value:
+        raise ExactTargetSourceToAnalysisConfigError(file_empty_reason_code)
+    return value
+
+
+def _read(values: Mapping[str, str], key: str, default: str) -> str:
+    value = values.get(key, default)
+    return value.strip() if isinstance(value, str) else default
+
+
+def _bool_value(value: str) -> bool:
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _safe_reason_code(exc: Exception) -> str:
+    value = str(exc)
+    if not value:
+        return "configuration_error"
+    if re_match := re.fullmatch(r"[a-z0-9_]{1,80}", value):
+        return re_match.group(0)
+    return "configuration_error"
+
+
+def _with_counts(
+    report: ExactTargetSourceToAnalysisReport,
+    counts: Mapping[str, int],
+) -> ExactTargetSourceToAnalysisReport:
+    merged = dict(report.bounded_counts)
+    merged.update({key: _bounded_count(value) for key, value in counts.items()})
+    return replace(report, bounded_counts=merged)
+
+
+def _bounded_count(value: int | None) -> int:
+    if value is None or value <= 0:
+        return 0
+    if value == 1:
+        return 1
+    return 2
+
+
+def _fingerprint(value: Any) -> str | None:
+    if value is None:
+        return None
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, UUID):
+        return str(value)
+    raise TypeError(f"unsupported json type: {type(value)!r}")
+
+
+def _jsonb_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=_json_default)
+
+
+def _compact_json(payload: Mapping[str, Any]) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    return asyncio.run(run_cli(argv))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
