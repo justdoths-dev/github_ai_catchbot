@@ -30,6 +30,14 @@ from src.services.router_normalizer.config import RouterNormalizerConfig
 ROOT = Path(__file__).resolve().parents[4]
 SOURCE_PATH = ROOT / "src/services/maintenance/exact_target_source_to_analysis_materializer.py"
 RAW_SECRET = "private exception body with raw packet text"
+KOREAN_LLM_WORKFLOW_TEXT = (
+    "회사에서 llm 사용 권한 받은김에 이것저것 작업 중인데.. "
+    "머 보안때문에 되는게 없네요. cli는 쓸수도 없고.. 자동화를 할수가 없네"
+)
+GITHUB_URL_TEXT = (
+    "https://github.com/DietrichGebert/ponytail\n\n"
+    "AI가 코드를 작성하기 전에 다음 6단계의 사다리를 거치도록 통제합니다..."
+)
 
 
 class RegistryLookupResult:
@@ -64,7 +72,10 @@ class Ledger:
         self.normalization_runs: list[dict[str, Any]] = []
         self.candidate_group_id: UUID | None = None
         self.primary_artifact_id: UUID | None = None
+        self.primary_artifact_type: str | None = None
         self.enrichment_requests = 0
+        self.enrichment_request_event_id: UUID | None = None
+        self.provider_route_counts: dict[str, int] = {}
         self.refresh_event_id: UUID | None = None
         self.text_idea_snapshot_count = 0
         self.bundle_id: UUID | None = None
@@ -105,7 +116,15 @@ class FakeCollectorRepository:
                 "current_version_no": 0,
             }
             self.ledger.current[key] = row
-        row.update({"raw_message_json": projection.raw_message_json})
+        row.update(
+            {
+                "text_body": projection.text_body,
+                "caption_text": projection.caption_text,
+                "text_surface": projection.text_surface,
+                "url_surface_json": projection.url_surface_json,
+                "raw_message_json": projection.raw_message_json,
+            }
+        )
         return row
 
     async def append_source_message_version(
@@ -162,10 +181,12 @@ class FakeMaterializerRepository:
             normalization_runs=len(self.ledger.normalization_runs),
             candidate_groups=1 if self.ledger.candidate_group_id else 0,
             primary_members=1 if self.ledger.primary_artifact_id else 0,
-            primary_artifact_type="text_idea" if self.ledger.primary_artifact_id else None,
+            primary_artifact_type=self.ledger.primary_artifact_type,
             primary_artifact_id=self.ledger.primary_artifact_id,
             candidate_group_id=self.ledger.candidate_group_id,
             enrichment_requests=self.ledger.enrichment_requests,
+            enrichment_request_event_id=self.ledger.enrichment_request_event_id,
+            provider_route_counts=self.ledger.provider_route_counts,
         )
 
     async def insert_candidate_bundle_refresh_event(
@@ -213,7 +234,11 @@ class FakeMaterializerRepository:
             telegram_raw_updates=self.ledger.raw_updates,
             normalization_runs=len(self.ledger.normalization_runs),
             candidate_groups=1 if self.ledger.candidate_group_id else 0,
-            primary_text_idea_members=1 if self.ledger.primary_artifact_id else 0,
+            primary_text_idea_members=(
+                1
+                if self.ledger.primary_artifact_id and self.ledger.primary_artifact_type == "text_idea"
+                else 0
+            ),
             external_enrichment_requests=self.ledger.enrichment_requests,
             text_idea_snapshots=self.ledger.text_idea_snapshot_count,
             ready_current_bundles=1 if self.ledger.bundle_id else 0,
@@ -238,6 +263,20 @@ class FakeNormalizerService:
             self.ledger.normalization_runs.append({"trigger_event_id": message.trigger_event_id})
             self.ledger.candidate_group_id = uuid4()
             self.ledger.primary_artifact_id = uuid4()
+            current = next(iter(self.ledger.current.values()))
+            if current.get("url_surface_json"):
+                self.ledger.primary_artifact_type = "github_repo"
+                self.ledger.enrichment_requests = 1
+                self.ledger.enrichment_request_event_id = uuid4()
+                self.ledger.provider_route_counts = {"github": 1}
+                self.ledger.outbox.append(
+                    {
+                        "event_id": self.ledger.enrichment_request_event_id,
+                        "event_type": "artifact.enrich.requested.v1",
+                    }
+                )
+            else:
+                self.ledger.primary_artifact_type = "text_idea"
 
 
 class FakeAssemblerService:
@@ -281,7 +320,7 @@ class FakeStageFactory:
         self.ledger.call_order.append(f"exit:{stage_name}")
 
 
-def packet(text: str = "AI developer workflow automation for repository tests."):
+def packet(text: str = KOREAN_LLM_WORKFLOW_TEXT):
     return parse_operator_source_packet(
         {
             "schema_version": "operator_supplied_telegram_source_v1",
@@ -330,7 +369,7 @@ def runtime_bundle() -> RuntimeConfigBundle:
 
 async def run(ledger: Ledger, *, mode: str = "plan", text: str | None = None):
     return await run_exact_target_source_to_analysis_materializer(
-        ExactTargetSourceToAnalysisRequest(mode=mode, packet=packet(text or "AI developer workflow automation for repository tests.")),
+        ExactTargetSourceToAnalysisRequest(mode=mode, packet=packet(text or KOREAN_LLM_WORKFLOW_TEXT)),
         stage_factory=FakeStageFactory(ledger),
     )
 
@@ -374,17 +413,21 @@ async def test_plan_is_read_only_and_reports_local_text_idea_candidate() -> None
 
 
 @pytest.mark.asyncio
-async def test_plan_blocks_external_url_before_writes() -> None:
+async def test_plan_predicts_provider_enrichment_for_url_before_writes() -> None:
     ledger = Ledger()
 
     report = await run(
         ledger,
         mode="plan",
-        text="AI developer workflow automation https://example.com/project",
+        text=GITHUB_URL_TEXT,
     )
 
-    assert report.status == "blocked"
-    assert report.reason_code == "external_enrichment_required"
+    assert report.status == "pass"
+    assert report.reason_code == "plan_ready"
+    assert report.bounded_counts["predicted_candidates"] == 1
+    assert report.bounded_counts["predicted_external_urls"] == 1
+    assert report.bounded_counts["predicted_enrichment_requests"] == 1
+    assert report.bounded_counts["predicted_provider_route_github"] == 1
     assert ledger.current == {}
     assert ledger.outbox == []
 
@@ -419,6 +462,7 @@ async def test_execute_stage_order_materializes_exactly_one_analysis_request() -
     assert report.text_idea_snapshot_created is True
     assert report.bundle_created is True
     assert report.analysis_request_created is True
+    assert report.artifact_enrichment_request_created is False
     assert report.openai_attempted is False
     assert report.redis_attempted is False
     assert report.telegram_live_read_attempted is False
@@ -433,6 +477,40 @@ async def test_execute_stage_order_materializes_exactly_one_analysis_request() -
     assert ledger.call_order.index("commit:normalization") < ledger.call_order.index("enter:normalization_readback")
     assert ledger.call_order.index("commit:refresh_event") < ledger.call_order.index("enter:assembler")
     assert ledger.call_order.index("commit:assembler") < ledger.call_order.index("enter:final_readback")
+
+
+@pytest.mark.asyncio
+async def test_execute_url_path_requests_provider_enrichment_without_assembler_or_analysis() -> None:
+    ledger = Ledger()
+
+    report = await run(ledger, mode="execute", text=GITHUB_URL_TEXT)
+
+    assert report.status == "pass"
+    assert report.reason_code == "provider_enrichment_requested"
+    assert report.source_ingest_attempted is True
+    assert report.normalization_attempted is True
+    assert report.bundle_refresh_attempted is False
+    assert report.assembler_attempted is False
+    assert report.source_message_created is True
+    assert report.source_version_created is True
+    assert report.candidate_created is True
+    assert report.artifact_enrichment_request_created is True
+    assert report.artifact_enrichment_request_fingerprint is not None
+    assert report.text_idea_snapshot_created is False
+    assert report.bundle_created is False
+    assert report.analysis_request_created is False
+    assert report.openai_attempted is False
+    assert report.redis_attempted is False
+    assert report.telegram_live_read_attempted is False
+    assert report.telegram_send_attempted is False
+    assert report.external_network_attempted is False
+    assert report.bounded_counts["external_enrichment_requests"] == 1
+    assert report.bounded_counts["provider_route_github"] == 1
+    assert report.bounded_counts["analysis_requested_events"] == 0
+    assert ledger.enrichment_requests == 1
+    assert sum(1 for row in ledger.outbox if row["event_type"] == "artifact.enrich.requested.v1") == 1
+    assert "enter:refresh_event" not in ledger.call_order
+    assert "enter:assembler" not in ledger.call_order
 
 
 @pytest.mark.asyncio

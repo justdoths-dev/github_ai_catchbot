@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Protocol
+from urllib.parse import urlparse
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -25,15 +26,15 @@ from ..collector_telegram.operator_supplied_source import (
     load_operator_source_packet,
 )
 from ..evidence_assembler.config import EvidenceAssemblerConfig
-from ..router_normalizer.canonicalizer import build_text_idea_artifact
+from ..router_normalizer.canonicalizer import build_text_idea_artifact, canonicalize_resolved_urls
 from ..router_normalizer.config import RouterNormalizerConfig
-from ..router_normalizer.models import RedisNormalizeMessage, SourceMessageSnapshot
+from ..router_normalizer.models import RedisNormalizeMessage, ResolvedUrl, SourceMessageSnapshot
 from ..router_normalizer.text_surfaces import build_text_surfaces
 from ..router_normalizer.trigger_rules import evaluate_triggers
 from ..router_normalizer.url_extraction import extract_urls
 
 
-SCHEMA_VERSION = "exact_target_source_to_analysis_materializer_report_v1"
+SCHEMA_VERSION = "exact_target_source_to_analysis_materializer_report_v2"
 CONFIRM_TOKEN = "materialize-source-analysis"
 PLACEHOLDER_REDIS_URL = "redis_locator_not_attempted"
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -88,6 +89,7 @@ class ExactTargetSourceToAnalysisReport:
     artifact_fingerprint: str | None
     candidate_group_fingerprint: str | None
     refresh_event_fingerprint: str | None
+    artifact_enrichment_request_fingerprint: str | None
     bundle_fingerprint: str | None
     analysis_request_fingerprint: str | None
     preflight_passed: bool
@@ -101,6 +103,7 @@ class ExactTargetSourceToAnalysisReport:
     text_idea_snapshot_created: bool
     bundle_created: bool
     analysis_request_created: bool
+    artifact_enrichment_request_created: bool
     openai_attempted: bool
     redis_attempted: bool
     telegram_live_read_attempted: bool
@@ -125,7 +128,7 @@ class RuntimeConfigBundle:
 
 
 @dataclass(slots=True, frozen=True)
-class LocalTextIdeaPlan:
+class LocalSourceRoutingPlan:
     signal_detected: bool
     candidate_eligible: bool
     predicted_candidate_count: int
@@ -133,6 +136,7 @@ class LocalTextIdeaPlan:
     artifact_fingerprint: str | None
     external_url_count: int
     enrichment_request_count: int
+    provider_route_counts: dict[str, int] = field(default_factory=dict)
     reason_code: str | None = None
 
     @property
@@ -149,6 +153,8 @@ class NormalizationReadback:
     primary_artifact_id: UUID | None
     candidate_group_id: UUID | None
     enrichment_requests: int
+    enrichment_request_event_id: UUID | None = None
+    provider_route_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
@@ -200,7 +206,7 @@ class PreflightSnapshot:
     registry_target: TelegramRegistryTarget | None = None
     source_content_hash: str | None = None
     source_message_id: str | None = None
-    local_plan: LocalTextIdeaPlan | None = None
+    local_plan: LocalSourceRoutingPlan | None = None
     reason_code: str | None = None
 
     @property
@@ -252,9 +258,20 @@ class StageFactoryProtocol(Protocol):
 
 
 class NoNetworkShortUrlResolver:
+    def __init__(self, allowlist: Sequence[str] = ()) -> None:
+        self._allowlist = {host.lower().removeprefix("www.") for host in allowlist}
+
     async def resolve(self, url: Any) -> Any:
-        del url
-        raise OperatorSuppliedSourceError("external_enrichment_required")
+        normalized = _strip_url_fragment(str(url.observed_url))
+        resolution_status = "short_url_unresolved" if _url_host(normalized) in self._allowlist else "not_short_url"
+        return ResolvedUrl(
+            observed_url=str(url.observed_url),
+            normalized_url=normalized,
+            resolved_url=None,
+            source_kind=str(url.source_kind),
+            context_path=getattr(url, "context_path", None),
+            resolution_status=resolution_status,
+        )
 
 
 class SqlExactTargetSourceToAnalysisRepository:
@@ -311,19 +328,26 @@ class SqlExactTargetSourceToAnalysisRepository:
                 "source_version_no": source_version_no,
             },
         )
-        enrichment_requests = await self._count(
+        enrichment_rows = await self._rows(
             """
-            SELECT count(*)
+            SELECT event_id, payload_json->>'provider_route' AS provider_route
             FROM event_outbox
             WHERE event_type = 'artifact.enrich.requested.v1'
               AND payload_json->>'source_message_id' = :source_message_id
               AND payload_json->>'source_version_no' = :source_version_no_text
+            ORDER BY created_at ASC, event_id ASC
+            LIMIT 10
             """,
             {
                 "source_message_id": str(source_message_id),
                 "source_version_no_text": str(source_version_no),
             },
         )
+        provider_route_counts: dict[str, int] = {}
+        for row in enrichment_rows:
+            route = str(row.get("provider_route") or "")
+            if route in {"github", "x", "web"}:
+                provider_route_counts[route] = provider_route_counts.get(route, 0) + 1
         first = primary_rows[0] if primary_rows else None
         return NormalizationReadback(
             normalization_runs=normalization_runs,
@@ -332,7 +356,11 @@ class SqlExactTargetSourceToAnalysisRepository:
             primary_artifact_type=None if first is None else str(first["artifact_type"]),
             primary_artifact_id=None if first is None else UUID(str(first["artifact_id"])),
             candidate_group_id=None if first is None else UUID(str(first["candidate_group_id"])),
-            enrichment_requests=enrichment_requests,
+            enrichment_requests=len(enrichment_rows),
+            enrichment_request_event_id=(
+                None if not enrichment_rows else UUID(str(enrichment_rows[0]["event_id"]))
+            ),
+            provider_route_counts=provider_route_counts,
         )
 
     async def insert_candidate_bundle_refresh_event(
@@ -625,7 +653,7 @@ class SqlStageComponents:
         self.normalizer_service = RouterNormalizerService(
             runtime.router_config,
             repository=RouterNormalizerRepository(session),
-            short_url_resolver=NoNetworkShortUrlResolver(),
+            short_url_resolver=NoNetworkShortUrlResolver(runtime.router_config.short_url_allowlist),
         )
         self.assembler_service = EvidenceAssemblerService(
             runtime.assembler_config,
@@ -847,6 +875,32 @@ async def run_exact_target_source_to_analysis_materializer(
             return replace(report, status="failed", reason_code=normalization_error)
         assert normalization.candidate_group_id is not None
 
+        if normalization.enrichment_requests >= 1:
+            async with stage_factory.stage("final_readback") as components:
+                final = await components.materializer_repository.load_final_readback(
+                    source_message_id=source_message_id,
+                    source_version_no=source_version_no,
+                    source_content_hash=preflight.source_content_hash,
+                    chat_id=preflight.registry_target.chat_id,
+                    message_id=request.packet.parsed_ref.message_id,
+                    candidate_group_id=normalization.candidate_group_id,
+                )
+            report = _apply_final_readback(report, final)
+            provider_error = _provider_enrichment_readback_error(final)
+            if provider_error is not None:
+                return replace(report, status="failed", reason_code=provider_error)
+            return replace(
+                report,
+                status="pass",
+                reason_code="provider_enrichment_requested",
+                preflight_passed=True,
+                source_message_created=True,
+                source_version_created=True,
+                candidate_created=True,
+                artifact_enrichment_request_created=True,
+                analysis_request_created=False,
+            )
+
         report = replace(report, bundle_refresh_attempted=True)
         async with stage_factory.stage("refresh_event") as components:
             refresh = await components.materializer_repository.insert_candidate_bundle_refresh_event(
@@ -1006,7 +1060,7 @@ async def _load_preflight(
         packet,
     )
     projection = build_source_projection(packet=packet, registry_target=registry_target)
-    local_plan = _plan_local_text_idea(packet=packet, registry_target=registry_target)
+    local_plan = _plan_source_routing(packet=packet, registry_target=registry_target)
     if not local_plan.passed:
         return PreflightSnapshot(
             registry_target=registry_target,
@@ -1034,11 +1088,11 @@ async def _load_preflight(
     )
 
 
-def _plan_local_text_idea(
+def _plan_source_routing(
     *,
     packet: OperatorSuppliedTelegramSourcePacket,
     registry_target: TelegramRegistryTarget,
-) -> LocalTextIdeaPlan:
+) -> LocalSourceRoutingPlan:
     projection = build_source_projection(packet=packet, registry_target=registry_target)
     snapshot = SourceMessageSnapshot(
         source_message_id=UUID("00000000-0000-0000-0000-000000000000"),
@@ -1053,19 +1107,63 @@ def _plan_local_text_idea(
     surfaces = build_text_surfaces(snapshot)
     extracted_urls = extract_urls(snapshot, surfaces)
     if extracted_urls:
-        return LocalTextIdeaPlan(
-            signal_detected=False,
-            candidate_eligible=False,
-            predicted_candidate_count=0,
-            primary_artifact_type=None,
-            artifact_fingerprint=None,
+        artifacts = canonicalize_resolved_urls(
+            [
+                ResolvedUrl(
+                    observed_url=url.observed_url,
+                    normalized_url=url.observed_url,
+                    resolved_url=None,
+                    source_kind=url.source_kind,
+                    context_path=url.context_path,
+                )
+                for url in extracted_urls
+            ]
+        )
+        evaluation = evaluate_triggers(surfaces, artifacts)
+        provider_request_count = sum(1 for artifact in artifacts if artifact.provider_route is not None)
+        provider_route_counts = _provider_route_counts(artifacts)
+        primary_artifact = artifacts[0] if artifacts else None
+        if not evaluation.signal_detected:
+            return LocalSourceRoutingPlan(
+                signal_detected=False,
+                candidate_eligible=False,
+                predicted_candidate_count=0,
+                primary_artifact_type=None,
+                artifact_fingerprint=None,
+                external_url_count=len(extracted_urls),
+                enrichment_request_count=provider_request_count,
+                provider_route_counts=provider_route_counts,
+                reason_code="signal_not_detected",
+            )
+        if not evaluation.candidate_eligible:
+            return LocalSourceRoutingPlan(
+                signal_detected=True,
+                candidate_eligible=False,
+                predicted_candidate_count=0,
+                primary_artifact_type=None if primary_artifact is None else primary_artifact.artifact_type,
+                artifact_fingerprint=(
+                    None if primary_artifact is None else fingerprint_value(primary_artifact.canonical_id)
+                ),
+                external_url_count=len(extracted_urls),
+                enrichment_request_count=provider_request_count,
+                provider_route_counts=provider_route_counts,
+                reason_code="candidate_not_eligible",
+            )
+        return LocalSourceRoutingPlan(
+            signal_detected=True,
+            candidate_eligible=True,
+            predicted_candidate_count=1,
+            primary_artifact_type=None if primary_artifact is None else primary_artifact.artifact_type,
+            artifact_fingerprint=(
+                None if primary_artifact is None else fingerprint_value(primary_artifact.canonical_id)
+            ),
             external_url_count=len(extracted_urls),
-            enrichment_request_count=len(extracted_urls),
-            reason_code="external_enrichment_required",
+            enrichment_request_count=provider_request_count,
+            provider_route_counts=provider_route_counts,
         )
     evaluation = evaluate_triggers(surfaces, [])
     if not evaluation.signal_detected:
-        return LocalTextIdeaPlan(
+        return LocalSourceRoutingPlan(
             signal_detected=False,
             candidate_eligible=False,
             predicted_candidate_count=0,
@@ -1076,7 +1174,7 @@ def _plan_local_text_idea(
             reason_code="signal_not_detected",
         )
     if not evaluation.candidate_eligible:
-        return LocalTextIdeaPlan(
+        return LocalSourceRoutingPlan(
             signal_detected=True,
             candidate_eligible=False,
             predicted_candidate_count=0,
@@ -1087,7 +1185,7 @@ def _plan_local_text_idea(
             reason_code="candidate_not_eligible",
         )
     artifact = build_text_idea_artifact(surfaces)
-    return LocalTextIdeaPlan(
+    return LocalSourceRoutingPlan(
         signal_detected=True,
         candidate_eligible=True,
         predicted_candidate_count=1,
@@ -1096,6 +1194,25 @@ def _plan_local_text_idea(
         external_url_count=0,
         enrichment_request_count=0,
     )
+
+
+def _provider_route_counts(artifacts: Sequence[Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for artifact in artifacts:
+        route = getattr(artifact, "provider_route", None)
+        if route in {"github", "x", "web"}:
+            counts[route] = counts.get(route, 0) + 1
+    return counts
+
+
+def _strip_url_fragment(url: str) -> str:
+    parsed = urlparse(url)
+    return parsed._replace(fragment="").geturl()
+
+
+def _url_host(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    return host.removeprefix("www.")
 
 
 def _apply_preflight(
@@ -1109,6 +1226,10 @@ def _apply_preflight(
                 "predicted_candidates": preflight.local_plan.predicted_candidate_count,
                 "predicted_external_urls": preflight.local_plan.external_url_count,
                 "predicted_enrichment_requests": preflight.local_plan.enrichment_request_count,
+                **{
+                    f"predicted_provider_route_{route}": count
+                    for route, count in preflight.local_plan.provider_route_counts.items()
+                },
             }
         )
     return replace(
@@ -1152,11 +1273,17 @@ def _apply_normalization_readback(
                 "candidate_groups": readback.candidate_groups,
                 "primary_members": readback.primary_members,
                 "external_enrichment_requests": readback.enrichment_requests,
+                **{
+                    f"provider_route_{route}": count
+                    for route, count in readback.provider_route_counts.items()
+                },
             },
         ),
         candidate_group_fingerprint=_fingerprint(readback.candidate_group_id),
         artifact_fingerprint=_fingerprint(readback.primary_artifact_id),
         candidate_created=readback.candidate_groups == 1,
+        artifact_enrichment_request_created=readback.enrichment_requests >= 1,
+        artifact_enrichment_request_fingerprint=_fingerprint(readback.enrichment_request_event_id),
     )
 
 
@@ -1181,10 +1308,43 @@ def _normalization_error(readback: NormalizationReadback) -> str | None:
         return "candidate_group_cardinality_invalid"
     if readback.primary_members != 1:
         return "primary_member_cardinality_invalid"
+    if readback.enrichment_requests >= 1:
+        if readback.primary_artifact_type == "text_idea":
+            return "primary_artifact_type_invalid_for_enrichment"
+        if not readback.provider_route_counts:
+            return "provider_route_missing"
+        return None
     if readback.primary_artifact_type != "text_idea":
         return "primary_artifact_type_not_text_idea"
-    if readback.enrichment_requests != 0:
-        return "external_enrichment_required"
+    return None
+
+
+def _provider_enrichment_readback_error(readback: FinalReadback) -> str | None:
+    expected_one = {
+        "source_messages": readback.source_messages,
+        "source_message_versions": readback.source_message_versions,
+        "source_created_events": readback.source_created_events,
+        "normalization_runs": readback.normalization_runs,
+        "candidate_groups": readback.candidate_groups,
+    }
+    for name, count in expected_one.items():
+        if count != 1:
+            return f"{name}_cardinality_invalid"
+    expected_zero = {
+        "telegram_raw_updates": readback.telegram_raw_updates,
+        "primary_text_idea_members": readback.primary_text_idea_members,
+        "text_idea_snapshots": readback.text_idea_snapshots,
+        "ready_current_bundles": readback.ready_current_bundles,
+        "candidate_evidence_members": readback.candidate_evidence_members,
+        "analysis_requested_events": readback.analysis_requested_events,
+        "judge_runs": readback.judge_runs,
+        "judge_call_requested_events": readback.judge_call_requested_events,
+    }
+    for name, count in expected_zero.items():
+        if count != 0:
+            return f"{name}_unexpected"
+    if readback.external_enrichment_requests < 1:
+        return "artifact_enrichment_request_missing"
     return None
 
 
@@ -1240,6 +1400,7 @@ def _report(
         artifact_fingerprint=None,
         candidate_group_fingerprint=None,
         refresh_event_fingerprint=None,
+        artifact_enrichment_request_fingerprint=None,
         bundle_fingerprint=None,
         analysis_request_fingerprint=None,
         preflight_passed=False,
@@ -1253,6 +1414,7 @@ def _report(
         text_idea_snapshot_created=False,
         bundle_created=False,
         analysis_request_created=False,
+        artifact_enrichment_request_created=False,
         openai_attempted=False,
         redis_attempted=False,
         telegram_live_read_attempted=False,

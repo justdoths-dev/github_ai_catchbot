@@ -40,6 +40,12 @@ from src.services.router_normalizer.models import (
 from src.services.router_normalizer.service import RouterNormalizerService
 
 
+KOREAN_LLM_WORKFLOW_TEXT = (
+    "회사에서 llm 사용 권한 받은김에 이것저것 작업 중인데.. "
+    "머 보안때문에 되는게 없네요. cli는 쓸수도 없고.. 자동화를 할수가 없네"
+)
+
+
 class Tx:
     async def __aenter__(self):
         return self
@@ -66,6 +72,7 @@ class Ledger:
         self.analysis_outbox: list[dict[str, Any]] = []
         self.current_bundle_updates: list[dict[str, Any]] = []
         self.commits: list[str] = []
+        self.allow_enrichment_requests = False
 
 
 class CollectorRepo:
@@ -250,8 +257,28 @@ class RouterRepo:
 
     async def insert_enrichment_requested_outbox(self, **kwargs):
         artifact = kwargs["artifact"]
-        if artifact.provider_route is not None:
+        if artifact.provider_route is not None and not self.ledger.allow_enrichment_requests:
             raise AssertionError("text_idea path must not request enrichment")
+        if artifact.provider_route is None:
+            return
+        self.ledger.outbox.append(
+            {
+                "event_id": uuid4(),
+                "event_type": "artifact.enrich.requested.v1",
+                "aggregate_type": "artifact",
+                "aggregate_id": kwargs["artifact_id"],
+                "payload_json": {
+                    "candidate_group_id": str(kwargs["candidate_group_id"]),
+                    "artifact_id": str(kwargs["artifact_id"]),
+                    "artifact_type": artifact.artifact_type,
+                    "provider_route": artifact.provider_route,
+                    "source_message_id": str(kwargs["source_message_id"]),
+                    "source_version_no": kwargs["source_version_no"],
+                },
+                "status": "pending",
+                "created_at": datetime.now(timezone.utc),
+            }
+        )
 
 
 class EvidenceRepo:
@@ -386,6 +413,18 @@ class MaterializerRepo:
         ]
         members = self.ledger.members.get(candidates[0].candidate_group_id, []) if candidates else []
         primary = next((member for member in members if member.member_role == "primary"), None)
+        enrichment_rows = [
+            row
+            for row in self.ledger.outbox
+            if row["event_type"] == "artifact.enrich.requested.v1"
+            and row["payload_json"].get("source_message_id") == str(source_message_id)
+            and row["payload_json"].get("source_version_no") == source_version_no
+        ]
+        provider_route_counts: dict[str, int] = {}
+        for row in enrichment_rows:
+            route = row["payload_json"].get("provider_route")
+            if route in {"github", "x", "web"}:
+                provider_route_counts[route] = provider_route_counts.get(route, 0) + 1
         return NormalizationReadback(
             normalization_runs=len(self.ledger.normalization_runs),
             candidate_groups=len(candidates),
@@ -393,7 +432,11 @@ class MaterializerRepo:
             primary_artifact_type=None if primary is None else primary.artifact_type,
             primary_artifact_id=None if primary is None else primary.artifact_id,
             candidate_group_id=None if not candidates else candidates[0].candidate_group_id,
-            enrichment_requests=0,
+            enrichment_requests=len(enrichment_rows),
+            enrichment_request_event_id=(
+                None if not enrichment_rows else enrichment_rows[0]["event_id"]
+            ),
+            provider_route_counts=provider_route_counts,
         )
 
     async def insert_candidate_bundle_refresh_event(
@@ -443,6 +486,9 @@ class MaterializerRepo:
                 1
                 for member in self.ledger.members[candidate_group_id]
                 if member.member_role == "primary" and member.artifact_type == "text_idea"
+            ),
+            external_enrichment_requests=sum(
+                1 for row in self.ledger.outbox if row["event_type"] == "artifact.enrich.requested.v1"
             ),
             text_idea_snapshots=self.ledger.text_idea_snapshots_created,
             ready_current_bundles=1 if bundle_id else 0,
@@ -513,13 +559,13 @@ def assembler_config() -> EvidenceAssemblerConfig:
     )
 
 
-def packet():
+def packet(message_text: str = KOREAN_LLM_WORKFLOW_TEXT):
     return parse_operator_source_packet(
         {
             "schema_version": "operator_supplied_telegram_source_v1",
             "source_ref": "https://t.me/SynthChannel/12345",
             "posted_at": "2026-06-23T01:02:03Z",
-            "message_text": "AI developer workflow automation for repository tests.",
+            "message_text": message_text,
         }
     )
 
@@ -553,3 +599,48 @@ async def test_operator_source_to_analysis_request_flow_uses_real_normalizer_and
     assert ledger.bundles[0][1].judge_profile == "text_idea_primary"
     assert len(ledger.analysis_outbox) == 1
     assert ledger.commits == ["source_ingest", "normalization", "refresh_event", "assembler"]
+
+
+@pytest.mark.asyncio
+async def test_operator_source_url_flow_requests_provider_enrichment_without_assembler() -> None:
+    ledger = Ledger()
+    ledger.allow_enrichment_requests = True
+
+    report = await run_exact_target_source_to_analysis_materializer(
+        ExactTargetSourceToAnalysisRequest(
+            mode="execute",
+            packet=packet(
+                "https://github.com/DietrichGebert/ponytail\n\n"
+                "AI가 코드를 작성하기 전에 다음 6단계의 사다리를 거치도록 통제합니다..."
+            ),
+        ),
+        stage_factory=StageFactory(ledger),
+    )
+
+    assert report.status == "pass"
+    assert report.reason_code == "provider_enrichment_requested"
+    assert report.bundle_refresh_attempted is False
+    assert report.assembler_attempted is False
+    assert report.artifact_enrichment_request_created is True
+    assert report.analysis_request_created is False
+    assert report.openai_attempted is False
+    assert report.redis_attempted is False
+    assert report.telegram_live_read_attempted is False
+    assert report.telegram_send_attempted is False
+    assert report.external_network_attempted is False
+    assert len(ledger.current) == 1
+    assert sum(len(rows) for rows in ledger.versions.values()) == 1
+    assert [row["event_type"] for row in ledger.outbox] == [
+        "source_message.created.v1",
+        "artifact.enrich.requested.v1",
+    ]
+    assert len(ledger.normalization_runs) == 1
+    assert len(ledger.candidates) == 1
+    candidate_group_id = next(iter(ledger.candidates))
+    members = ledger.members[candidate_group_id]
+    assert len(members) == 1
+    assert members[0].artifact_type == "github_repo"
+    assert ledger.text_idea_snapshots_created == 0
+    assert len(ledger.bundles) == 0
+    assert len(ledger.analysis_outbox) == 0
+    assert ledger.commits == ["source_ingest", "normalization"]
