@@ -36,6 +36,7 @@ from ..router_normalizer.url_extraction import extract_urls
 
 SCHEMA_VERSION = "exact_target_source_to_analysis_materializer_report_v2"
 CONFIRM_TOKEN = "materialize-source-analysis"
+PROVIDER_LIVE_CONFIRM_TOKEN = "live-github-provider-evidence"
 PLACEHOLDER_REDIS_URL = "redis_locator_not_attempted"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -60,6 +61,17 @@ RUNTIME_VALUE_KEYS = {
     "EVIDENCE_ASSEMBLER_BUNDLE_PROFILE_VERSION",
     "EVIDENCE_ASSEMBLER_ENABLE_TEXT_IDEA",
     "EVIDENCE_ASSEMBLER_ENABLE_REROOT",
+    "GH_ENRICHER_QUEUE_NAME",
+    "GH_ENRICHER_CONSUMER_GROUP",
+    "GH_ENRICHER_CONSUMER_NAME",
+    "GH_ENRICHER_BATCH_SIZE",
+    "GH_ENRICHER_BLOCK_MS",
+    "GITHUB_API_BASE_URL",
+    "GH_ENRICHER_REQUEST_TIMEOUT_SEC",
+    "GH_ENRICHER_SAMPLE_MAX_FILES",
+    "GH_ENRICHER_SAMPLE_EXCERPT_CHARS",
+    "GH_ENRICHER_MAX_FILE_BYTES",
+    "GH_ENRICHER_STALE_AFTER_SEC",
     "LOG_LEVEL",
 }
 RUNTIME_FILE_KEYS = {"DATABASE_URL_FILE"}
@@ -74,6 +86,21 @@ class SilentArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # pragma: no cover - argparse calls this
         del message
         raise ExactTargetSourceToAnalysisConfigError("invalid_cli_arguments")
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderLiveAuthority:
+    allow_live_github_provider_read: bool = False
+    allow_provider_snapshot_write: bool = False
+    provider_live_confirm: str | None = None
+
+    @property
+    def github_live_opened(self) -> bool:
+        return (
+            self.allow_live_github_provider_read
+            and self.allow_provider_snapshot_write
+            and self.provider_live_confirm == PROVIDER_LIVE_CONFIRM_TOKEN
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -120,6 +147,7 @@ class ExactTargetSourceToAnalysisReport:
 class ExactTargetSourceToAnalysisRequest:
     mode: str
     packet: OperatorSuppliedTelegramSourcePacket
+    provider_authority: ProviderLiveAuthority = field(default_factory=ProviderLiveAuthority)
 
 
 @dataclass(slots=True, frozen=True)
@@ -178,6 +206,7 @@ class ProviderEnrichmentRequest:
     provider_route: str
     refresh_mode: str
     depth_budget: int
+    provider_authority: ProviderLiveAuthority = field(default_factory=ProviderLiveAuthority)
 
 
 @dataclass(slots=True, frozen=True)
@@ -187,6 +216,9 @@ class ProviderEnrichmentResult:
     emitted_snapshot_updated: bool
     snapshot_id: UUID | None = None
     snapshot_updated_event_id: UUID | None = None
+    snapshot_created: bool = False
+    external_network_attempted: bool = False
+    github_request_count: int = 0
     error_code: str | None = None
 
 
@@ -770,19 +802,331 @@ class SqlStageFactory:
 
 
 class SqlProviderEnrichmentService:
-    def __init__(self, session: Any, runtime: RuntimeConfigBundle) -> None:
-        del session, runtime
+    def __init__(
+        self,
+        session: Any,
+        runtime: RuntimeConfigBundle,
+        *,
+        github_client_factory: Callable[[Any], Any] | None = None,
+        repository_factory: Callable[[Any], Any] | None = None,
+        track_external_network: bool = True,
+    ) -> None:
+        self._session = session
+        self._runtime = runtime
+        self._github_client_factory = github_client_factory
+        self._repository_factory = repository_factory
+        self._track_external_network = track_external_network
 
     async def materialize_provider_request(
         self,
         request: ProviderEnrichmentRequest,
     ) -> ProviderEnrichmentResult:
+        if not request.provider_authority.github_live_opened:
+            return ProviderEnrichmentResult(
+                provider_route=request.provider_route,
+                status="blocked",
+                emitted_snapshot_updated=False,
+                error_code="provider_live_authority_required",
+            )
+        if request.provider_route != "github":
+            return ProviderEnrichmentResult(
+                provider_route=request.provider_route,
+                status="blocked",
+                emitted_snapshot_updated=False,
+                error_code="provider_route_not_supported_by_live_exact_materializer",
+            )
+        try:
+            gh_config = _build_gh_enricher_config(self._runtime)
+            _validate_gh_enricher_caps(gh_config)
+        except ExactTargetSourceToAnalysisConfigError as exc:
+            return ProviderEnrichmentResult(
+                provider_route=request.provider_route,
+                status="blocked",
+                emitted_snapshot_updated=False,
+                error_code=_safe_reason_code(exc),
+            )
+
+        from ..gh_enricher.fetch_planner import GitHubFetchPlanner
+        from ..gh_enricher.file_sampler import GitHubFileSampler
+        from ..gh_enricher.github_client import GitHubClient
+        from ..gh_enricher.models import ArtifactEnrichmentJob
+        from ..gh_enricher.repositories import GhEnricherRepository
+        from ..gh_enricher.service import GhEnricherService
+        from ..gh_enricher.url_discovery import GitHubUrlDiscovery
+
+        state = _GitHubProviderAttemptState()
+        client_factory = self._github_client_factory or (
+            lambda config: GitHubClient(
+                api_base_url=config.github_api_base_url,
+                timeout_sec=config.request_timeout_sec,
+                token_provider=None,
+            )
+        )
+        repository_factory = self._repository_factory or (lambda session: GhEnricherRepository(session))
+        repository = _SnapshotUpdatedEventCapturingGhRepository(
+            repository_factory(self._session),
+            session=self._session,
+        )
+        github_client = _TrackedGitHubClient(
+            client_factory(gh_config),
+            state,
+            request_limit=_github_request_limit(),
+            track_external_network=self._track_external_network,
+        )
+        service = GhEnricherService(
+            gh_config,
+            repository=repository,  # type: ignore[arg-type]
+            github_client=github_client,  # type: ignore[arg-type]
+            fetch_planner=GitHubFetchPlanner(),
+            file_sampler=GitHubFileSampler(),
+            url_discovery=GitHubUrlDiscovery(),
+        )
+        try:
+            result = await service.handle_job(
+                ArtifactEnrichmentJob(
+                    trigger_event_id=request.trigger_event_id,
+                    event_type="artifact.enrich.requested.v1",
+                    candidate_group_id=request.candidate_group_id,
+                    artifact_id=request.artifact_id,
+                    artifact_type=request.artifact_type,  # type: ignore[arg-type]
+                    provider_route=request.provider_route,
+                    refresh_mode=request.refresh_mode,
+                    depth_budget=request.depth_budget,
+                )
+            )
+        except _GitHubRequestCapExceeded:
+            return ProviderEnrichmentResult(
+                provider_route=request.provider_route,
+                status="blocked",
+                emitted_snapshot_updated=False,
+                external_network_attempted=state.external_network_attempted,
+                github_request_count=state.github_request_count,
+                error_code="github_request_cap_exceeded",
+            )
+        except Exception:
+            return ProviderEnrichmentResult(
+                provider_route=request.provider_route,
+                status="failed_transient",
+                emitted_snapshot_updated=False,
+                external_network_attempted=state.external_network_attempted,
+                github_request_count=state.github_request_count,
+                error_code="provider_live_read_failed",
+            )
+
         return ProviderEnrichmentResult(
             provider_route=request.provider_route,
-            status="blocked",
-            emitted_snapshot_updated=False,
-            error_code="provider_live_authority_required",
+            status=result.status,
+            emitted_snapshot_updated=result.emitted_snapshot_updated,
+            snapshot_id=result.snapshot_id,
+            snapshot_updated_event_id=repository.snapshot_updated_event_id,
+            snapshot_created=repository.snapshot_write_attempted,
+            external_network_attempted=state.external_network_attempted,
+            github_request_count=state.github_request_count,
         )
+
+
+@dataclass(slots=True)
+class _GitHubProviderAttemptState:
+    external_network_attempted: bool = False
+    github_request_count: int = 0
+
+
+class _GitHubRequestCapExceeded(Exception):
+    pass
+
+
+class _TrackedGitHubClient:
+    def __init__(
+        self,
+        github_client: Any,
+        state: _GitHubProviderAttemptState,
+        *,
+        request_limit: int,
+        track_external_network: bool,
+    ) -> None:
+        self._github_client = github_client
+        self._state = state
+        self._request_limit = request_limit
+        self._track_external_network = track_external_network
+
+    async def get_repo(self, owner: str, repo: str, *, auth_mode: str) -> dict[str, Any]:
+        self._count_request()
+        return await self._github_client.get_repo(owner, repo, auth_mode=auth_mode)
+
+    async def get_tree(
+        self,
+        owner: str,
+        repo: str,
+        ref: str,
+        *,
+        recursive: bool,
+        auth_mode: str,
+    ) -> dict[str, Any]:
+        self._count_request()
+        return await self._github_client.get_tree(
+            owner,
+            repo,
+            ref,
+            recursive=recursive,
+            auth_mode=auth_mode,
+        )
+
+    async def get_contents(
+        self,
+        owner: str,
+        repo: str,
+        path: str,
+        *,
+        ref: str | None,
+        auth_mode: str,
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        self._count_request()
+        return await self._github_client.get_contents(owner, repo, path, ref=ref, auth_mode=auth_mode)
+
+    async def get_releases(self, owner: str, repo: str, *, auth_mode: str) -> list[dict[str, Any]]:
+        self._count_request()
+        return await self._github_client.get_releases(owner, repo, auth_mode=auth_mode)
+
+    async def get_default_branch_head(
+        self,
+        owner: str,
+        repo: str,
+        default_branch: str,
+        *,
+        auth_mode: str,
+    ) -> dict[str, Any]:
+        self._count_request()
+        return await self._github_client.get_default_branch_head(
+            owner,
+            repo,
+            default_branch,
+            auth_mode=auth_mode,
+        )
+
+    async def get_gist(self, gist_id: str, *, auth_mode: str) -> dict[str, Any]:
+        self._count_request()
+        return await self._github_client.get_gist(gist_id, auth_mode=auth_mode)
+
+    def _count_request(self) -> None:
+        self._state.github_request_count += 1
+        if self._state.github_request_count > self._request_limit:
+            raise _GitHubRequestCapExceeded
+        if self._track_external_network:
+            self._state.external_network_attempted = True
+
+
+class _SnapshotUpdatedEventCapturingGhRepository:
+    def __init__(self, repository: Any, *, session: Any) -> None:
+        self._repository = repository
+        self._session = session
+        self.snapshot_updated_event_id: UUID | None = None
+        self.snapshot_write_attempted = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._repository, name)
+
+    async def insert_snapshot(self, **kwargs: Any) -> UUID:
+        self.snapshot_write_attempted = True
+        return await self._repository.insert_snapshot(**kwargs)
+
+    async def insert_snapshot_updated_outbox(self, **kwargs: Any) -> UUID | None:
+        event_id = await self._repository.insert_snapshot_updated_outbox(**kwargs)
+        if event_id is None:
+            event_id = await self._load_existing_snapshot_updated_event_id(
+                artifact_id=kwargs["artifact_id"],
+                snapshot_id=kwargs["snapshot_id"],
+            )
+        self.snapshot_updated_event_id = event_id
+        return event_id
+
+    async def _load_existing_snapshot_updated_event_id(
+        self,
+        *,
+        artifact_id: UUID,
+        snapshot_id: UUID,
+    ) -> UUID | None:
+        execute = getattr(self._session, "execute", None)
+        if execute is None:
+            return None
+        result = await execute(
+            sa.text(
+                """
+                SELECT event_id
+                FROM event_outbox
+                WHERE event_type = 'artifact.snapshot.updated.v1'
+                  AND dedupe_key = :dedupe_key
+                ORDER BY created_at ASC, event_id ASC
+                LIMIT 1
+                """
+            ),
+            {"dedupe_key": f"artifact:snapshot_updated:{artifact_id}:{snapshot_id}"},
+        )
+        scalar = getattr(result, "scalar_one_or_none", None)
+        if scalar is None:
+            return None
+        row = scalar()
+        return UUID(str(row)) if row else None
+
+
+def _build_gh_enricher_config(runtime: RuntimeConfigBundle) -> Any:
+    from ..gh_enricher.config import GhEnricherConfig
+
+    values = runtime.values
+    try:
+        config = GhEnricherConfig(
+            app_env=_read(values, "APP_ENV", runtime.router_config.app_env).lower(),
+            database_url=runtime.database_url,
+            redis_url=runtime.router_config.redis_url or PLACEHOLDER_REDIS_URL,
+            queue_name=_read(values, "GH_ENRICHER_QUEUE_NAME", "q.artifact.enrich.github"),
+            consumer_group=_read(values, "GH_ENRICHER_CONSUMER_GROUP", "gh-enricher"),
+            consumer_name=_read(values, "GH_ENRICHER_CONSUMER_NAME", "gh-enricher-1"),
+            batch_size=int(_read(values, "GH_ENRICHER_BATCH_SIZE", "1")),
+            block_ms=int(_read(values, "GH_ENRICHER_BLOCK_MS", "5000")),
+            github_api_base_url=_read(values, "GITHUB_API_BASE_URL", "https://api.github.com"),
+            github_app_id=None,
+            github_installation_id=None,
+            github_private_key=None,
+            request_timeout_sec=float(_read(values, "GH_ENRICHER_REQUEST_TIMEOUT_SEC", "10")),
+            sample_max_files=int(_read(values, "GH_ENRICHER_SAMPLE_MAX_FILES", "20")),
+            sample_excerpt_chars=int(_read(values, "GH_ENRICHER_SAMPLE_EXCERPT_CHARS", "1200")),
+            max_file_bytes=int(_read(values, "GH_ENRICHER_MAX_FILE_BYTES", "131072")),
+            stale_after_sec=int(_read(values, "GH_ENRICHER_STALE_AFTER_SEC", "21600")),
+            log_level=_read(values, "LOG_LEVEL", "INFO").upper(),
+        )
+        config.validate()
+        return config
+    except Exception:
+        raise ExactTargetSourceToAnalysisConfigError("github_provider_runtime_config_invalid") from None
+
+
+def _validate_gh_enricher_caps(config: Any) -> None:
+    from ..gh_enricher.bounded_github_enrich_runner import (
+        ALLOWED_GITHUB_API_BASE_URL,
+        HARD_MAX_FILE_BYTES,
+        HARD_REQUEST_TIMEOUT_SEC,
+        HARD_SAMPLE_EXCERPT_CHARS,
+        HARD_SAMPLE_MAX_FILES,
+        QUEUE_NAME,
+    )
+
+    if config.queue_name != QUEUE_NAME:
+        raise ExactTargetSourceToAnalysisConfigError("github_provider_queue_name_mismatch")
+    if config.github_api_base_url.rstrip("/") != ALLOWED_GITHUB_API_BASE_URL:
+        raise ExactTargetSourceToAnalysisConfigError("github_api_base_url_not_allowed")
+    if config.request_timeout_sec <= 0 or config.request_timeout_sec > HARD_REQUEST_TIMEOUT_SEC:
+        raise ExactTargetSourceToAnalysisConfigError("github_timeout_cap_out_of_range")
+    if config.sample_max_files <= 0 or config.sample_max_files > HARD_SAMPLE_MAX_FILES:
+        raise ExactTargetSourceToAnalysisConfigError("github_sample_max_files_cap_out_of_range")
+    if config.sample_excerpt_chars <= 0 or config.sample_excerpt_chars > HARD_SAMPLE_EXCERPT_CHARS:
+        raise ExactTargetSourceToAnalysisConfigError("github_sample_excerpt_cap_out_of_range")
+    if config.max_file_bytes <= 0 or config.max_file_bytes > HARD_MAX_FILE_BYTES:
+        raise ExactTargetSourceToAnalysisConfigError("github_max_file_bytes_cap_out_of_range")
+
+
+def _github_request_limit() -> int:
+    from ..gh_enricher.bounded_github_enrich_runner import HARD_GITHUB_REQUEST_LIMIT
+
+    return HARD_GITHUB_REQUEST_LIMIT
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -791,6 +1135,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-packet-json", action="append", default=[])
     parser.add_argument("--env-file")
     parser.add_argument("--confirm", default=None)
+    parser.add_argument("--allow-live-github-provider-read", action="store_true")
+    parser.add_argument("--allow-provider-snapshot-write", action="store_true")
+    parser.add_argument("--provider-live-confirm", default=None)
     return parser
 
 
@@ -840,6 +1187,19 @@ async def run_cli(
             )
         )
         return 2
+    if args.mode == "plan" and _provider_authority_args_present(args):
+        emit_json(
+            _compact_json(
+                asdict(
+                    _report(
+                        mode=args.mode,
+                        status="blocked",
+                        reason_code="provider_live_authority_not_allowed_for_plan",
+                    )
+                )
+            )
+        )
+        return 2
 
     try:
         packet = load_operator_source_packet(args.source_packet_json[0], repo_root=repo_root)
@@ -877,7 +1237,11 @@ async def run_cli(
     builder = stage_factory_builder or (lambda runtime_config: SqlStageFactory(runtime_config))
     async with builder(runtime) as stage_factory:
         report = await run_exact_target_source_to_analysis_materializer(
-            ExactTargetSourceToAnalysisRequest(mode=args.mode, packet=packet),
+            ExactTargetSourceToAnalysisRequest(
+                mode=args.mode,
+                packet=packet,
+                provider_authority=_provider_authority_from_args(args),
+            ),
             stage_factory=stage_factory,
         )
     emit_json(_compact_json(asdict(report)))
@@ -982,6 +1346,7 @@ async def run_exact_target_source_to_analysis_materializer(
                 provider_route=normalization.provider_route,
                 refresh_mode=normalization.refresh_mode,
                 depth_budget=normalization.depth_budget,
+                provider_authority=request.provider_authority,
             )
             report = replace(report, provider_enrichment_attempted=True)
             async with stage_factory.stage("provider_enrichment") as components:
@@ -1067,7 +1432,6 @@ async def run_exact_target_source_to_analysis_materializer(
                 source_version_created=True,
                 candidate_created=True,
                 artifact_enrichment_request_created=True,
-                provider_snapshot_created=True,
                 bundle_created=True,
                 analysis_request_created=True,
             )
@@ -1470,10 +1834,13 @@ def _apply_provider_enrichment_result(
                 "provider_snapshot_updated_events": (
                     1 if result.snapshot_updated_event_id is not None else 0
                 ),
+                "github_request_count": result.github_request_count,
             },
         ),
         provider_snapshot_update_fingerprint=_fingerprint(result.snapshot_updated_event_id),
-        provider_snapshot_created=result.snapshot_id is not None,
+        provider_snapshot_created=result.snapshot_created,
+        external_network_attempted=report.external_network_attempted
+        or result.external_network_attempted,
     )
 
 
@@ -1716,6 +2083,22 @@ def _cli_request_error(args: argparse.Namespace) -> str | None:
     if not args.env_file:
         return "env_file_required"
     return None
+
+
+def _provider_authority_args_present(args: argparse.Namespace) -> bool:
+    return (
+        bool(args.allow_live_github_provider_read)
+        or bool(args.allow_provider_snapshot_write)
+        or args.provider_live_confirm is not None
+    )
+
+
+def _provider_authority_from_args(args: argparse.Namespace) -> ProviderLiveAuthority:
+    return ProviderLiveAuthority(
+        allow_live_github_provider_read=bool(args.allow_live_github_provider_read),
+        allow_provider_snapshot_write=bool(args.allow_provider_snapshot_write),
+        provider_live_confirm=args.provider_live_confirm,
+    )
 
 
 def _read_runtime_env_file(env_file: str) -> dict[str, str]:

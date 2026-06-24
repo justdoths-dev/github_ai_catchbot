@@ -546,6 +546,7 @@ class GithubProviderRepo:
     def __init__(self, ledger: Ledger) -> None:
         self.ledger = ledger
         self.snapshot_updated_event_id: UUID | None = None
+        self.snapshot_created = False
 
     def transaction(self):
         return Tx()
@@ -594,6 +595,7 @@ class GithubProviderRepo:
         del kwargs
 
     async def insert_snapshot(self, *, artifact_id: UUID, provider: str, plan) -> UUID:
+        self.snapshot_created = True
         snapshot = SnapshotRecord(
             snapshot_id=uuid4(),
             artifact_id=artifact_id,
@@ -739,6 +741,8 @@ class ProviderEnrichmentService:
             emitted_snapshot_updated=result.emitted_snapshot_updated,
             snapshot_id=result.snapshot_id,
             snapshot_updated_event_id=repository.snapshot_updated_event_id,
+            snapshot_created=repository.snapshot_created,
+            github_request_count=len(self.ledger.github_client_calls),
         )
 
 
@@ -883,6 +887,7 @@ async def test_operator_source_url_flow_materializes_provider_evidence_analysis_
     assert report.telegram_live_read_attempted is False
     assert report.telegram_send_attempted is False
     assert report.external_network_attempted is False
+    assert report.bounded_counts["github_request_count"] == 2
     assert len(ledger.current) == 1
     assert sum(len(rows) for rows in ledger.versions.values()) == 1
     assert [row["event_type"] for row in ledger.outbox] == [

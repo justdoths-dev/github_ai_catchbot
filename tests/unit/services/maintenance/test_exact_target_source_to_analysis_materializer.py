@@ -21,10 +21,12 @@ from src.services.maintenance.exact_target_source_to_analysis_materializer impor
     NormalizationReadback,
     ProviderEnrichmentRequest,
     ProviderEnrichmentResult,
+    ProviderLiveAuthority,
     RefreshEventRecord,
     RuntimeConfigBundle,
     SqlProviderEnrichmentService,
     SqlStageComponents,
+    run_cli,
     run_exact_target_source_to_analysis_materializer,
 )
 from src.services.router_normalizer.config import RouterNormalizerConfig
@@ -76,6 +78,131 @@ class NoProviderWriteSession:
         raise AssertionError("SQL provider enrichment path must fail before provider writes")
 
 
+class SqlProviderTx:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class SqlProviderFakeRepository:
+    def __init__(self, *, artifact_id: UUID) -> None:
+        from src.services.gh_enricher.models import ArtifactRecord
+
+        self.artifact = ArtifactRecord(
+            artifact_id=artifact_id,
+            artifact_type="github_repo",
+            canonical_id="github_repo:example/project",
+            canonical_url="https://github.com/example/project",
+            normalized_host="github.com",
+            artifact_key_json={"owner": "example", "repo": "project"},
+            current_snapshot_id=None,
+            current_status=None,
+        )
+        self.runs: list[dict[str, Any]] = []
+        self.snapshots: list[dict[str, Any]] = []
+        self.outbox_event_id = uuid4()
+        self.outbox: list[dict[str, Any]] = []
+
+    def transaction(self):
+        return SqlProviderTx()
+
+    async def load_artifact(self, artifact_id):
+        assert artifact_id == self.artifact.artifact_id
+        return self.artifact
+
+    async def load_current_snapshot(self, snapshot_id):
+        assert snapshot_id is None
+        return None
+
+    async def insert_enrichment_run_if_absent(self, **kwargs):
+        self.runs.append(kwargs)
+        return uuid4()
+
+    async def mark_enrichment_run_started(self, run_id):
+        del run_id
+
+    async def mark_enrichment_run_finished(self, **kwargs):
+        del kwargs
+
+    async def insert_snapshot(self, **kwargs):
+        self.snapshots.append(kwargs)
+        return uuid4()
+
+    async def insert_github_repo_child(self, **kwargs):
+        del kwargs
+
+    async def insert_github_file_sample(self, **kwargs):
+        del kwargs
+
+    async def insert_discovered_url(self, **kwargs):
+        del kwargs
+
+    async def update_artifact_current_snapshot(self, **kwargs):
+        del kwargs
+
+    async def insert_snapshot_updated_outbox(self, **kwargs):
+        self.outbox.append(kwargs)
+        return self.outbox_event_id
+
+
+class SqlProviderFakeGitHubClient:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def get_repo(self, owner, repo, *, auth_mode):
+        del auth_mode
+        self.calls.append("repo")
+        return {
+            "full_name": f"{owner}/{repo}",
+            "default_branch": "main",
+            "description": "offline injected provider fixture",
+            "homepage": None,
+            "license": {"spdx_id": "MIT"},
+            "topics": ["ai"],
+            "language": "Python",
+            "stargazers_count": 3,
+            "subscribers_count": 1,
+            "forks_count": 0,
+            "open_issues_count": 0,
+            "archived": False,
+            "fork": False,
+            "is_template": False,
+            "pushed_at": "2026-06-01T00:00:00Z",
+        }
+
+    async def get_default_branch_head(self, owner, repo, default_branch, *, auth_mode):
+        del owner, repo, default_branch, auth_mode
+        self.calls.append("head")
+        return {"sha": "abc123"}
+
+    async def get_tree(self, owner, repo, ref, *, recursive, auth_mode):
+        del owner, repo, ref, auth_mode
+        self.calls.append("tree")
+        return {
+            "truncated": False,
+            "tree": [
+                {"type": "blob", "path": "README.md"},
+                {"type": "blob", "path": "pyproject.toml"},
+            ],
+        } if recursive else {"truncated": False, "tree": []}
+
+    async def get_contents(self, owner, repo, path, *, ref, auth_mode):
+        del owner, repo, ref, auth_mode
+        self.calls.append(f"contents:{path}")
+        return {
+            "encoding": "base64",
+            "content": "IyBGYWtlIHByb3ZpZGVyIGV2aWRlbmNlCg==",
+            "size": 25,
+        }
+
+    async def get_releases(self, owner, repo, *, auth_mode):
+        del owner, repo, auth_mode
+        self.calls.append("releases")
+        return []
+
+
 class Ledger:
     def __init__(self) -> None:
         self.registry_rows = [{"registry_id": str(uuid4()), "chat_id": 9001}]
@@ -107,6 +234,7 @@ class Ledger:
         self.call_order: list[str] = []
         self.normalizer_failure = False
         self.assembler_failure = False
+        self.provider_authority: ProviderLiveAuthority | None = None
 
 
 class FakeCollectorRepository:
@@ -313,6 +441,7 @@ class FakeProviderEnrichmentService:
 
     async def materialize_provider_request(self, request) -> ProviderEnrichmentResult:
         self.ledger.call_order.append("provider.materialize_provider_request")
+        self.ledger.provider_authority = request.provider_authority
         assert request.trigger_event_id == self.ledger.enrichment_request_event_id
         assert request.artifact_id == self.ledger.primary_artifact_id
         assert request.candidate_group_id == self.ledger.candidate_group_id
@@ -340,6 +469,7 @@ class FakeProviderEnrichmentService:
             emitted_snapshot_updated=True,
             snapshot_id=self.ledger.provider_snapshot_id,
             snapshot_updated_event_id=self.ledger.provider_snapshot_updated_event_id,
+            snapshot_created=True,
         )
 
 
@@ -390,6 +520,17 @@ class FakeStageFactory:
         self.ledger.call_order.append(f"exit:{stage_name}")
 
 
+class FakeStageFactoryContext:
+    def __init__(self, ledger: Ledger) -> None:
+        self.ledger = ledger
+
+    async def __aenter__(self):
+        return FakeStageFactory(self.ledger)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
 def packet(text: str = KOREAN_LLM_WORKFLOW_TEXT):
     return parse_operator_source_packet(
         {
@@ -398,6 +539,18 @@ def packet(text: str = KOREAN_LLM_WORKFLOW_TEXT):
             "posted_at": "2026-06-23T01:02:03Z",
             "message_text": text,
         }
+    )
+
+
+def packet_json(text: str = KOREAN_LLM_WORKFLOW_TEXT) -> str:
+    return json.dumps(
+        {
+            "schema_version": "operator_supplied_telegram_source_v1",
+            "source_ref": "https://t.me/SynthChannel/12345",
+            "posted_at": "2026-06-23T01:02:03Z",
+            "message_text": text,
+        },
+        ensure_ascii=False,
     )
 
 
@@ -486,7 +639,127 @@ async def test_sql_provider_enrichment_service_requires_live_authority_without_f
     assert result.emitted_snapshot_updated is False
     assert result.snapshot_id is None
     assert result.snapshot_updated_event_id is None
+    assert result.snapshot_created is False
+    assert result.external_network_attempted is False
+    assert result.github_request_count == 0
     assert session.sql_calls == []
+
+
+@pytest.mark.asyncio
+async def test_sql_provider_partial_live_authority_blocks_before_network_or_snapshot_write() -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderFakeRepository(artifact_id=artifact_id)
+    fake_client = SqlProviderFakeGitHubClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        github_client_factory=lambda config: fake_client,
+        repository_factory=lambda session: fake_repository,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="github_repo",
+            provider_route="github",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=ProviderLiveAuthority(
+                allow_live_github_provider_read=True,
+                allow_provider_snapshot_write=False,
+                provider_live_confirm="live-github-provider-evidence",
+            ),
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.error_code == "provider_live_authority_required"
+    assert result.github_request_count == 0
+    assert result.external_network_attempted is False
+    assert fake_client.calls == []
+    assert fake_repository.snapshots == []
+    assert fake_repository.outbox == []
+
+
+@pytest.mark.asyncio
+async def test_sql_provider_live_authority_rejects_non_github_route_without_network() -> None:
+    fake_client = SqlProviderFakeGitHubClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        github_client_factory=lambda config: fake_client,
+        repository_factory=lambda session: SqlProviderFakeRepository(artifact_id=uuid4()),
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=uuid4(),
+            artifact_type="web_article",
+            provider_route="web",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=ProviderLiveAuthority(
+                allow_live_github_provider_read=True,
+                allow_provider_snapshot_write=True,
+                provider_live_confirm="live-github-provider-evidence",
+            ),
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.error_code == "provider_route_not_supported_by_live_exact_materializer"
+    assert result.github_request_count == 0
+    assert result.external_network_attempted is False
+    assert fake_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_sql_provider_live_authority_uses_real_gh_service_with_injected_client() -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderFakeRepository(artifact_id=artifact_id)
+    fake_client = SqlProviderFakeGitHubClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        github_client_factory=lambda config: fake_client,
+        repository_factory=lambda session: fake_repository,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="github_repo",
+            provider_route="github",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=ProviderLiveAuthority(
+                allow_live_github_provider_read=True,
+                allow_provider_snapshot_write=True,
+                provider_live_confirm="live-github-provider-evidence",
+            ),
+        )
+    )
+
+    assert result.error_code is None
+    assert result.status == "ready"
+    assert result.snapshot_id is not None
+    assert result.snapshot_updated_event_id == fake_repository.outbox_event_id
+    assert result.snapshot_created is True
+    assert result.emitted_snapshot_updated is True
+    assert result.github_request_count == len(fake_client.calls)
+    assert result.github_request_count >= 5
+    assert result.external_network_attempted is False
+    assert fake_repository.snapshots
+    assert fake_repository.outbox
 
 
 @pytest.mark.asyncio
@@ -603,6 +876,11 @@ async def test_execute_url_path_materializes_provider_snapshot_and_analysis_requ
     assert report.telegram_live_read_attempted is False
     assert report.telegram_send_attempted is False
     assert report.external_network_attempted is False
+    rendered_report = json.dumps(asdict(report), sort_keys=True)
+    assert "https://github.com/DietrichGebert/ponytail" not in rendered_report
+    assert "DietrichGebert" not in rendered_report
+    assert "ponytail" not in rendered_report
+    assert "AI가 코드를 작성" not in rendered_report
     assert report.bounded_counts["external_enrichment_requests"] == 1
     assert report.bounded_counts["provider_route_github"] == 1
     assert report.bounded_counts["provider_snapshots"] == 1
@@ -680,6 +958,68 @@ async def test_duplicate_execute_blocks_before_second_stage_write() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cli_live_provider_flags_reach_provider_request_authority(tmp_path: Path) -> None:
+    ledger = Ledger()
+    emitted: list[str] = []
+    packet_path = tmp_path / "source-packet.json"
+    packet_path.write_text(packet_json(GITHUB_URL_TEXT), encoding="utf-8")
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "execute",
+            "--source-packet-json",
+            str(packet_path),
+            "--env-file",
+            "/tmp/not-read-by-test.env",
+            "--confirm",
+            "materialize-source-analysis",
+            "--allow-live-github-provider-read",
+            "--allow-provider-snapshot-write",
+            "--provider-live-confirm",
+            "live-github-provider-evidence",
+        ],
+        emit_json=emitted.append,
+        runtime_config_loader=lambda env_file: runtime_bundle(),
+        stage_factory_builder=lambda runtime_config: FakeStageFactoryContext(ledger),
+    )
+
+    assert exit_code == 0
+    assert ledger.provider_authority is not None
+    assert ledger.provider_authority.github_live_opened is True
+    payload = json.loads(emitted[0])
+    assert payload["status"] == "pass"
+    assert payload["reason_code"] == "source_url_provider_evidence_analysis_requested"
+
+
+@pytest.mark.asyncio
+async def test_cli_provider_live_flags_are_blocked_in_plan_mode(tmp_path: Path) -> None:
+    emitted: list[str] = []
+    packet_path = tmp_path / "source-packet.json"
+    packet_path.write_text(packet_json(GITHUB_URL_TEXT), encoding="utf-8")
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--source-packet-json",
+            str(packet_path),
+            "--env-file",
+            "/tmp/not-read-by-test.env",
+            "--allow-live-github-provider-read",
+        ],
+        emit_json=emitted.append,
+        runtime_config_loader=lambda env_file: runtime_bundle(),
+        stage_factory_builder=lambda runtime_config: FakeStageFactoryContext(Ledger()),
+    )
+
+    assert exit_code == 2
+    payload = json.loads(emitted[0])
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "provider_live_authority_not_allowed_for_plan"
+
+
+@pytest.mark.asyncio
 async def test_partial_stage_failure_returns_sanitized_failure_without_false_pass() -> None:
     ledger = Ledger()
     ledger.normalizer_failure = True
@@ -712,6 +1052,12 @@ def test_module_does_not_import_openai_redis_telegram_notifier_or_judge_boundari
         "redis.asyncio",
         "openai",
         "telegram",
+        "docker",
+        "systemd",
+        "alembic",
+        "requests",
+        "httpx",
+        "aiohttp",
         "src.services.judge_openai",
         "..judge_openai",
         "src.services.notifier_telegram",
