@@ -28,6 +28,8 @@ from services.maintenance.exact_target_live_openai_canary import (
     ExactTargetPreflight,
     JudgeReadback,
     NotificationReadback,
+    POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN,
+    PostJudgeOutputResumeAuthority,
     RuntimeConfigBundle,
     build_parser,
     run_cli,
@@ -882,6 +884,129 @@ async def _run_execute(ledger: _Ledger, responses: list[Any], tmp_path: Path):
     return report, fake_client
 
 
+def _resume_authority() -> PostJudgeOutputResumeAuthority:
+    return PostJudgeOutputResumeAuthority(
+        allow_existing_judge_output_resume=True,
+        resume_confirm=POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN,
+    )
+
+
+def _materialize_existing_judge_output(ledger: _Ledger) -> UUID:
+    judge_output_id = uuid4()
+    ledger.judge_output_id = judge_output_id
+    ledger.runs[ledger.judge_run_id] = replace(ledger.runs[ledger.judge_run_id], status="succeeded")
+    ledger.finish_reason = "stop"
+    ledger.refusal_detected = False
+    ledger.outputs.append(
+        {
+            "judge_output_id": judge_output_id,
+            "judge_run_id": ledger.judge_run_id,
+            "candidate_group_id": ledger.candidate_group_id,
+            "judge_schema_version": "judge_output_v1",
+            "payload_json": ledger.payload,
+            "model_proposed_verdict": ledger.payload["model_proposed_verdict"],
+            "model_confidence_band": ledger.payload["model_confidence_band"],
+        }
+    )
+    ledger._append_event(
+        event_type="judge.output.ready.v1",
+        aggregate_type="judge_run",
+        aggregate_id=ledger.judge_run_id,
+        dedupe_key=f"judge-output-ready:{ledger.judge_run_id}:{judge_output_id}",
+        payload_json={
+            "judge_run_id": str(ledger.judge_run_id),
+            "judge_output_id": str(judge_output_id),
+            "finish_reason": ledger.finish_reason,
+            "refusal_detected": False,
+        },
+        count_write=False,
+    )
+    return judge_output_id
+
+
+async def _run_resume_execute(ledger: _Ledger, tmp_path: Path, *, openai_client_builder=None):
+    report = await run_exact_target_canary(
+        ExactTargetCanaryRequest(
+            mode="execute",
+            trigger_event_id=ledger.trigger_event_id,
+            post_judge_output_resume_authority=_resume_authority(),
+        ),
+        runtime=_runtime(tmp_path),
+        components=_components(ledger),
+        openai_client_builder=(
+            openai_client_builder
+            or (lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built in resume mode")))
+        ),
+    )
+    return report
+
+
+def _add_partial_notification_state(ledger: _Ledger, judge_output_id: UUID) -> None:
+    analysis_id = uuid4()
+    draft = AnalysisDraft(
+        candidate_group_id=ledger.candidate_group_id,
+        judge_output_id=judge_output_id,
+        schema_version="analysis_v1",
+        policy_version="verdict_policy_v1",
+        prompt_version=ledger.runs[ledger.judge_run_id].prompt_version,
+        delivery_policy_version="delivery_policy_v1",
+        verdict="inspect_now",
+        delivery_decision="send_now",
+        scores_json=_send_scores(),
+        reason_codes_json=["specific_evidence"],
+        evidence_limitations_ko="limited",
+        recommended_action_ko="inspect",
+        freshness_note_ko="fresh",
+        model_proposed_verdict="inspect_now",
+        policy_reconciled_flag=False,
+    )
+    ledger.analysis_id = analysis_id
+    ledger.existing_analysis = ExistingAnalysisRecord(
+        analysis_id=analysis_id,
+        judge_output_id=judge_output_id,
+        policy_version=draft.policy_version,
+        delivery_policy_version=draft.delivery_policy_version,
+    )
+    ledger.analyses.append((analysis_id, draft))
+    plan_id = uuid4()
+    ledger._append_event(
+        event_type="notification.plan.created.v1",
+        aggregate_type="analysis",
+        aggregate_id=analysis_id,
+        dedupe_key=f"notification-plan-created:{analysis_id}:12345:partial",
+        payload_json={
+            "notification_plan_id": str(plan_id),
+            "analysis_id": str(analysis_id),
+            "candidate_group_id": str(ledger.candidate_group_id),
+            "delivery_decision": "send_now",
+            "urgency_profile": "high",
+            "target_chat_id": 12345,
+            "target_thread_id": None,
+            "render_profile": "telegram_single_alert_high_v1",
+            "dedupe_subject_key": f"candidate:{ledger.candidate_group_id}",
+            "material_change_hash": "partial",
+            "send_after": None,
+            "suppress_reason_code": None,
+        },
+        count_write=False,
+    )
+    ledger.plans[plan_id] = NotificationPlanDraft(
+        notification_plan_id=plan_id,
+        analysis_id=analysis_id,
+        candidate_group_id=ledger.candidate_group_id,
+        delivery_decision="send_now",
+        urgency_profile="high",
+        target_chat_id=12345,
+        target_thread_id=None,
+        render_profile="telegram_single_alert_high_v1",
+        dedupe_subject_key=f"candidate:{ledger.candidate_group_id}",
+        material_change_hash="partial",
+        send_after=None,
+        suppress_reason_code=None,
+        status="planned",
+    )
+
+
 def _plan_row(plan: NotificationPlanDraft | None) -> dict[str, Any] | None:
     if plan is None:
         return None
@@ -1060,6 +1185,83 @@ async def test_preflight_block_occurs_before_redis_or_openai_secret_indirection(
     assert payload["openai_request_count"] == 0
     assert "missing-redis" not in outputs[0]
     assert "missing-openai" not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_resume_execute_cli_does_not_require_live_openai_confirm_or_key(tmp_path: Path) -> None:
+    ledger = _Ledger()
+    _materialize_existing_judge_output(ledger)
+    env_file = tmp_path / "runtime.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                _joined("DATABASE_URL=", _test_database_url()),
+                _joined("REDIS_URL=", _test_redis_url()),
+                "TELEGRAM_OPERATOR_CHAT_ID=12345",
+                "ENABLE_NOTIFICATION_SEND=true",
+                "ENABLE_LATER_DELIVERY=true",
+                "ENABLE_SILENT_LATER=true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    outputs: list[str] = []
+
+    @asynccontextmanager
+    async def builder(runtime):
+        del runtime
+        yield _components(ledger)
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "execute",
+            "--trigger-event-id",
+            str(ledger.trigger_event_id),
+            "--env-file",
+            str(env_file),
+            "--allow-existing-judge-output-resume",
+            "--resume-confirm",
+            POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=builder,
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 0
+    assert payload["status"] == "pass"
+    assert payload["reason_code"] == "notification_send_disabled_suppressed"
+    assert payload["post_judge_output_resume_attempted"] is True
+    assert payload["openai_call_attempted"] is False
+    assert payload["openai_request_count"] == 0
+    assert payload["telegram_transport_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_resume_authority_requires_both_flags_before_env_load(tmp_path: Path) -> None:
+    outputs: list[str] = []
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "execute",
+            "--trigger-event-id",
+            str(uuid4()),
+            "--env-file",
+            str(tmp_path / "missing-runtime.env"),
+            "--allow-existing-judge-output-resume",
+        ],
+        emit_json=outputs.append,
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["reason_code"] == "post_judge_output_resume_authority_required"
+    assert payload["openai_request_count"] == 0
+    assert "missing-runtime" not in outputs[0]
 
 
 @pytest.mark.parametrize(
@@ -1302,6 +1504,133 @@ async def test_rerun_blocks_before_openai_and_does_not_duplicate_rows(tmp_path: 
         len(ledger.renders),
         len(ledger.delivery_records),
     )
+
+
+@pytest.mark.asyncio
+async def test_existing_judge_output_without_resume_flags_keeps_current_block(tmp_path: Path) -> None:
+    ledger = _Ledger()
+    _materialize_existing_judge_output(ledger)
+
+    report, fake_client = await _run_execute(ledger, [_structured_response(ledger.payload)], tmp_path)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "target_already_consumed"
+    assert report.post_judge_output_resume_attempted is False
+    assert report.openai_request_count == 0
+    assert fake_client.calls == []
+    assert report.validator_attempted is False
+    assert report.notifier_attempted is False
+
+
+@pytest.mark.asyncio
+async def test_resume_from_existing_judge_output_reaches_send_disabled_notifier(tmp_path: Path) -> None:
+    ledger = _Ledger()
+    _materialize_existing_judge_output(ledger)
+
+    report = await _run_resume_execute(ledger, tmp_path)
+
+    assert report.status == "pass"
+    assert report.reason_code == "notification_send_disabled_suppressed"
+    assert report.post_judge_output_resume_attempted is True
+    assert report.openai_call_attempted is False
+    assert report.openai_request_count == 0
+    assert report.judge_output_created is True
+    assert report.judge_output_ready_event_created is True
+    assert report.validator_attempted is True
+    assert report.validator_forwarded_policy is True
+    assert report.policy_attempted is True
+    assert report.analysis_created is True
+    assert report.final_verdict == "inspect_now"
+    assert report.delivery_decision == "send_now"
+    assert report.notification_intent_created is True
+    assert report.notifier_attempted is True
+    assert report.notification_plan_created is True
+    assert report.notification_render_created is True
+    assert report.send_disabled_delivery_record_created is True
+    assert report.telegram_transport_attempted is False
+    assert report.redis_attempted is False
+    assert len(ledger.plans) == 1
+    assert len(ledger.renders) == 1
+    assert len(ledger.delivery_records) == 1
+    assert len(ledger.delivery_outbox) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_policy_suppressed_returns_pass_without_notifier(tmp_path: Path) -> None:
+    ledger = _Ledger(scores=_suppress_scores(), verdict="skip")
+    _materialize_existing_judge_output(ledger)
+
+    report = await _run_resume_execute(ledger, tmp_path)
+
+    assert report.status == "pass"
+    assert report.reason_code == "policy_suppressed"
+    assert report.post_judge_output_resume_attempted is True
+    assert report.openai_request_count == 0
+    assert report.validator_attempted is True
+    assert report.policy_attempted is True
+    assert report.analysis_created is True
+    assert report.final_verdict == "skip"
+    assert report.delivery_decision == "suppress"
+    assert report.notification_intent_created is False
+    assert report.notifier_attempted is False
+    assert len(ledger.plans) == 0
+    assert len(ledger.renders) == 0
+    assert len(ledger.delivery_records) == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_multiple_policy_events_fail_closed(tmp_path: Path) -> None:
+    ledger = _Ledger()
+    ledger.force_duplicate_policy_events = True
+    _materialize_existing_judge_output(ledger)
+
+    report = await _run_resume_execute(ledger, tmp_path)
+
+    assert report.status == "failed"
+    assert report.reason_code == "resume_policy_state_ambiguous"
+    assert report.openai_request_count == 0
+    assert report.validator_attempted is True
+    assert report.validator_forwarded_policy is False
+    assert report.policy_attempted is False
+    assert report.notifier_attempted is False
+    assert report.telegram_transport_attempted is False
+
+
+@pytest.mark.asyncio
+async def test_resume_existing_partial_notification_state_fails_closed(tmp_path: Path) -> None:
+    ledger = _Ledger()
+    judge_output_id = _materialize_existing_judge_output(ledger)
+    _add_partial_notification_state(ledger, judge_output_id)
+
+    report = await _run_resume_execute(ledger, tmp_path)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "resume_notification_state_ambiguous"
+    assert report.openai_request_count == 0
+    assert report.validator_attempted is False
+    assert report.policy_attempted is False
+    assert report.notifier_attempted is False
+    assert report.telegram_transport_attempted is False
+
+
+@pytest.mark.asyncio
+async def test_resume_mode_fails_if_openai_request_count_becomes_nonzero(tmp_path: Path, monkeypatch) -> None:
+    ledger = _Ledger()
+    _materialize_existing_judge_output(ledger)
+
+    async def fake_continue(**kwargs):
+        report = kwargs["report"]
+        return replace(report, openai_call_attempted=True, openai_request_count=1)
+
+    monkeypatch.setattr(canary, "_continue_from_judge_output_ready", fake_continue)
+
+    report = await _run_resume_execute(ledger, tmp_path)
+
+    assert report.status == "failed"
+    assert report.reason_code == "resume_openai_attempted"
+    assert report.openai_call_attempted is True
+    assert report.openai_request_count == 1
+    assert report.telegram_transport_attempted is False
 
 
 @pytest.mark.asyncio

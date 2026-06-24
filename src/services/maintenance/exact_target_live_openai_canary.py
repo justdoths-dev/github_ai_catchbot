@@ -7,7 +7,7 @@ import json
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Protocol
 from uuid import UUID
@@ -34,6 +34,7 @@ from ..policy_engine.service import PolicyEngineService
 SCHEMA_VERSION = "exact_target_live_openai_canary_report_v1"
 READY_EVENT_TYPE = "judge.output.ready.v1"
 POLICY_EVENT_TYPE = "analysis.policy.apply.v1"
+POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN = "post-judge-output-to-send-disabled-notification"
 
 
 RUNTIME_VALUE_KEYS = {
@@ -102,6 +103,7 @@ class ExactTargetCanaryReport:
     target_event_fingerprint: str | None
     target_run_fingerprint: str | None
     preflight_passed: bool
+    post_judge_output_resume_attempted: bool
     openai_call_attempted: bool
     openai_request_count: int
     judge_status: str | None
@@ -127,9 +129,29 @@ class ExactTargetCanaryReport:
 
 
 @dataclass(slots=True, frozen=True)
+class PostJudgeOutputResumeAuthority:
+    allow_existing_judge_output_resume: bool = False
+    resume_confirm: str | None = None
+
+    @property
+    def args_present(self) -> bool:
+        return self.allow_existing_judge_output_resume or self.resume_confirm is not None
+
+    @property
+    def opened(self) -> bool:
+        return (
+            self.allow_existing_judge_output_resume
+            and self.resume_confirm == POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class ExactTargetCanaryRequest:
     mode: str
     trigger_event_id: UUID
+    post_judge_output_resume_authority: PostJudgeOutputResumeAuthority = field(
+        default_factory=PostJudgeOutputResumeAuthority
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -141,6 +163,13 @@ class RuntimeConfigBundle:
 @dataclass(slots=True, frozen=True)
 class ServiceConfigBundle:
     judge: JudgeOpenAIConfig
+    validator: AnalysisValidatorConfig
+    policy: PolicyEngineConfig
+    notifier: NotifierTelegramConfig
+
+
+@dataclass(slots=True, frozen=True)
+class DownstreamServiceConfigBundle:
     validator: AnalysisValidatorConfig
     policy: PolicyEngineConfig
     notifier: NotifierTelegramConfig
@@ -581,6 +610,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trigger-event-id", action="append", default=[])
     parser.add_argument("--env-file")
     parser.add_argument("--confirm", choices=["live-openai"], default=None)
+    parser.add_argument("--allow-existing-judge-output-resume", action="store_true")
+    parser.add_argument("--resume-confirm", default=None)
     return parser
 
 
@@ -607,7 +638,28 @@ async def run_cli(
         return 2
 
     assert trigger_event_id is not None
-    if args.mode == "execute" and args.confirm != "live-openai":
+    resume_authority = _post_judge_output_resume_authority_from_args(args)
+    if resume_authority.args_present and not resume_authority.opened:
+        report = _report(
+            mode=args.mode,
+            status="blocked",
+            reason_code="post_judge_output_resume_authority_required",
+            started_monotonic=started,
+            target_event_id=trigger_event_id,
+        )
+        emit_json(_compact_json(asdict(report)))
+        return 2
+    if args.mode == "execute" and resume_authority.opened and args.confirm is not None:
+        report = _report(
+            mode=args.mode,
+            status="blocked",
+            reason_code="live_openai_confirm_not_allowed_for_resume",
+            started_monotonic=started,
+            target_event_id=trigger_event_id,
+        )
+        emit_json(_compact_json(asdict(report)))
+        return 2
+    if args.mode == "execute" and not resume_authority.opened and args.confirm != "live-openai":
         report = _report(
             mode=args.mode,
             status="blocked",
@@ -644,7 +696,11 @@ async def run_cli(
     builder = session_components_builder or sql_session_components
     async with builder(runtime) as components:
         report = await run_exact_target_canary(
-            ExactTargetCanaryRequest(mode=args.mode, trigger_event_id=trigger_event_id),
+            ExactTargetCanaryRequest(
+                mode=args.mode,
+                trigger_event_id=trigger_event_id,
+                post_judge_output_resume_authority=resume_authority,
+            ),
             runtime=runtime,
             components=components,
             started_monotonic=started,
@@ -673,6 +729,41 @@ async def run_exact_target_canary(
     try:
         preflight = await components.canary_repository.load_preflight(request.trigger_event_id)
         report = _apply_preflight(report, preflight)
+        if request.post_judge_output_resume_authority.opened:
+            report = replace(report, post_judge_output_resume_attempted=True)
+            resume_block = _post_judge_output_resume_preflight_block_reason(preflight)
+            if resume_block is not None:
+                return replace(report, status="blocked", reason_code=resume_block)
+            report = replace(report, preflight_passed=True)
+            if request.mode == "plan":
+                return replace(report, status="pass", reason_code="post_judge_output_resume_plan_ready")
+
+            assert preflight.judge_run is not None
+            downstream_configs = load_downstream_service_configs(runtime.values)
+            judge_readback = await components.canary_repository.load_judge_readback(
+                judge_run_id=preflight.judge_run.judge_run_id,
+            )
+            report = _apply_judge_readback(report, judge_readback)
+            judge_block = _judge_readback_block_reason(judge_readback)
+            if judge_block is not None:
+                return replace(report, status="failed", reason_code=judge_block)
+            report = await _continue_from_judge_output_ready(
+                preflight=preflight,
+                judge_readback=judge_readback,
+                service_configs=downstream_configs,
+                components=components,
+                report=report,
+                resume_mode=True,
+            )
+            if report.openai_call_attempted or report.openai_request_count:
+                return replace(
+                    report,
+                    status="failed",
+                    reason_code="resume_openai_attempted",
+                    openai_call_attempted=True,
+                )
+            return report
+
         if not preflight.passed:
             return replace(report, status="blocked", reason_code=preflight.reason_code or "preflight_blocked")
         if request.mode == "plan":
@@ -708,98 +799,18 @@ async def run_exact_target_canary(
         if judge_readback.judge_output_id is None:
             return replace(report, status="failed", reason_code="judge_output_missing")
 
-        validator = AnalysisValidatorService(
-            service_configs.validator,
-            repository=components.validator_repository,
-        )
-        await validator.handle_trigger_event(judge_readback.ready_event_id)
-        policy_event_ids = await components.canary_repository.load_policy_event_ids(
-            judge_run_id=preflight.judge_run.judge_run_id,
-            judge_output_id=judge_readback.judge_output_id,
-        )
-        report = replace(
-            report,
-            validator_attempted=True,
-            validator_forwarded_policy=len(policy_event_ids) == 1,
-        )
-        if len(policy_event_ids) > 1:
-            return replace(report, status="failed", reason_code="multiple_policy_events")
-        if not policy_event_ids:
-            if judge_readback.refusal_detected:
-                return replace(report, status="pass", reason_code="validator_refusal_terminal")
-            return replace(report, status="failed", reason_code="validator_rejected")
-
-        policy = PolicyEngineService(
-            service_configs.policy,
-            repository=components.policy_repository,
-        )
-        await policy.handle_trigger_event(policy_event_ids[0])
-        analysis = await components.canary_repository.load_analysis_readback(
-            judge_output_id=judge_readback.judge_output_id,
-            policy_version=service_configs.policy.policy_version,
-            delivery_policy_version=service_configs.policy.delivery_policy_version,
-        )
-        report = _apply_analysis_readback(replace(report, policy_attempted=True), analysis)
-        if analysis.analysis_count > 1:
-            return replace(report, status="failed", reason_code="multiple_analyses")
-        if analysis.analysis_id is None:
-            return replace(report, status="failed", reason_code="analysis_missing")
-
-        notification_event_ids = await components.canary_repository.load_notification_intent_event_ids(
-            analysis_id=analysis.analysis_id,
-        )
-        report = replace(report, notification_intent_created=len(notification_event_ids) == 1)
-        if len(notification_event_ids) > 1:
-            return replace(report, status="failed", reason_code="multiple_notification_intents")
-        if not notification_event_ids:
-            if analysis.delivery_decision == "suppress":
-                return replace(report, status="pass", reason_code="policy_suppressed")
-            return replace(report, status="failed", reason_code="notification_intent_missing")
-
-        notifier_transport = FailClosedTelegramTransport()
-        safe_notifier_config = replace(
-            service_configs.notifier,
-            enable_notification_send=False,
-            dry_run=True,
-            allow_edits=False,
-            telegram_bot_token="",
-        )
-        notifier = NotifierTelegramService(
-            safe_notifier_config,
-            repository=components.notifier_repository,
-            telegram_client=notifier_transport,
-        )
-        try:
-            await notifier.handle_trigger_event(notification_event_ids[0])
-        except TelegramTransportTerminalError:
-            return replace(
-                report,
-                notifier_attempted=True,
-                telegram_transport_attempted=notifier_transport.attempted,
-                status="failed",
-                reason_code="telegram_transport_attempted",
-            )
-        notification_plan_id = await _notification_plan_id_from_intent(
-            components.notifier_repository,
-            notification_event_ids[0],
-        )
-        notification = await components.canary_repository.load_notification_readback(
-            analysis_id=analysis.analysis_id,
-            notification_plan_id=notification_plan_id,
-        )
-        report = _apply_notification_readback(
-            replace(
-                report,
-                notifier_attempted=True,
-                telegram_transport_attempted=notifier_transport.attempted,
+        return await _continue_from_judge_output_ready(
+            preflight=preflight,
+            judge_readback=judge_readback,
+            service_configs=DownstreamServiceConfigBundle(
+                validator=service_configs.validator,
+                policy=service_configs.policy,
+                notifier=service_configs.notifier,
             ),
-            notification,
+            components=components,
+            report=report,
+            resume_mode=False,
         )
-        if notifier_transport.attempted:
-            return replace(report, status="failed", reason_code="telegram_transport_attempted")
-        if not report.send_disabled_delivery_record_created:
-            return replace(report, status="failed", reason_code="send_disabled_delivery_missing")
-        return replace(report, status="pass", reason_code="notification_send_disabled_suppressed")
     except ExactTargetCanaryConfigError as exc:
         return replace(report, status="blocked", reason_code=_safe_reason_code(exc))
     except Exception:
@@ -843,6 +854,23 @@ def load_service_configs(values: Mapping[str, str]) -> ServiceConfigBundle:
     return ServiceConfigBundle(judge=judge, validator=validator, policy=policy, notifier=notifier)
 
 
+def load_downstream_service_configs(values: Mapping[str, str]) -> DownstreamServiceConfigBundle:
+    resolved_values = dict(values)
+    _resolve_file_indirection(
+        resolved_values,
+        value_key="REDIS_URL",
+        file_key="REDIS_URL_FILE",
+        missing_reason_code="redis_url_missing",
+        file_missing_reason_code="redis_url_file_missing",
+        file_empty_reason_code="redis_url_file_empty",
+    )
+    return DownstreamServiceConfigBundle(
+        validator=_validator_config(resolved_values),
+        policy=_policy_config(resolved_values),
+        notifier=_notifier_config(resolved_values),
+    )
+
+
 @asynccontextmanager
 async def sql_session_components(runtime: RuntimeConfigBundle) -> AsyncIterator[ExactTargetCanaryComponents]:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # type: ignore[import-not-found]
@@ -873,6 +901,182 @@ def _default_openai_client(config: JudgeOpenAIConfig) -> OpenAIJudgeClient:
 async def _notification_plan_id_from_intent(notifier_repository: Any, event_id: UUID) -> UUID | None:
     intent = await notifier_repository.load_intent_job(event_id)
     return intent.notification_plan_id if intent is not None else None
+
+
+async def _continue_from_judge_output_ready(
+    *,
+    preflight: ExactTargetPreflight,
+    judge_readback: JudgeReadback,
+    service_configs: DownstreamServiceConfigBundle,
+    components: ExactTargetCanaryComponents,
+    report: ExactTargetCanaryReport,
+    resume_mode: bool,
+) -> ExactTargetCanaryReport:
+    assert preflight.judge_run is not None
+    if judge_readback.judge_output_id is None or judge_readback.ready_event_id is None:
+        return replace(report, status="failed", reason_code="judge_output_missing")
+
+    validator = AnalysisValidatorService(
+        service_configs.validator,
+        repository=components.validator_repository,
+    )
+    await validator.handle_trigger_event(judge_readback.ready_event_id)
+    policy_event_ids = await components.canary_repository.load_policy_event_ids(
+        judge_run_id=preflight.judge_run.judge_run_id,
+        judge_output_id=judge_readback.judge_output_id,
+    )
+    report = replace(
+        report,
+        validator_attempted=True,
+        validator_forwarded_policy=len(policy_event_ids) == 1,
+    )
+    if len(policy_event_ids) > 1:
+        return replace(
+            report,
+            status="failed",
+            reason_code="resume_policy_state_ambiguous" if resume_mode else "multiple_policy_events",
+        )
+    if not policy_event_ids:
+        if judge_readback.refusal_detected:
+            return replace(report, status="pass", reason_code="validator_refusal_terminal")
+        return replace(report, status="failed", reason_code="validator_rejected")
+
+    policy = PolicyEngineService(
+        service_configs.policy,
+        repository=components.policy_repository,
+    )
+    await policy.handle_trigger_event(policy_event_ids[0])
+    analysis = await components.canary_repository.load_analysis_readback(
+        judge_output_id=judge_readback.judge_output_id,
+        policy_version=service_configs.policy.policy_version,
+        delivery_policy_version=service_configs.policy.delivery_policy_version,
+    )
+    report = _apply_analysis_readback(replace(report, policy_attempted=True), analysis)
+    if analysis.analysis_count > 1:
+        return replace(
+            report,
+            status="failed",
+            reason_code="resume_analysis_state_ambiguous" if resume_mode else "multiple_analyses",
+        )
+    if analysis.analysis_id is None:
+        return replace(report, status="failed", reason_code="analysis_missing")
+
+    notification_event_ids = await components.canary_repository.load_notification_intent_event_ids(
+        analysis_id=analysis.analysis_id,
+    )
+    report = replace(report, notification_intent_created=len(notification_event_ids) == 1)
+    if len(notification_event_ids) > 1:
+        return replace(
+            report,
+            status="failed",
+            reason_code="resume_notification_state_ambiguous" if resume_mode else "multiple_notification_intents",
+        )
+    if not notification_event_ids:
+        if analysis.delivery_decision == "suppress":
+            return replace(report, status="pass", reason_code="policy_suppressed")
+        return replace(
+            report,
+            status="failed",
+            reason_code="resume_notification_state_ambiguous" if resume_mode else "notification_intent_missing",
+        )
+
+    notifier_transport = FailClosedTelegramTransport()
+    safe_notifier_config = replace(
+        service_configs.notifier,
+        enable_notification_send=False,
+        dry_run=True,
+        allow_edits=False,
+        telegram_bot_token="",
+    )
+    notifier = NotifierTelegramService(
+        safe_notifier_config,
+        repository=components.notifier_repository,
+        telegram_client=notifier_transport,
+    )
+    try:
+        await notifier.handle_trigger_event(notification_event_ids[0])
+    except TelegramTransportTerminalError:
+        return replace(
+            report,
+            notifier_attempted=True,
+            telegram_transport_attempted=notifier_transport.attempted,
+            status="failed",
+            reason_code="telegram_transport_attempted",
+        )
+    notification_plan_id = await _notification_plan_id_from_intent(
+        components.notifier_repository,
+        notification_event_ids[0],
+    )
+    notification = await components.canary_repository.load_notification_readback(
+        analysis_id=analysis.analysis_id,
+        notification_plan_id=notification_plan_id,
+    )
+    report = _apply_notification_readback(
+        replace(
+            report,
+            notifier_attempted=True,
+            telegram_transport_attempted=notifier_transport.attempted,
+        ),
+        notification,
+    )
+    if notifier_transport.attempted:
+        return replace(report, status="failed", reason_code="telegram_transport_attempted")
+    if notification.notification_plan_count != 1 or notification.notification_render_count != 1:
+        return replace(
+            report,
+            status="failed",
+            reason_code="resume_notification_state_ambiguous" if resume_mode else "notification_readback_invalid",
+        )
+    if (
+        notification.send_disabled_delivery_record_count != 1
+        or notification.delivery_result_event_count != 1
+    ):
+        return replace(
+            report,
+            status="failed",
+            reason_code="resume_delivery_state_ambiguous" if resume_mode else "send_disabled_delivery_missing",
+        )
+    return replace(report, status="pass", reason_code="notification_send_disabled_suppressed")
+
+
+def _post_judge_output_resume_preflight_block_reason(preflight: ExactTargetPreflight) -> str | None:
+    if preflight.event is None:
+        return preflight.reason_code or "target_event_missing"
+    if preflight.event.event_type != "judge.call.requested.v1":
+        return "wrong_event_type"
+    if preflight.job is None:
+        return "invalid_event_payload"
+    if preflight.judge_run is None:
+        return "judge_run_missing"
+    if preflight.judge_run.status != "succeeded":
+        return "judge_run_not_succeeded"
+    if preflight.job.bundle_id != preflight.judge_run.bundle_id:
+        return "event_run_bundle_mismatch"
+    if _job_conflicts_with_run(preflight.job, preflight.judge_run):
+        return "event_run_config_conflict"
+    if preflight.bundle is None:
+        return "bundle_missing"
+    if preflight.judge_output_count != 1:
+        return "resume_judge_output_state_ambiguous"
+    if preflight.ready_event_count != 1:
+        return "resume_ready_event_state_ambiguous"
+    return _post_judge_output_resume_downstream_block_reason(preflight)
+
+
+def _post_judge_output_resume_downstream_block_reason(preflight: ExactTargetPreflight) -> str | None:
+    if preflight.notification_delivery_count:
+        return "resume_delivery_state_ambiguous"
+    if (
+        preflight.notification_intent_count
+        or preflight.notification_plan_count
+        or preflight.notification_render_count
+    ):
+        return "resume_notification_state_ambiguous"
+    if preflight.analysis_count:
+        return "resume_analysis_state_ambiguous"
+    if preflight.policy_event_count:
+        return "resume_policy_state_ambiguous"
+    return None
 
 
 def _validate_preflight_snapshot(snapshot: ExactTargetPreflight) -> ExactTargetPreflight:
@@ -1013,6 +1217,7 @@ def _report(
         target_event_fingerprint=_fingerprint(target_event_id),
         target_run_fingerprint=None,
         preflight_passed=False,
+        post_judge_output_resume_attempted=False,
         openai_call_attempted=False,
         openai_request_count=0,
         judge_status=None,
@@ -1048,6 +1253,13 @@ def _cli_request_error(args: argparse.Namespace) -> str | None:
     if _uuid_or_none(args.trigger_event_id[0]) is None:
         return "invalid_trigger_event_id"
     return None
+
+
+def _post_judge_output_resume_authority_from_args(args: argparse.Namespace) -> PostJudgeOutputResumeAuthority:
+    return PostJudgeOutputResumeAuthority(
+        allow_existing_judge_output_resume=bool(args.allow_existing_judge_output_resume),
+        resume_confirm=args.resume_confirm,
+    )
 
 
 def _read_runtime_env_file(env_file: str) -> dict[str, str]:
@@ -1256,6 +1468,7 @@ __all__ = [
     "FailClosedTelegramTransport",
     "JudgeReadback",
     "NotificationReadback",
+    "PostJudgeOutputResumeAuthority",
     "RuntimeConfigBundle",
     "ServiceConfigBundle",
     "SqlExactTargetCanaryRepository",
