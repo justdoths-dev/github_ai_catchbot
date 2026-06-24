@@ -166,6 +166,38 @@ class SqlProviderFakeRepository:
         return self.outbox_event_id
 
 
+class SqlProviderConflictRetryFakeRepository(SqlProviderFakeRepository):
+    def __init__(self, *, artifact_id: UUID, existing_status: str = "failed_transient") -> None:
+        super().__init__(artifact_id=artifact_id)
+        self.existing_status = existing_status
+        self.status_by_key: dict[str, str] = {}
+        self.run_key_by_id: dict[UUID, str] = {}
+        self.claim_calls = 0
+        self.status_loads = 0
+
+    async def insert_enrichment_run_if_absent(self, **kwargs):
+        self.runs.append(kwargs)
+        self.status_by_key[kwargs["job_idempotency_key"]] = self.existing_status
+        return None
+
+    async def claim_failed_transient_enrichment_run_for_retry(self, *, job_idempotency_key: str):
+        self.claim_calls += 1
+        if self.status_by_key.get(job_idempotency_key) != "failed_transient":
+            return None
+        run_id = uuid4()
+        self.status_by_key[job_idempotency_key] = "fetching"
+        self.run_key_by_id[run_id] = job_idempotency_key
+        return run_id
+
+    async def load_enrichment_run_status_by_job_idempotency_key(self, *, job_idempotency_key: str):
+        self.status_loads += 1
+        return self.status_by_key.get(job_idempotency_key)
+
+    async def mark_enrichment_run_finished(self, **kwargs):
+        key = self.run_key_by_id[kwargs["run_id"]]
+        self.status_by_key[key] = kwargs["status"]
+
+
 class SqlProviderFakeGitHubClient:
     def __init__(self, *, repo_error: Exception | None = None) -> None:
         self.repo_error = repo_error
@@ -807,6 +839,53 @@ async def test_sql_provider_live_authority_uses_real_gh_service_with_injected_cl
 
 
 @pytest.mark.asyncio
+async def test_sql_provider_failed_transient_conflict_retries_with_injected_github_client() -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderConflictRetryFakeRepository(artifact_id=artifact_id)
+    fake_client = SqlProviderFakeGitHubClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        github_client_factory=lambda config: fake_client,
+        repository_factory=lambda session: fake_repository,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="github_repo",
+            provider_route="github",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=ProviderLiveAuthority(
+                allow_live_github_provider_read=True,
+                allow_provider_snapshot_write=True,
+                provider_live_confirm="live-github-provider-evidence",
+            ),
+        )
+    )
+
+    assert result.error_code is None
+    assert result.status == "ready"
+    assert result.snapshot_id is not None
+    assert result.snapshot_updated_event_id == fake_repository.outbox_event_id
+    assert result.snapshot_created is True
+    assert result.emitted_snapshot_updated is True
+    assert result.github_request_count == len(fake_client.calls)
+    assert result.github_request_count >= 5
+    assert result.external_network_attempted is False
+    assert fake_repository.claim_calls == 1
+    assert fake_repository.status_loads == 0
+    assert len(fake_repository.runs) == 1
+    assert set(fake_repository.status_by_key.values()) == {"ready"}
+    assert fake_repository.snapshots
+    assert fake_repository.outbox
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error", "reason_code"),
     [
@@ -1048,7 +1127,7 @@ async def test_execute_url_path_provider_pending_does_not_emit_analysis_request(
     report = await run(ledger, mode="execute", text=GITHUB_URL_TEXT)
 
     assert report.status == "pass"
-    assert report.reason_code == "provider_evidence_pending"
+    assert report.reason_code == "provider_enrichment_run_in_progress"
     assert report.provider_enrichment_attempted is True
     assert report.assembler_attempted is False
     assert report.provider_snapshot_created is False

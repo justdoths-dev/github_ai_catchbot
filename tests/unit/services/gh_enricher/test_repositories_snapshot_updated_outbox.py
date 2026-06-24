@@ -73,6 +73,43 @@ async def test_insert_snapshot_updated_outbox_returns_none_on_conflict() -> None
 
 
 @pytest.mark.asyncio
+async def test_claim_failed_transient_enrichment_run_for_retry_fetching_state() -> None:
+    run_id = uuid4()
+    session = FakeAsyncSession(FakeExecuteResult(str(run_id)))
+    repository = GhEnricherRepository(session)
+
+    result = await repository.claim_failed_transient_enrichment_run_for_retry(
+        job_idempotency_key="enrich:github:artifact:hash",
+    )
+
+    assert result == run_id
+    assert len(session.execute_calls) == 1
+    statement, params = session.execute_calls[0]
+    rendered = str(statement)
+    assert "status = 'fetching'::snapshot_status_enum" in rendered
+    assert "finished_at = NULL" in rendered
+    assert "status = 'failed_transient'::snapshot_status_enum" in rendered
+    assert "RETURNING artifact_enrichment_run_id" in rendered
+    assert params == {"job_idempotency_key": "enrich:github:artifact:hash"}
+
+
+@pytest.mark.asyncio
+async def test_load_enrichment_run_status_by_job_idempotency_key_returns_status() -> None:
+    session = FakeAsyncSession(FakeExecuteResult("fetching"))
+    repository = GhEnricherRepository(session)
+
+    result = await repository.load_enrichment_run_status_by_job_idempotency_key(
+        job_idempotency_key="enrich:github:artifact:hash",
+    )
+
+    assert result == "fetching"
+    assert len(session.execute_calls) == 1
+    statement, params = session.execute_calls[0]
+    assert "FROM artifact_enrichment_runs" in str(statement)
+    assert params == {"job_idempotency_key": "enrich:github:artifact:hash"}
+
+
+@pytest.mark.asyncio
 async def test_counting_repository_records_snapshot_updated_event_suffix_on_insert() -> None:
     event_id = uuid4()
     counters = BoundedGithubEnrichCounters()

@@ -442,6 +442,12 @@ class CountingGhEnricherRepository:
     async def mark_enrichment_run_started(self, run_id: UUID) -> None:
         await self._repository.mark_enrichment_run_started(run_id)
 
+    async def claim_failed_transient_enrichment_run_for_retry(self, **kwargs):
+        return await self._repository.claim_failed_transient_enrichment_run_for_retry(**kwargs)
+
+    async def load_enrichment_run_status_by_job_idempotency_key(self, **kwargs):
+        return await self._repository.load_enrichment_run_status_by_job_idempotency_key(**kwargs)
+
     async def mark_enrichment_run_finished(self, **kwargs) -> None:
         await self._repository.mark_enrichment_run_finished(**kwargs)
         self._counters.enrichment_runs_finished_count += 1

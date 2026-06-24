@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -80,7 +81,7 @@ class Ledger:
         self.candidates: dict[UUID, CandidateGroupRecord] = {}
         self.members: dict[UUID, list[CandidateMemberRecord]] = {}
         self.snapshots: dict[UUID, SnapshotRecord] = {}
-        self.enrichment_run_keys: set[str] = set()
+        self.enrichment_run_status_by_key: dict[str, str] = {}
         self.provider_snapshot_events: list[UUID] = []
         self.text_idea_snapshots_created = 0
         self.bundles: list[tuple[UUID, EvidenceBundleDraft]] = []
@@ -550,6 +551,7 @@ class GithubProviderRepo:
         self.ledger = ledger
         self.snapshot_updated_event_id: UUID | None = None
         self.snapshot_created = False
+        self.run_key_by_id: dict[UUID, str] = {}
 
     def transaction(self):
         return Tx()
@@ -586,16 +588,31 @@ class GithubProviderRepo:
 
     async def insert_enrichment_run_if_absent(self, **kwargs):
         key = kwargs["job_idempotency_key"]
-        if key in self.ledger.enrichment_run_keys:
+        if key in self.ledger.enrichment_run_status_by_key:
             return None
-        self.ledger.enrichment_run_keys.add(key)
-        return uuid4()
+        run_id = uuid4()
+        self.ledger.enrichment_run_status_by_key[key] = "pending"
+        self.run_key_by_id[run_id] = key
+        return run_id
 
     async def mark_enrichment_run_started(self, run_id) -> None:
-        del run_id
+        key = self.run_key_by_id[run_id]
+        self.ledger.enrichment_run_status_by_key[key] = "fetching"
+
+    async def claim_failed_transient_enrichment_run_for_retry(self, *, job_idempotency_key: str):
+        if self.ledger.enrichment_run_status_by_key.get(job_idempotency_key) != "failed_transient":
+            return None
+        run_id = uuid4()
+        self.ledger.enrichment_run_status_by_key[job_idempotency_key] = "fetching"
+        self.run_key_by_id[run_id] = job_idempotency_key
+        return run_id
+
+    async def load_enrichment_run_status_by_job_idempotency_key(self, *, job_idempotency_key: str):
+        return self.ledger.enrichment_run_status_by_key.get(job_idempotency_key)
 
     async def mark_enrichment_run_finished(self, **kwargs) -> None:
-        del kwargs
+        key = self.run_key_by_id[kwargs["run_id"]]
+        self.ledger.enrichment_run_status_by_key[key] = kwargs["status"]
 
     async def insert_snapshot(self, *, artifact_id: UUID, provider: str, plan) -> UUID:
         self.snapshot_created = True
@@ -718,6 +735,9 @@ class ProviderEnrichmentService:
     ) -> ProviderEnrichmentResult:
         assert request.provider_route == "github"
         if self.ledger.provider_error_code is not None:
+            self.ledger.enrichment_run_status_by_key[
+                _provider_job_idempotency_key(request)
+            ] = "failed_transient"
             return ProviderEnrichmentResult(
                 provider_route="github",
                 status="failed_transient",
@@ -754,6 +774,21 @@ class ProviderEnrichmentService:
             snapshot_created=repository.snapshot_created,
             github_request_count=len(self.ledger.github_client_calls),
         )
+
+
+def _provider_job_idempotency_key(request: ProviderEnrichmentRequest) -> str:
+    raw = "|".join(
+        [
+            str(request.artifact_id),
+            request.artifact_type,
+            request.refresh_mode,
+            str(request.depth_budget),
+            "none",
+            "none",
+        ]
+    )
+    snapshot_input_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"enrich:github:{request.artifact_id}:{snapshot_input_hash}"
 
 
 class StageComponents:
@@ -977,6 +1012,9 @@ async def test_existing_operator_source_resume_reuses_provider_and_assembler_wit
     assert len(ledger.candidates) == 1
     assert len(ledger.provider_snapshot_events) == 1
     assert len(ledger.snapshots) == 1
+    assert len(ledger.enrichment_run_status_by_key) == 1
+    assert set(ledger.enrichment_run_status_by_key.values()) == {"ready"}
+    assert len(ledger.github_client_calls) >= 5
     assert len(ledger.bundles) == 1
     assert len(ledger.analysis_outbox) == 1
     assert ledger.commits[:first_commit_count] == ["source_ingest", "normalization", "provider_enrichment"]

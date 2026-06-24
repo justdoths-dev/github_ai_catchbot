@@ -199,6 +199,48 @@ class GhEnricherRepository:
         row = result.scalar_one_or_none()
         return UUID(str(row)) if row else None
 
+    async def claim_failed_transient_enrichment_run_for_retry(
+        self,
+        *,
+        job_idempotency_key: str,
+    ) -> UUID | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                UPDATE artifact_enrichment_runs
+                SET status = 'fetching'::snapshot_status_enum,
+                    started_at = now(),
+                    finished_at = NULL,
+                    content_anchor = NULL
+                WHERE job_idempotency_key = :job_idempotency_key
+                  AND status = 'failed_transient'::snapshot_status_enum
+                RETURNING artifact_enrichment_run_id
+                """
+            ),
+            {"job_idempotency_key": job_idempotency_key},
+        )
+        row = result.scalar_one_or_none()
+        return UUID(str(row)) if row else None
+
+    async def load_enrichment_run_status_by_job_idempotency_key(
+        self,
+        *,
+        job_idempotency_key: str,
+    ) -> str | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT status
+                FROM artifact_enrichment_runs
+                WHERE job_idempotency_key = :job_idempotency_key
+                LIMIT 1
+                """
+            ),
+            {"job_idempotency_key": job_idempotency_key},
+        )
+        row = result.scalar_one_or_none()
+        return str(row) if row else None
+
     async def mark_enrichment_run_started(self, run_id: UUID) -> None:
         await self._session.execute(
             sa.text(

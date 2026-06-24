@@ -1130,6 +1130,16 @@ class _SnapshotUpdatedEventCapturingGhRepository:
     async def mark_enrichment_run_started(self, run_id: UUID) -> None:
         await self._repository_write("provider_repository_write_failed", "mark_enrichment_run_started", run_id)
 
+    async def claim_failed_transient_enrichment_run_for_retry(self, **kwargs: Any) -> UUID | None:
+        return await self._repository_write(
+            "provider_repository_write_failed",
+            "claim_failed_transient_enrichment_run_for_retry",
+            **kwargs,
+        )
+
+    async def load_enrichment_run_status_by_job_idempotency_key(self, **kwargs: Any) -> str | None:
+        return await self._repository.load_enrichment_run_status_by_job_idempotency_key(**kwargs)
+
     async def mark_enrichment_run_finished(self, **kwargs: Any) -> None:
         await self._repository_write("provider_repository_write_failed", "mark_enrichment_run_finished", **kwargs)
 
@@ -2336,8 +2346,8 @@ def _provider_result_ready_for_assembly(result: ProviderEnrichmentResult) -> boo
 
 
 def _provider_not_ready_reason(result: ProviderEnrichmentResult) -> str:
-    if result.status == "pending":
-        return "provider_evidence_pending"
+    if result.status in {"pending", "fetching"}:
+        return "provider_enrichment_run_in_progress"
     if result.status == "low_evidence":
         return "provider_evidence_low_evidence"
     if result.status in {"failed_transient", "failed_permanent", "rate_limited", "access_denied", "unsupported"}:

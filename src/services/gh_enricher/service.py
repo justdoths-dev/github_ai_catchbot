@@ -93,6 +93,7 @@ class GhEnricherService:
             )
 
         snapshot_input_hash = self._build_snapshot_input_hash(job=job, artifact=artifact, current_snapshot=current_snapshot)
+        job_idempotency_key = f"enrich:github:{artifact.artifact_id}:{snapshot_input_hash}"
         async with self._repository.transaction():
             run_id = await self._repository.insert_enrichment_run_if_absent(
                 artifact_id=artifact.artifact_id,
@@ -100,17 +101,30 @@ class GhEnricherService:
                 refresh_mode=job.refresh_mode,
                 depth_budget=job.depth_budget,
                 status="pending",
-                job_idempotency_key=f"enrich:github:{artifact.artifact_id}:{snapshot_input_hash}",
+                job_idempotency_key=job_idempotency_key,
                 content_anchor=None,
             )
             if run_id is not None:
                 await self._repository.mark_enrichment_run_started(run_id)
+            elif current_snapshot is None:
+                run_id = await self._repository.claim_failed_transient_enrichment_run_for_retry(
+                    job_idempotency_key=job_idempotency_key,
+                )
 
         if run_id is None:
+            existing_status = None
+            if current_snapshot is None:
+                existing_status = await self._repository.load_enrichment_run_status_by_job_idempotency_key(
+                    job_idempotency_key=job_idempotency_key,
+                )
             return EnrichmentResult(
                 artifact_id=artifact.artifact_id,
                 snapshot_id=current_snapshot.snapshot_id if current_snapshot else None,
-                status=current_snapshot.status if current_snapshot else "pending",  # type: ignore[arg-type]
+                status=(
+                    current_snapshot.status
+                    if current_snapshot
+                    else existing_status or "pending"
+                ),  # type: ignore[arg-type]
                 content_anchor=current_snapshot.content_anchor if current_snapshot else None,
                 emitted_snapshot_updated=False,
             )
