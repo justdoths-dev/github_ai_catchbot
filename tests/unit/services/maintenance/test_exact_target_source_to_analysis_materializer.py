@@ -15,7 +15,14 @@ from src.services.collector_telegram.operator_supplied_source import (
     parse_operator_source_packet,
 )
 from src.services.evidence_assembler.config import EvidenceAssemblerConfig
+from src.services.gh_enricher.github_client import (
+    GitHubAccessDeniedError,
+    GitHubClientError,
+    GitHubNotFoundError,
+    GitHubRateLimitedError,
+)
 from src.services.maintenance.exact_target_source_to_analysis_materializer import (
+    ExistingSourceProviderResumeAuthority,
     ExactTargetSourceToAnalysisRequest,
     FinalReadback,
     NormalizationReadback,
@@ -87,9 +94,17 @@ class SqlProviderTx:
 
 
 class SqlProviderFakeRepository:
-    def __init__(self, *, artifact_id: UUID) -> None:
+    def __init__(
+        self,
+        *,
+        artifact_id: UUID,
+        fail_insert_snapshot: bool = False,
+        fail_insert_snapshot_updated_outbox: bool = False,
+    ) -> None:
         from src.services.gh_enricher.models import ArtifactRecord
 
+        self.fail_insert_snapshot = fail_insert_snapshot
+        self.fail_insert_snapshot_updated_outbox = fail_insert_snapshot_updated_outbox
         self.artifact = ArtifactRecord(
             artifact_id=artifact_id,
             artifact_type="github_repo",
@@ -127,6 +142,8 @@ class SqlProviderFakeRepository:
         del kwargs
 
     async def insert_snapshot(self, **kwargs):
+        if self.fail_insert_snapshot:
+            raise RuntimeError(RAW_SECRET)
         self.snapshots.append(kwargs)
         return uuid4()
 
@@ -143,17 +160,22 @@ class SqlProviderFakeRepository:
         del kwargs
 
     async def insert_snapshot_updated_outbox(self, **kwargs):
+        if self.fail_insert_snapshot_updated_outbox:
+            raise RuntimeError(RAW_SECRET)
         self.outbox.append(kwargs)
         return self.outbox_event_id
 
 
 class SqlProviderFakeGitHubClient:
-    def __init__(self) -> None:
+    def __init__(self, *, repo_error: Exception | None = None) -> None:
+        self.repo_error = repo_error
         self.calls: list[str] = []
 
     async def get_repo(self, owner, repo, *, auth_mode):
         del auth_mode
         self.calls.append("repo")
+        if self.repo_error is not None:
+            raise self.repo_error
         return {
             "full_name": f"{owner}/{repo}",
             "default_branch": "main",
@@ -223,6 +245,7 @@ class Ledger:
         self.provider_snapshot_status = "ready"
         self.provider_snapshot_updated_event_id: UUID | None = None
         self.provider_error_code: str | None = None
+        self.provider_requires_live_authority = False
         self.refresh_event_id: UUID | None = None
         self.text_idea_snapshot_count = 0
         self.bundle_id: UUID | None = None
@@ -446,6 +469,13 @@ class FakeProviderEnrichmentService:
         assert request.artifact_id == self.ledger.primary_artifact_id
         assert request.candidate_group_id == self.ledger.candidate_group_id
         assert request.provider_route == "github"
+        if self.ledger.provider_requires_live_authority and not request.provider_authority.github_live_opened:
+            return ProviderEnrichmentResult(
+                provider_route="github",
+                status="blocked",
+                emitted_snapshot_updated=False,
+                error_code="provider_live_authority_required",
+            )
         if self.ledger.provider_error_code is not None:
             return ProviderEnrichmentResult(
                 provider_route="github",
@@ -590,9 +620,23 @@ def runtime_bundle() -> RuntimeConfigBundle:
     )
 
 
-async def run(ledger: Ledger, *, mode: str = "plan", text: str | None = None):
+async def run(
+    ledger: Ledger,
+    *,
+    mode: str = "plan",
+    text: str | None = None,
+    provider_authority: ProviderLiveAuthority | None = None,
+    provider_resume_authority: ExistingSourceProviderResumeAuthority | None = None,
+):
     return await run_exact_target_source_to_analysis_materializer(
-        ExactTargetSourceToAnalysisRequest(mode=mode, packet=packet(text or KOREAN_LLM_WORKFLOW_TEXT)),
+        ExactTargetSourceToAnalysisRequest(
+            mode=mode,
+            packet=packet(text or KOREAN_LLM_WORKFLOW_TEXT),
+            provider_authority=provider_authority or ProviderLiveAuthority(),
+            provider_resume_authority=(
+                provider_resume_authority or ExistingSourceProviderResumeAuthority()
+            ),
+        ),
         stage_factory=FakeStageFactory(ledger),
     )
 
@@ -760,6 +804,106 @@ async def test_sql_provider_live_authority_uses_real_gh_service_with_injected_cl
     assert result.external_network_attempted is False
     assert fake_repository.snapshots
     assert fake_repository.outbox
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "reason_code"),
+    [
+        (GitHubRateLimitedError(f"rate limited {RAW_SECRET}"), "provider_github_rate_limited"),
+        (GitHubAccessDeniedError(f"access denied {RAW_SECRET}"), "provider_github_access_denied"),
+        (GitHubNotFoundError(f"not found {RAW_SECRET}"), "provider_github_not_found"),
+        (GitHubClientError(f"client failed {RAW_SECRET}"), "provider_github_client_error"),
+    ],
+)
+async def test_sql_provider_classifies_github_client_exceptions_without_raw_body(
+    error: Exception,
+    reason_code: str,
+) -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderFakeRepository(artifact_id=artifact_id)
+    fake_client = SqlProviderFakeGitHubClient(repo_error=error)
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        github_client_factory=lambda config: fake_client,
+        repository_factory=lambda session: fake_repository,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="github_repo",
+            provider_route="github",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=ProviderLiveAuthority(
+                allow_live_github_provider_read=True,
+                allow_provider_snapshot_write=True,
+                provider_live_confirm="live-github-provider-evidence",
+            ),
+        )
+    )
+    rendered = json.dumps(asdict(result), sort_keys=True)
+
+    assert result.error_code == reason_code
+    assert result.github_request_count == 1
+    assert result.external_network_attempted is False
+    assert result.snapshot_created is False
+    assert RAW_SECRET not in rendered
+    assert "Traceback" not in rendered
+    assert "example/project" not in rendered
+    assert "https://github.com/example/project" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("repository_kwargs", "reason_code"),
+    [
+        ({"fail_insert_snapshot": True}, "provider_snapshot_write_failed"),
+        ({"fail_insert_snapshot_updated_outbox": True}, "provider_snapshot_outbox_write_failed"),
+    ],
+)
+async def test_sql_provider_classifies_repository_write_failures(
+    repository_kwargs: dict[str, bool],
+    reason_code: str,
+) -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderFakeRepository(artifact_id=artifact_id, **repository_kwargs)
+    fake_client = SqlProviderFakeGitHubClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        github_client_factory=lambda config: fake_client,
+        repository_factory=lambda session: fake_repository,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="github_repo",
+            provider_route="github",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=ProviderLiveAuthority(
+                allow_live_github_provider_read=True,
+                allow_provider_snapshot_write=True,
+                provider_live_confirm="live-github-provider-evidence",
+            ),
+        )
+    )
+    rendered = json.dumps(asdict(result), sort_keys=True)
+
+    assert result.error_code == reason_code
+    assert result.error_code != "provider_live_read_failed"
+    assert RAW_SECRET not in rendered
+    assert "Traceback" not in rendered
 
 
 @pytest.mark.asyncio
@@ -955,6 +1099,162 @@ async def test_duplicate_execute_blocks_before_second_stage_write() -> None:
     assert len(ledger.versions[source_id]) == 1
     assert sum(1 for row in ledger.outbox if row["event_type"] == "source_message.created.v1") == 1
     assert sum(1 for row in ledger.outbox if row["event_type"] == "candidate.bundle.refresh.v1") == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_url_execute_without_resume_gate_blocks_after_prior_provider_failure() -> None:
+    ledger = Ledger()
+    ledger.provider_error_code = "provider_github_client_error"
+
+    first = await run(ledger, mode="execute", text=GITHUB_URL_TEXT)
+    second = await run(ledger, mode="execute", text=GITHUB_URL_TEXT)
+
+    assert first.status == "blocked"
+    assert first.reason_code == "provider_github_client_error"
+    assert second.status == "blocked"
+    assert second.reason_code == "source_packet_already_materialized"
+    assert second.source_ingest_attempted is False
+    assert second.normalization_attempted is False
+    assert second.provider_enrichment_attempted is False
+    assert sum(len(rows) for rows in ledger.versions.values()) == 1
+    assert sum(1 for row in ledger.outbox if row["event_type"] == "source_message.created.v1") == 1
+    assert sum(1 for row in ledger.outbox if row["event_type"] == "artifact.enrich.requested.v1") == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_url_resume_gate_without_live_provider_gate_blocks_before_snapshot() -> None:
+    ledger = Ledger()
+    ledger.provider_error_code = "provider_github_client_error"
+    first = await run(ledger, mode="execute", text=GITHUB_URL_TEXT)
+    ledger.provider_error_code = None
+    ledger.provider_requires_live_authority = True
+    second_call_start = len(ledger.call_order)
+
+    second = await run(
+        ledger,
+        mode="execute",
+        text=GITHUB_URL_TEXT,
+        provider_resume_authority=ExistingSourceProviderResumeAuthority(
+            allow_existing_source_provider_resume=True,
+            provider_resume_confirm="resume-live-github-provider-evidence",
+        ),
+    )
+
+    assert first.reason_code == "provider_github_client_error"
+    assert second.status == "blocked"
+    assert second.reason_code == "provider_live_authority_required"
+    assert second.source_ingest_attempted is False
+    assert second.normalization_attempted is False
+    assert second.provider_enrichment_attempted is True
+    assert second.assembler_attempted is False
+    assert ledger.provider_snapshot_id is None
+    assert ledger.provider_snapshot_updated_event_id is None
+    assert ledger.analysis_request_event_id is None
+    assert "normalizer.process_stream_message" not in ledger.call_order[second_call_start:]
+    assert sum(len(rows) for rows in ledger.versions.values()) == 1
+    assert sum(1 for row in ledger.outbox if row["event_type"] == "artifact.enrich.requested.v1") == 1
+
+
+@pytest.mark.asyncio
+async def test_duplicate_url_resume_gate_retries_provider_without_duplicate_source_or_candidate() -> None:
+    ledger = Ledger()
+    ledger.provider_error_code = "provider_github_client_error"
+    first = await run(ledger, mode="execute", text=GITHUB_URL_TEXT)
+    ledger.provider_error_code = None
+    second_call_start = len(ledger.call_order)
+
+    second = await run(
+        ledger,
+        mode="execute",
+        text=GITHUB_URL_TEXT,
+        provider_authority=ProviderLiveAuthority(
+            allow_live_github_provider_read=True,
+            allow_provider_snapshot_write=True,
+            provider_live_confirm="live-github-provider-evidence",
+        ),
+        provider_resume_authority=ExistingSourceProviderResumeAuthority(
+            allow_existing_source_provider_resume=True,
+            provider_resume_confirm="resume-live-github-provider-evidence",
+        ),
+    )
+
+    assert first.status == "blocked"
+    assert first.reason_code == "provider_github_client_error"
+    assert second.status == "pass"
+    assert second.reason_code == "source_url_provider_evidence_analysis_requested"
+    assert second.source_ingest_attempted is False
+    assert second.normalization_attempted is False
+    assert second.provider_enrichment_attempted is True
+    assert second.assembler_attempted is True
+    assert second.source_message_created is False
+    assert second.source_version_created is False
+    assert second.candidate_created is True
+    assert second.artifact_enrichment_request_created is True
+    assert second.provider_snapshot_created is True
+    assert second.analysis_request_created is True
+    assert second.bounded_counts["provider_snapshots"] == 1
+    assert second.bounded_counts["artifact_snapshot_updated_events"] == 1
+    assert second.bounded_counts["analysis_requested_events"] == 1
+    assert len(ledger.current) == 1
+    assert sum(len(rows) for rows in ledger.versions.values()) == 1
+    assert sum(1 for row in ledger.outbox if row["event_type"] == "source_message.created.v1") == 1
+    assert sum(1 for row in ledger.outbox if row["event_type"] == "artifact.enrich.requested.v1") == 1
+    assert "collector.upsert_source_message" not in ledger.call_order[second_call_start:]
+    assert "normalizer.process_stream_message" not in ledger.call_order[second_call_start:]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutate", "reason_code"),
+    [
+        (
+            lambda ledger: setattr(ledger, "enrichment_requests", 2),
+            "artifact_enrichment_request_cardinality_invalid",
+        ),
+        (
+            lambda ledger: (
+                setattr(ledger, "provider_route", "web"),
+                setattr(ledger, "provider_route_counts", {"web": 1}),
+            ),
+            "provider_resume_provider_route_not_github",
+        ),
+        (
+            lambda ledger: setattr(ledger, "analysis_request_event_id", uuid4()),
+            "provider_resume_analysis_already_present",
+        ),
+        (
+            lambda ledger: setattr(ledger, "candidate_group_id", None),
+            "candidate_group_cardinality_invalid",
+        ),
+    ],
+)
+async def test_duplicate_url_resume_refuses_ambiguous_existing_state(mutate, reason_code: str) -> None:
+    ledger = Ledger()
+    ledger.provider_error_code = "provider_github_client_error"
+    first = await run(ledger, mode="execute", text=GITHUB_URL_TEXT)
+    ledger.provider_error_code = None
+    mutate(ledger)
+
+    second = await run(
+        ledger,
+        mode="execute",
+        text=GITHUB_URL_TEXT,
+        provider_authority=ProviderLiveAuthority(
+            allow_live_github_provider_read=True,
+            allow_provider_snapshot_write=True,
+            provider_live_confirm="live-github-provider-evidence",
+        ),
+        provider_resume_authority=ExistingSourceProviderResumeAuthority(
+            allow_existing_source_provider_resume=True,
+            provider_resume_confirm="resume-live-github-provider-evidence",
+        ),
+    )
+
+    assert first.reason_code == "provider_github_client_error"
+    assert second.status == "blocked"
+    assert second.reason_code == reason_code
+    assert second.provider_enrichment_attempted is False
+    assert second.assembler_attempted is False
 
 
 @pytest.mark.asyncio

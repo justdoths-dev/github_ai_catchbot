@@ -151,6 +151,34 @@ async def test_plan_rejects_confirmation_before_env_or_session(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_plan_rejects_resume_authority_before_env_or_session(tmp_path: Path) -> None:
+    packet_path = write_packet(tmp_path / "packet.json")
+    loader = CountingRuntimeLoader()
+    outputs: list[str] = []
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--source-packet-json",
+            str(packet_path),
+            "--env-file",
+            RAW_ENV_PATH,
+            "--allow-existing-source-provider-resume",
+            "--provider-resume-confirm",
+            "resume-live-github-provider-evidence",
+        ],
+        emit_json=outputs.append,
+        runtime_config_loader=loader,
+        stage_factory_builder=raising_stage_factory_builder,
+    )
+
+    assert exit_code == 2
+    assert json.loads(outputs[0])["reason_code"] == "provider_resume_authority_not_allowed_for_plan"
+    assert loader.calls == []
+
+
+@pytest.mark.asyncio
 async def test_no_latest_or_multiple_packet_support(tmp_path: Path) -> None:
     loader = CountingRuntimeLoader()
     outputs: list[str] = []
@@ -272,6 +300,22 @@ def test_parser_surface_has_no_latest_selector() -> None:
 
     with pytest.raises(ExactTargetSourceToAnalysisConfigError):
         parser.parse_args(["--mode", "plan", "--latest", "--env-file", RAW_ENV_PATH])
+
+    parsed = parser.parse_args(
+        [
+            "--mode",
+            "execute",
+            "--source-packet-json",
+            "/tmp/source-packet.json",
+            "--env-file",
+            RAW_ENV_PATH,
+            "--allow-existing-source-provider-resume",
+            "--provider-resume-confirm",
+            "resume-live-github-provider-evidence",
+        ]
+    )
+    assert parsed.allow_existing_source_provider_resume is True
+    assert parsed.provider_resume_confirm == "resume-live-github-provider-evidence"
 
 
 def test_script_is_thin_delegate() -> None:

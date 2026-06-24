@@ -34,11 +34,13 @@ from src.services.gh_enricher.models import (
 from src.services.gh_enricher.service import GhEnricherService
 from src.services.gh_enricher.url_discovery import GitHubUrlDiscovery
 from src.services.maintenance.exact_target_source_to_analysis_materializer import (
+    ExistingSourceProviderResumeAuthority,
     ExactTargetSourceToAnalysisRequest,
     FinalReadback,
     NormalizationReadback,
     ProviderEnrichmentRequest,
     ProviderEnrichmentResult,
+    ProviderLiveAuthority,
     RefreshEventRecord,
     run_exact_target_source_to_analysis_materializer,
 )
@@ -87,6 +89,7 @@ class Ledger:
         self.commits: list[str] = []
         self.allow_enrichment_requests = False
         self.github_client_calls: list[str] = []
+        self.provider_error_code: str | None = None
 
 
 class CollectorRepo:
@@ -714,6 +717,13 @@ class ProviderEnrichmentService:
         request: ProviderEnrichmentRequest,
     ) -> ProviderEnrichmentResult:
         assert request.provider_route == "github"
+        if self.ledger.provider_error_code is not None:
+            return ProviderEnrichmentResult(
+                provider_route="github",
+                status="failed_transient",
+                emitted_snapshot_updated=False,
+                error_code=self.ledger.provider_error_code,
+            )
         repository = GithubProviderRepo(self.ledger)
         service = GhEnricherService(
             github_config(),
@@ -910,3 +920,64 @@ async def test_operator_source_url_flow_materializes_provider_evidence_analysis_
     assert ledger.bundles[0][1].judge_profile == "github_primary"
     assert len(ledger.analysis_outbox) == 1
     assert ledger.commits == ["source_ingest", "normalization", "provider_enrichment", "assembler"]
+
+
+@pytest.mark.asyncio
+async def test_existing_operator_source_resume_reuses_provider_and_assembler_without_duplicates() -> None:
+    ledger = Ledger()
+    ledger.allow_enrichment_requests = True
+    ledger.provider_error_code = "provider_github_client_error"
+    source_packet = packet(
+        "https://github.com/DietrichGebert/ponytail\n\n"
+        "AI가 코드를 작성하기 전에 다음 6단계의 사다리를 거치도록 통제합니다..."
+    )
+
+    first = await run_exact_target_source_to_analysis_materializer(
+        ExactTargetSourceToAnalysisRequest(mode="execute", packet=source_packet),
+        stage_factory=StageFactory(ledger),
+    )
+    first_commit_count = len(ledger.commits)
+    ledger.provider_error_code = None
+
+    second = await run_exact_target_source_to_analysis_materializer(
+        ExactTargetSourceToAnalysisRequest(
+            mode="execute",
+            packet=source_packet,
+            provider_authority=ProviderLiveAuthority(
+                allow_live_github_provider_read=True,
+                allow_provider_snapshot_write=True,
+                provider_live_confirm="live-github-provider-evidence",
+            ),
+            provider_resume_authority=ExistingSourceProviderResumeAuthority(
+                allow_existing_source_provider_resume=True,
+                provider_resume_confirm="resume-live-github-provider-evidence",
+            ),
+        ),
+        stage_factory=StageFactory(ledger),
+    )
+
+    assert first.status == "blocked"
+    assert first.reason_code == "provider_github_client_error"
+    assert second.status == "pass"
+    assert second.reason_code == "source_url_provider_evidence_analysis_requested"
+    assert second.source_ingest_attempted is False
+    assert second.normalization_attempted is False
+    assert second.provider_enrichment_attempted is True
+    assert second.assembler_attempted is True
+    assert second.provider_snapshot_created is True
+    assert second.analysis_request_created is True
+    assert len(ledger.current) == 1
+    assert sum(len(rows) for rows in ledger.versions.values()) == 1
+    assert [row["event_type"] for row in ledger.outbox] == [
+        "source_message.created.v1",
+        "artifact.enrich.requested.v1",
+        "artifact.snapshot.updated.v1",
+    ]
+    assert len(ledger.normalization_runs) == 1
+    assert len(ledger.candidates) == 1
+    assert len(ledger.provider_snapshot_events) == 1
+    assert len(ledger.snapshots) == 1
+    assert len(ledger.bundles) == 1
+    assert len(ledger.analysis_outbox) == 1
+    assert ledger.commits[:first_commit_count] == ["source_ingest", "normalization", "provider_enrichment"]
+    assert ledger.commits[first_commit_count:] == ["provider_enrichment", "assembler"]

@@ -37,6 +37,7 @@ from ..router_normalizer.url_extraction import extract_urls
 SCHEMA_VERSION = "exact_target_source_to_analysis_materializer_report_v2"
 CONFIRM_TOKEN = "materialize-source-analysis"
 PROVIDER_LIVE_CONFIRM_TOKEN = "live-github-provider-evidence"
+PROVIDER_RESUME_CONFIRM_TOKEN = "resume-live-github-provider-evidence"
 PLACEHOLDER_REDIS_URL = "redis_locator_not_attempted"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -104,6 +105,26 @@ class ProviderLiveAuthority:
 
 
 @dataclass(slots=True, frozen=True)
+class ExistingSourceProviderResumeAuthority:
+    allow_existing_source_provider_resume: bool = False
+    provider_resume_confirm: str | None = None
+
+    @property
+    def args_present(self) -> bool:
+        return (
+            self.allow_existing_source_provider_resume
+            or self.provider_resume_confirm is not None
+        )
+
+    @property
+    def opened(self) -> bool:
+        return (
+            self.allow_existing_source_provider_resume
+            and self.provider_resume_confirm == PROVIDER_RESUME_CONFIRM_TOKEN
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class ExactTargetSourceToAnalysisReport:
     schema_version: str
     mode: str
@@ -148,6 +169,9 @@ class ExactTargetSourceToAnalysisRequest:
     mode: str
     packet: OperatorSuppliedTelegramSourcePacket
     provider_authority: ProviderLiveAuthority = field(default_factory=ProviderLiveAuthority)
+    provider_resume_authority: ExistingSourceProviderResumeAuthority = field(
+        default_factory=ExistingSourceProviderResumeAuthority
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -269,6 +293,7 @@ class PreflightSnapshot:
     registry_target: TelegramRegistryTarget | None = None
     source_content_hash: str | None = None
     source_message_id: str | None = None
+    source_version_no: int | None = None
     local_plan: LocalSourceRoutingPlan | None = None
     reason_code: str | None = None
 
@@ -848,7 +873,13 @@ class SqlProviderEnrichmentService:
 
         from ..gh_enricher.fetch_planner import GitHubFetchPlanner
         from ..gh_enricher.file_sampler import GitHubFileSampler
-        from ..gh_enricher.github_client import GitHubClient
+        from ..gh_enricher.github_client import (
+            GitHubAccessDeniedError,
+            GitHubClient,
+            GitHubClientError,
+            GitHubNotFoundError,
+            GitHubRateLimitedError,
+        )
         from ..gh_enricher.models import ArtifactEnrichmentJob
         from ..gh_enricher.repositories import GhEnricherRepository
         from ..gh_enricher.service import GhEnricherService
@@ -866,6 +897,7 @@ class SqlProviderEnrichmentService:
         repository = _SnapshotUpdatedEventCapturingGhRepository(
             repository_factory(self._session),
             session=self._session,
+            state=state,
         )
         github_client = _TrackedGitHubClient(
             client_factory(gh_config),
@@ -903,15 +935,49 @@ class SqlProviderEnrichmentService:
                 github_request_count=state.github_request_count,
                 error_code="github_request_cap_exceeded",
             )
+        except (
+            GitHubRateLimitedError,
+            GitHubAccessDeniedError,
+            GitHubNotFoundError,
+            GitHubClientError,
+        ) as exc:
+            return ProviderEnrichmentResult(
+                provider_route=request.provider_route,
+                status="failed_transient",
+                emitted_snapshot_updated=False,
+                snapshot_created=repository.snapshot_created,
+                external_network_attempted=state.external_network_attempted,
+                github_request_count=state.github_request_count,
+                error_code=_github_client_exception_reason(exc) or "provider_github_client_error",
+            )
         except Exception:
             return ProviderEnrichmentResult(
                 provider_route=request.provider_route,
                 status="failed_transient",
                 emitted_snapshot_updated=False,
+                snapshot_created=repository.snapshot_created,
                 external_network_attempted=state.external_network_attempted,
                 github_request_count=state.github_request_count,
-                error_code="provider_live_read_failed",
+                error_code=(
+                    state.repository_error_code
+                    or state.github_error_code
+                    or "provider_live_enrichment_failed"
+                ),
             )
+
+        if result.status in {"rate_limited", "access_denied", "failed_permanent", "failed_transient"}:
+            if state.github_error_code is not None:
+                return ProviderEnrichmentResult(
+                    provider_route=request.provider_route,
+                    status=result.status,
+                    emitted_snapshot_updated=result.emitted_snapshot_updated,
+                    snapshot_id=result.snapshot_id,
+                    snapshot_updated_event_id=repository.snapshot_updated_event_id,
+                    snapshot_created=repository.snapshot_created,
+                    external_network_attempted=state.external_network_attempted,
+                    github_request_count=state.github_request_count,
+                    error_code=state.github_error_code,
+                )
 
         return ProviderEnrichmentResult(
             provider_route=request.provider_route,
@@ -919,7 +985,7 @@ class SqlProviderEnrichmentService:
             emitted_snapshot_updated=result.emitted_snapshot_updated,
             snapshot_id=result.snapshot_id,
             snapshot_updated_event_id=repository.snapshot_updated_event_id,
-            snapshot_created=repository.snapshot_write_attempted,
+            snapshot_created=repository.snapshot_created,
             external_network_attempted=state.external_network_attempted,
             github_request_count=state.github_request_count,
         )
@@ -929,6 +995,8 @@ class SqlProviderEnrichmentService:
 class _GitHubProviderAttemptState:
     external_network_attempted: bool = False
     github_request_count: int = 0
+    github_error_code: str | None = None
+    repository_error_code: str | None = None
 
 
 class _GitHubRequestCapExceeded(Exception):
@@ -951,7 +1019,11 @@ class _TrackedGitHubClient:
 
     async def get_repo(self, owner: str, repo: str, *, auth_mode: str) -> dict[str, Any]:
         self._count_request()
-        return await self._github_client.get_repo(owner, repo, auth_mode=auth_mode)
+        try:
+            return await self._github_client.get_repo(owner, repo, auth_mode=auth_mode)
+        except Exception as exc:
+            self._record_github_error(exc)
+            raise
 
     async def get_tree(
         self,
@@ -963,13 +1035,17 @@ class _TrackedGitHubClient:
         auth_mode: str,
     ) -> dict[str, Any]:
         self._count_request()
-        return await self._github_client.get_tree(
-            owner,
-            repo,
-            ref,
-            recursive=recursive,
-            auth_mode=auth_mode,
-        )
+        try:
+            return await self._github_client.get_tree(
+                owner,
+                repo,
+                ref,
+                recursive=recursive,
+                auth_mode=auth_mode,
+            )
+        except Exception as exc:
+            self._record_github_error(exc)
+            raise
 
     async def get_contents(
         self,
@@ -981,11 +1057,19 @@ class _TrackedGitHubClient:
         auth_mode: str,
     ) -> dict[str, Any] | list[dict[str, Any]]:
         self._count_request()
-        return await self._github_client.get_contents(owner, repo, path, ref=ref, auth_mode=auth_mode)
+        try:
+            return await self._github_client.get_contents(owner, repo, path, ref=ref, auth_mode=auth_mode)
+        except Exception as exc:
+            self._record_github_error(exc)
+            raise
 
     async def get_releases(self, owner: str, repo: str, *, auth_mode: str) -> list[dict[str, Any]]:
         self._count_request()
-        return await self._github_client.get_releases(owner, repo, auth_mode=auth_mode)
+        try:
+            return await self._github_client.get_releases(owner, repo, auth_mode=auth_mode)
+        except Exception as exc:
+            self._record_github_error(exc)
+            raise
 
     async def get_default_branch_head(
         self,
@@ -996,16 +1080,24 @@ class _TrackedGitHubClient:
         auth_mode: str,
     ) -> dict[str, Any]:
         self._count_request()
-        return await self._github_client.get_default_branch_head(
-            owner,
-            repo,
-            default_branch,
-            auth_mode=auth_mode,
-        )
+        try:
+            return await self._github_client.get_default_branch_head(
+                owner,
+                repo,
+                default_branch,
+                auth_mode=auth_mode,
+            )
+        except Exception as exc:
+            self._record_github_error(exc)
+            raise
 
     async def get_gist(self, gist_id: str, *, auth_mode: str) -> dict[str, Any]:
         self._count_request()
-        return await self._github_client.get_gist(gist_id, auth_mode=auth_mode)
+        try:
+            return await self._github_client.get_gist(gist_id, auth_mode=auth_mode)
+        except Exception as exc:
+            self._record_github_error(exc)
+            raise
 
     def _count_request(self) -> None:
         self._state.github_request_count += 1
@@ -1014,30 +1106,75 @@ class _TrackedGitHubClient:
         if self._track_external_network:
             self._state.external_network_attempted = True
 
+    def _record_github_error(self, exc: Exception) -> None:
+        reason_code = _github_client_exception_reason(exc)
+        if reason_code is not None:
+            self._state.github_error_code = reason_code
+
 
 class _SnapshotUpdatedEventCapturingGhRepository:
-    def __init__(self, repository: Any, *, session: Any) -> None:
+    def __init__(self, repository: Any, *, session: Any, state: _GitHubProviderAttemptState) -> None:
         self._repository = repository
         self._session = session
+        self._state = state
         self.snapshot_updated_event_id: UUID | None = None
         self.snapshot_write_attempted = False
+        self.snapshot_created = False
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._repository, name)
 
+    async def insert_enrichment_run_if_absent(self, **kwargs: Any) -> UUID | None:
+        return await self._repository_write("provider_repository_write_failed", "insert_enrichment_run_if_absent", **kwargs)
+
+    async def mark_enrichment_run_started(self, run_id: UUID) -> None:
+        await self._repository_write("provider_repository_write_failed", "mark_enrichment_run_started", run_id)
+
+    async def mark_enrichment_run_finished(self, **kwargs: Any) -> None:
+        await self._repository_write("provider_repository_write_failed", "mark_enrichment_run_finished", **kwargs)
+
     async def insert_snapshot(self, **kwargs: Any) -> UUID:
         self.snapshot_write_attempted = True
-        return await self._repository.insert_snapshot(**kwargs)
+        snapshot_id = await self._repository_write(
+            "provider_snapshot_write_failed",
+            "insert_snapshot",
+            **kwargs,
+        )
+        self.snapshot_created = True
+        return snapshot_id
+
+    async def insert_github_repo_child(self, **kwargs: Any) -> None:
+        await self._repository_write("provider_snapshot_write_failed", "insert_github_repo_child", **kwargs)
+
+    async def insert_github_file_sample(self, **kwargs: Any) -> None:
+        await self._repository_write("provider_snapshot_write_failed", "insert_github_file_sample", **kwargs)
+
+    async def insert_discovered_url(self, **kwargs: Any) -> None:
+        await self._repository_write("provider_snapshot_write_failed", "insert_discovered_url", **kwargs)
+
+    async def update_artifact_current_snapshot(self, **kwargs: Any) -> None:
+        await self._repository_write("provider_snapshot_write_failed", "update_artifact_current_snapshot", **kwargs)
 
     async def insert_snapshot_updated_outbox(self, **kwargs: Any) -> UUID | None:
-        event_id = await self._repository.insert_snapshot_updated_outbox(**kwargs)
-        if event_id is None:
-            event_id = await self._load_existing_snapshot_updated_event_id(
-                artifact_id=kwargs["artifact_id"],
-                snapshot_id=kwargs["snapshot_id"],
-            )
+        try:
+            event_id = await self._repository.insert_snapshot_updated_outbox(**kwargs)
+            if event_id is None:
+                event_id = await self._load_existing_snapshot_updated_event_id(
+                    artifact_id=kwargs["artifact_id"],
+                    snapshot_id=kwargs["snapshot_id"],
+                )
+        except Exception:
+            self._state.repository_error_code = "provider_snapshot_outbox_write_failed"
+            raise
         self.snapshot_updated_event_id = event_id
         return event_id
+
+    async def _repository_write(self, reason_code: str, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await getattr(self._repository, method_name)(*args, **kwargs)
+        except Exception:
+            self._state.repository_error_code = reason_code
+            raise
 
     async def _load_existing_snapshot_updated_event_id(
         self,
@@ -1138,6 +1275,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-live-github-provider-read", action="store_true")
     parser.add_argument("--allow-provider-snapshot-write", action="store_true")
     parser.add_argument("--provider-live-confirm", default=None)
+    parser.add_argument("--allow-existing-source-provider-resume", action="store_true")
+    parser.add_argument("--provider-resume-confirm", default=None)
     return parser
 
 
@@ -1200,6 +1339,19 @@ async def run_cli(
             )
         )
         return 2
+    if args.mode == "plan" and _provider_resume_authority_args_present(args):
+        emit_json(
+            _compact_json(
+                asdict(
+                    _report(
+                        mode=args.mode,
+                        status="blocked",
+                        reason_code="provider_resume_authority_not_allowed_for_plan",
+                    )
+                )
+            )
+        )
+        return 2
 
     try:
         packet = load_operator_source_packet(args.source_packet_json[0], repo_root=repo_root)
@@ -1241,6 +1393,7 @@ async def run_cli(
                 mode=args.mode,
                 packet=packet,
                 provider_authority=_provider_authority_from_args(args),
+                provider_resume_authority=_provider_resume_authority_from_args(args),
             ),
             stage_factory=stage_factory,
         )
@@ -1261,7 +1414,11 @@ async def run_exact_target_source_to_analysis_materializer(
     )
     try:
         async with stage_factory.stage("preflight") as components:
-            preflight = await _load_preflight(components, request.packet)
+            preflight = await _load_preflight(
+                components,
+                request.packet,
+                provider_resume_authority=request.provider_resume_authority,
+            )
         report = _apply_preflight(report, preflight)
         if not preflight.passed:
             return replace(
@@ -1274,6 +1431,16 @@ async def run_exact_target_source_to_analysis_materializer(
 
         assert preflight.registry_target is not None
         assert preflight.source_content_hash is not None
+
+        if preflight.source_message_id is not None and request.provider_resume_authority.opened:
+            resume = await _load_existing_provider_resume(
+                request=request,
+                stage_factory=stage_factory,
+                report=report,
+                preflight=preflight,
+            )
+            if resume is not None:
+                return resume
 
         report = replace(report, source_ingest_attempted=True)
         async with stage_factory.stage("source_ingest") as components:
@@ -1327,113 +1494,14 @@ async def run_exact_target_source_to_analysis_materializer(
         assert normalization.candidate_group_id is not None
 
         if normalization.enrichment_requests >= 1:
-            provider_request_error = _provider_request_error(normalization)
-            if provider_request_error is not None:
-                return replace(report, status="failed", reason_code=provider_request_error)
-            assert normalization.enrichment_request_event_id is not None
-            assert normalization.candidate_group_id is not None
-            assert normalization.primary_artifact_id is not None
-            assert normalization.primary_artifact_type is not None
-            assert normalization.provider_route is not None
-            assert normalization.refresh_mode is not None
-            assert normalization.depth_budget is not None
-
-            provider_request = ProviderEnrichmentRequest(
-                trigger_event_id=normalization.enrichment_request_event_id,
-                candidate_group_id=normalization.candidate_group_id,
-                artifact_id=normalization.primary_artifact_id,
-                artifact_type=normalization.primary_artifact_type,
-                provider_route=normalization.provider_route,
-                refresh_mode=normalization.refresh_mode,
-                depth_budget=normalization.depth_budget,
-                provider_authority=request.provider_authority,
-            )
-            report = replace(report, provider_enrichment_attempted=True)
-            async with stage_factory.stage("provider_enrichment") as components:
-                provider = await components.provider_enrichment_service.materialize_provider_request(
-                    provider_request
-                )
-                await components.commit()
-            report = _apply_provider_enrichment_result(report, provider)
-
-            async with stage_factory.stage("final_readback") as components:
-                final = await components.materializer_repository.load_final_readback(
-                    source_message_id=source_message_id,
-                    source_version_no=source_version_no,
-                    source_content_hash=preflight.source_content_hash,
-                    chat_id=preflight.registry_target.chat_id,
-                    message_id=request.packet.parsed_ref.message_id,
-                    candidate_group_id=normalization.candidate_group_id,
-                )
-            report = _apply_final_readback(report, final)
-            if provider.error_code is not None:
-                provider_error = _provider_not_ready_readback_error(final)
-                if provider_error is not None:
-                    return replace(report, status="failed", reason_code=provider_error)
-                return replace(
-                    report,
-                    status="blocked",
-                    reason_code=provider.error_code,
-                    preflight_passed=True,
-                    source_message_created=True,
-                    source_version_created=True,
-                    candidate_created=True,
-                    artifact_enrichment_request_created=True,
-                    analysis_request_created=False,
-                )
-            if not _provider_result_ready_for_assembly(provider):
-                provider_error = _provider_not_ready_readback_error(final)
-                if provider_error is not None:
-                    return replace(report, status="failed", reason_code=provider_error)
-                return replace(
-                    report,
-                    status="pass",
-                    reason_code=_provider_not_ready_reason(provider),
-                    preflight_passed=True,
-                    source_message_created=True,
-                    source_version_created=True,
-                    candidate_created=True,
-                    artifact_enrichment_request_created=True,
-                    analysis_request_created=False,
-                )
-            if provider.snapshot_updated_event_id is None:
-                return replace(
-                    report,
-                    status="failed",
-                    reason_code="provider_snapshot_updated_event_missing",
-                )
-
-            report = replace(report, assembler_attempted=True)
-            async with stage_factory.stage("assembler") as components:
-                await components.assembler_service.handle_trigger_event(
-                    provider.snapshot_updated_event_id
-                )
-                await components.commit()
-
-            async with stage_factory.stage("final_readback") as components:
-                final = await components.materializer_repository.load_final_readback(
-                    source_message_id=source_message_id,
-                    source_version_no=source_version_no,
-                    source_content_hash=preflight.source_content_hash,
-                    chat_id=preflight.registry_target.chat_id,
-                    message_id=request.packet.parsed_ref.message_id,
-                    candidate_group_id=normalization.candidate_group_id,
-                )
-            report = _apply_final_readback(report, final)
-            provider_final_error = _provider_final_readback_error(final)
-            if provider_final_error is not None:
-                return replace(report, status="failed", reason_code=provider_final_error)
-            return replace(
-                report,
-                status="pass",
-                reason_code="source_url_provider_evidence_analysis_requested",
-                preflight_passed=True,
-                source_message_created=True,
-                source_version_created=True,
-                candidate_created=True,
-                artifact_enrichment_request_created=True,
-                bundle_created=True,
-                analysis_request_created=True,
+            return await _run_provider_enrichment_to_analysis(
+                request=request,
+                stage_factory=stage_factory,
+                report=report,
+                preflight=preflight,
+                source_message_id=source_message_id,
+                source_version_no=source_version_no,
+                normalization=normalization,
             )
 
         report = replace(report, bundle_refresh_attempted=True)
@@ -1486,6 +1554,190 @@ async def run_exact_target_source_to_analysis_materializer(
         return replace(report, status="blocked", reason_code=_safe_reason_code(exc))
     except Exception:
         return replace(report, status="failed", reason_code="unhandled_error")
+
+
+async def _load_existing_provider_resume(
+    *,
+    request: ExactTargetSourceToAnalysisRequest,
+    stage_factory: StageFactoryProtocol,
+    report: ExactTargetSourceToAnalysisReport,
+    preflight: PreflightSnapshot,
+) -> ExactTargetSourceToAnalysisReport | None:
+    if preflight.source_message_id is None:
+        return None
+    if preflight.source_version_no is None:
+        return replace(
+            report,
+            status="blocked",
+            reason_code="provider_resume_source_version_missing",
+            preflight_passed=True,
+        )
+    if preflight.source_version_no != 1:
+        return replace(
+            report,
+            status="blocked",
+            reason_code="provider_resume_source_version_cardinality_invalid",
+            preflight_passed=True,
+        )
+    assert preflight.registry_target is not None
+    assert preflight.source_content_hash is not None
+
+    source_message_id = UUID(preflight.source_message_id)
+    source_version_no = int(preflight.source_version_no)
+    async with stage_factory.stage("normalization_readback") as components:
+        normalization = await components.materializer_repository.load_normalization_readback(
+            source_message_id=source_message_id,
+            source_version_no=source_version_no,
+        )
+    report = _apply_normalization_readback(report, normalization)
+    normalization_error = _normalization_error(normalization)
+    if normalization_error is not None:
+        return replace(report, status="blocked", reason_code=normalization_error, preflight_passed=True)
+    resume_request_error = _provider_resume_request_error(normalization)
+    if resume_request_error is not None:
+        return replace(report, status="blocked", reason_code=resume_request_error, preflight_passed=True)
+    assert normalization.candidate_group_id is not None
+
+    async with stage_factory.stage("final_readback") as components:
+        final = await components.materializer_repository.load_final_readback(
+            source_message_id=source_message_id,
+            source_version_no=source_version_no,
+            source_content_hash=preflight.source_content_hash,
+            chat_id=preflight.registry_target.chat_id,
+            message_id=request.packet.parsed_ref.message_id,
+            candidate_group_id=normalization.candidate_group_id,
+        )
+    report = _apply_final_readback(report, final)
+    resume_readback_error = _provider_resume_pre_provider_readback_error(final)
+    if resume_readback_error == "existing_source_analysis_already_materialized":
+        return replace(
+            report,
+            status="pass",
+            reason_code=resume_readback_error,
+            preflight_passed=True,
+        )
+    if resume_readback_error is not None:
+        return replace(report, status="blocked", reason_code=resume_readback_error, preflight_passed=True)
+
+    return await _run_provider_enrichment_to_analysis(
+        request=request,
+        stage_factory=stage_factory,
+        report=report,
+        preflight=preflight,
+        source_message_id=source_message_id,
+        source_version_no=source_version_no,
+        normalization=normalization,
+    )
+
+
+async def _run_provider_enrichment_to_analysis(
+    *,
+    request: ExactTargetSourceToAnalysisRequest,
+    stage_factory: StageFactoryProtocol,
+    report: ExactTargetSourceToAnalysisReport,
+    preflight: PreflightSnapshot,
+    source_message_id: UUID,
+    source_version_no: int,
+    normalization: NormalizationReadback,
+) -> ExactTargetSourceToAnalysisReport:
+    provider_request_error = _provider_request_error(normalization)
+    if provider_request_error is not None:
+        return replace(report, status="failed", reason_code=provider_request_error)
+    assert preflight.registry_target is not None
+    assert preflight.source_content_hash is not None
+    assert normalization.enrichment_request_event_id is not None
+    assert normalization.candidate_group_id is not None
+    assert normalization.primary_artifact_id is not None
+    assert normalization.primary_artifact_type is not None
+    assert normalization.provider_route is not None
+    assert normalization.refresh_mode is not None
+    assert normalization.depth_budget is not None
+
+    provider_request = ProviderEnrichmentRequest(
+        trigger_event_id=normalization.enrichment_request_event_id,
+        candidate_group_id=normalization.candidate_group_id,
+        artifact_id=normalization.primary_artifact_id,
+        artifact_type=normalization.primary_artifact_type,
+        provider_route=normalization.provider_route,
+        refresh_mode=normalization.refresh_mode,
+        depth_budget=normalization.depth_budget,
+        provider_authority=request.provider_authority,
+    )
+    report = replace(report, provider_enrichment_attempted=True)
+    async with stage_factory.stage("provider_enrichment") as components:
+        provider = await components.provider_enrichment_service.materialize_provider_request(
+            provider_request
+        )
+        await components.commit()
+    report = _apply_provider_enrichment_result(report, provider)
+
+    async with stage_factory.stage("final_readback") as components:
+        final = await components.materializer_repository.load_final_readback(
+            source_message_id=source_message_id,
+            source_version_no=source_version_no,
+            source_content_hash=preflight.source_content_hash,
+            chat_id=preflight.registry_target.chat_id,
+            message_id=request.packet.parsed_ref.message_id,
+            candidate_group_id=normalization.candidate_group_id,
+        )
+    report = _apply_final_readback(report, final)
+    if provider.error_code is not None:
+        provider_error = _provider_not_ready_readback_error(final)
+        if provider_error is not None:
+            return replace(report, status="failed", reason_code=provider_error)
+        return replace(
+            report,
+            status="blocked",
+            reason_code=provider.error_code,
+            preflight_passed=True,
+            analysis_request_created=False,
+        )
+    if not _provider_result_ready_for_assembly(provider):
+        provider_error = _provider_not_ready_readback_error(final)
+        if provider_error is not None:
+            return replace(report, status="failed", reason_code=provider_error)
+        return replace(
+            report,
+            status="pass",
+            reason_code=_provider_not_ready_reason(provider),
+            preflight_passed=True,
+            analysis_request_created=False,
+        )
+    if provider.snapshot_updated_event_id is None:
+        return replace(
+            report,
+            status="failed",
+            reason_code="provider_snapshot_updated_event_missing",
+        )
+
+    report = replace(report, assembler_attempted=True)
+    async with stage_factory.stage("assembler") as components:
+        await components.assembler_service.handle_trigger_event(
+            provider.snapshot_updated_event_id
+        )
+        await components.commit()
+
+    async with stage_factory.stage("final_readback") as components:
+        final = await components.materializer_repository.load_final_readback(
+            source_message_id=source_message_id,
+            source_version_no=source_version_no,
+            source_content_hash=preflight.source_content_hash,
+            chat_id=preflight.registry_target.chat_id,
+            message_id=request.packet.parsed_ref.message_id,
+            candidate_group_id=normalization.candidate_group_id,
+        )
+    report = _apply_final_readback(report, final)
+    provider_final_error = _provider_final_readback_error(final)
+    if provider_final_error is not None:
+        return replace(report, status="failed", reason_code=provider_final_error)
+    return replace(
+        report,
+        status="pass",
+        reason_code="source_url_provider_evidence_analysis_requested",
+        preflight_passed=True,
+        bundle_created=True,
+        analysis_request_created=True,
+    )
 
 
 def load_runtime_config(env_file: str) -> RuntimeConfigBundle:
@@ -1589,6 +1841,8 @@ def load_runtime_config(env_file: str) -> RuntimeConfigBundle:
 async def _load_preflight(
     components: StageComponentsProtocol,
     packet: OperatorSuppliedTelegramSourcePacket,
+    *,
+    provider_resume_authority: ExistingSourceProviderResumeAuthority,
 ) -> PreflightSnapshot:
     registry_target = await components.source_adapter.resolve_registry_target(
         components.collector_repository,
@@ -1609,12 +1863,26 @@ async def _load_preflight(
         registry_target=registry_target,
     )
     if existing is not None:
+        if provider_resume_authority.opened:
+            return PreflightSnapshot(
+                registry_target=registry_target,
+                source_content_hash=projection.content_hash,
+                source_message_id=existing.source_message_id,
+                source_version_no=existing.current_version_no,
+                local_plan=local_plan,
+            )
+        reason_code = (
+            "provider_resume_authority_required"
+            if provider_resume_authority.args_present
+            else "source_packet_already_materialized"
+        )
         return PreflightSnapshot(
             registry_target=registry_target,
             source_content_hash=projection.content_hash,
             source_message_id=existing.source_message_id,
+            source_version_no=existing.current_version_no,
             local_plan=local_plan,
-            reason_code="source_packet_already_materialized",
+            reason_code=reason_code,
         )
     return PreflightSnapshot(
         registry_target=registry_target,
@@ -1908,6 +2176,57 @@ def _provider_request_error(readback: NormalizationReadback) -> str | None:
     return None
 
 
+def _provider_resume_request_error(readback: NormalizationReadback) -> str | None:
+    request_error = _provider_request_error(readback)
+    if request_error is not None:
+        return request_error
+    if readback.provider_route != "github":
+        return "provider_resume_provider_route_not_github"
+    return None
+
+
+def _provider_resume_pre_provider_readback_error(readback: FinalReadback) -> str | None:
+    expected_one = {
+        "source_messages": readback.source_messages,
+        "source_message_versions": readback.source_message_versions,
+        "source_created_events": readback.source_created_events,
+        "normalization_runs": readback.normalization_runs,
+        "candidate_groups": readback.candidate_groups,
+        "external_enrichment_requests": readback.external_enrichment_requests,
+    }
+    for name, count in expected_one.items():
+        if count != 1:
+            return f"provider_resume_{name}_cardinality_invalid"
+    completed = (
+        readback.provider_snapshots == 1
+        and readback.artifact_snapshot_updated_events == 1
+        and readback.ready_current_bundles == 1
+        and readback.analysis_requested_events == 1
+        and readback.candidate_evidence_members >= 1
+        and readback.bundle_id is not None
+        and readback.analysis_request_event_id is not None
+        and readback.judge_runs == 0
+        and readback.judge_call_requested_events == 0
+    )
+    if completed:
+        return "existing_source_analysis_already_materialized"
+    if readback.telegram_raw_updates != 0:
+        return "provider_resume_telegram_raw_updates_unexpected"
+    if readback.primary_text_idea_members != 0:
+        return "provider_resume_primary_text_idea_members_unexpected"
+    if readback.text_idea_snapshots != 0:
+        return "provider_resume_text_idea_snapshots_unexpected"
+    if readback.analysis_requested_events != 0:
+        return "provider_resume_analysis_already_present"
+    if readback.provider_snapshots != 0 or readback.artifact_snapshot_updated_events != 0:
+        return "provider_resume_snapshot_already_present"
+    if readback.ready_current_bundles != 0 or readback.candidate_evidence_members != 0:
+        return "provider_resume_bundle_already_present"
+    if readback.judge_runs != 0 or readback.judge_call_requested_events != 0:
+        return "provider_resume_judge_state_unexpected"
+    return None
+
+
 def _provider_not_ready_readback_error(readback: FinalReadback) -> str | None:
     expected_one = {
         "source_messages": readback.source_messages,
@@ -2028,6 +2347,25 @@ def _provider_not_ready_reason(result: ProviderEnrichmentResult) -> str:
     return "provider_evidence_not_ready"
 
 
+def _github_client_exception_reason(exc: Exception) -> str | None:
+    from ..gh_enricher.github_client import (
+        GitHubAccessDeniedError,
+        GitHubClientError,
+        GitHubNotFoundError,
+        GitHubRateLimitedError,
+    )
+
+    if isinstance(exc, GitHubRateLimitedError):
+        return "provider_github_rate_limited"
+    if isinstance(exc, GitHubAccessDeniedError):
+        return "provider_github_access_denied"
+    if isinstance(exc, GitHubNotFoundError):
+        return "provider_github_not_found"
+    if isinstance(exc, GitHubClientError):
+        return "provider_github_client_error"
+    return None
+
+
 def _report(
     *,
     mode: str,
@@ -2093,11 +2431,25 @@ def _provider_authority_args_present(args: argparse.Namespace) -> bool:
     )
 
 
+def _provider_resume_authority_args_present(args: argparse.Namespace) -> bool:
+    return (
+        bool(args.allow_existing_source_provider_resume)
+        or args.provider_resume_confirm is not None
+    )
+
+
 def _provider_authority_from_args(args: argparse.Namespace) -> ProviderLiveAuthority:
     return ProviderLiveAuthority(
         allow_live_github_provider_read=bool(args.allow_live_github_provider_read),
         allow_provider_snapshot_write=bool(args.allow_provider_snapshot_write),
         provider_live_confirm=args.provider_live_confirm,
+    )
+
+
+def _provider_resume_authority_from_args(args: argparse.Namespace) -> ExistingSourceProviderResumeAuthority:
+    return ExistingSourceProviderResumeAuthority(
+        allow_existing_source_provider_resume=bool(args.allow_existing_source_provider_resume),
+        provider_resume_confirm=args.provider_resume_confirm,
     )
 
 
