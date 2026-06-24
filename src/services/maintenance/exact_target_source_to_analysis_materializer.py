@@ -90,16 +90,19 @@ class ExactTargetSourceToAnalysisReport:
     candidate_group_fingerprint: str | None
     refresh_event_fingerprint: str | None
     artifact_enrichment_request_fingerprint: str | None
+    provider_snapshot_update_fingerprint: str | None
     bundle_fingerprint: str | None
     analysis_request_fingerprint: str | None
     preflight_passed: bool
     source_ingest_attempted: bool
     normalization_attempted: bool
+    provider_enrichment_attempted: bool
     bundle_refresh_attempted: bool
     assembler_attempted: bool
     source_message_created: bool
     source_version_created: bool
     candidate_created: bool
+    provider_snapshot_created: bool
     text_idea_snapshot_created: bool
     bundle_created: bool
     analysis_request_created: bool
@@ -154,6 +157,9 @@ class NormalizationReadback:
     candidate_group_id: UUID | None
     enrichment_requests: int
     enrichment_request_event_id: UUID | None = None
+    provider_route: str | None = None
+    refresh_mode: str | None = None
+    depth_budget: int | None = None
     provider_route_counts: dict[str, int] = field(default_factory=dict)
 
 
@@ -161,6 +167,27 @@ class NormalizationReadback:
 class RefreshEventRecord:
     event_id: UUID
     created: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderEnrichmentRequest:
+    trigger_event_id: UUID
+    candidate_group_id: UUID
+    artifact_id: UUID
+    artifact_type: str
+    provider_route: str
+    refresh_mode: str
+    depth_budget: int
+
+
+@dataclass(slots=True, frozen=True)
+class ProviderEnrichmentResult:
+    provider_route: str
+    status: str
+    emitted_snapshot_updated: bool
+    snapshot_id: UUID | None = None
+    snapshot_updated_event_id: UUID | None = None
+    error_code: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -173,6 +200,8 @@ class FinalReadback:
     candidate_groups: int = 0
     primary_text_idea_members: int = 0
     external_enrichment_requests: int = 0
+    provider_snapshots: int = 0
+    artifact_snapshot_updated_events: int = 0
     text_idea_snapshots: int = 0
     ready_current_bundles: int = 0
     candidate_evidence_members: int = 0
@@ -192,6 +221,8 @@ class FinalReadback:
             "candidate_groups": self.candidate_groups,
             "primary_text_idea_members": self.primary_text_idea_members,
             "external_enrichment_requests": self.external_enrichment_requests,
+            "provider_snapshots": self.provider_snapshots,
+            "artifact_snapshot_updated_events": self.artifact_snapshot_updated_events,
             "text_idea_snapshots": self.text_idea_snapshots,
             "ready_current_bundles": self.ready_current_bundles,
             "candidate_evidence_members": self.candidate_evidence_members,
@@ -243,11 +274,19 @@ class MaterializerRepositoryProtocol(Protocol):
     ) -> FinalReadback: ...
 
 
+class ProviderEnrichmentServiceProtocol(Protocol):
+    async def materialize_provider_request(
+        self,
+        request: ProviderEnrichmentRequest,
+    ) -> ProviderEnrichmentResult: ...
+
+
 class StageComponentsProtocol(Protocol):
     collector_repository: Any
     source_adapter: OperatorSuppliedSourceAdapter
     materializer_repository: MaterializerRepositoryProtocol
     normalizer_service: Any
+    provider_enrichment_service: ProviderEnrichmentServiceProtocol
     assembler_service: Any
 
     async def commit(self) -> None: ...
@@ -330,7 +369,11 @@ class SqlExactTargetSourceToAnalysisRepository:
         )
         enrichment_rows = await self._rows(
             """
-            SELECT event_id, payload_json->>'provider_route' AS provider_route
+            SELECT
+                event_id,
+                payload_json->>'provider_route' AS provider_route,
+                payload_json->>'refresh_mode' AS refresh_mode,
+                payload_json->>'depth_budget' AS depth_budget
             FROM event_outbox
             WHERE event_type = 'artifact.enrich.requested.v1'
               AND payload_json->>'source_message_id' = :source_message_id
@@ -349,6 +392,7 @@ class SqlExactTargetSourceToAnalysisRepository:
             if route in {"github", "x", "web"}:
                 provider_route_counts[route] = provider_route_counts.get(route, 0) + 1
         first = primary_rows[0] if primary_rows else None
+        enrichment = enrichment_rows[0] if enrichment_rows else None
         return NormalizationReadback(
             normalization_runs=normalization_runs,
             candidate_groups=candidate_groups,
@@ -360,6 +404,9 @@ class SqlExactTargetSourceToAnalysisRepository:
             enrichment_request_event_id=(
                 None if not enrichment_rows else UUID(str(enrichment_rows[0]["event_id"]))
             ),
+            provider_route=None if enrichment is None else str(enrichment.get("provider_route") or ""),
+            refresh_mode=None if enrichment is None else str(enrichment.get("refresh_mode") or ""),
+            depth_budget=_int_or_none(None if enrichment is None else enrichment.get("depth_budget")),
             provider_route_counts=provider_route_counts,
         )
 
@@ -555,6 +602,29 @@ class SqlExactTargetSourceToAnalysisRepository:
                     "source_version_no_text": str(source_version_no),
                 },
             ),
+            provider_snapshots=await self._count(
+                """
+                SELECT count(*)
+                FROM candidate_group_members cgm
+                JOIN artifact_registry ar ON ar.artifact_id = cgm.artifact_id
+                JOIN artifact_snapshots aps ON aps.snapshot_id = ar.current_snapshot_id
+                WHERE cgm.candidate_group_id = CAST(:candidate_group_id AS uuid)
+                  AND aps.provider IN ('github', 'x', 'web')
+                """,
+                {"candidate_group_id": str(candidate_group_id)},
+            ),
+            artifact_snapshot_updated_events=await self._count(
+                """
+                SELECT count(*)
+                FROM event_outbox eo
+                JOIN candidate_group_members cgm
+                  ON cgm.artifact_id = eo.aggregate_id
+                WHERE cgm.candidate_group_id = CAST(:candidate_group_id AS uuid)
+                  AND eo.event_type = 'artifact.snapshot.updated.v1'
+                  AND eo.aggregate_type = 'artifact'
+                """,
+                {"candidate_group_id": str(candidate_group_id)},
+            ),
             text_idea_snapshots=await self._count(
                 """
                 SELECT count(*)
@@ -655,6 +725,7 @@ class SqlStageComponents:
             repository=RouterNormalizerRepository(session),
             short_url_resolver=NoNetworkShortUrlResolver(runtime.router_config.short_url_allowlist),
         )
+        self.provider_enrichment_service = SqlProviderEnrichmentService(session, runtime)
         self.assembler_service = EvidenceAssemblerService(
             runtime.assembler_config,
             repository=EvidenceAssemblerRepository(session),
@@ -696,6 +767,22 @@ class SqlStageFactory:
                 if session.in_transaction():
                     await session.rollback()
                 raise
+
+
+class SqlProviderEnrichmentService:
+    def __init__(self, session: Any, runtime: RuntimeConfigBundle) -> None:
+        del session, runtime
+
+    async def materialize_provider_request(
+        self,
+        request: ProviderEnrichmentRequest,
+    ) -> ProviderEnrichmentResult:
+        return ProviderEnrichmentResult(
+            provider_route=request.provider_route,
+            status="blocked",
+            emitted_snapshot_updated=False,
+            error_code="provider_live_authority_required",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -876,6 +963,34 @@ async def run_exact_target_source_to_analysis_materializer(
         assert normalization.candidate_group_id is not None
 
         if normalization.enrichment_requests >= 1:
+            provider_request_error = _provider_request_error(normalization)
+            if provider_request_error is not None:
+                return replace(report, status="failed", reason_code=provider_request_error)
+            assert normalization.enrichment_request_event_id is not None
+            assert normalization.candidate_group_id is not None
+            assert normalization.primary_artifact_id is not None
+            assert normalization.primary_artifact_type is not None
+            assert normalization.provider_route is not None
+            assert normalization.refresh_mode is not None
+            assert normalization.depth_budget is not None
+
+            provider_request = ProviderEnrichmentRequest(
+                trigger_event_id=normalization.enrichment_request_event_id,
+                candidate_group_id=normalization.candidate_group_id,
+                artifact_id=normalization.primary_artifact_id,
+                artifact_type=normalization.primary_artifact_type,
+                provider_route=normalization.provider_route,
+                refresh_mode=normalization.refresh_mode,
+                depth_budget=normalization.depth_budget,
+            )
+            report = replace(report, provider_enrichment_attempted=True)
+            async with stage_factory.stage("provider_enrichment") as components:
+                provider = await components.provider_enrichment_service.materialize_provider_request(
+                    provider_request
+                )
+                await components.commit()
+            report = _apply_provider_enrichment_result(report, provider)
+
             async with stage_factory.stage("final_readback") as components:
                 final = await components.materializer_repository.load_final_readback(
                     source_message_id=source_message_id,
@@ -886,19 +1001,75 @@ async def run_exact_target_source_to_analysis_materializer(
                     candidate_group_id=normalization.candidate_group_id,
                 )
             report = _apply_final_readback(report, final)
-            provider_error = _provider_enrichment_readback_error(final)
-            if provider_error is not None:
-                return replace(report, status="failed", reason_code=provider_error)
+            if provider.error_code is not None:
+                provider_error = _provider_not_ready_readback_error(final)
+                if provider_error is not None:
+                    return replace(report, status="failed", reason_code=provider_error)
+                return replace(
+                    report,
+                    status="blocked",
+                    reason_code=provider.error_code,
+                    preflight_passed=True,
+                    source_message_created=True,
+                    source_version_created=True,
+                    candidate_created=True,
+                    artifact_enrichment_request_created=True,
+                    analysis_request_created=False,
+                )
+            if not _provider_result_ready_for_assembly(provider):
+                provider_error = _provider_not_ready_readback_error(final)
+                if provider_error is not None:
+                    return replace(report, status="failed", reason_code=provider_error)
+                return replace(
+                    report,
+                    status="pass",
+                    reason_code=_provider_not_ready_reason(provider),
+                    preflight_passed=True,
+                    source_message_created=True,
+                    source_version_created=True,
+                    candidate_created=True,
+                    artifact_enrichment_request_created=True,
+                    analysis_request_created=False,
+                )
+            if provider.snapshot_updated_event_id is None:
+                return replace(
+                    report,
+                    status="failed",
+                    reason_code="provider_snapshot_updated_event_missing",
+                )
+
+            report = replace(report, assembler_attempted=True)
+            async with stage_factory.stage("assembler") as components:
+                await components.assembler_service.handle_trigger_event(
+                    provider.snapshot_updated_event_id
+                )
+                await components.commit()
+
+            async with stage_factory.stage("final_readback") as components:
+                final = await components.materializer_repository.load_final_readback(
+                    source_message_id=source_message_id,
+                    source_version_no=source_version_no,
+                    source_content_hash=preflight.source_content_hash,
+                    chat_id=preflight.registry_target.chat_id,
+                    message_id=request.packet.parsed_ref.message_id,
+                    candidate_group_id=normalization.candidate_group_id,
+                )
+            report = _apply_final_readback(report, final)
+            provider_final_error = _provider_final_readback_error(final)
+            if provider_final_error is not None:
+                return replace(report, status="failed", reason_code=provider_final_error)
             return replace(
                 report,
                 status="pass",
-                reason_code="provider_enrichment_requested",
+                reason_code="source_url_provider_evidence_analysis_requested",
                 preflight_passed=True,
                 source_message_created=True,
                 source_version_created=True,
                 candidate_created=True,
                 artifact_enrichment_request_created=True,
-                analysis_request_created=False,
+                provider_snapshot_created=True,
+                bundle_created=True,
+                analysis_request_created=True,
             )
 
         report = replace(report, bundle_refresh_attempted=True)
@@ -1287,6 +1458,25 @@ def _apply_normalization_readback(
     )
 
 
+def _apply_provider_enrichment_result(
+    report: ExactTargetSourceToAnalysisReport,
+    result: ProviderEnrichmentResult,
+) -> ExactTargetSourceToAnalysisReport:
+    return replace(
+        _with_counts(
+            report,
+            {
+                "provider_snapshot_results": 1 if result.snapshot_id is not None else 0,
+                "provider_snapshot_updated_events": (
+                    1 if result.snapshot_updated_event_id is not None else 0
+                ),
+            },
+        ),
+        provider_snapshot_update_fingerprint=_fingerprint(result.snapshot_updated_event_id),
+        provider_snapshot_created=result.snapshot_id is not None,
+    )
+
+
 def _apply_final_readback(
     report: ExactTargetSourceToAnalysisReport,
     readback: FinalReadback,
@@ -1309,23 +1499,56 @@ def _normalization_error(readback: NormalizationReadback) -> str | None:
     if readback.primary_members != 1:
         return "primary_member_cardinality_invalid"
     if readback.enrichment_requests >= 1:
+        if readback.enrichment_requests != 1:
+            return "artifact_enrichment_request_cardinality_invalid"
         if readback.primary_artifact_type == "text_idea":
             return "primary_artifact_type_invalid_for_enrichment"
         if not readback.provider_route_counts:
             return "provider_route_missing"
+        if readback.enrichment_request_event_id is None:
+            return "artifact_enrichment_request_missing"
+        if not readback.provider_route:
+            return "provider_route_missing"
+        if not readback.refresh_mode:
+            return "refresh_mode_missing"
+        if readback.depth_budget is None:
+            return "depth_budget_missing"
         return None
     if readback.primary_artifact_type != "text_idea":
         return "primary_artifact_type_not_text_idea"
     return None
 
 
-def _provider_enrichment_readback_error(readback: FinalReadback) -> str | None:
+def _provider_request_error(readback: NormalizationReadback) -> str | None:
+    if readback.enrichment_requests != 1:
+        return "artifact_enrichment_request_cardinality_invalid"
+    if readback.enrichment_request_event_id is None:
+        return "artifact_enrichment_request_missing"
+    if readback.candidate_group_id is None:
+        return "candidate_group_missing"
+    if readback.primary_artifact_id is None:
+        return "primary_artifact_missing"
+    if not readback.primary_artifact_type:
+        return "primary_artifact_type_missing"
+    if not readback.provider_route:
+        return "provider_route_missing"
+    if readback.provider_route not in {"github", "x", "web"}:
+        return "provider_route_not_allowed"
+    if not readback.refresh_mode:
+        return "refresh_mode_missing"
+    if readback.depth_budget is None:
+        return "depth_budget_missing"
+    return None
+
+
+def _provider_not_ready_readback_error(readback: FinalReadback) -> str | None:
     expected_one = {
         "source_messages": readback.source_messages,
         "source_message_versions": readback.source_message_versions,
         "source_created_events": readback.source_created_events,
         "normalization_runs": readback.normalization_runs,
         "candidate_groups": readback.candidate_groups,
+        "external_enrichment_requests": readback.external_enrichment_requests,
     }
     for name, count in expected_one.items():
         if count != 1:
@@ -1343,8 +1566,41 @@ def _provider_enrichment_readback_error(readback: FinalReadback) -> str | None:
     for name, count in expected_zero.items():
         if count != 0:
             return f"{name}_unexpected"
-    if readback.external_enrichment_requests < 1:
-        return "artifact_enrichment_request_missing"
+    return None
+
+
+def _provider_final_readback_error(readback: FinalReadback) -> str | None:
+    expected_one = {
+        "source_messages": readback.source_messages,
+        "source_message_versions": readback.source_message_versions,
+        "source_created_events": readback.source_created_events,
+        "normalization_runs": readback.normalization_runs,
+        "candidate_groups": readback.candidate_groups,
+        "external_enrichment_requests": readback.external_enrichment_requests,
+        "provider_snapshots": readback.provider_snapshots,
+        "artifact_snapshot_updated_events": readback.artifact_snapshot_updated_events,
+        "ready_current_bundles": readback.ready_current_bundles,
+        "analysis_requested_events": readback.analysis_requested_events,
+    }
+    for key, value in expected_one.items():
+        if value != 1:
+            return f"{key}_cardinality_invalid"
+    expected_zero = {
+        "telegram_raw_updates": readback.telegram_raw_updates,
+        "primary_text_idea_members": readback.primary_text_idea_members,
+        "text_idea_snapshots": readback.text_idea_snapshots,
+        "judge_runs": readback.judge_runs,
+        "judge_call_requested_events": readback.judge_call_requested_events,
+    }
+    for key, value in expected_zero.items():
+        if value != 0:
+            return f"{key}_unexpected"
+    if readback.candidate_evidence_members < 1:
+        return "candidate_evidence_members_missing"
+    if readback.bundle_id is None:
+        return "bundle_missing"
+    if readback.analysis_request_event_id is None:
+        return "analysis_request_missing"
     return None
 
 
@@ -1366,6 +1622,8 @@ def _final_readback_error(readback: FinalReadback) -> str | None:
     expected_zero = {
         "telegram_raw_updates": readback.telegram_raw_updates,
         "external_enrichment_requests": readback.external_enrichment_requests,
+        "provider_snapshots": readback.provider_snapshots,
+        "artifact_snapshot_updated_events": readback.artifact_snapshot_updated_events,
         "judge_runs": readback.judge_runs,
         "judge_call_requested_events": readback.judge_call_requested_events,
     }
@@ -1379,6 +1637,28 @@ def _final_readback_error(readback: FinalReadback) -> str | None:
     if readback.analysis_request_event_id is None:
         return "analysis_request_missing"
     return None
+
+
+def _provider_result_ready_for_assembly(result: ProviderEnrichmentResult) -> bool:
+    if result.error_code is not None:
+        return False
+    if result.snapshot_updated_event_id is None:
+        return False
+    if not result.emitted_snapshot_updated:
+        return False
+    return result.status in {"ready", "partial_ready"}
+
+
+def _provider_not_ready_reason(result: ProviderEnrichmentResult) -> str:
+    if result.status == "pending":
+        return "provider_evidence_pending"
+    if result.status == "low_evidence":
+        return "provider_evidence_low_evidence"
+    if result.status in {"failed_transient", "failed_permanent", "rate_limited", "access_denied", "unsupported"}:
+        return "provider_evidence_unusable"
+    if not result.emitted_snapshot_updated:
+        return "provider_snapshot_not_updated"
+    return "provider_evidence_not_ready"
 
 
 def _report(
@@ -1401,16 +1681,19 @@ def _report(
         candidate_group_fingerprint=None,
         refresh_event_fingerprint=None,
         artifact_enrichment_request_fingerprint=None,
+        provider_snapshot_update_fingerprint=None,
         bundle_fingerprint=None,
         analysis_request_fingerprint=None,
         preflight_passed=False,
         source_ingest_attempted=False,
         normalization_attempted=False,
+        provider_enrichment_attempted=False,
         bundle_refresh_attempted=False,
         assembler_attempted=False,
         source_message_created=False,
         source_version_created=False,
         candidate_created=False,
+        provider_snapshot_created=False,
         text_idea_snapshot_created=False,
         bundle_created=False,
         analysis_request_created=False,
@@ -1522,6 +1805,15 @@ def _bounded_count(value: int | None) -> int:
     if value == 1:
         return 1
     return 2
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _fingerprint(value: Any) -> str | None:

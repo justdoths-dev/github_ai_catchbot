@@ -19,8 +19,11 @@ from src.services.maintenance.exact_target_source_to_analysis_materializer impor
     ExactTargetSourceToAnalysisRequest,
     FinalReadback,
     NormalizationReadback,
+    ProviderEnrichmentRequest,
+    ProviderEnrichmentResult,
     RefreshEventRecord,
     RuntimeConfigBundle,
+    SqlProviderEnrichmentService,
     SqlStageComponents,
     run_exact_target_source_to_analysis_materializer,
 )
@@ -63,6 +66,16 @@ class RegistryLookupSession:
         return RegistryLookupResult()
 
 
+class NoProviderWriteSession:
+    def __init__(self) -> None:
+        self.sql_calls: list[str] = []
+
+    async def execute(self, statement, params=None):
+        del params
+        self.sql_calls.append(str(statement))
+        raise AssertionError("SQL provider enrichment path must fail before provider writes")
+
+
 class Ledger:
     def __init__(self) -> None:
         self.registry_rows = [{"registry_id": str(uuid4()), "chat_id": 9001}]
@@ -76,6 +89,13 @@ class Ledger:
         self.enrichment_requests = 0
         self.enrichment_request_event_id: UUID | None = None
         self.provider_route_counts: dict[str, int] = {}
+        self.provider_route: str | None = None
+        self.refresh_mode: str | None = None
+        self.depth_budget: int | None = None
+        self.provider_snapshot_id: UUID | None = None
+        self.provider_snapshot_status = "ready"
+        self.provider_snapshot_updated_event_id: UUID | None = None
+        self.provider_error_code: str | None = None
         self.refresh_event_id: UUID | None = None
         self.text_idea_snapshot_count = 0
         self.bundle_id: UUID | None = None
@@ -186,6 +206,9 @@ class FakeMaterializerRepository:
             candidate_group_id=self.ledger.candidate_group_id,
             enrichment_requests=self.ledger.enrichment_requests,
             enrichment_request_event_id=self.ledger.enrichment_request_event_id,
+            provider_route=self.ledger.provider_route,
+            refresh_mode=self.ledger.refresh_mode,
+            depth_budget=self.ledger.depth_budget,
             provider_route_counts=self.ledger.provider_route_counts,
         )
 
@@ -240,6 +263,8 @@ class FakeMaterializerRepository:
                 else 0
             ),
             external_enrichment_requests=self.ledger.enrichment_requests,
+            provider_snapshots=1 if self.ledger.provider_snapshot_id else 0,
+            artifact_snapshot_updated_events=1 if self.ledger.provider_snapshot_updated_event_id else 0,
             text_idea_snapshots=self.ledger.text_idea_snapshot_count,
             ready_current_bundles=1 if self.ledger.bundle_id else 0,
             candidate_evidence_members=self.ledger.evidence_member_count,
@@ -268,6 +293,9 @@ class FakeNormalizerService:
                 self.ledger.primary_artifact_type = "github_repo"
                 self.ledger.enrichment_requests = 1
                 self.ledger.enrichment_request_event_id = uuid4()
+                self.ledger.provider_route = "github"
+                self.ledger.refresh_mode = "standard"
+                self.ledger.depth_budget = 1
                 self.ledger.provider_route_counts = {"github": 1}
                 self.ledger.outbox.append(
                     {
@@ -279,6 +307,42 @@ class FakeNormalizerService:
                 self.ledger.primary_artifact_type = "text_idea"
 
 
+class FakeProviderEnrichmentService:
+    def __init__(self, ledger: Ledger) -> None:
+        self.ledger = ledger
+
+    async def materialize_provider_request(self, request) -> ProviderEnrichmentResult:
+        self.ledger.call_order.append("provider.materialize_provider_request")
+        assert request.trigger_event_id == self.ledger.enrichment_request_event_id
+        assert request.artifact_id == self.ledger.primary_artifact_id
+        assert request.candidate_group_id == self.ledger.candidate_group_id
+        assert request.provider_route == "github"
+        if self.ledger.provider_error_code is not None:
+            return ProviderEnrichmentResult(
+                provider_route="github",
+                status="unsupported",
+                emitted_snapshot_updated=False,
+                error_code=self.ledger.provider_error_code,
+            )
+        if self.ledger.provider_snapshot_status == "pending":
+            return ProviderEnrichmentResult(
+                provider_route="github",
+                status="pending",
+                emitted_snapshot_updated=False,
+            )
+        self.ledger.provider_snapshot_id = self.ledger.provider_snapshot_id or uuid4()
+        self.ledger.provider_snapshot_updated_event_id = (
+            self.ledger.provider_snapshot_updated_event_id or uuid4()
+        )
+        return ProviderEnrichmentResult(
+            provider_route="github",
+            status=self.ledger.provider_snapshot_status,
+            emitted_snapshot_updated=True,
+            snapshot_id=self.ledger.provider_snapshot_id,
+            snapshot_updated_event_id=self.ledger.provider_snapshot_updated_event_id,
+        )
+
+
 class FakeAssemblerService:
     def __init__(self, ledger: Ledger) -> None:
         self.ledger = ledger
@@ -287,9 +351,14 @@ class FakeAssemblerService:
         self.ledger.call_order.append("assembler.handle_trigger_event")
         if self.ledger.assembler_failure:
             raise RuntimeError(RAW_SECRET)
-        assert self.ledger.refresh_event_id == UUID(str(trigger_event_id))
+        parsed_trigger_event_id = UUID(str(trigger_event_id))
+        assert parsed_trigger_event_id in {
+            self.ledger.refresh_event_id,
+            self.ledger.provider_snapshot_updated_event_id,
+        }
         if not self.ledger.bundle_id:
-            self.ledger.text_idea_snapshot_count = 1
+            if parsed_trigger_event_id == self.ledger.refresh_event_id:
+                self.ledger.text_idea_snapshot_count = 1
             self.ledger.bundle_id = uuid4()
             self.ledger.evidence_member_count = 1
             self.ledger.analysis_request_event_id = uuid4()
@@ -303,6 +372,7 @@ class FakeStageComponents:
         self.source_adapter = OperatorSuppliedSourceAdapter()
         self.materializer_repository = FakeMaterializerRepository(ledger)
         self.normalizer_service = FakeNormalizerService(ledger)
+        self.provider_enrichment_service = FakeProviderEnrichmentService(ledger)
         self.assembler_service = FakeAssemblerService(ledger)
 
     async def commit(self) -> None:
@@ -394,6 +464,32 @@ async def test_sql_stage_components_wire_adapter_to_real_collector_registry_look
 
 
 @pytest.mark.asyncio
+async def test_sql_provider_enrichment_service_requires_live_authority_without_fake_writes() -> None:
+    session = NoProviderWriteSession()
+    service = SqlProviderEnrichmentService(session, runtime_bundle())
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=uuid4(),
+            artifact_type="github_repo",
+            provider_route="github",
+            refresh_mode="standard",
+            depth_budget=1,
+        )
+    )
+
+    assert result.provider_route == "github"
+    assert result.status == "blocked"
+    assert result.error_code == "provider_live_authority_required"
+    assert result.emitted_snapshot_updated is False
+    assert result.snapshot_id is None
+    assert result.snapshot_updated_event_id is None
+    assert session.sql_calls == []
+
+
+@pytest.mark.asyncio
 async def test_plan_is_read_only_and_reports_local_text_idea_candidate() -> None:
     ledger = Ledger()
 
@@ -480,25 +576,28 @@ async def test_execute_stage_order_materializes_exactly_one_analysis_request() -
 
 
 @pytest.mark.asyncio
-async def test_execute_url_path_requests_provider_enrichment_without_assembler_or_analysis() -> None:
+async def test_execute_url_path_materializes_provider_snapshot_and_analysis_request() -> None:
     ledger = Ledger()
 
     report = await run(ledger, mode="execute", text=GITHUB_URL_TEXT)
 
     assert report.status == "pass"
-    assert report.reason_code == "provider_enrichment_requested"
+    assert report.reason_code == "source_url_provider_evidence_analysis_requested"
     assert report.source_ingest_attempted is True
     assert report.normalization_attempted is True
+    assert report.provider_enrichment_attempted is True
     assert report.bundle_refresh_attempted is False
-    assert report.assembler_attempted is False
+    assert report.assembler_attempted is True
     assert report.source_message_created is True
     assert report.source_version_created is True
     assert report.candidate_created is True
     assert report.artifact_enrichment_request_created is True
     assert report.artifact_enrichment_request_fingerprint is not None
+    assert report.provider_snapshot_created is True
+    assert report.provider_snapshot_update_fingerprint is not None
     assert report.text_idea_snapshot_created is False
-    assert report.bundle_created is False
-    assert report.analysis_request_created is False
+    assert report.bundle_created is True
+    assert report.analysis_request_created is True
     assert report.openai_attempted is False
     assert report.redis_attempted is False
     assert report.telegram_live_read_attempted is False
@@ -506,10 +605,60 @@ async def test_execute_url_path_requests_provider_enrichment_without_assembler_o
     assert report.external_network_attempted is False
     assert report.bounded_counts["external_enrichment_requests"] == 1
     assert report.bounded_counts["provider_route_github"] == 1
-    assert report.bounded_counts["analysis_requested_events"] == 0
+    assert report.bounded_counts["provider_snapshots"] == 1
+    assert report.bounded_counts["artifact_snapshot_updated_events"] == 1
+    assert report.bounded_counts["analysis_requested_events"] == 1
     assert ledger.enrichment_requests == 1
+    assert ledger.provider_snapshot_id is not None
+    assert ledger.provider_snapshot_updated_event_id is not None
+    assert ledger.bundle_id is not None
+    assert ledger.analysis_request_event_id is not None
     assert sum(1 for row in ledger.outbox if row["event_type"] == "artifact.enrich.requested.v1") == 1
     assert "enter:refresh_event" not in ledger.call_order
+    assert ledger.call_order.index("commit:provider_enrichment") < ledger.call_order.index("enter:assembler")
+
+
+@pytest.mark.asyncio
+async def test_execute_url_path_provider_pending_does_not_emit_analysis_request() -> None:
+    ledger = Ledger()
+    ledger.provider_snapshot_status = "pending"
+
+    report = await run(ledger, mode="execute", text=GITHUB_URL_TEXT)
+
+    assert report.status == "pass"
+    assert report.reason_code == "provider_evidence_pending"
+    assert report.provider_enrichment_attempted is True
+    assert report.assembler_attempted is False
+    assert report.provider_snapshot_created is False
+    assert report.bundle_created is False
+    assert report.analysis_request_created is False
+    assert report.bounded_counts["analysis_requested_events"] == 0
+    assert ledger.provider_snapshot_id is None
+    assert ledger.bundle_id is None
+    assert ledger.analysis_request_event_id is None
+    assert "enter:assembler" not in ledger.call_order
+
+
+@pytest.mark.asyncio
+async def test_execute_url_path_provider_low_evidence_does_not_emit_analysis_request() -> None:
+    ledger = Ledger()
+    ledger.provider_snapshot_status = "low_evidence"
+
+    report = await run(ledger, mode="execute", text=GITHUB_URL_TEXT)
+
+    assert report.status == "pass"
+    assert report.reason_code == "provider_evidence_low_evidence"
+    assert report.provider_enrichment_attempted is True
+    assert report.assembler_attempted is False
+    assert report.provider_snapshot_created is True
+    assert report.bundle_created is False
+    assert report.analysis_request_created is False
+    assert report.bounded_counts["provider_snapshots"] == 1
+    assert report.bounded_counts["artifact_snapshot_updated_events"] == 1
+    assert report.bounded_counts["analysis_requested_events"] == 0
+    assert ledger.provider_snapshot_id is not None
+    assert ledger.bundle_id is None
+    assert ledger.analysis_request_event_id is None
     assert "enter:assembler" not in ledger.call_order
 
 
@@ -558,6 +707,7 @@ def test_module_does_not_import_openai_redis_telegram_notifier_or_judge_boundari
             imported_modules.add(node.module)
 
     forbidden = {
+        "base64",
         "redis",
         "redis.asyncio",
         "openai",
@@ -568,3 +718,4 @@ def test_module_does_not_import_openai_redis_telegram_notifier_or_judge_boundari
         "..notifier_telegram",
     }
     assert imported_modules.isdisjoint(forbidden)
+    assert "LocalFakeGitHubClient" not in source

@@ -24,10 +24,21 @@ from src.services.evidence_assembler.models import (
 )
 from src.services.evidence_assembler.service import EvidenceAssemblerService
 from src.services.evidence_assembler.text_idea_builder import TextIdeaBuilder
+from src.services.gh_enricher.fetch_planner import GitHubFetchPlanner
+from src.services.gh_enricher.file_sampler import GitHubFileSampler
+from src.services.gh_enricher.models import (
+    ArtifactEnrichmentJob,
+    ArtifactRecord as GhArtifactRecord,
+    CurrentSnapshotRef as GhCurrentSnapshotRef,
+)
+from src.services.gh_enricher.service import GhEnricherService
+from src.services.gh_enricher.url_discovery import GitHubUrlDiscovery
 from src.services.maintenance.exact_target_source_to_analysis_materializer import (
     ExactTargetSourceToAnalysisRequest,
     FinalReadback,
     NormalizationReadback,
+    ProviderEnrichmentRequest,
+    ProviderEnrichmentResult,
     RefreshEventRecord,
     run_exact_target_source_to_analysis_materializer,
 )
@@ -67,12 +78,15 @@ class Ledger:
         self.candidates: dict[UUID, CandidateGroupRecord] = {}
         self.members: dict[UUID, list[CandidateMemberRecord]] = {}
         self.snapshots: dict[UUID, SnapshotRecord] = {}
+        self.enrichment_run_keys: set[str] = set()
+        self.provider_snapshot_events: list[UUID] = []
         self.text_idea_snapshots_created = 0
         self.bundles: list[tuple[UUID, EvidenceBundleDraft]] = []
         self.analysis_outbox: list[dict[str, Any]] = []
         self.current_bundle_updates: list[dict[str, Any]] = []
         self.commits: list[str] = []
         self.allow_enrichment_requests = False
+        self.github_client_calls: list[str] = []
 
 
 class CollectorRepo:
@@ -272,6 +286,8 @@ class RouterRepo:
                     "artifact_id": str(kwargs["artifact_id"]),
                     "artifact_type": artifact.artifact_type,
                     "provider_route": artifact.provider_route,
+                    "refresh_mode": "standard",
+                    "depth_budget": 1,
                     "source_message_id": str(kwargs["source_message_id"]),
                     "source_version_no": kwargs["source_version_no"],
                 },
@@ -292,6 +308,19 @@ class EvidenceRepo:
         row = next((item for item in self.ledger.outbox if item["event_id"] == trigger_event_id), None)
         if row is None:
             return []
+        if row["event_type"] == "artifact.snapshot.updated.v1":
+            artifact_id = row["aggregate_id"]
+            return [
+                BundleRefreshTarget(
+                    candidate_group_id=candidate_group_id,
+                    trigger_event_id=row["event_id"],
+                    trigger_event_type=row["event_type"],
+                    trigger_artifact_id=artifact_id,
+                    trigger_snapshot_id=UUID(str(row["payload_json"]["snapshot_id"])),
+                )
+                for candidate_group_id, members in self.ledger.members.items()
+                if any(member.artifact_id == artifact_id for member in members)
+            ]
         return [
             BundleRefreshTarget(
                 candidate_group_id=row["aggregate_id"],
@@ -436,6 +465,9 @@ class MaterializerRepo:
             enrichment_request_event_id=(
                 None if not enrichment_rows else enrichment_rows[0]["event_id"]
             ),
+            provider_route=None if not enrichment_rows else enrichment_rows[0]["payload_json"].get("provider_route"),
+            refresh_mode=None if not enrichment_rows else enrichment_rows[0]["payload_json"].get("refresh_mode"),
+            depth_budget=None if not enrichment_rows else int(enrichment_rows[0]["payload_json"].get("depth_budget")),
             provider_route_counts=provider_route_counts,
         )
 
@@ -490,6 +522,15 @@ class MaterializerRepo:
             external_enrichment_requests=sum(
                 1 for row in self.ledger.outbox if row["event_type"] == "artifact.enrich.requested.v1"
             ),
+            provider_snapshots=sum(
+                1
+                for member in self.ledger.members[candidate_group_id]
+                if member.artifact_id in self.ledger.snapshots
+                and self.ledger.snapshots[member.artifact_id].provider in {"github", "x", "web"}
+            ),
+            artifact_snapshot_updated_events=sum(
+                1 for row in self.ledger.outbox if row["event_type"] == "artifact.snapshot.updated.v1"
+            ),
             text_idea_snapshots=self.ledger.text_idea_snapshots_created,
             ready_current_bundles=1 if bundle_id else 0,
             candidate_evidence_members=1 if bundle_id else 0,
@@ -501,6 +542,206 @@ class MaterializerRepo:
         )
 
 
+class GithubProviderRepo:
+    def __init__(self, ledger: Ledger) -> None:
+        self.ledger = ledger
+        self.snapshot_updated_event_id: UUID | None = None
+
+    def transaction(self):
+        return Tx()
+
+    async def load_artifact(self, artifact_id: UUID):
+        artifact = self.ledger.artifact_records.get(artifact_id)
+        if artifact is None:
+            return None
+        snapshot = self.ledger.snapshots.get(artifact_id)
+        return GhArtifactRecord(
+            artifact_id=artifact_id,
+            artifact_type=artifact.artifact_type,
+            canonical_id=artifact.canonical_id,
+            canonical_url=artifact.canonical_url,
+            normalized_host=artifact.normalized_host,
+            artifact_key_json=artifact.artifact_key_json,
+            current_snapshot_id=None if snapshot is None else snapshot.snapshot_id,
+            current_status=None if snapshot is None else snapshot.status,
+        )
+
+    async def load_current_snapshot(self, snapshot_id: UUID | None):
+        if snapshot_id is None:
+            return None
+        for snapshot in self.ledger.snapshots.values():
+            if snapshot.snapshot_id == snapshot_id:
+                return GhCurrentSnapshotRef(
+                    snapshot_id=snapshot.snapshot_id,
+                    status=snapshot.status,
+                    fetched_at=snapshot.fetched_at,
+                    content_anchor=snapshot.content_anchor,
+                    normalized_projection=snapshot.normalized_projection,
+                )
+        return None
+
+    async def insert_enrichment_run_if_absent(self, **kwargs):
+        key = kwargs["job_idempotency_key"]
+        if key in self.ledger.enrichment_run_keys:
+            return None
+        self.ledger.enrichment_run_keys.add(key)
+        return uuid4()
+
+    async def mark_enrichment_run_started(self, run_id) -> None:
+        del run_id
+
+    async def mark_enrichment_run_finished(self, **kwargs) -> None:
+        del kwargs
+
+    async def insert_snapshot(self, *, artifact_id: UUID, provider: str, plan) -> UUID:
+        snapshot = SnapshotRecord(
+            snapshot_id=uuid4(),
+            artifact_id=artifact_id,
+            provider=provider,
+            snapshot_type=plan.snapshot_type,
+            status=plan.status,
+            fetched_at=datetime.now(timezone.utc),
+            content_anchor=plan.content_anchor,
+            normalized_projection=plan.normalized_projection,
+            evidence_limitations=plan.evidence_limitations,
+        )
+        self.ledger.snapshots[artifact_id] = snapshot
+        return snapshot.snapshot_id
+
+    async def insert_github_repo_child(self, **kwargs) -> None:
+        del kwargs
+
+    async def insert_github_file_sample(self, **kwargs) -> None:
+        del kwargs
+
+    async def insert_discovered_url(self, *, snapshot_id: UUID, draft) -> None:
+        del snapshot_id, draft
+
+    async def update_artifact_current_snapshot(self, **kwargs) -> None:
+        del kwargs
+
+    async def insert_snapshot_updated_outbox(self, **kwargs):
+        event_id = uuid4()
+        self.snapshot_updated_event_id = event_id
+        self.ledger.provider_snapshot_events.append(event_id)
+        self.ledger.outbox.append(
+            {
+                "event_id": event_id,
+                "event_type": "artifact.snapshot.updated.v1",
+                "aggregate_type": "artifact",
+                "aggregate_id": kwargs["artifact_id"],
+                "payload_json": {
+                    "artifact_id": str(kwargs["artifact_id"]),
+                    "snapshot_id": str(kwargs["snapshot_id"]),
+                    "provider": "github",
+                    "status": kwargs["status"],
+                    "content_anchor": kwargs["content_anchor"],
+                },
+                "status": "pending",
+                "created_at": datetime.now(timezone.utc),
+            }
+        )
+        return event_id
+
+
+class FakeGitHubClient:
+    def __init__(self, ledger: Ledger) -> None:
+        self.ledger = ledger
+
+    async def get_repo(self, owner, repo, *, auth_mode):
+        del auth_mode
+        self.ledger.github_client_calls.append("repo")
+        return {
+            "full_name": f"{owner}/{repo}",
+            "default_branch": "main",
+            "description": "In-memory fake GitHub provider fixture",
+            "homepage": None,
+            "license": {"spdx_id": "MIT"},
+            "topics": ["ai"],
+            "language": "Python",
+            "stargazers_count": 3,
+            "subscribers_count": 1,
+            "forks_count": 0,
+            "open_issues_count": 0,
+            "archived": False,
+            "fork": False,
+            "is_template": False,
+            "pushed_at": "2026-06-01T00:00:00Z",
+        }
+
+    async def get_default_branch_head(self, owner, repo, default_branch, *, auth_mode):
+        del owner, repo, default_branch, auth_mode
+        self.ledger.github_client_calls.append("head")
+        return {"sha": "abc123def456"}
+
+    async def get_tree(self, owner, repo, ref, *, recursive, auth_mode):
+        del owner, repo, ref, auth_mode
+        self.ledger.github_client_calls.append("tree")
+        return {
+            "truncated": False,
+            "tree": [
+                {"type": "blob", "path": "README.md"},
+                {"type": "blob", "path": "pyproject.toml"},
+                {"type": "blob", "path": "tests/test_feature.py"},
+            ],
+        } if recursive else {"truncated": False, "tree": []}
+
+    async def get_contents(self, owner, repo, path, *, ref, auth_mode):
+        del owner, repo, ref, auth_mode
+        self.ledger.github_client_calls.append(f"contents:{path}")
+        return {
+            "encoding": "base64",
+            "content": (
+                "IyBGYWtlIHByb3ZpZGVyIGV2aWRlbmNlCk9mZmxpbmUgb25seS4K"
+            ),
+            "size": 46,
+        }
+
+    async def get_releases(self, owner, repo, *, auth_mode):
+        del owner, repo, auth_mode
+        self.ledger.github_client_calls.append("releases")
+        return []
+
+
+class ProviderEnrichmentService:
+    def __init__(self, ledger: Ledger) -> None:
+        self.ledger = ledger
+
+    async def materialize_provider_request(
+        self,
+        request: ProviderEnrichmentRequest,
+    ) -> ProviderEnrichmentResult:
+        assert request.provider_route == "github"
+        repository = GithubProviderRepo(self.ledger)
+        service = GhEnricherService(
+            github_config(),
+            repository=repository,
+            github_client=FakeGitHubClient(self.ledger),
+            fetch_planner=GitHubFetchPlanner(),
+            file_sampler=GitHubFileSampler(),
+            url_discovery=GitHubUrlDiscovery(),
+        )
+        result = await service.handle_job(
+            ArtifactEnrichmentJob(
+                trigger_event_id=request.trigger_event_id,
+                event_type="artifact.enrich.requested.v1",
+                candidate_group_id=request.candidate_group_id,
+                artifact_id=request.artifact_id,
+                artifact_type=request.artifact_type,
+                provider_route=request.provider_route,
+                refresh_mode=request.refresh_mode,
+                depth_budget=request.depth_budget,
+            )
+        )
+        return ProviderEnrichmentResult(
+            provider_route=request.provider_route,
+            status=result.status,
+            emitted_snapshot_updated=result.emitted_snapshot_updated,
+            snapshot_id=result.snapshot_id,
+            snapshot_updated_event_id=repository.snapshot_updated_event_id,
+        )
+
+
 class StageComponents:
     def __init__(self, ledger: Ledger, stage_name: str) -> None:
         self.ledger = ledger
@@ -509,6 +750,7 @@ class StageComponents:
         self.source_adapter = OperatorSuppliedSourceAdapter()
         self.materializer_repository = MaterializerRepo(ledger)
         self.normalizer_service = RouterNormalizerService(router_config(), repository=RouterRepo(ledger))
+        self.provider_enrichment_service = ProviderEnrichmentService(ledger)
         self.assembler_service = EvidenceAssemblerService(assembler_config(), repository=EvidenceRepo(ledger))
 
     async def commit(self) -> None:
@@ -559,6 +801,17 @@ def assembler_config() -> EvidenceAssemblerConfig:
     )
 
 
+def github_config():
+    class Config:
+        sample_max_files = 5
+        sample_excerpt_chars = 600
+        max_file_bytes = 16384
+        github_app_id = None
+        github_installation_id = None
+
+    return Config()
+
+
 def packet(message_text: str = KOREAN_LLM_WORKFLOW_TEXT):
     return parse_operator_source_packet(
         {
@@ -602,7 +855,7 @@ async def test_operator_source_to_analysis_request_flow_uses_real_normalizer_and
 
 
 @pytest.mark.asyncio
-async def test_operator_source_url_flow_requests_provider_enrichment_without_assembler() -> None:
+async def test_operator_source_url_flow_materializes_provider_evidence_analysis_request() -> None:
     ledger = Ledger()
     ledger.allow_enrichment_requests = True
 
@@ -618,11 +871,13 @@ async def test_operator_source_url_flow_requests_provider_enrichment_without_ass
     )
 
     assert report.status == "pass"
-    assert report.reason_code == "provider_enrichment_requested"
+    assert report.reason_code == "source_url_provider_evidence_analysis_requested"
     assert report.bundle_refresh_attempted is False
-    assert report.assembler_attempted is False
+    assert report.provider_enrichment_attempted is True
+    assert report.assembler_attempted is True
     assert report.artifact_enrichment_request_created is True
-    assert report.analysis_request_created is False
+    assert report.provider_snapshot_created is True
+    assert report.analysis_request_created is True
     assert report.openai_attempted is False
     assert report.redis_attempted is False
     assert report.telegram_live_read_attempted is False
@@ -633,6 +888,7 @@ async def test_operator_source_url_flow_requests_provider_enrichment_without_ass
     assert [row["event_type"] for row in ledger.outbox] == [
         "source_message.created.v1",
         "artifact.enrich.requested.v1",
+        "artifact.snapshot.updated.v1",
     ]
     assert len(ledger.normalization_runs) == 1
     assert len(ledger.candidates) == 1
@@ -640,7 +896,12 @@ async def test_operator_source_url_flow_requests_provider_enrichment_without_ass
     members = ledger.members[candidate_group_id]
     assert len(members) == 1
     assert members[0].artifact_type == "github_repo"
+    assert len(ledger.github_client_calls) >= 5
+    assert len(ledger.provider_snapshot_events) == 1
+    assert len(ledger.snapshots) == 1
     assert ledger.text_idea_snapshots_created == 0
-    assert len(ledger.bundles) == 0
-    assert len(ledger.analysis_outbox) == 0
-    assert ledger.commits == ["source_ingest", "normalization"]
+    assert len(ledger.bundles) == 1
+    assert ledger.bundles[0][1].ready_for_analysis is True
+    assert ledger.bundles[0][1].judge_profile == "github_primary"
+    assert len(ledger.analysis_outbox) == 1
+    assert ledger.commits == ["source_ingest", "normalization", "provider_enrichment", "assembler"]
