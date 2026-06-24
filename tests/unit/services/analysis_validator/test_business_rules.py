@@ -117,7 +117,34 @@ def test_business_rules_reject_inspect_now_with_hype_penalty_70_or_higher() -> N
     assert decision.reason_code == "validator_inspect_now_hype_too_high"
 
 
-def test_business_rules_allow_conservative_github_no_comparables_with_comparison_gap() -> None:
+def test_business_rules_allow_github_no_comparables_skip_to_reach_policy_suppress() -> None:
+    payload = _live_terminal_no_comparables_payload()
+    payload["scores"].update(
+        {
+            "novelty": 2,
+            "practical_usefulness": 1,
+            "evidence_strength": 1,
+            "hype_penalty": 0,
+            "confidence": 9,
+            "code_quality": None,
+            "maintenance_signal": None,
+            "specificity": 1,
+            "reproducibility_signal": None,
+        }
+    )
+    payload["model_proposed_verdict"] = "skip"
+    payload["model_confidence_band"] = "high"
+
+    decision = AnalysisValidatorBusinessRules().validate_semantics(
+        payload=payload,
+        bundle=_bundle("github_repo"),
+    )
+
+    assert decision.action == "forward_policy"
+    assert decision.reason_code == "validator_passed"
+
+
+def test_business_rules_reject_github_no_comparables_later_even_with_comparison_gap_marker() -> None:
     payload = _live_terminal_no_comparables_payload()
     payload["reason_codes"].extend(["comparison_gap", "insufficient_comparables"])
     payload["evidence_limitations_ko"] = ["comparison_gap"]
@@ -125,6 +152,20 @@ def test_business_rules_allow_conservative_github_no_comparables_with_comparison
     decision = AnalysisValidatorBusinessRules().validate_semantics(
         payload=payload,
         bundle=_bundle("github_repo"),
+    )
+
+    assert decision.action == "failed_terminal"
+    assert decision.reason_code == "validator_missing_github_comparables"
+
+
+def test_business_rules_non_github_no_comparables_later_still_forwards_policy() -> None:
+    payload = _live_terminal_no_comparables_payload()
+    payload["reason_codes"].extend(["comparison_gap", "insufficient_comparables"])
+    payload["evidence_limitations_ko"] = ["comparison_gap"]
+
+    decision = AnalysisValidatorBusinessRules().validate_semantics(
+        payload=payload,
+        bundle=_bundle("web_article"),
     )
 
     assert decision.action == "forward_policy"

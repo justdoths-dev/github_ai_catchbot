@@ -349,10 +349,24 @@ async def test_valid_output_emits_exactly_one_policy_apply_event_and_analysis_va
 
 
 @pytest.mark.asyncio
-async def test_conservative_github_no_comparables_with_comparison_gap_emits_policy_apply_event() -> None:
+async def test_github_no_comparables_skip_emits_policy_apply_event() -> None:
     repository, job, run, output = _repo_with_valid_case()
     payload = _live_terminal_no_comparables_payload()
-    payload["reason_codes"].append("comparison_gap")
+    payload["scores"].update(
+        {
+            "novelty": 2,
+            "practical_usefulness": 1,
+            "evidence_strength": 1,
+            "hype_penalty": 0,
+            "confidence": 9,
+            "code_quality": None,
+            "maintenance_signal": None,
+            "specificity": 1,
+            "reproducibility_signal": None,
+        }
+    )
+    payload["model_proposed_verdict"] = "skip"
+    payload["model_confidence_band"] = "high"
     payload["candidate_group_id"] = str(output.candidate_group_id)
     repository.outputs[output.judge_output_id] = replace(output, payload_json=payload)
 
@@ -369,6 +383,24 @@ async def test_conservative_github_no_comparables_with_comparison_gap_emits_poli
         "candidate_group_id": output.candidate_group_id,
         "bundle_id": run.bundle_id,
     }
+
+
+@pytest.mark.asyncio
+async def test_github_no_comparables_later_with_comparison_gap_fails_before_policy_apply() -> None:
+    repository, job, run, output = _repo_with_valid_case()
+    payload = _live_terminal_no_comparables_payload()
+    payload["reason_codes"].extend(["comparison_gap", "insufficient_comparables"])
+    payload["evidence_limitations_ko"] = ["comparison_gap"]
+    payload["candidate_group_id"] = str(output.candidate_group_id)
+    repository.outputs[output.judge_output_id] = replace(output, payload_json=payload)
+
+    await _handle(repository, job)
+
+    assert repository.runs[run.judge_run_id].status == "failed_terminal"
+    assert repository.runs[run.judge_run_id].finish_reason == "validator_missing_github_comparables"
+    assert repository.state_transitions[0]["to_state"] == "analysis_failed_semantic"
+    assert repository.state_transitions[0]["reason_code"] == "validator_missing_github_comparables"
+    assert repository.outbox == []
 
 
 @pytest.mark.asyncio

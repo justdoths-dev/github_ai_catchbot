@@ -524,11 +524,11 @@ async def test_validator_policy_suppress_path_stops_before_notification_queue() 
 
 
 @pytest.mark.asyncio
-async def test_validator_allows_conservative_github_no_comparables_policy_handoff_only_with_gap_marker() -> None:
+async def test_validator_allows_github_no_comparables_skip_to_policy_suppress() -> None:
     ledger = _ValidatorPolicyLedger(
-        scores=_conservative_no_comparables_scores(),
-        model_proposed_verdict="later",
-        mutate_payload=_mark_conservative_comparison_gap,
+        scores=_runtime_skip_no_comparables_scores(),
+        model_proposed_verdict="skip",
+        mutate_payload=_mark_empty_comparables,
     )
     _validator_repo, policy_repo, relay_repo, publisher, processed = await _run_pipeline(ledger)
 
@@ -539,7 +539,7 @@ async def test_validator_allows_conservative_github_no_comparables_policy_handof
     analysis = ledger.analyses[0]
     assert analysis.verdict == "skip"
     assert analysis.delivery_decision == "suppress"
-    assert "comparison_gap" in analysis.reason_codes_json
+    assert analysis.model_proposed_verdict == "skip"
     assert ledger.rows_of_type("notification.plan.created.v1") == []
     assert processed == 0
     assert relay_repo.marked_published == []
@@ -549,86 +549,37 @@ async def test_validator_allows_conservative_github_no_comparables_policy_handof
 
 
 @pytest.mark.asyncio
-async def test_conservative_github_no_comparables_replays_to_notification_queue_once() -> None:
+async def test_validator_rejects_github_no_comparables_later_before_policy_queue() -> None:
     ledger = _ValidatorPolicyLedger(
         scores=_conservative_no_comparables_later_scores(),
         model_proposed_verdict="later",
         mutate_payload=_mark_conservative_comparison_gap,
     )
-    validator_repo = _ValidatorRepository(ledger)
-    policy_repo = _PolicyRepository(ledger)
-    validator_service = AnalysisValidatorService(_validator_config(), repository=validator_repo)
-    policy_service = PolicyEngineService(_policy_config(), repository=policy_repo)
+    validator_repo, policy_repo, relay_repo, publisher, processed = await _run_pipeline(ledger)
 
-    await validator_service.handle_trigger_event(ledger.trigger_event_id)
-    await validator_service.handle_trigger_event(ledger.trigger_event_id)
-
-    policy_apply_events = ledger.rows_of_type("analysis.policy.apply.v1")
-    assert len(policy_apply_events) == 1
-    assert policy_apply_events[0].payload_json == {
-        "judge_run_id": str(ledger.judge_run_id),
-        "judge_output_id": str(ledger.judge_output_id),
-        "candidate_group_id": str(ledger.candidate_group_id),
-        "bundle_id": str(ledger.bundle_id),
-    }
-
-    await policy_service.handle_trigger_event(policy_apply_events[0].event_id)
-    await policy_service.handle_trigger_event(policy_apply_events[0].event_id)
-
-    assert policy_repo.loaded_trigger_event_ids == [
-        policy_apply_events[0].event_id,
-        policy_apply_events[0].event_id,
+    assert ledger.rows_of_type("analysis.policy.apply.v1") == []
+    assert policy_repo.loaded_trigger_event_ids == []
+    assert ledger.analyses == []
+    assert ledger.rows_of_type("notification.plan.created.v1") == []
+    assert processed == 0
+    assert relay_repo.marked_published == []
+    assert publisher.published == []
+    assert validator_repo.ledger.judge_run_status_updates == [
+        {
+            "judge_run_id": ledger.judge_run_id,
+            "status": "failed_terminal",
+            "finish_reason": "validator_missing_github_comparables",
+        }
     ]
-    assert len(ledger.analyses) == 1
-    analysis = ledger.analyses[0]
-    assert analysis.verdict == "later"
-    assert analysis.delivery_decision == "send_now"
-    assert analysis.model_proposed_verdict == "later"
-    assert analysis.policy_reconciled_flag is True
-    assert "comparison_gap" in analysis.reason_codes_json
-    assert "insufficient_comparables" in analysis.reason_codes_json
-    assert "policy_threshold_later" in analysis.reason_codes_json
-
-    notification_events = ledger.rows_of_type("notification.plan.created.v1")
-    assert len(notification_events) == 1
-    notification_row = notification_events[0]
-    assert notification_row.payload_json["analysis_id"] == str(ledger.analysis_id)
-    assert notification_row.payload_json["candidate_group_id"] == str(ledger.candidate_group_id)
-    assert notification_row.payload_json["delivery_decision"] == "send_now"
-    assert notification_row.payload_json["urgency_profile"] == "normal_silent"
-    assert notification_row.payload_json["render_profile"] == "telegram_single_alert_normal_v1"
-    assert notification_row.payload_json["suppress_reason_code"] is None
-    assert set(notification_row.payload_json) == REQUIRED_NOTIFICATION_PLAN_PAYLOAD_KEYS
-
-    relay_repo = _OutboxRepository(notification_events)
-    publisher = _RecordingPublisher()
-    relay_service = OutboxRelayService(
-        _outbox_config(),
-        repository=relay_repo,
-        publisher=publisher,
-        route_resolver=OutboxRouteResolver(),
-    )
-    assert await relay_service.run_once() == 1
-    assert await relay_service.run_once() == 0
-    assert relay_repo.marked_published == [notification_row.event_id]
-    assert len(publisher.published) == 1
-    route, message = publisher.published[0]
-    assert route.queue_name == "q.notification.send"
-    assert route.stage_name == "notify"
-    fields = message.as_stream_fields()
-    assert fields == {
-        "job_id": str(notification_row.event_id),
-        "stage_name": "notify",
-        "root_object_type": "analysis",
-        "root_object_id": str(ledger.analysis_id),
-        "idempotency_key": notification_row.dedupe_key,
-        "pipeline_run_id": "",
-        "not_before": "",
-        "trigger_event_id": str(notification_row.event_id),
-    }
-    assert set(fields) == THIN_REDIS_FIELDS
-    assert "payload_json" not in fields
-    assert publisher.notifier_transport_calls == 0
+    assert ledger.state_transitions == [
+        {
+            "object_type": "judge_run",
+            "object_id": ledger.judge_run_id,
+            "from_state": "succeeded",
+            "to_state": "analysis_failed_semantic",
+            "reason_code": "validator_missing_github_comparables",
+        }
+    ]
     _assert_no_notifier_owned_writes(ledger)
     _assert_no_external_authority(ledger)
 
@@ -839,16 +790,16 @@ def _suppress_scores() -> dict[str, int | None]:
     }
 
 
-def _conservative_no_comparables_scores() -> dict[str, int | None]:
+def _runtime_skip_no_comparables_scores() -> dict[str, int | None]:
     return {
-        "novelty": 22,
-        "practical_usefulness": 28,
+        "novelty": 2,
+        "practical_usefulness": 1,
         "evidence_strength": 1,
-        "hype_penalty": 35,
-        "confidence": 20,
+        "hype_penalty": 0,
+        "confidence": 9,
         "code_quality": None,
         "maintenance_signal": None,
-        "specificity": 20,
+        "specificity": 1,
         "reproducibility_signal": None,
     }
 
@@ -865,6 +816,10 @@ def _conservative_no_comparables_later_scores() -> dict[str, int | None]:
         "specificity": None,
         "reproducibility_signal": None,
     }
+
+
+def _mark_empty_comparables(payload: dict[str, Any]) -> None:
+    payload["comparables"] = []
 
 
 def _mark_conservative_comparison_gap(payload: dict[str, Any]) -> None:
