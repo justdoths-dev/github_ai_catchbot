@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
 import pytest
 
 from services.gh_enricher.fetch_planner import GitHubFetchPlanner
 from services.gh_enricher.file_sampler import GitHubFileSampler
-from services.gh_enricher.models import ArtifactEnrichmentJob, ArtifactRecord
+from services.gh_enricher.models import ArtifactEnrichmentJob, ArtifactRecord, CurrentSnapshotRef, EnrichmentRunRef
 from services.gh_enricher.service import GhEnricherService
 from services.gh_enricher.url_discovery import GitHubUrlDiscovery
 
@@ -21,17 +22,27 @@ class _Tx:
 
 
 class ConflictRepository:
-    def __init__(self, artifact: ArtifactRecord, *, existing_status: str) -> None:
+    def __init__(
+        self,
+        artifact: ArtifactRecord,
+        *,
+        existing_status: str,
+        orphan_snapshots: list[CurrentSnapshotRef] | None = None,
+    ) -> None:
         self.artifact = artifact
         self.status_by_key: dict[str, str] = {}
         self.run_key_by_id: dict[UUID, str] = {}
         self.existing_status = existing_status
+        self.existing_run_id = uuid4()
+        self.orphan_snapshots = orphan_snapshots or []
         self.job_key: str | None = None
         self.insert_calls = 0
         self.claim_calls = 0
         self.status_loads = 0
+        self.orphan_loads = 0
         self.snapshots = []
         self.outbox = []
+        self.current_updates = []
         self.started_run_ids = []
 
     def transaction(self):
@@ -49,6 +60,7 @@ class ConflictRepository:
         self.insert_calls += 1
         self.job_key = kwargs["job_idempotency_key"]
         self.status_by_key[self.job_key] = self.existing_status
+        self.run_key_by_id[self.existing_run_id] = self.job_key
         return None
 
     async def claim_failed_transient_enrichment_run_for_retry(self, *, job_idempotency_key: str):
@@ -61,8 +73,23 @@ class ConflictRepository:
         return run_id
 
     async def load_enrichment_run_status_by_job_idempotency_key(self, *, job_idempotency_key: str):
+        run = await self.load_enrichment_run_by_job_idempotency_key(
+            job_idempotency_key=job_idempotency_key,
+        )
+        return None if run is None else run.status
+
+    async def load_enrichment_run_by_job_idempotency_key(self, *, job_idempotency_key: str):
         self.status_loads += 1
-        return self.status_by_key.get(job_idempotency_key)
+        status = self.status_by_key.get(job_idempotency_key)
+        if status is None:
+            return None
+        return EnrichmentRunRef(run_id=self.existing_run_id, status=status)
+
+    async def load_valid_orphan_provider_snapshots(self, **kwargs):
+        self.orphan_loads += 1
+        assert kwargs["artifact_id"] == self.artifact.artifact_id
+        assert kwargs["provider"] == "github"
+        return self.orphan_snapshots[: kwargs.get("limit", 2)]
 
     async def mark_enrichment_run_started(self, run_id):
         self.started_run_ids.append(run_id)
@@ -86,7 +113,7 @@ class ConflictRepository:
         del kwargs
 
     async def update_artifact_current_snapshot(self, **kwargs):
-        del kwargs
+        self.current_updates.append(kwargs)
 
     async def insert_snapshot_updated_outbox(self, **kwargs):
         self.outbox.append(kwargs)
@@ -176,6 +203,16 @@ def _job(artifact_id: UUID) -> ArtifactEnrichmentJob:
     )
 
 
+def _orphan_snapshot(*, status: str = "ready") -> CurrentSnapshotRef:
+    return CurrentSnapshotRef(
+        snapshot_id=uuid4(),
+        status=status,
+        fetched_at=datetime.now(timezone.utc),
+        content_anchor="commit:abc123",
+        normalized_projection={"repo_full_name": "owner_fixture/repo_fixture"},
+    )
+
+
 def _service(repository: ConflictRepository, client: FakeGitHubClient) -> GhEnricherService:
     return GhEnricherService(
         Config(),
@@ -207,6 +244,93 @@ async def test_failed_transient_conflict_without_current_snapshot_retries_and_em
     assert len(repository.snapshots) == 1
     assert len(repository.outbox) == 1
     assert client.calls[:3] == ["repo", "head", "tree"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_status", ["fetching", "pending"])
+async def test_in_progress_conflict_with_one_orphan_snapshot_recovers_without_github_read(
+    existing_status: str,
+) -> None:
+    artifact_id = uuid4()
+    orphan = _orphan_snapshot()
+    repository = ConflictRepository(
+        _artifact(artifact_id),
+        existing_status=existing_status,
+        orphan_snapshots=[orphan],
+    )
+    client = FakeGitHubClient()
+
+    result = await _service(repository, client).handle_job(_job(artifact_id))
+
+    assert result.error_code is None
+    assert result.status == "ready"
+    assert result.snapshot_id == orphan.snapshot_id
+    assert result.content_anchor == orphan.content_anchor
+    assert result.emitted_snapshot_updated is True
+    assert repository.insert_calls == 1
+    assert repository.claim_calls == 1
+    assert repository.status_loads == 1
+    assert repository.orphan_loads == 1
+    assert repository.current_updates == [
+        {
+            "artifact_id": artifact_id,
+            "snapshot_id": orphan.snapshot_id,
+            "status": "ready",
+        }
+    ]
+    assert repository.outbox == [
+        {
+            "artifact_id": artifact_id,
+            "snapshot_id": orphan.snapshot_id,
+            "status": "ready",
+            "content_anchor": orphan.content_anchor,
+        }
+    ]
+    assert repository.status_by_key[repository.job_key] == "ready"
+    assert repository.snapshots == []
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fetching_conflict_without_orphan_snapshot_remains_in_progress_without_github_read() -> None:
+    artifact_id = uuid4()
+    repository = ConflictRepository(_artifact(artifact_id), existing_status="fetching")
+    client = FakeGitHubClient()
+
+    result = await _service(repository, client).handle_job(_job(artifact_id))
+
+    assert result.error_code is None
+    assert result.status == "fetching"
+    assert result.snapshot_id is None
+    assert result.emitted_snapshot_updated is False
+    assert repository.orphan_loads == 1
+    assert repository.current_updates == []
+    assert repository.snapshots == []
+    assert repository.outbox == []
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fetching_conflict_with_multiple_orphan_snapshots_fails_closed_without_github_read() -> None:
+    artifact_id = uuid4()
+    repository = ConflictRepository(
+        _artifact(artifact_id),
+        existing_status="fetching",
+        orphan_snapshots=[_orphan_snapshot(), _orphan_snapshot(status="partial_ready")],
+    )
+    client = FakeGitHubClient()
+
+    result = await _service(repository, client).handle_job(_job(artifact_id))
+
+    assert result.status == "failed_permanent"
+    assert result.error_code == "multiple_orphan_github_provider_snapshots"
+    assert result.snapshot_id is None
+    assert result.emitted_snapshot_updated is False
+    assert repository.orphan_loads == 1
+    assert repository.current_updates == []
+    assert repository.snapshots == []
+    assert repository.outbox == []
+    assert client.calls == []
 
 
 @pytest.mark.asyncio

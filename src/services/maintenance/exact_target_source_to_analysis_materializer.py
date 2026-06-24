@@ -965,6 +965,19 @@ class SqlProviderEnrichmentService:
                 ),
             )
 
+        if result.error_code is not None:
+            return ProviderEnrichmentResult(
+                provider_route=request.provider_route,
+                status=result.status,
+                emitted_snapshot_updated=result.emitted_snapshot_updated,
+                snapshot_id=result.snapshot_id,
+                snapshot_updated_event_id=repository.snapshot_updated_event_id,
+                snapshot_created=repository.snapshot_created,
+                external_network_attempted=state.external_network_attempted,
+                github_request_count=state.github_request_count,
+                error_code=result.error_code,
+            )
+
         if result.status in {"rate_limited", "access_denied", "failed_permanent", "failed_transient"}:
             if state.github_error_code is not None:
                 return ProviderEnrichmentResult(

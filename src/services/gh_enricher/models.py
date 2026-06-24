@@ -63,6 +63,12 @@ class CurrentSnapshotRef:
 
 
 @dataclass(slots=True, frozen=True)
+class EnrichmentRunRef:
+    run_id: UUID
+    status: str
+
+
+@dataclass(slots=True, frozen=True)
 class GitHubArtifactLocator:
     artifact_type: str
     owner: str | None = None
@@ -136,3 +142,4 @@ class EnrichmentResult:
     status: SnapshotStatus
     content_anchor: str | None
     emitted_snapshot_updated: bool
+    error_code: str | None = None

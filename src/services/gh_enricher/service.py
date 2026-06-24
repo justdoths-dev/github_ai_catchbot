@@ -114,9 +114,17 @@ class GhEnricherService:
         if run_id is None:
             existing_status = None
             if current_snapshot is None:
-                existing_status = await self._repository.load_enrichment_run_status_by_job_idempotency_key(
+                existing_run = await self._repository.load_enrichment_run_by_job_idempotency_key(
                     job_idempotency_key=job_idempotency_key,
                 )
+                existing_status = None if existing_run is None else existing_run.status
+                if existing_run is not None and existing_run.status in {"pending", "fetching"}:
+                    recovered = await self._recover_orphan_snapshot(
+                        artifact=artifact,
+                        run_id=existing_run.run_id,
+                    )
+                    if recovered is not None:
+                        return recovered
             return EnrichmentResult(
                 artifact_id=artifact.artifact_id,
                 snapshot_id=current_snapshot.snapshot_id if current_snapshot else None,
@@ -194,6 +202,56 @@ class GhEnricherService:
             status=status,  # type: ignore[arg-type]
             content_anchor=None,
             emitted_snapshot_updated=False,
+        )
+
+    async def _recover_orphan_snapshot(
+        self,
+        *,
+        artifact: ArtifactRecord,
+        run_id,
+    ) -> EnrichmentResult | None:
+        snapshots = await self._repository.load_valid_orphan_provider_snapshots(
+            artifact_id=artifact.artifact_id,
+            provider="github",
+            limit=2,
+        )
+        if not snapshots:
+            return None
+        if len(snapshots) > 1:
+            return EnrichmentResult(
+                artifact_id=artifact.artifact_id,
+                snapshot_id=None,
+                status="failed_permanent",
+                content_anchor=None,
+                emitted_snapshot_updated=False,
+                error_code="multiple_orphan_github_provider_snapshots",
+            )
+
+        snapshot = snapshots[0]
+        async with self._repository.transaction():
+            await self._repository.update_artifact_current_snapshot(
+                artifact_id=artifact.artifact_id,
+                snapshot_id=snapshot.snapshot_id,
+                status=snapshot.status,
+            )
+            await self._repository.insert_snapshot_updated_outbox(
+                artifact_id=artifact.artifact_id,
+                snapshot_id=snapshot.snapshot_id,
+                status=snapshot.status,
+                content_anchor=snapshot.content_anchor,
+            )
+            await self._repository.mark_enrichment_run_finished(
+                run_id=run_id,
+                status=snapshot.status,
+                content_anchor=snapshot.content_anchor,
+            )
+
+        return EnrichmentResult(
+            artifact_id=artifact.artifact_id,
+            snapshot_id=snapshot.snapshot_id,
+            status=snapshot.status,  # type: ignore[arg-type]
+            content_anchor=snapshot.content_anchor,
+            emitted_snapshot_updated=True,
         )
 
     def _should_short_circuit(

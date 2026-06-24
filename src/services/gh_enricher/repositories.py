@@ -13,6 +13,7 @@ from .models import (
     ArtifactRecord,
     CurrentSnapshotRef,
     DiscoveredUrlObservationDraft,
+    EnrichmentRunRef,
     GitHubFileSample,
     GitHubRepoProjection,
     SnapshotWritePlan,
@@ -227,19 +228,77 @@ class GhEnricherRepository:
         *,
         job_idempotency_key: str,
     ) -> str | None:
+        run = await self.load_enrichment_run_by_job_idempotency_key(
+            job_idempotency_key=job_idempotency_key,
+        )
+        return None if run is None else run.status
+
+    async def load_enrichment_run_by_job_idempotency_key(
+        self,
+        *,
+        job_idempotency_key: str,
+    ) -> EnrichmentRunRef | None:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT status
+                SELECT artifact_enrichment_run_id, status
                 FROM artifact_enrichment_runs
                 WHERE job_idempotency_key = :job_idempotency_key
+                ORDER BY requested_at ASC, artifact_enrichment_run_id ASC
                 LIMIT 1
                 """
             ),
             {"job_idempotency_key": job_idempotency_key},
         )
-        row = result.scalar_one_or_none()
-        return str(row) if row else None
+        row = result.mappings().first()
+        if row is None:
+            return None
+        return EnrichmentRunRef(
+            run_id=UUID(str(row["artifact_enrichment_run_id"])),
+            status=str(row["status"]),
+        )
+
+    async def load_valid_orphan_provider_snapshots(
+        self,
+        *,
+        artifact_id: UUID,
+        provider: str,
+        limit: int = 2,
+    ) -> list[CurrentSnapshotRef]:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT snapshot_id, status, fetched_at, content_anchor, normalized_projection
+                FROM artifact_snapshots
+                WHERE artifact_id = CAST(:artifact_id AS uuid)
+                  AND provider = :provider
+                  AND snapshot_type IN (
+                      'github_repo',
+                      'github_subpath',
+                      'github_repo_page',
+                      'github_gist'
+                  )
+                  AND status IN (
+                      'ready'::snapshot_status_enum,
+                      'partial_ready'::snapshot_status_enum
+                  )
+                  AND content_anchor IS NOT NULL
+                ORDER BY fetched_at ASC NULLS LAST, snapshot_id ASC
+                LIMIT :limit
+                """
+            ),
+            {"artifact_id": str(artifact_id), "provider": provider, "limit": int(limit)},
+        )
+        return [
+            CurrentSnapshotRef(
+                snapshot_id=UUID(str(row["snapshot_id"])),
+                status=str(row["status"]),
+                fetched_at=row["fetched_at"],
+                content_anchor=str(row["content_anchor"]),
+                normalized_projection=_json_loads(row["normalized_projection"]),
+            )
+            for row in result.mappings().all()
+        ]
 
     async def mark_enrichment_run_started(self, run_id: UUID) -> None:
         await self._session.execute(

@@ -4,6 +4,7 @@ import ast
 import json
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -21,6 +22,7 @@ from src.services.gh_enricher.github_client import (
     GitHubNotFoundError,
     GitHubRateLimitedError,
 )
+from src.services.gh_enricher.models import CurrentSnapshotRef, EnrichmentRunRef
 from src.services.maintenance.exact_target_source_to_analysis_materializer import (
     ExistingSourceProviderResumeAuthority,
     ExactTargetSourceToAnalysisRequest,
@@ -131,6 +133,14 @@ class SqlProviderFakeRepository:
         assert snapshot_id is None
         return None
 
+    async def load_enrichment_run_by_job_idempotency_key(self, *, job_idempotency_key: str):
+        del job_idempotency_key
+        return None
+
+    async def load_valid_orphan_provider_snapshots(self, **kwargs):
+        del kwargs
+        return []
+
     async def insert_enrichment_run_if_absent(self, **kwargs):
         self.runs.append(kwargs)
         return uuid4()
@@ -190,12 +200,63 @@ class SqlProviderConflictRetryFakeRepository(SqlProviderFakeRepository):
         return run_id
 
     async def load_enrichment_run_status_by_job_idempotency_key(self, *, job_idempotency_key: str):
+        run = await self.load_enrichment_run_by_job_idempotency_key(
+            job_idempotency_key=job_idempotency_key,
+        )
+        return None if run is None else run.status
+
+    async def load_enrichment_run_by_job_idempotency_key(self, *, job_idempotency_key: str):
         self.status_loads += 1
-        return self.status_by_key.get(job_idempotency_key)
+        status = self.status_by_key.get(job_idempotency_key)
+        if status is None:
+            return None
+        run_id = next(
+            (
+                existing_run_id
+                for existing_run_id, key in self.run_key_by_id.items()
+                if key == job_idempotency_key
+            ),
+            None,
+        )
+        if run_id is None:
+            run_id = uuid4()
+            self.run_key_by_id[run_id] = job_idempotency_key
+        return EnrichmentRunRef(run_id=run_id, status=status)
 
     async def mark_enrichment_run_finished(self, **kwargs):
         key = self.run_key_by_id[kwargs["run_id"]]
         self.status_by_key[key] = kwargs["status"]
+
+
+class SqlProviderOrphanSnapshotFakeRepository(SqlProviderConflictRetryFakeRepository):
+    def __init__(
+        self,
+        *,
+        artifact_id: UUID,
+        existing_status: str = "fetching",
+        orphan_snapshots: list[CurrentSnapshotRef] | None = None,
+    ) -> None:
+        super().__init__(artifact_id=artifact_id, existing_status=existing_status)
+        self.orphan_snapshots = orphan_snapshots or [
+            CurrentSnapshotRef(
+                snapshot_id=uuid4(),
+                status="ready",
+                fetched_at=datetime.now(timezone.utc),
+                content_anchor="commit:abc123",
+                normalized_projection={"repo_full_name": "example/project"},
+            )
+        ]
+        self.current_updates: list[dict[str, Any]] = []
+        self.orphan_loads = 0
+
+    async def load_valid_orphan_provider_snapshots(self, **kwargs):
+        self.orphan_loads += 1
+        assert kwargs["artifact_id"] == self.artifact.artifact_id
+        assert kwargs["provider"] == "github"
+        return self.orphan_snapshots[: kwargs.get("limit", 2)]
+
+    async def update_artifact_current_snapshot(self, **kwargs):
+        self.current_updates.append(kwargs)
 
 
 class SqlProviderFakeGitHubClient:
@@ -277,6 +338,7 @@ class Ledger:
         self.provider_snapshot_status = "ready"
         self.provider_snapshot_updated_event_id: UUID | None = None
         self.provider_error_code: str | None = None
+        self.provider_orphan_snapshot_recovered = False
         self.provider_requires_live_authority = False
         self.refresh_event_id: UUID | None = None
         self.text_idea_snapshot_count = 0
@@ -520,6 +582,20 @@ class FakeProviderEnrichmentService:
                 provider_route="github",
                 status="pending",
                 emitted_snapshot_updated=False,
+            )
+        if self.ledger.provider_orphan_snapshot_recovered:
+            self.ledger.provider_snapshot_id = self.ledger.provider_snapshot_id or uuid4()
+            self.ledger.provider_snapshot_updated_event_id = (
+                self.ledger.provider_snapshot_updated_event_id or uuid4()
+            )
+            return ProviderEnrichmentResult(
+                provider_route="github",
+                status="ready",
+                emitted_snapshot_updated=True,
+                snapshot_id=self.ledger.provider_snapshot_id,
+                snapshot_updated_event_id=self.ledger.provider_snapshot_updated_event_id,
+                snapshot_created=False,
+                github_request_count=0,
             )
         self.ledger.provider_snapshot_id = self.ledger.provider_snapshot_id or uuid4()
         self.ledger.provider_snapshot_updated_event_id = (
@@ -886,6 +962,126 @@ async def test_sql_provider_failed_transient_conflict_retries_with_injected_gith
 
 
 @pytest.mark.asyncio
+async def test_sql_provider_fetching_conflict_recovers_orphan_snapshot_without_github_read() -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderOrphanSnapshotFakeRepository(
+        artifact_id=artifact_id,
+        existing_status="fetching",
+    )
+    fake_client = SqlProviderFakeGitHubClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        github_client_factory=lambda config: fake_client,
+        repository_factory=lambda session: fake_repository,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="github_repo",
+            provider_route="github",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=ProviderLiveAuthority(
+                allow_live_github_provider_read=True,
+                allow_provider_snapshot_write=True,
+                provider_live_confirm="live-github-provider-evidence",
+            ),
+        )
+    )
+
+    orphan = fake_repository.orphan_snapshots[0]
+    assert result.error_code is None
+    assert result.status == "ready"
+    assert result.snapshot_id == orphan.snapshot_id
+    assert result.snapshot_updated_event_id == fake_repository.outbox_event_id
+    assert result.snapshot_created is False
+    assert result.emitted_snapshot_updated is True
+    assert result.github_request_count == 0
+    assert result.external_network_attempted is False
+    assert fake_client.calls == []
+    assert fake_repository.claim_calls == 1
+    assert fake_repository.status_loads == 1
+    assert fake_repository.orphan_loads == 1
+    assert fake_repository.current_updates == [
+        {
+            "artifact_id": artifact_id,
+            "snapshot_id": orphan.snapshot_id,
+            "status": "ready",
+        }
+    ]
+    assert fake_repository.status_by_key[fake_repository.runs[0]["job_idempotency_key"]] == "ready"
+    assert fake_repository.snapshots == []
+    assert fake_repository.outbox
+
+
+@pytest.mark.asyncio
+async def test_sql_provider_multiple_orphan_snapshots_returns_precise_error_without_github_read() -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderOrphanSnapshotFakeRepository(
+        artifact_id=artifact_id,
+        existing_status="fetching",
+        orphan_snapshots=[
+            CurrentSnapshotRef(
+                snapshot_id=uuid4(),
+                status="ready",
+                fetched_at=datetime.now(timezone.utc),
+                content_anchor="commit:abc123",
+                normalized_projection={"repo_full_name": "example/project"},
+            ),
+            CurrentSnapshotRef(
+                snapshot_id=uuid4(),
+                status="partial_ready",
+                fetched_at=datetime.now(timezone.utc),
+                content_anchor="commit:def456",
+                normalized_projection={"repo_full_name": "example/project"},
+            ),
+        ],
+    )
+    fake_client = SqlProviderFakeGitHubClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        github_client_factory=lambda config: fake_client,
+        repository_factory=lambda session: fake_repository,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="github_repo",
+            provider_route="github",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=ProviderLiveAuthority(
+                allow_live_github_provider_read=True,
+                allow_provider_snapshot_write=True,
+                provider_live_confirm="live-github-provider-evidence",
+            ),
+        )
+    )
+
+    assert result.status == "failed_permanent"
+    assert result.error_code == "multiple_orphan_github_provider_snapshots"
+    assert result.snapshot_id is None
+    assert result.snapshot_updated_event_id is None
+    assert result.snapshot_created is False
+    assert result.github_request_count == 0
+    assert result.external_network_attempted is False
+    assert fake_client.calls == []
+    assert fake_repository.current_updates == []
+    assert fake_repository.snapshots == []
+    assert fake_repository.outbox == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("error", "reason_code"),
     [
@@ -1138,6 +1334,34 @@ async def test_execute_url_path_provider_pending_does_not_emit_analysis_request(
     assert ledger.bundle_id is None
     assert ledger.analysis_request_event_id is None
     assert "enter:assembler" not in ledger.call_order
+
+
+@pytest.mark.asyncio
+async def test_execute_url_path_orphan_provider_snapshot_recovery_continues_to_analysis_request() -> None:
+    ledger = Ledger()
+    ledger.provider_orphan_snapshot_recovered = True
+
+    report = await run(ledger, mode="execute", text=GITHUB_URL_TEXT)
+
+    assert report.status == "pass"
+    assert report.reason_code == "source_url_provider_evidence_analysis_requested"
+    assert report.provider_enrichment_attempted is True
+    assert report.assembler_attempted is True
+    assert report.provider_snapshot_created is False
+    assert report.provider_snapshot_update_fingerprint is not None
+    assert report.bundle_created is True
+    assert report.analysis_request_created is True
+    assert report.bounded_counts["provider_snapshot_results"] == 1
+    assert report.bounded_counts["provider_snapshot_updated_events"] == 1
+    assert report.bounded_counts["github_request_count"] == 0
+    assert report.bounded_counts["provider_snapshots"] == 1
+    assert report.bounded_counts["artifact_snapshot_updated_events"] == 1
+    assert report.bounded_counts["analysis_requested_events"] == 1
+    assert ledger.provider_snapshot_id is not None
+    assert ledger.provider_snapshot_updated_event_id is not None
+    assert ledger.bundle_id is not None
+    assert ledger.analysis_request_event_id is not None
+    assert ledger.call_order.index("commit:provider_enrichment") < ledger.call_order.index("enter:assembler")
 
 
 @pytest.mark.asyncio

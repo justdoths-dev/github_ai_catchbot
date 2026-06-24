@@ -448,6 +448,12 @@ class CountingGhEnricherRepository:
     async def load_enrichment_run_status_by_job_idempotency_key(self, **kwargs):
         return await self._repository.load_enrichment_run_status_by_job_idempotency_key(**kwargs)
 
+    async def load_enrichment_run_by_job_idempotency_key(self, **kwargs):
+        return await self._repository.load_enrichment_run_by_job_idempotency_key(**kwargs)
+
+    async def load_valid_orphan_provider_snapshots(self, **kwargs):
+        return await self._repository.load_valid_orphan_provider_snapshots(**kwargs)
+
     async def mark_enrichment_run_finished(self, **kwargs) -> None:
         await self._repository.mark_enrichment_run_finished(**kwargs)
         self._counters.enrichment_runs_finished_count += 1

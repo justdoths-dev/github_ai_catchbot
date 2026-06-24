@@ -31,6 +31,7 @@ from src.services.gh_enricher.models import (
     ArtifactEnrichmentJob,
     ArtifactRecord as GhArtifactRecord,
     CurrentSnapshotRef as GhCurrentSnapshotRef,
+    EnrichmentRunRef as GhEnrichmentRunRef,
 )
 from src.services.gh_enricher.service import GhEnricherService
 from src.services.gh_enricher.url_discovery import GitHubUrlDiscovery
@@ -610,6 +611,27 @@ class GithubProviderRepo:
     async def load_enrichment_run_status_by_job_idempotency_key(self, *, job_idempotency_key: str):
         return self.ledger.enrichment_run_status_by_key.get(job_idempotency_key)
 
+    async def load_enrichment_run_by_job_idempotency_key(self, *, job_idempotency_key: str):
+        status = self.ledger.enrichment_run_status_by_key.get(job_idempotency_key)
+        if status is None:
+            return None
+        run_id = next(
+            (
+                existing_run_id
+                for existing_run_id, key in self.run_key_by_id.items()
+                if key == job_idempotency_key
+            ),
+            None,
+        )
+        if run_id is None:
+            run_id = uuid4()
+            self.run_key_by_id[run_id] = job_idempotency_key
+        return GhEnrichmentRunRef(run_id=run_id, status=status)
+
+    async def load_valid_orphan_provider_snapshots(self, **kwargs):
+        del kwargs
+        return []
+
     async def mark_enrichment_run_finished(self, **kwargs) -> None:
         key = self.run_key_by_id[kwargs["run_id"]]
         self.ledger.enrichment_run_status_by_key[key] = kwargs["status"]
@@ -773,6 +795,7 @@ class ProviderEnrichmentService:
             snapshot_updated_event_id=repository.snapshot_updated_event_id,
             snapshot_created=repository.snapshot_created,
             github_request_count=len(self.ledger.github_client_calls),
+            error_code=result.error_code,
         )
 
 
