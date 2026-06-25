@@ -99,7 +99,21 @@ class _FakeOpenAIClient:
 
 
 class _Ledger:
-    def __init__(self, *, scores: dict[str, int | None] | None = None, verdict: str = "inspect_now") -> None:
+    def __init__(
+        self,
+        *,
+        scores: dict[str, int | None] | None = None,
+        verdict: str = "inspect_now",
+        require_commit_visibility: bool = False,
+    ) -> None:
+        self.require_commit_visibility = require_commit_visibility
+        self.commit_count = 0
+        self._pending_event_ids: set[UUID] = set()
+        self._pending_analysis_ids: set[UUID] = set()
+        self._pending_plan_ids: set[UUID] = set()
+        self._pending_render_keys: set[tuple[UUID, str]] = set()
+        self._pending_delivery_record_ids: set[UUID] = set()
+        self._pending_delivery_outbox_keys: set[tuple[UUID, UUID]] = set()
         self.trigger_event_id = uuid4()
         self.judge_run_id = uuid4()
         self.bundle_id = uuid4()
@@ -176,9 +190,18 @@ class _Ledger:
     def tx(self) -> _Tx:
         return _Tx()
 
+    async def commit_active_transaction(self) -> None:
+        self.commit_count += 1
+        self._pending_event_ids.clear()
+        self._pending_analysis_ids.clear()
+        self._pending_plan_ids.clear()
+        self._pending_render_keys.clear()
+        self._pending_delivery_record_ids.clear()
+        self._pending_delivery_outbox_keys.clear()
+
     def event_by_id(self, event_id: UUID) -> dict[str, Any] | None:
         for row in self.event_outbox:
-            if row["event_id"] == event_id:
+            if row["event_id"] == event_id and self._event_is_visible(row):
                 return row
         return None
 
@@ -190,7 +213,11 @@ class _Ledger:
         judge_output_id: UUID | None = None,
         analysis_id: UUID | None = None,
     ) -> list[dict[str, Any]]:
-        rows = [row for row in self.event_outbox if row["event_type"] == event_type]
+        rows = [
+            row
+            for row in self.event_outbox
+            if row["event_type"] == event_type and self._event_is_visible(row)
+        ]
         if judge_run_id is not None:
             rows = [row for row in rows if row["payload_json"].get("judge_run_id") == str(judge_run_id)]
         if judge_output_id is not None:
@@ -228,12 +255,75 @@ class _Ledger:
         )
         if count_write:
             self.write_count += 1
+            if self.require_commit_visibility:
+                self._pending_event_ids.add(event_id)
         return event_id
+
+    def analysis_rows(self) -> list[tuple[UUID, AnalysisDraft]]:
+        if not self.require_commit_visibility:
+            return list(self.analyses)
+        return [
+            (analysis_id, analysis)
+            for analysis_id, analysis in self.analyses
+            if analysis_id not in self._pending_analysis_ids
+        ]
+
+    def committed_plan_ids(self, *, analysis_id: UUID, notification_plan_id: UUID | None) -> list[UUID]:
+        return [
+            plan_id
+            for plan_id, plan in self.plans.items()
+            if plan.analysis_id == analysis_id
+            and (notification_plan_id is None or plan_id == notification_plan_id)
+            and (not self.require_commit_visibility or plan_id not in self._pending_plan_ids)
+        ]
+
+    def committed_render_count(self, plan_ids: list[UUID]) -> int:
+        return sum(
+            1
+            for render in self.renders
+            if render.notification_plan_id in plan_ids
+            and (
+                not self.require_commit_visibility
+                or (render.notification_plan_id, render.render_hash) not in self._pending_render_keys
+            )
+        )
+
+    def committed_send_disabled_delivery_count(self, plan_ids: list[UUID]) -> int:
+        return sum(
+            1
+            for record in self.delivery_records
+            if record["notification_plan_id"] in plan_ids
+            and (
+                not self.require_commit_visibility
+                or record["notification_delivery_record_id"] not in self._pending_delivery_record_ids
+            )
+            and record["result_status"] == "suppressed"
+            and (record.get("telegram_response_json") or {}).get("send_disabled") is True
+            and (record.get("telegram_response_json") or {}).get("dry_run") is True
+        )
+
+    def committed_delivery_result_event_count(self, plan_ids: list[UUID]) -> int:
+        return sum(
+            1
+            for row in self.delivery_outbox
+            if row["notification_plan_id"] in plan_ids
+            and (
+                not self.require_commit_visibility
+                or (row["notification_plan_id"], row["notification_delivery_record_id"])
+                not in self._pending_delivery_outbox_keys
+            )
+        )
+
+    def _event_is_visible(self, row: dict[str, Any]) -> bool:
+        return not self.require_commit_visibility or row["event_id"] not in self._pending_event_ids
 
 
 class _CanaryRepository:
     def __init__(self, ledger: _Ledger) -> None:
         self.ledger = ledger
+
+    async def commit_active_transaction(self) -> None:
+        await self.ledger.commit_active_transaction()
 
     async def load_preflight(self, trigger_event_id: UUID) -> ExactTargetPreflight:
         event_row = self.ledger.event_by_id(trigger_event_id)
@@ -309,7 +399,7 @@ class _CanaryRepository:
     ) -> AnalysisReadback:
         rows = [
             (analysis_id, analysis)
-            for analysis_id, analysis in self.ledger.analyses
+            for analysis_id, analysis in self.ledger.analysis_rows()
             if analysis.judge_output_id == judge_output_id
             and analysis.policy_version == policy_version
             and analysis.delivery_policy_version == delivery_policy_version
@@ -330,25 +420,15 @@ class _CanaryRepository:
         analysis_id: UUID,
         notification_plan_id: UUID | None,
     ) -> NotificationReadback:
-        plan_ids = [
-            plan_id
-            for plan_id, plan in self.ledger.plans.items()
-            if plan.analysis_id == analysis_id and (notification_plan_id is None or plan_id == notification_plan_id)
-        ]
+        plan_ids = self.ledger.committed_plan_ids(
+            analysis_id=analysis_id,
+            notification_plan_id=notification_plan_id,
+        )
         return NotificationReadback(
             notification_plan_count=len(plan_ids),
-            notification_render_count=sum(1 for render in self.ledger.renders if render.notification_plan_id in plan_ids),
-            send_disabled_delivery_record_count=sum(
-                1
-                for record in self.ledger.delivery_records
-                if record["notification_plan_id"] in plan_ids
-                and record["result_status"] == "suppressed"
-                and (record.get("telegram_response_json") or {}).get("send_disabled") is True
-                and (record.get("telegram_response_json") or {}).get("dry_run") is True
-            ),
-            delivery_result_event_count=sum(
-                1 for row in self.ledger.delivery_outbox if row["notification_plan_id"] in plan_ids
-            ),
+            notification_render_count=self.ledger.committed_render_count(plan_ids),
+            send_disabled_delivery_record_count=self.ledger.committed_send_disabled_delivery_count(plan_ids),
+            delivery_result_event_count=self.ledger.committed_delivery_result_event_count(plan_ids),
         )
 
 
@@ -614,6 +694,8 @@ class _PolicyRepository:
             delivery_policy_version=draft.delivery_policy_version,
         )
         self.ledger.analyses.append((analysis_id, draft))
+        if self.ledger.require_commit_visibility:
+            self.ledger._pending_analysis_ids.add(analysis_id)
         self.ledger.write_count += 1
         return analysis_id
 
@@ -741,11 +823,13 @@ class _NotifierRepository:
         if existing is not None:
             return UUID(str(existing["notification_plan_id"]))
         self.ledger.plans[draft.notification_plan_id] = draft
+        if self.ledger.require_commit_visibility:
+            self.ledger._pending_plan_ids.add(draft.notification_plan_id)
         self.ledger.write_count += 1
         return draft.notification_plan_id
 
     async def load_analysis(self, analysis_id: UUID) -> AnalysisRenderContext | None:
-        for current_id, analysis in self.ledger.analyses:
+        for current_id, analysis in self.ledger.analysis_rows():
             if current_id != analysis_id:
                 continue
             return AnalysisRenderContext(
@@ -807,12 +891,16 @@ class _NotifierRepository:
         ):
             return None
         self.ledger.renders.append(draft)
+        if self.ledger.require_commit_visibility:
+            self.ledger._pending_render_keys.add((draft.notification_plan_id, draft.render_hash))
         self.ledger.write_count += 1
         return uuid4()
 
     async def insert_delivery_record(self, **kwargs: Any) -> UUID:
         record_id = uuid4()
         self.ledger.delivery_records.append({"notification_delivery_record_id": record_id, **kwargs})
+        if self.ledger.require_commit_visibility:
+            self.ledger._pending_delivery_record_ids.add(record_id)
         self.ledger.write_count += 1
         return record_id
 
@@ -828,6 +916,10 @@ class _NotifierRepository:
 
     async def insert_delivery_result_outbox(self, **kwargs: Any) -> None:
         self.ledger.delivery_outbox.append(kwargs)
+        if self.ledger.require_commit_visibility:
+            self.ledger._pending_delivery_outbox_keys.add(
+                (kwargs["notification_plan_id"], kwargs["notification_delivery_record_id"])
+            )
         self.ledger.write_count += 1
 
 
@@ -1387,6 +1479,28 @@ async def test_successful_live_shape_fake_reaches_send_disabled_notifier(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_fresh_execute_writes_are_committed_before_durable_readbacks(tmp_path: Path) -> None:
+    ledger = _Ledger(require_commit_visibility=True)
+
+    report, fake_client = await _run_execute(ledger, [_structured_response(ledger.payload)], tmp_path)
+
+    assert report.status == "pass"
+    assert report.reason_code == "notification_send_disabled_suppressed"
+    assert report.openai_request_count == 1
+    assert len(fake_client.calls) == 1
+    assert report.judge_output_created is True
+    assert report.judge_output_ready_event_created is True
+    assert report.validator_forwarded_policy is True
+    assert report.analysis_created is True
+    assert report.notification_plan_created is True
+    assert report.notification_render_created is True
+    assert report.send_disabled_delivery_record_created is True
+    assert report.telegram_transport_attempted is False
+    assert report.redis_attempted is False
+    assert ledger.commit_count == 4
+
+
+@pytest.mark.asyncio
 async def test_forbidden_telegram_transport_attempt_reports_bounded_failure(tmp_path: Path, monkeypatch) -> None:
     ledger = _Ledger()
 
@@ -1567,6 +1681,78 @@ async def test_resume_from_existing_judge_output_reaches_send_disabled_notifier(
     assert len(ledger.renders) == 1
     assert len(ledger.delivery_records) == 1
     assert len(ledger.delivery_outbox) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_downstream_writes_are_committed_before_durable_readback(tmp_path: Path) -> None:
+    ledger = _Ledger(require_commit_visibility=True)
+    _materialize_existing_judge_output(ledger)
+
+    report = await _run_resume_execute(ledger, tmp_path)
+
+    assert report.status == "pass"
+    assert report.reason_code == "notification_send_disabled_suppressed"
+    assert report.post_judge_output_resume_attempted is True
+    assert report.openai_call_attempted is False
+    assert report.openai_request_count == 0
+    assert report.validator_attempted is True
+    assert report.validator_forwarded_policy is True
+    assert report.policy_attempted is True
+    assert report.analysis_created is True
+    assert report.notification_intent_created is True
+    assert report.notifier_attempted is True
+    assert report.notification_plan_created is True
+    assert report.notification_render_created is True
+    assert report.send_disabled_delivery_record_created is True
+    assert report.telegram_transport_attempted is False
+    assert report.redis_attempted is False
+    assert ledger.commit_count == 3
+    assert len(ledger.events("analysis.policy.apply.v1", judge_run_id=ledger.judge_run_id)) == 1
+    assert len(ledger.analysis_rows()) == 1
+    assert len(ledger.events("notification.plan.created.v1", analysis_id=ledger.analysis_id)) == 1
+    assert ledger.committed_plan_ids(analysis_id=ledger.analysis_id, notification_plan_id=None) == list(ledger.plans)
+    assert ledger.committed_render_count(list(ledger.plans)) == 1
+    assert ledger.committed_send_disabled_delivery_count(list(ledger.plans)) == 1
+    assert ledger.committed_delivery_result_event_count(list(ledger.plans)) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_downstream_commit_failure_fails_closed_without_raw_error(tmp_path: Path) -> None:
+    ledger = _Ledger(require_commit_visibility=True)
+    _materialize_existing_judge_output(ledger)
+    private_error_text = _joined("private", "-", "commit", "-", "body")
+
+    class _FailingCommitCanaryRepository(_CanaryRepository):
+        async def commit_active_transaction(self) -> None:
+            raise RuntimeError(private_error_text)
+
+    base_components = _components(ledger)
+    components = ExactTargetCanaryComponents(
+        canary_repository=_FailingCommitCanaryRepository(ledger),
+        judge_repository=base_components.judge_repository,
+        validator_repository=base_components.validator_repository,
+        policy_repository=base_components.policy_repository,
+        notifier_repository=base_components.notifier_repository,
+    )
+
+    report = await run_exact_target_canary(
+        ExactTargetCanaryRequest(
+            mode="execute",
+            trigger_event_id=ledger.trigger_event_id,
+            post_judge_output_resume_authority=_resume_authority(),
+        ),
+        runtime=_runtime(tmp_path),
+        components=components,
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    rendered = json.dumps(asdict(report), default=str)
+    assert report.status == "failed"
+    assert report.reason_code == "validator_commit_failed"
+    assert report.openai_request_count == 0
+    assert report.telegram_transport_attempted is False
+    assert private_error_text not in rendered
+    assert len(ledger.events("analysis.policy.apply.v1", judge_run_id=ledger.judge_run_id)) == 0
 
 
 @pytest.mark.asyncio

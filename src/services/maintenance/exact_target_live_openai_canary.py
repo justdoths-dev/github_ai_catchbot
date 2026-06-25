@@ -248,6 +248,7 @@ class ExactTargetCanaryRepositoryProtocol(Protocol):
         analysis_id: UUID,
         notification_plan_id: UUID | None,
     ) -> NotificationReadback: ...
+    async def commit_active_transaction(self) -> None: ...
 
 
 @dataclass(slots=True)
@@ -294,6 +295,10 @@ class SqlExactTargetCanaryRepository:
     def __init__(self, session: Any) -> None:
         self._session = session
         self._judge_repository = JudgeOpenAIRepository(session)
+
+    async def commit_active_transaction(self) -> None:
+        if self._session.in_transaction():
+            await self._session.commit()
 
     async def load_preflight(self, trigger_event_id: UUID) -> ExactTargetPreflight:
         event = await self._load_target_event(trigger_event_id)
@@ -780,6 +785,12 @@ async def run_exact_target_canary(
             openai_client=openai_client,
         )
         await judge_service.handle_trigger_event(request.trigger_event_id)
+        commit_failed_reason = await _commit_active_transaction(
+            components=components,
+            failure_reason_code="judge_commit_failed",
+        )
+        if commit_failed_reason is not None:
+            return replace(report, status="failed", reason_code=commit_failed_reason)
         report = replace(
             report,
             openai_request_count=min(openai_client.request_count, 2),
@@ -898,6 +909,18 @@ def _default_openai_client(config: JudgeOpenAIConfig) -> OpenAIJudgeClient:
     )
 
 
+async def _commit_active_transaction(
+    *,
+    components: ExactTargetCanaryComponents,
+    failure_reason_code: str,
+) -> str | None:
+    try:
+        await components.canary_repository.commit_active_transaction()
+    except Exception:
+        return failure_reason_code
+    return None
+
+
 async def _notification_plan_id_from_intent(notifier_repository: Any, event_id: UUID) -> UUID | None:
     intent = await notifier_repository.load_intent_job(event_id)
     return intent.notification_plan_id if intent is not None else None
@@ -921,6 +944,12 @@ async def _continue_from_judge_output_ready(
         repository=components.validator_repository,
     )
     await validator.handle_trigger_event(judge_readback.ready_event_id)
+    commit_failed_reason = await _commit_active_transaction(
+        components=components,
+        failure_reason_code="validator_commit_failed",
+    )
+    if commit_failed_reason is not None:
+        return replace(report, status="failed", reason_code=commit_failed_reason)
     policy_event_ids = await components.canary_repository.load_policy_event_ids(
         judge_run_id=preflight.judge_run.judge_run_id,
         judge_output_id=judge_readback.judge_output_id,
@@ -946,6 +975,12 @@ async def _continue_from_judge_output_ready(
         repository=components.policy_repository,
     )
     await policy.handle_trigger_event(policy_event_ids[0])
+    commit_failed_reason = await _commit_active_transaction(
+        components=components,
+        failure_reason_code="policy_commit_failed",
+    )
+    if commit_failed_reason is not None:
+        return replace(report, status="failed", reason_code=commit_failed_reason)
     analysis = await components.canary_repository.load_analysis_readback(
         judge_output_id=judge_readback.judge_output_id,
         policy_version=service_configs.policy.policy_version,
@@ -1003,6 +1038,12 @@ async def _continue_from_judge_output_ready(
             status="failed",
             reason_code="telegram_transport_attempted",
         )
+    commit_failed_reason = await _commit_active_transaction(
+        components=components,
+        failure_reason_code="notifier_commit_failed",
+    )
+    if commit_failed_reason is not None:
+        return replace(report, status="failed", reason_code=commit_failed_reason)
     notification_plan_id = await _notification_plan_id_from_intent(
         components.notifier_repository,
         notification_event_ids[0],
