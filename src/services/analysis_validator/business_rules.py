@@ -11,6 +11,20 @@ _TRUNCATION_FINISH_REASONS = {"incomplete", "max_output_tokens", "output_truncat
 
 
 class AnalysisValidatorBusinessRules:
+    def normalize_payload_for_validation(
+        self,
+        *,
+        payload: dict[str, Any],
+        bundle: BundleValidationContext,
+    ) -> dict[str, Any]:
+        if bundle.current_primary_artifact_type not in _GITHUB_PRIMARY_TYPES:
+            return payload
+        if "comparables" in payload and payload.get("comparables") is not None:
+            return payload
+        normalized = dict(payload)
+        normalized["comparables"] = []
+        return normalized
+
     def evaluate_control_flow(
         self,
         *,
@@ -53,6 +67,8 @@ class AnalysisValidatorBusinessRules:
             return self._semantic("validator_score_range_invalid")
 
         comparables = payload.get("comparables")
+        if bundle.current_primary_artifact_type in _GITHUB_PRIMARY_TYPES and comparables is None:
+            comparables = []
         verdict = payload.get("model_proposed_verdict")
         if (
             bundle.current_primary_artifact_type in _GITHUB_PRIMARY_TYPES

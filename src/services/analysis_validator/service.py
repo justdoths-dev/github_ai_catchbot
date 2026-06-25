@@ -97,7 +97,10 @@ class AnalysisValidatorService:
             )
             return
 
-        payload = judge_output.payload_json
+        payload = self._business_rules.normalize_payload_for_validation(
+            payload=judge_output.payload_json,
+            bundle=bundle,
+        )
         control_decision = self._business_rules.evaluate_control_flow(
             payload=payload,
             finish_reason=job.finish_reason or judge_run.finish_reason,

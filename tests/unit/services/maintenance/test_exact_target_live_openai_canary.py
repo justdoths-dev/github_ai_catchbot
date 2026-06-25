@@ -1809,6 +1809,42 @@ async def test_resume_existing_skip_judge_output_with_empty_github_comparables_r
     assert len(ledger.delivery_records) == 0
 
 
+@pytest.mark.parametrize("shape", ["missing", "null"])
+@pytest.mark.asyncio
+async def test_resume_existing_skip_judge_output_with_missing_or_null_github_comparables_reaches_policy_suppressed(
+    tmp_path: Path,
+    shape: str,
+) -> None:
+    ledger = _Ledger(scores=_runtime_empty_comparable_skip_scores(), verdict="skip")
+    if shape == "missing":
+        ledger.payload.pop("comparables")
+    else:
+        ledger.payload["comparables"] = None
+    ledger.payload["model_confidence_band"] = "high"
+    _materialize_existing_judge_output(ledger)
+
+    report = await _run_resume_execute(ledger, tmp_path)
+
+    assert report.status == "pass"
+    assert report.reason_code == "policy_suppressed"
+    assert report.post_judge_output_resume_attempted is True
+    assert report.openai_call_attempted is False
+    assert report.openai_request_count == 0
+    assert report.telegram_transport_attempted is False
+    assert report.redis_attempted is False
+    assert report.validator_attempted is True
+    assert report.validator_forwarded_policy is True
+    assert report.policy_attempted is True
+    assert report.analysis_created is True
+    assert report.final_verdict == "skip"
+    assert report.delivery_decision == "suppress"
+    assert report.notification_intent_created is False
+    assert report.notifier_attempted is False
+    assert len(ledger.plans) == 0
+    assert len(ledger.renders) == 0
+    assert len(ledger.delivery_records) == 0
+
+
 @pytest.mark.asyncio
 async def test_resume_multiple_policy_events_fail_closed(tmp_path: Path) -> None:
     ledger = _Ledger()
