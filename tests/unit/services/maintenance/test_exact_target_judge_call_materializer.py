@@ -69,6 +69,8 @@ class FakeMaterializerRepository:
         router_conflicting_judge_run_id: UUID | None = None,
         downstream_counts: DownstreamCounts | None = None,
         close_preflight_error: Exception | None = None,
+        commit_error: Exception | None = None,
+        require_commit_visibility: bool = False,
     ) -> None:
         self.event = event
         self.candidate_state = candidate_state
@@ -76,16 +78,23 @@ class FakeMaterializerRepository:
         self.shape = shape or BundleShapeStats(member_count=1, supporting_count=0)
         self.judge_run_id = existing_judge_run_id
         self.judge_call_event_id = existing_judge_call_event_id
+        self.pending_judge_run_id: UUID | None = None
+        self.pending_judge_call_event_id: UUID | None = None
         self.router_conflicting_judge_run_id = router_conflicting_judge_run_id
         self.downstream_counts = downstream_counts or DownstreamCounts()
         self.close_preflight_error = close_preflight_error
+        self.commit_error = commit_error
+        self.require_commit_visibility = require_commit_visibility
         self.materialize_calls = 0
         self.close_preflight_calls = 0
+        self.commit_active_calls = 0
+        self.pre_commit_visible_judge_run_count: int | None = None
         self.call_order: list[str] = []
         self.load_event_calls: list[UUID] = []
         self.load_candidate_calls: list[UUID] = []
         self.load_bundle_calls: list[UUID] = []
         self.load_shape_calls: list[UUID] = []
+        self.exact_judge_run_readback_counts: list[int] = []
 
     async def load_event_by_id(self, event_id: UUID) -> MaterializerEvent | None:
         self.call_order.append("load_event_by_id")
@@ -114,8 +123,10 @@ class FakeMaterializerRepository:
     async def load_exact_judge_run(self, decision, *, bundle_id: UUID) -> ExistingJudgeRunReadback:
         self.call_order.append("load_exact_judge_run")
         del decision, bundle_id
+        count = 1 if self.judge_run_id else 0
+        self.exact_judge_run_readback_counts.append(count)
         return ExistingJudgeRunReadback(
-            count=1 if self.judge_run_id else 0,
+            count=count,
             judge_run_id=self.judge_run_id,
         )
 
@@ -146,12 +157,30 @@ class FakeMaterializerRepository:
         if self.close_preflight_error is not None:
             raise self.close_preflight_error
 
+    async def commit_active_transaction(self) -> None:
+        self.call_order.append("commit_active_transaction")
+        self.commit_active_calls += 1
+        if self.commit_error is not None:
+            raise self.commit_error
+        self.pre_commit_visible_judge_run_count = 1 if self.judge_run_id else 0
+        if self.pending_judge_run_id is not None:
+            self.judge_run_id = self.pending_judge_run_id
+            self.judge_call_event_id = self.pending_judge_call_event_id
+            self.pending_judge_run_id = None
+            self.pending_judge_call_event_id = None
+
     def materialize(self) -> None:
         self.call_order.append("materialize")
         self.materialize_calls += 1
-        if self.judge_run_id is None:
-            self.judge_run_id = uuid4()
-            self.judge_call_event_id = uuid4()
+        if self.judge_run_id is None and self.pending_judge_run_id is None:
+            judge_run_id = uuid4()
+            judge_call_event_id = uuid4()
+            if self.require_commit_visibility:
+                self.pending_judge_run_id = judge_run_id
+                self.pending_judge_call_event_id = judge_call_event_id
+                return
+            self.judge_run_id = judge_run_id
+            self.judge_call_event_id = judge_call_event_id
 
 
 class FakeRouterService:
@@ -252,6 +281,8 @@ def _success_parts(
     router_conflicting_judge_run_id: UUID | None = None,
     downstream_counts: DownstreamCounts | None = None,
     close_preflight_error: Exception | None = None,
+    commit_error: Exception | None = None,
+    require_commit_visibility: bool = False,
 ) -> tuple[UUID, FakeMaterializerRepository, FakeRouterService]:
     event_id = uuid4()
     candidate_group_id = uuid4()
@@ -270,6 +301,8 @@ def _success_parts(
         router_conflicting_judge_run_id=router_conflicting_judge_run_id,
         downstream_counts=downstream_counts,
         close_preflight_error=close_preflight_error,
+        commit_error=commit_error,
+        require_commit_visibility=require_commit_visibility,
     )
     service = FakeRouterService(repository)
     return event_id, repository, service
@@ -307,6 +340,7 @@ async def test_plan_is_read_only_and_reports_ready_target() -> None:
     assert service.calls == []
     assert repository.materialize_calls == 0
     assert repository.close_preflight_calls == 0
+    assert repository.commit_active_calls == 0
     assert repository.load_event_calls == [event_id]
     assert report.analysis_request_fingerprint is not None
     assert len(report.analysis_request_fingerprint) == 16
@@ -456,8 +490,37 @@ async def test_successful_execute_invokes_router_once_and_materializes_one_judge
     assert report.telegram_attempted is False
     assert service.calls == [event_id]
     assert repository.materialize_calls == 1
+    assert repository.commit_active_calls == 1
     assert report.judge_run_fingerprint is not None
     assert report.judge_call_event_fingerprint is not None
+    assert report.bounded_counts["existing_judge_runs"] == 1
+    assert report.bounded_counts["existing_judge_call_events"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_commits_router_writes_before_final_durable_readback() -> None:
+    event_id, repository, service = _success_parts(require_commit_visibility=True)
+
+    report = await _run(event_id, repository, service, mode="execute")
+
+    assert report.status == "pass"
+    assert report.reason_code == "judge_call_materialized"
+    assert report.judge_run_created is True
+    assert report.judge_call_event_created is True
+    assert service.calls == [event_id]
+    assert repository.materialize_calls == 1
+    assert repository.commit_active_calls == 1
+    assert repository.pre_commit_visible_judge_run_count == 0
+    assert repository.exact_judge_run_readback_counts == [0, 1]
+    assert repository.pending_judge_run_id is None
+    assert repository.pending_judge_call_event_id is None
+    assert repository.call_order[6:11] == [
+        "close_preflight_transaction",
+        "router_service.handle_trigger_event",
+        "materialize",
+        "commit_active_transaction",
+        "load_exact_judge_run",
+    ]
     assert report.bounded_counts["existing_judge_runs"] == 1
     assert report.bounded_counts["existing_judge_call_events"] == 1
 
@@ -497,6 +560,30 @@ async def test_preflight_transaction_close_failure_blocks_router_with_sanitized_
     assert service.calls == []
     assert repository.materialize_calls == 0
     assert repository.call_order[-1] == "close_preflight_transaction"
+    assert RAW_EXCEPTION_BODY not in rendered
+    assert "Traceback" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_commit_failure_fails_closed_without_private_exception_text() -> None:
+    event_id, repository, service = _success_parts(
+        commit_error=RuntimeError(RAW_EXCEPTION_BODY),
+        require_commit_visibility=True,
+    )
+
+    report = await _run(event_id, repository, service, mode="execute")
+    rendered = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "failed"
+    assert report.reason_code == "judge_call_commit_failed"
+    assert report.router_attempted is True
+    assert report.judge_run_created is False
+    assert report.judge_call_event_created is False
+    assert service.calls == [event_id]
+    assert repository.materialize_calls == 1
+    assert repository.commit_active_calls == 1
+    assert repository.exact_judge_run_readback_counts == [0]
+    assert repository.pending_judge_run_id is not None
     assert RAW_EXCEPTION_BODY not in rendered
     assert "Traceback" not in rendered
 
@@ -605,3 +692,38 @@ async def test_sql_repository_commits_active_preflight_transaction_before_router
     assert session.in_transaction_calls == 1
     assert session.commit_calls == 1
     assert session.transaction_open is False
+
+
+@pytest.mark.asyncio
+async def test_sql_repository_commits_active_transaction_before_final_readback() -> None:
+    class FakeSqlSession:
+        def __init__(self, transaction_open: bool) -> None:
+            self.transaction_open = transaction_open
+            self.in_transaction_calls = 0
+            self.commit_calls = 0
+
+        def in_transaction(self) -> bool:
+            self.in_transaction_calls += 1
+            return self.transaction_open
+
+        async def commit(self) -> None:
+            self.commit_calls += 1
+            self.transaction_open = False
+
+    active_session = FakeSqlSession(transaction_open=True)
+    active_repository = SqlExactTargetJudgeCallMaterializerRepository(active_session)
+
+    await active_repository.commit_active_transaction()
+
+    assert active_session.in_transaction_calls == 1
+    assert active_session.commit_calls == 1
+    assert active_session.transaction_open is False
+
+    idle_session = FakeSqlSession(transaction_open=False)
+    idle_repository = SqlExactTargetJudgeCallMaterializerRepository(idle_session)
+
+    await idle_repository.commit_active_transaction()
+
+    assert idle_session.in_transaction_calls == 1
+    assert idle_session.commit_calls == 0
+    assert idle_session.transaction_open is False

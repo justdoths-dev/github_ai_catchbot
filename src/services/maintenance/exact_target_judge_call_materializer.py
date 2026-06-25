@@ -199,6 +199,7 @@ class MaterializerRepositoryProtocol(Protocol):
     ) -> JudgeCallEventReadback: ...
     async def load_downstream_counts_for_run(self, judge_run_id: UUID) -> DownstreamCounts: ...
     async def close_preflight_transaction(self) -> None: ...
+    async def commit_active_transaction(self) -> None: ...
 
 
 class RouterServiceProtocol(Protocol):
@@ -418,6 +419,9 @@ class SqlExactTargetJudgeCallMaterializerRepository:
         )
 
     async def close_preflight_transaction(self) -> None:
+        await self.commit_active_transaction()
+
+    async def commit_active_transaction(self) -> None:
         if self._session.in_transaction():
             await self._session.commit()
 
@@ -579,6 +583,12 @@ async def run_exact_target_judge_call_materializer(
 
         report = replace(report, router_attempted=True)
         await components.router_service.handle_trigger_event(request.trigger_event_id)
+        commit_failed_reason = await _commit_active_transaction(
+            components=components,
+            failure_reason_code="judge_call_commit_failed",
+        )
+        if commit_failed_reason is not None:
+            return replace(report, status="failed", reason_code=commit_failed_reason)
 
         run_readback = await components.materializer_repository.load_exact_judge_run(
             preflight.decision,
@@ -618,6 +628,18 @@ async def run_exact_target_judge_call_materializer(
         return replace(report, status="blocked", reason_code=_safe_reason_code(exc))
     except Exception:
         return replace(report, status="failed", reason_code="unhandled_error")
+
+
+async def _commit_active_transaction(
+    *,
+    components: ExactTargetJudgeCallMaterializerComponents,
+    failure_reason_code: str,
+) -> str | None:
+    try:
+        await components.materializer_repository.commit_active_transaction()
+    except Exception:
+        return failure_reason_code
+    return None
 
 
 def load_runtime_config(env_file: str) -> RuntimeConfigBundle:
