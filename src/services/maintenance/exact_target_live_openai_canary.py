@@ -35,6 +35,7 @@ SCHEMA_VERSION = "exact_target_live_openai_canary_report_v1"
 READY_EVENT_TYPE = "judge.output.ready.v1"
 POLICY_EVENT_TYPE = "analysis.policy.apply.v1"
 POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN = "post-judge-output-to-send-disabled-notification"
+NOTIFICATION_INTENT_PROOF_CONFIRM_TOKEN = "policy-notification-intent-to-send-disabled-proof"
 
 
 RUNTIME_VALUE_KEYS = {
@@ -146,11 +147,34 @@ class PostJudgeOutputResumeAuthority:
 
 
 @dataclass(slots=True, frozen=True)
+class NotificationIntentProofAuthority:
+    allow_policy_notification_intent_for_send_disabled_proof: bool = False
+    notification_intent_proof_confirm: str | None = None
+
+    @property
+    def args_present(self) -> bool:
+        return (
+            self.allow_policy_notification_intent_for_send_disabled_proof
+            or self.notification_intent_proof_confirm is not None
+        )
+
+    @property
+    def opened(self) -> bool:
+        return (
+            self.allow_policy_notification_intent_for_send_disabled_proof
+            and self.notification_intent_proof_confirm == NOTIFICATION_INTENT_PROOF_CONFIRM_TOKEN
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class ExactTargetCanaryRequest:
     mode: str
     trigger_event_id: UUID
     post_judge_output_resume_authority: PostJudgeOutputResumeAuthority = field(
         default_factory=PostJudgeOutputResumeAuthority
+    )
+    notification_intent_proof_authority: NotificationIntentProofAuthority = field(
+        default_factory=NotificationIntentProofAuthority
     )
 
 
@@ -617,6 +641,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--confirm", choices=["live-openai"], default=None)
     parser.add_argument("--allow-existing-judge-output-resume", action="store_true")
     parser.add_argument("--resume-confirm", default=None)
+    parser.add_argument("--allow-policy-notification-intent-for-send-disabled-proof", action="store_true")
+    parser.add_argument("--notification-intent-proof-confirm", default=None)
     return parser
 
 
@@ -644,11 +670,22 @@ async def run_cli(
 
     assert trigger_event_id is not None
     resume_authority = _post_judge_output_resume_authority_from_args(args)
+    notification_intent_authority = _notification_intent_proof_authority_from_args(args)
     if resume_authority.args_present and not resume_authority.opened:
         report = _report(
             mode=args.mode,
             status="blocked",
             reason_code="post_judge_output_resume_authority_required",
+            started_monotonic=started,
+            target_event_id=trigger_event_id,
+        )
+        emit_json(_compact_json(asdict(report)))
+        return 2
+    if notification_intent_authority.args_present and not notification_intent_authority.opened:
+        report = _report(
+            mode=args.mode,
+            status="blocked",
+            reason_code="notification_intent_proof_authority_required",
             started_monotonic=started,
             target_event_id=trigger_event_id,
         )
@@ -705,6 +742,7 @@ async def run_cli(
                 mode=args.mode,
                 trigger_event_id=trigger_event_id,
                 post_judge_output_resume_authority=resume_authority,
+                notification_intent_proof_authority=notification_intent_authority,
             ),
             runtime=runtime,
             components=components,
@@ -745,6 +783,10 @@ async def run_exact_target_canary(
 
             assert preflight.judge_run is not None
             downstream_configs = load_downstream_service_configs(runtime.values)
+            downstream_configs = _apply_notification_intent_proof_authority(
+                downstream_configs,
+                request.notification_intent_proof_authority,
+            )
             judge_readback = await components.canary_repository.load_judge_readback(
                 judge_run_id=preflight.judge_run.judge_run_id,
             )
@@ -776,6 +818,10 @@ async def run_exact_target_canary(
 
         assert preflight.judge_run is not None
         service_configs = load_service_configs(runtime.values)
+        service_configs = _apply_notification_intent_proof_authority(
+            service_configs,
+            request.notification_intent_proof_authority,
+        )
         openai_client = CountingOpenAIJudgeClient(
             (openai_client_builder or _default_openai_client)(service_configs.judge)
         )
@@ -880,6 +926,17 @@ def load_downstream_service_configs(values: Mapping[str, str]) -> DownstreamServ
         policy=_policy_config(resolved_values),
         notifier=_notifier_config(resolved_values),
     )
+
+
+def _apply_notification_intent_proof_authority(
+    configs: ServiceConfigBundle | DownstreamServiceConfigBundle,
+    authority: NotificationIntentProofAuthority,
+) -> ServiceConfigBundle | DownstreamServiceConfigBundle:
+    if not authority.opened:
+        return configs
+    if configs.policy.operator_chat_id == 0:
+        raise ExactTargetCanaryConfigError("notification_intent_operator_chat_id_missing")
+    return replace(configs, policy=replace(configs.policy, enable_notification_send=True))
 
 
 @asynccontextmanager
@@ -1303,6 +1360,15 @@ def _post_judge_output_resume_authority_from_args(args: argparse.Namespace) -> P
     )
 
 
+def _notification_intent_proof_authority_from_args(args: argparse.Namespace) -> NotificationIntentProofAuthority:
+    return NotificationIntentProofAuthority(
+        allow_policy_notification_intent_for_send_disabled_proof=bool(
+            args.allow_policy_notification_intent_for_send_disabled_proof
+        ),
+        notification_intent_proof_confirm=args.notification_intent_proof_confirm,
+    )
+
+
 def _read_runtime_env_file(env_file: str) -> dict[str, str]:
     path = Path(env_file)
     try:
@@ -1508,6 +1574,8 @@ __all__ = [
     "ExactTargetEvent",
     "FailClosedTelegramTransport",
     "JudgeReadback",
+    "NOTIFICATION_INTENT_PROOF_CONFIRM_TOKEN",
+    "NotificationIntentProofAuthority",
     "NotificationReadback",
     "PostJudgeOutputResumeAuthority",
     "RuntimeConfigBundle",

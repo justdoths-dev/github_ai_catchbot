@@ -27,6 +27,8 @@ from services.maintenance.exact_target_live_openai_canary import (
     ExactTargetEvent,
     ExactTargetPreflight,
     JudgeReadback,
+    NOTIFICATION_INTENT_PROOF_CONFIRM_TOKEN,
+    NotificationIntentProofAuthority,
     NotificationReadback,
     POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN,
     PostJudgeOutputResumeAuthority,
@@ -169,6 +171,7 @@ class _Ledger:
         self.write_count = 0
         self.redis_calls = 0
         self.force_duplicate_policy_events = False
+        self.force_duplicate_notification_events = False
         self.skip_notification_intent = False
         self._append_event(
             event_id=self.trigger_event_id,
@@ -412,7 +415,10 @@ class _CanaryRepository:
         )
 
     async def load_notification_intent_event_ids(self, *, analysis_id: UUID) -> list[UUID]:
-        return [row["event_id"] for row in self.ledger.events("notification.plan.created.v1", analysis_id=analysis_id)]
+        rows = self.ledger.events("notification.plan.created.v1", analysis_id=analysis_id)
+        if self.ledger.force_duplicate_notification_events and len(rows) == 1:
+            rows = [*rows, {**rows[0], "event_id": uuid4()}]
+        return [row["event_id"] for row in rows]
 
     async def load_notification_readback(
         self,
@@ -945,7 +951,12 @@ def _test_redis_url() -> str:
     return _joined("redis://", "local", "-", "redis")
 
 
-def _runtime(tmp_path: Path) -> RuntimeConfigBundle:
+def _runtime(
+    tmp_path: Path,
+    *,
+    enable_notification_send: str = "true",
+    telegram_operator_chat_id: str = "12345",
+) -> RuntimeConfigBundle:
     key_file = tmp_path / "openai-key.secret"
     key_file.write_text(_joined("test", "-", "openai", "-", "key"), encoding="utf-8")
     return RuntimeConfigBundle(
@@ -955,8 +966,8 @@ def _runtime(tmp_path: Path) -> RuntimeConfigBundle:
             "DATABASE_URL": _test_database_url(),
             "REDIS_URL": _test_redis_url(),
             "OPENAI_API_KEY_FILE": str(key_file),
-            "TELEGRAM_OPERATOR_CHAT_ID": "12345",
-            "ENABLE_NOTIFICATION_SEND": "true",
+            "TELEGRAM_OPERATOR_CHAT_ID": telegram_operator_chat_id,
+            "ENABLE_NOTIFICATION_SEND": enable_notification_send,
             "ENABLE_LATER_DELIVERY": "true",
             "ENABLE_SILENT_LATER": "true",
             "JUDGE_MAX_OUTPUT_TOKENS": "800",
@@ -965,11 +976,18 @@ def _runtime(tmp_path: Path) -> RuntimeConfigBundle:
     )
 
 
-async def _run_execute(ledger: _Ledger, responses: list[Any], tmp_path: Path):
+async def _run_execute(
+    ledger: _Ledger,
+    responses: list[Any],
+    tmp_path: Path,
+    *,
+    runtime: RuntimeConfigBundle | None = None,
+    request: ExactTargetCanaryRequest | None = None,
+):
     fake_client = _FakeOpenAIClient(responses)
     report = await run_exact_target_canary(
-        ExactTargetCanaryRequest(mode="execute", trigger_event_id=ledger.trigger_event_id),
-        runtime=_runtime(tmp_path),
+        request or ExactTargetCanaryRequest(mode="execute", trigger_event_id=ledger.trigger_event_id),
+        runtime=runtime or _runtime(tmp_path),
         components=_components(ledger),
         openai_client_builder=lambda _config: fake_client,
     )
@@ -980,6 +998,13 @@ def _resume_authority() -> PostJudgeOutputResumeAuthority:
     return PostJudgeOutputResumeAuthority(
         allow_existing_judge_output_resume=True,
         resume_confirm=POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN,
+    )
+
+
+def _notification_intent_authority() -> NotificationIntentProofAuthority:
+    return NotificationIntentProofAuthority(
+        allow_policy_notification_intent_for_send_disabled_proof=True,
+        notification_intent_proof_confirm=NOTIFICATION_INTENT_PROOF_CONFIRM_TOKEN,
     )
 
 
@@ -1370,6 +1395,33 @@ async def test_resume_authority_requires_both_flags_before_env_load(tmp_path: Pa
     assert "missing-runtime" not in outputs[0]
 
 
+@pytest.mark.asyncio
+async def test_notification_intent_proof_authority_requires_confirm_before_env_load(tmp_path: Path) -> None:
+    outputs: list[str] = []
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "execute",
+            "--trigger-event-id",
+            str(uuid4()),
+            "--env-file",
+            str(tmp_path / "missing-runtime.env"),
+            "--confirm",
+            "live-openai",
+            "--allow-policy-notification-intent-for-send-disabled-proof",
+        ],
+        emit_json=outputs.append,
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["reason_code"] == "notification_intent_proof_authority_required"
+    assert payload["openai_request_count"] == 0
+    assert "missing-runtime" not in outputs[0]
+
+
 @pytest.mark.parametrize(
     ("mutate", "reason_code"),
     [
@@ -1476,6 +1528,110 @@ async def test_successful_live_shape_fake_reaches_send_disabled_notifier(tmp_pat
     assert report.telegram_transport_attempted is False
     assert report.redis_attempted is False
     assert ledger.redis_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_notification_intent_proof_authority_overrides_policy_only_for_send_disabled_proof(
+    tmp_path: Path,
+) -> None:
+    ledger = _Ledger()
+    runtime = _runtime(tmp_path, enable_notification_send="false")
+    request = ExactTargetCanaryRequest(
+        mode="execute",
+        trigger_event_id=ledger.trigger_event_id,
+        notification_intent_proof_authority=_notification_intent_authority(),
+    )
+
+    report, fake_client = await _run_execute(
+        ledger,
+        [_structured_response(ledger.payload)],
+        tmp_path,
+        runtime=runtime,
+        request=request,
+    )
+
+    assert report.status == "pass"
+    assert report.reason_code == "notification_send_disabled_suppressed"
+    assert report.openai_request_count == 1
+    assert len(fake_client.calls) == 1
+    assert report.final_verdict == "inspect_now"
+    assert report.delivery_decision == "send_now"
+    assert report.notification_intent_created is True
+    assert report.notification_plan_created is True
+    assert report.notification_render_created is True
+    assert report.send_disabled_delivery_record_created is True
+    assert report.telegram_transport_attempted is False
+    assert report.redis_attempted is False
+    assert ledger.delivery_records[0]["telegram_response_json"] == {
+        "dry_run": True,
+        "send_disabled": True,
+        "send_enabled": False,
+        "transport_skipped": True,
+        "reason_code": "dry_run_skip_transport",
+        "delivery_action": "send",
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_disabled_runtime_without_notification_intent_authority_fails_closed(
+    tmp_path: Path,
+) -> None:
+    ledger = _Ledger()
+    runtime = _runtime(tmp_path, enable_notification_send="false")
+
+    report, fake_client = await _run_execute(
+        ledger,
+        [_structured_response(ledger.payload)],
+        tmp_path,
+        runtime=runtime,
+    )
+
+    assert report.status == "failed"
+    assert report.reason_code == "notification_intent_missing"
+    assert report.openai_request_count == 1
+    assert len(fake_client.calls) == 1
+    assert report.analysis_created is True
+    assert report.delivery_decision == "send_now"
+    assert report.notification_intent_created is False
+    assert report.notifier_attempted is False
+    assert report.telegram_transport_attempted is False
+    assert len(ledger.events("notification.plan.created.v1")) == 0
+    assert len(ledger.plans) == 0
+    assert len(ledger.renders) == 0
+    assert len(ledger.delivery_records) == 0
+
+
+@pytest.mark.asyncio
+async def test_notification_intent_proof_authority_requires_operator_chat_id(
+    tmp_path: Path,
+) -> None:
+    ledger = _Ledger()
+    runtime = _runtime(
+        tmp_path,
+        enable_notification_send="false",
+        telegram_operator_chat_id="0",
+    )
+    request = ExactTargetCanaryRequest(
+        mode="execute",
+        trigger_event_id=ledger.trigger_event_id,
+        notification_intent_proof_authority=_notification_intent_authority(),
+    )
+
+    report, fake_client = await _run_execute(
+        ledger,
+        [_structured_response(ledger.payload)],
+        tmp_path,
+        runtime=runtime,
+        request=request,
+    )
+
+    assert report.status == "blocked"
+    assert report.reason_code == "notification_intent_operator_chat_id_missing"
+    assert report.openai_request_count == 0
+    assert fake_client.calls == []
+    assert report.telegram_transport_attempted is False
+    assert len(ledger.events("notification.plan.created.v1")) == 0
+    assert len(ledger.plans) == 0
 
 
 @pytest.mark.asyncio
@@ -1597,6 +1753,23 @@ async def test_send_now_analysis_without_notification_intent_fails_closed(tmp_pa
     assert len(ledger.renders) == 0
     assert len(ledger.delivery_records) == 0
     assert len(ledger.delivery_outbox) == 0
+
+
+@pytest.mark.asyncio
+async def test_multiple_notification_intents_fail_closed_before_notifier(tmp_path: Path) -> None:
+    ledger = _Ledger()
+    ledger.force_duplicate_notification_events = True
+
+    report, _fake_client = await _run_execute(ledger, [_structured_response(ledger.payload)], tmp_path)
+
+    assert report.status == "failed"
+    assert report.reason_code == "multiple_notification_intents"
+    assert report.notification_intent_created is False
+    assert report.notifier_attempted is False
+    assert report.telegram_transport_attempted is False
+    assert len(ledger.plans) == 0
+    assert len(ledger.renders) == 0
+    assert len(ledger.delivery_records) == 0
 
 
 @pytest.mark.asyncio
