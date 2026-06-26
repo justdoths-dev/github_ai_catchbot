@@ -188,6 +188,87 @@ async def test_ai_alone_signals_but_does_not_create_hard_candidate() -> None:
 
 
 @pytest.mark.asyncio
+async def test_text_only_developer_tool_signal_creates_text_idea_candidate() -> None:
+    snapshot = SourceMessageSnapshot(
+        source_message_id=uuid4(),
+        source_version_no=1,
+        text_body="new agent CLI for coding workflows",
+        caption_text=None,
+        text_surface="new agent CLI for coding workflows",
+        entities_json=[],
+        url_surface_json=[],
+        raw_message_json={},
+    )
+
+    repository, result = await _run(snapshot)
+
+    assert result.signal_detected is True
+    assert result.candidate_eligible is True
+    assert result.trigger_strength == "medium"
+    assert result.suppression_reason_codes == []
+    assert len(repository.artifacts_by_id) == 1
+    canonical_id = next(iter(repository.artifacts_by_id))
+    artifact = repository.artifacts[canonical_id]
+    assert artifact.artifact_type == "text_idea"
+    assert artifact.provider_route is None
+    assert len(repository.observations) == 1
+    assert len(repository.candidate_groups) == 1
+    assert repository.candidate_groups[0]["dedupe_subject_key"] == canonical_id
+    assert [member["member_role"] for member in repository.members] == ["primary"]
+    assert repository.enrich_events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["cli", "sdk", "api", "mcp", "codegen", "coding assistant", "terminal"])
+async def test_low_level_developer_tool_terms_do_not_create_text_idea_candidate(text: str) -> None:
+    snapshot = SourceMessageSnapshot(
+        source_message_id=uuid4(),
+        source_version_no=1,
+        text_body=text,
+        caption_text=None,
+        text_surface=text,
+        entities_json=[],
+        url_surface_json=[],
+        raw_message_json={},
+    )
+
+    repository, result = await _run(snapshot)
+
+    assert result.signal_detected is True
+    assert result.candidate_eligible is False
+    assert result.trigger_strength == "weak"
+    assert result.suppression_reason_codes != ["developer_tool_signal"]
+    assert repository.artifacts_by_id == {}
+    assert repository.candidate_groups == []
+    assert repository.enrich_events == []
+
+
+@pytest.mark.asyncio
+async def test_generic_agent_hype_stays_suppressed_with_trace() -> None:
+    snapshot = SourceMessageSnapshot(
+        source_message_id=uuid4(),
+        source_version_no=1,
+        text_body="agent hype thread",
+        caption_text=None,
+        text_surface="agent hype thread",
+        entities_json=[],
+        url_surface_json=[],
+        raw_message_json={},
+    )
+
+    repository, result = await _run(snapshot)
+
+    assert result.signal_detected is True
+    assert result.candidate_eligible is False
+    assert result.trigger_strength == "weak"
+    assert result.suppression_reason_codes == ["domain_signal_without_candidate_context"]
+    assert repository.suppression_traces[0]["reason_code"] == "domain_signal_without_candidate_context"
+    assert repository.artifacts_by_id == {}
+    assert repository.candidate_groups == []
+    assert repository.enrich_events == []
+
+
+@pytest.mark.asyncio
 async def test_same_repo_repost_uses_stable_candidate_subject() -> None:
     first = _load_fixture("source_message_github_repo_signal.json")
     second = SourceMessageSnapshot(

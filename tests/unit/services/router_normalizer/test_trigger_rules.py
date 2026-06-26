@@ -91,6 +91,46 @@ def test_korean_llm_cli_automation_security_constraint_is_candidate_eligible() -
     assert evaluation.reason_codes == ["developer_workflow_constraint_signal"]
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "new agent CLI for coding workflows",
+        "LLM SDK for Python developers",
+        "prompt tool for repo automation",
+        "MCP server package for coding agents",
+        "새 에이전트 CLI 프롬프트 도구로 개발 자동화 실험",
+    ],
+)
+def test_text_only_developer_tool_signal_is_candidate_eligible(text: str) -> None:
+    evaluation = evaluate_triggers(_surfaces(text), [])
+
+    assert evaluation.signal_detected is True
+    assert evaluation.candidate_eligible is True
+    assert evaluation.trigger_strength == "medium"
+    assert evaluation.reason_codes == ["developer_tool_signal"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "cli",
+        "sdk",
+        "api",
+        "mcp",
+        "codegen",
+        "coding assistant",
+        "terminal",
+    ],
+)
+def test_low_level_developer_tool_terms_do_not_self_match_as_candidates(text: str) -> None:
+    evaluation = evaluate_triggers(_surfaces(text), [])
+
+    assert evaluation.signal_detected is True
+    assert evaluation.candidate_eligible is False
+    assert evaluation.trigger_strength == "weak"
+    assert evaluation.reason_codes != ["developer_tool_signal"]
+
+
 @pytest.mark.parametrize("text", ["llm", "AI", "요즘 AI 좋네"])
 def test_weak_generic_ai_or_llm_messages_are_not_candidate_eligible(text: str) -> None:
     evaluation = evaluate_triggers(_surfaces(text), [])
@@ -98,6 +138,27 @@ def test_weak_generic_ai_or_llm_messages_are_not_candidate_eligible(text: str) -
     assert evaluation.signal_detected is True
     assert evaluation.candidate_eligible is False
     assert evaluation.trigger_strength == "weak"
+
+
+@pytest.mark.parametrize(
+    ("text", "reason_code"),
+    [
+        ("AI is the future", "ai_without_dev_context"),
+        ("new model is amazing", "domain_signal_without_candidate_context"),
+        ("agent hype thread", "domain_signal_without_candidate_context"),
+        ("permission issue", "weak_keyword_only"),
+        ("GitHub changed something", "github_without_dev_context"),
+        ("tool", "weak_keyword_only"),
+        ("automation", "weak_keyword_only"),
+    ],
+)
+def test_generic_text_only_chatter_stays_candidate_ineligible(text: str, reason_code: str) -> None:
+    evaluation = evaluate_triggers(_surfaces(text), [])
+
+    assert evaluation.signal_detected is True
+    assert evaluation.candidate_eligible is False
+    assert evaluation.trigger_strength == "weak"
+    assert evaluation.reason_codes == [reason_code]
 
 
 def test_mixed_english_korean_dev_workflow_constraint_is_deterministic_candidate() -> None:

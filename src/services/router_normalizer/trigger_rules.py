@@ -9,22 +9,32 @@ _AI_RE = re.compile(r"(?<![a-z0-9])ai(?![a-z0-9])")
 _LLM_RE = re.compile(r"(?<![a-z0-9])llm(?![a-z0-9])")
 _STRONG_TYPES = {"github_repo", "github_subpath", "github_repo_page", "github_gist", "x_post"}
 _MEDIUM_TYPES = {"web_article"}
-_DOMAIN_SIGNAL_TERMS = {
+_HIGH_INTENT_DOMAIN_SIGNAL_TERMS = {
     "language model",
     "model",
     "모델",
     "대형언어모델",
     "생성형",
     "agent",
+    "agents",
+    "coding agent",
+    "coding agents",
     "에이전트",
     "prompt",
     "프롬프트",
+}
+_LOW_LEVEL_DEVELOPER_SIGNAL_TERMS = {
     "cli",
     "sdk",
     "api",
+    "mcp",
+    "mcp server",
+    "codegen",
+    "coding assistant",
     "terminal",
     "터미널",
 }
+_DOMAIN_SIGNAL_TERMS = _HIGH_INTENT_DOMAIN_SIGNAL_TERMS | _LOW_LEVEL_DEVELOPER_SIGNAL_TERMS
 _DEV_CONTEXT_TERMS = {
     "repo",
     "repository",
@@ -88,6 +98,35 @@ _ACTIONABILITY_TERMS = {
     "되는게 없",
     "안되",
 }
+_DEVELOPER_TOOL_PRODUCT_TERMS = {
+    "cli",
+    "sdk",
+    "api",
+    "package",
+    "library",
+    "framework",
+    "repo",
+    "repository",
+    "open source",
+    "opensource",
+    "tool",
+    "workflow",
+    "automation",
+    "script",
+    "mcp",
+    "mcp server",
+    "codegen",
+    "coding assistant",
+    "developer tool",
+    "dev tool",
+    "도구",
+    "자동화",
+    "라이브러리",
+    "패키지",
+    "오픈소스",
+    "개발자 도구",
+    "코딩 도구",
+}
 _VIBE_TERMS = ("vibe coding", "vibe-coding")
 
 
@@ -112,11 +151,16 @@ def evaluate_triggers(surfaces: TextSurfaces, artifacts: list[CanonicalArtifact]
 
     text = surfaces.keyword_scan_surface
     has_ai = bool(_AI_RE.search(text))
-    has_domain_signal = bool(_LLM_RE.search(text)) or _contains_any_term(text, _DOMAIN_SIGNAL_TERMS)
+    has_llm = bool(_LLM_RE.search(text))
+    has_domain_signal = has_llm or _contains_any_term(text, _DOMAIN_SIGNAL_TERMS)
+    has_developer_tool_intent = (
+        has_ai or has_llm or _contains_any_term(text, _HIGH_INTENT_DOMAIN_SIGNAL_TERMS)
+    )
     has_vibe = any(term in text for term in _VIBE_TERMS)
     has_github_keyword = "github" in text
     has_dev_context = _contains_any_term(text, _DEV_CONTEXT_TERMS)
     has_actionability = _contains_any_term(text, _ACTIONABILITY_TERMS)
+    has_developer_tool_product = _contains_any_term(text, _DEVELOPER_TOOL_PRODUCT_TERMS)
     if has_vibe:
         return TriggerEvaluation(
             signal_detected=True,
@@ -143,6 +187,19 @@ def evaluate_triggers(surfaces: TextSurfaces, artifacts: list[CanonicalArtifact]
                 "has_domain_signal": True,
                 "has_dev_context": True,
                 "has_actionability": True,
+            },
+        )
+    if has_developer_tool_intent and has_developer_tool_product:
+        return TriggerEvaluation(
+            signal_detected=True,
+            candidate_eligible=True,
+            trigger_strength="medium",
+            reason_codes=["developer_tool_signal"],
+            notes={
+                "has_ai": has_ai,
+                "has_domain_signal": has_domain_signal,
+                "has_developer_tool_intent": True,
+                "has_developer_tool_product": True,
             },
         )
     if has_ai and has_dev_context:
