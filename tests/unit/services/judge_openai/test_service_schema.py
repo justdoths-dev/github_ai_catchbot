@@ -56,5 +56,25 @@ def test_judge_output_schema_documents_no_fabricated_comparables_contract() -> N
 
     assert "supported by the provided CandidateEvidenceBundle" in properties["comparables"]["description"]
     assert "do not use latent/general knowledge" in properties["comparables"]["description"]
-    assert "use [] when no reliable comparables are available" in properties["comparables"]["description"]
+    assert "use [] only with conservative skip" in properties["comparables"]["description"]
+    assert "comparison_gap or insufficient_comparables" in properties["reason_codes"]["description"]
+
+
+def test_judge_output_schema_guides_github_primary_non_skip_to_include_comparables() -> None:
+    properties = JudgeOpenAIService.judge_output_schema()["properties"]
+
+    assert "GitHub-primary later or inspect_now outputs" in properties["comparables"]["description"]
+    assert "require 1-3 meaningful bundle-supported comparables" in properties["comparables"]["description"]
+    assert "later or inspect_now requires meaningful bundle-supported comparables" in properties[
+        "model_proposed_verdict"
+    ]["description"]
+
+
+def test_judge_output_schema_guides_no_reliable_comparables_to_skip() -> None:
+    properties = JudgeOpenAIService.judge_output_schema()["properties"]
+
+    assert "if no reliable comparables are available, emit skip" in properties["model_proposed_verdict"][
+        "description"
+    ]
+    assert "align that with model_proposed_verdict=skip" in properties["reason_codes"]["description"]
     assert "comparison_gap or insufficient_comparables" in properties["reason_codes"]["description"]

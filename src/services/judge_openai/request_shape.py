@@ -230,7 +230,9 @@ def build_judge_output_schema() -> dict[str, Any]:
                 "items": {"type": "string"},
                 "description": (
                     "Comparable tools only when supported by the provided CandidateEvidenceBundle; "
-                    "do not use latent/general knowledge; use [] when no reliable comparables are available."
+                    "do not use latent/general knowledge; GitHub-primary later or inspect_now outputs "
+                    "require 1-3 meaningful bundle-supported comparables; use [] only with conservative "
+                    "skip when no reliable comparables are available."
                 ),
             },
             "scores": {
@@ -264,7 +266,8 @@ def build_judge_output_schema() -> dict[str, Any]:
                 "items": {"type": "string"},
                 "description": (
                     "Include comparison_gap or insufficient_comparables when comparables is [] "
-                    "because no reliable comparable tools are available."
+                    "because no reliable comparable tools are available; for GitHub-primary no-comparable "
+                    "outputs, align that with model_proposed_verdict=skip."
                 ),
             },
             "red_flags_ko": {"type": "array", "items": {"type": "string"}},
@@ -274,6 +277,12 @@ def build_judge_output_schema() -> dict[str, Any]:
             "model_proposed_verdict": {
                 "type": ["string", "null"],
                 "enum": ["inspect_now", "later", "skip", None],
+                "description": (
+                    "Model's provisional action hint only; policy remains final. For GitHub-primary "
+                    "outputs, later or inspect_now requires meaningful bundle-supported comparables; "
+                    "if no reliable comparables are available, emit skip with comparison_gap or "
+                    "insufficient_comparables evidence limitation."
+                ),
             },
             "model_confidence_band": {
                 "type": ["string", "null"],
