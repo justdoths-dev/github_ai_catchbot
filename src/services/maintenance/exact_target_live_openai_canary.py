@@ -36,6 +36,7 @@ READY_EVENT_TYPE = "judge.output.ready.v1"
 POLICY_EVENT_TYPE = "analysis.policy.apply.v1"
 POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN = "post-judge-output-to-send-disabled-notification"
 NOTIFICATION_INTENT_PROOF_CONFIRM_TOKEN = "policy-notification-intent-to-send-disabled-proof"
+JUDGE_CALL_SELECTION_CONFIRM_TOKEN = "latest-eligible-judge-call"
 
 
 RUNTIME_VALUE_KEYS = {
@@ -167,6 +168,23 @@ class NotificationIntentProofAuthority:
 
 
 @dataclass(slots=True, frozen=True)
+class JudgeCallSelectionAuthority:
+    select_latest_eligible_judge_call: bool = False
+    selection_confirm: str | None = None
+
+    @property
+    def args_present(self) -> bool:
+        return self.select_latest_eligible_judge_call or self.selection_confirm is not None
+
+    @property
+    def opened(self) -> bool:
+        return (
+            self.select_latest_eligible_judge_call
+            and self.selection_confirm == JUDGE_CALL_SELECTION_CONFIRM_TOKEN
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class ExactTargetCanaryRequest:
     mode: str
     trigger_event_id: UUID
@@ -255,6 +273,7 @@ class NotificationReadback:
 
 
 class ExactTargetCanaryRepositoryProtocol(Protocol):
+    async def select_latest_eligible_judge_call(self) -> UUID | None: ...
     async def load_preflight(self, trigger_event_id: UUID) -> ExactTargetPreflight: ...
     async def load_judge_readback(self, *, judge_run_id: UUID) -> JudgeReadback: ...
     async def load_policy_event_ids(self, *, judge_run_id: UUID, judge_output_id: UUID) -> list[UUID]: ...
@@ -323,6 +342,80 @@ class SqlExactTargetCanaryRepository:
     async def commit_active_transaction(self) -> None:
         if self._session.in_transaction():
             await self._session.commit()
+
+    async def select_latest_eligible_judge_call(self) -> UUID | None:
+        rows = await self._rows(
+            """
+            SELECT eo.event_id
+            FROM event_outbox eo
+            JOIN judge_runs jr ON jr.judge_run_id = eo.aggregate_id
+            WHERE eo.event_type = 'judge.call.requested.v1'
+              AND eo.aggregate_type = 'judge_run'
+              AND jr.status = 'pending'
+              AND eo.payload_json->>'judge_run_id' = jr.judge_run_id::text
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM judge_outputs jo
+                    WHERE jo.judge_run_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM event_outbox ready
+                    WHERE ready.event_type = 'judge.output.ready.v1'
+                      AND ready.aggregate_type = 'judge_run'
+                      AND ready.aggregate_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM event_outbox policy
+                    WHERE policy.event_type = 'analysis.policy.apply.v1'
+                      AND policy.aggregate_type = 'judge_run'
+                      AND policy.aggregate_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM analyses a
+                    JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                    WHERE jo.judge_run_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM event_outbox notification_intent
+                    JOIN analyses a ON a.analysis_id = notification_intent.aggregate_id
+                    JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                    WHERE notification_intent.event_type = 'notification.plan.created.v1'
+                      AND notification_intent.aggregate_type = 'analysis'
+                      AND jo.judge_run_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM notification_plans np
+                    JOIN analyses a ON a.analysis_id = np.analysis_id
+                    JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                    WHERE jo.judge_run_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM notification_renders nr
+                    JOIN notification_plans np ON np.notification_plan_id = nr.notification_plan_id
+                    JOIN analyses a ON a.analysis_id = np.analysis_id
+                    JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                    WHERE jo.judge_run_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM notification_delivery_records ndr
+                    JOIN notification_plans np ON np.notification_plan_id = ndr.notification_plan_id
+                    JOIN analyses a ON a.analysis_id = np.analysis_id
+                    JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                    WHERE jo.judge_run_id = jr.judge_run_id
+                  )
+            ORDER BY eo.created_at DESC, eo.event_id DESC
+            LIMIT 1
+            """,
+            {},
+        )
+        return UUID(str(rows[0]["event_id"])) if rows else None
 
     async def load_preflight(self, trigger_event_id: UUID) -> ExactTargetPreflight:
         event = await self._load_target_event(trigger_event_id)
@@ -643,6 +736,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume-confirm", default=None)
     parser.add_argument("--allow-policy-notification-intent-for-send-disabled-proof", action="store_true")
     parser.add_argument("--notification-intent-proof-confirm", default=None)
+    parser.add_argument("--select-latest-eligible-judge-call", action="store_true")
+    parser.add_argument("--selection-confirm", default=None)
     return parser
 
 
@@ -668,7 +763,9 @@ async def run_cli(
         emit_json(_compact_json(asdict(report)))
         return 2
 
-    assert trigger_event_id is not None
+    selection_authority = _judge_call_selection_authority_from_args(args)
+    if not selection_authority.opened:
+        assert trigger_event_id is not None
     resume_authority = _post_judge_output_resume_authority_from_args(args)
     notification_intent_authority = _notification_intent_proof_authority_from_args(args)
     if resume_authority.args_present and not resume_authority.opened:
@@ -737,6 +834,28 @@ async def run_cli(
 
     builder = session_components_builder or sql_session_components
     async with builder(runtime) as components:
+        if selection_authority.opened:
+            try:
+                trigger_event_id = await components.canary_repository.select_latest_eligible_judge_call()
+            except Exception:
+                report = _report(
+                    mode=args.mode,
+                    status="failed",
+                    reason_code="unhandled_error",
+                    started_monotonic=started,
+                )
+                emit_json(_compact_json(asdict(report)))
+                return 2
+            if trigger_event_id is None:
+                report = _report(
+                    mode=args.mode,
+                    status="blocked",
+                    reason_code="eligible_judge_call_target_missing",
+                    started_monotonic=started,
+                )
+                emit_json(_compact_json(asdict(report)))
+                return 2
+        assert trigger_event_id is not None
         report = await run_exact_target_canary(
             ExactTargetCanaryRequest(
                 mode=args.mode,
@@ -1346,11 +1465,25 @@ def _cli_request_error(args: argparse.Namespace) -> str | None:
         return "mode_required"
     if not args.env_file:
         return "env_file_required"
+    selection_authority = _judge_call_selection_authority_from_args(args)
+    if args.select_latest_eligible_judge_call and args.trigger_event_id:
+        return "target_selection_conflict"
+    if selection_authority.args_present and not selection_authority.opened:
+        return "judge_call_selection_authority_required"
+    if selection_authority.opened:
+        return None
     if len(args.trigger_event_id) != 1:
         return "exactly_one_trigger_event_id_required"
     if _uuid_or_none(args.trigger_event_id[0]) is None:
         return "invalid_trigger_event_id"
     return None
+
+
+def _judge_call_selection_authority_from_args(args: argparse.Namespace) -> JudgeCallSelectionAuthority:
+    return JudgeCallSelectionAuthority(
+        select_latest_eligible_judge_call=bool(args.select_latest_eligible_judge_call),
+        selection_confirm=args.selection_confirm,
+    )
 
 
 def _post_judge_output_resume_authority_from_args(args: argparse.Namespace) -> PostJudgeOutputResumeAuthority:
@@ -1574,6 +1707,8 @@ __all__ = [
     "ExactTargetEvent",
     "FailClosedTelegramTransport",
     "JudgeReadback",
+    "JUDGE_CALL_SELECTION_CONFIRM_TOKEN",
+    "JudgeCallSelectionAuthority",
     "NOTIFICATION_INTENT_PROOF_CONFIRM_TOKEN",
     "NotificationIntentProofAuthority",
     "NotificationReadback",
