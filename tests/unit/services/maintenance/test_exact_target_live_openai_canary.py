@@ -32,6 +32,7 @@ from services.maintenance.exact_target_live_openai_canary import (
     NotificationIntentProofAuthority,
     NotificationReadback,
     POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN,
+    RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
     PostJudgeOutputResumeAuthority,
     RuntimeConfigBundle,
     build_parser,
@@ -174,6 +175,8 @@ class _Ledger:
         self.force_duplicate_policy_events = False
         self.force_duplicate_notification_events = False
         self.skip_notification_intent = False
+        self.reset_retryable_count = 0
+        self.status_before_mark_running: list[str] = []
         self._append_event(
             event_id=self.trigger_event_id,
             event_type="judge.call.requested.v1",
@@ -357,6 +360,62 @@ class _CanaryRepository:
             return row["event_id"]
         return None
 
+    async def select_latest_retryable_judge_call(self) -> UUID | None:
+        rows = [
+            row
+            for row in self.ledger.event_outbox
+            if row["event_type"] == "judge.call.requested.v1"
+            and row["aggregate_type"] == "judge_run"
+            and self.ledger._event_is_visible(row)
+        ]
+        rows.sort(key=lambda row: (row["created_at"], row["event_id"]), reverse=True)
+        for row in rows:
+            if self._retryable_row_is_eligible(row):
+                return row["event_id"]
+        return None
+
+    async def reset_retryable_judge_call_for_retry(self, trigger_event_id: UUID) -> bool:
+        row = self.ledger.event_by_id(trigger_event_id)
+        if row is None or not self._retryable_row_is_eligible(row):
+            return False
+        judge_run_id = row["aggregate_id"]
+        self.ledger.runs[judge_run_id] = replace(self.ledger.runs[judge_run_id], status="pending")
+        self.ledger.finish_reason = None
+        self.ledger.refusal_detected = False
+        self.ledger.reset_retryable_count += 1
+        self.ledger.write_count += 1
+        return True
+
+    def _retryable_row_is_eligible(self, row: dict[str, Any]) -> bool:
+        judge_run_id = row["aggregate_id"]
+        run = self.ledger.runs.get(judge_run_id)
+        if run is None or run.status != "failed_retryable":
+            return False
+        payload = row["payload_json"]
+        if payload.get("judge_run_id") != str(judge_run_id):
+            return False
+        if payload.get("bundle_id") != str(run.bundle_id):
+            return False
+        if payload.get("model") != run.model:
+            return False
+        if payload.get("reasoning_effort") != run.reasoning_effort:
+            return False
+        if payload.get("prompt_version") != run.prompt_version:
+            return False
+        payload_cache_key = payload.get("prompt_cache_key")
+        if payload_cache_key is not None and run.prompt_cache_key is not None and payload_cache_key != run.prompt_cache_key:
+            return False
+        outputs = [output for output in self.ledger.outputs if output["judge_run_id"] == judge_run_id]
+        if outputs:
+            return False
+        if self.ledger.events("judge.output.ready.v1", judge_run_id=judge_run_id):
+            return False
+        if self.ledger.events("analysis.policy.apply.v1", judge_run_id=judge_run_id):
+            return False
+        if _downstream_rows_exist_for_run(self.ledger, judge_run_id):
+            return False
+        return True
+
     async def load_preflight(self, trigger_event_id: UUID) -> ExactTargetPreflight:
         event_row = self.ledger.event_by_id(trigger_event_id)
         if event_row is None:
@@ -518,6 +577,7 @@ class _JudgeRepository:
         return self.ledger.bundles.get(bundle_id)
 
     async def mark_judge_run_running(self, judge_run_id: UUID) -> None:
+        self.ledger.status_before_mark_running.append(self.ledger.runs[judge_run_id].status)
         self.ledger.runs[judge_run_id] = replace(self.ledger.runs[judge_run_id], status="running")
         self.ledger.write_count += 1
 
@@ -1087,6 +1147,13 @@ def _notification_intent_authority() -> NotificationIntentProofAuthority:
     )
 
 
+def _mark_failed_retryable(ledger: _Ledger) -> _Ledger:
+    ledger.runs[ledger.judge_run_id] = replace(ledger.runs[ledger.judge_run_id], status="failed_retryable")
+    ledger.finish_reason = "openai_transport_retryable"
+    ledger.refusal_detected = True
+    return ledger
+
+
 def _materialize_existing_judge_output(ledger: _Ledger) -> UUID:
     judge_output_id = uuid4()
     ledger.judge_output_id = judge_output_id
@@ -1391,6 +1458,46 @@ async def test_selection_authority_requires_both_flag_and_exact_confirm_before_e
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "selection_args",
+    [
+        ["--select-latest-retryable-judge-call"],
+        ["--retryable-selection-confirm", RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN],
+        ["--select-latest-retryable-judge-call", "--retryable-selection-confirm", "latest"],
+    ],
+)
+async def test_retryable_selection_authority_requires_flag_and_exact_confirm_before_env_load(
+    selection_args: list[str],
+    tmp_path: Path,
+) -> None:
+    outputs: list[str] = []
+
+    async def fail_builder(runtime):
+        raise AssertionError("DB/session builder must not be called without retryable selection authority")
+        yield runtime
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            str(tmp_path / "missing-runtime.env"),
+            *selection_args,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=asynccontextmanager(fail_builder),
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["reason_code"] == "retryable_judge_call_selection_authority_required"
+    assert payload["openai_request_count"] == 0
+    assert payload["telegram_transport_attempted"] is False
+    assert "missing-runtime" not in outputs[0]
+
+
+@pytest.mark.asyncio
 async def test_trigger_event_id_conflicts_with_selection_flag_before_env_load(tmp_path: Path) -> None:
     outputs: list[str] = []
     trigger_event_id = uuid4()
@@ -1420,6 +1527,71 @@ async def test_trigger_event_id_conflicts_with_selection_flag_before_env_load(tm
     assert payload["reason_code"] == "target_selection_conflict"
     assert payload["target_event_fingerprint"] == canary._fingerprint(trigger_event_id)
     assert str(trigger_event_id) not in outputs[0]
+    assert "missing-runtime" not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_trigger_event_id_conflicts_with_retryable_selection_flag_before_env_load(tmp_path: Path) -> None:
+    outputs: list[str] = []
+    trigger_event_id = uuid4()
+
+    async def fail_builder(runtime):
+        raise AssertionError("DB/session builder must not be called on retryable target conflict")
+        yield runtime
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--trigger-event-id",
+            str(trigger_event_id),
+            "--env-file",
+            str(tmp_path / "missing-runtime.env"),
+            "--select-latest-retryable-judge-call",
+            "--retryable-selection-confirm",
+            RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=asynccontextmanager(fail_builder),
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["reason_code"] == "target_selection_conflict"
+    assert payload["target_event_fingerprint"] == canary._fingerprint(trigger_event_id)
+    assert str(trigger_event_id) not in outputs[0]
+    assert "missing-runtime" not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_pending_selector_conflicts_with_retryable_selector_before_env_load(tmp_path: Path) -> None:
+    outputs: list[str] = []
+
+    async def fail_builder(runtime):
+        raise AssertionError("DB/session builder must not be called on selector conflict")
+        yield runtime
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            str(tmp_path / "missing-runtime.env"),
+            "--select-latest-eligible-judge-call",
+            "--selection-confirm",
+            JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+            "--select-latest-retryable-judge-call",
+            "--retryable-selection-confirm",
+            RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=asynccontextmanager(fail_builder),
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["reason_code"] == "target_selection_conflict"
+    assert payload["openai_request_count"] == 0
     assert "missing-runtime" not in outputs[0]
 
 
@@ -1551,6 +1723,146 @@ async def test_select_latest_eligible_execute_uses_canary_path_and_send_disabled
 
 
 @pytest.mark.asyncio
+async def test_select_latest_retryable_blocks_when_no_target_exists(tmp_path: Path) -> None:
+    ledger = _Ledger()
+    env_file = _write_cli_runtime_env(tmp_path, require_openai_key=False)
+    outputs: list[str] = []
+
+    @asynccontextmanager
+    async def builder(runtime):
+        del runtime
+        yield _components(ledger)
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            str(env_file),
+            "--select-latest-retryable-judge-call",
+            "--retryable-selection-confirm",
+            RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=builder,
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "retryable_judge_call_target_missing"
+    assert payload["target_event_fingerprint"] is None
+    assert payload["openai_request_count"] == 0
+    assert payload["telegram_transport_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert str(ledger.trigger_event_id) not in outputs[0]
+    assert str(ledger.judge_run_id) not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_select_latest_retryable_plan_reaches_retry_plan_ready_without_raw_uuid_output(
+    tmp_path: Path,
+) -> None:
+    ledger = _mark_failed_retryable(_Ledger())
+    env_file = _write_cli_runtime_env(tmp_path, require_openai_key=False)
+    outputs: list[str] = []
+
+    @asynccontextmanager
+    async def builder(runtime):
+        del runtime
+        yield _components(ledger)
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            str(env_file),
+            "--select-latest-retryable-judge-call",
+            "--retryable-selection-confirm",
+            RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=builder,
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 0
+    assert payload["status"] == "pass"
+    assert payload["reason_code"] == "retry_plan_ready"
+    assert payload["preflight_passed"] is True
+    assert payload["judge_status"] == "failed_retryable"
+    assert payload["target_event_fingerprint"] == canary._fingerprint(ledger.trigger_event_id)
+    assert payload["target_run_fingerprint"] == canary._fingerprint(ledger.judge_run_id)
+    assert payload["openai_request_count"] == 0
+    assert payload["telegram_transport_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert ledger.reset_retryable_count == 0
+    assert str(ledger.trigger_event_id) not in outputs[0]
+    assert str(ledger.judge_run_id) not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_select_latest_retryable_execute_resets_and_reuses_existing_judge_path(
+    tmp_path: Path,
+) -> None:
+    ledger = _mark_failed_retryable(_Ledger())
+    original_run_ids = set(ledger.runs)
+    original_judge_call_event_count = len(ledger.events("judge.call.requested.v1"))
+    env_file = _write_cli_runtime_env(tmp_path, require_openai_key=True)
+    fake_client = _FakeOpenAIClient([_structured_response(ledger.payload)])
+    outputs: list[str] = []
+
+    @asynccontextmanager
+    async def builder(runtime):
+        del runtime
+        yield _components(ledger)
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "execute",
+            "--env-file",
+            str(env_file),
+            "--confirm",
+            "live-openai",
+            "--select-latest-retryable-judge-call",
+            "--retryable-selection-confirm",
+            RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=builder,
+        openai_client_builder=lambda _config: fake_client,
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 0
+    assert payload["status"] == "pass"
+    assert payload["reason_code"] == "notification_send_disabled_suppressed"
+    assert payload["openai_request_count"] == 1
+    assert len(fake_client.calls) == 1
+    assert ledger.reset_retryable_count == 1
+    assert ledger.status_before_mark_running == ["pending"]
+    assert set(ledger.runs) == original_run_ids
+    assert len(ledger.events("judge.call.requested.v1")) == original_judge_call_event_count
+    assert len(ledger.outputs) == 1
+    assert len(ledger.events("judge.output.ready.v1", judge_run_id=ledger.judge_run_id)) == 1
+    assert payload["judge_output_created"] is True
+    assert payload["judge_output_ready_event_created"] is True
+    assert payload["validator_forwarded_policy"] is True
+    assert payload["analysis_created"] is True
+    assert payload["notification_plan_created"] is True
+    assert payload["notification_render_created"] is True
+    assert payload["send_disabled_delivery_record_created"] is True
+    assert payload["telegram_transport_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert str(ledger.trigger_event_id) not in outputs[0]
+    assert str(ledger.judge_run_id) not in outputs[0]
+
+
+@pytest.mark.asyncio
 async def test_consumed_or_downstream_target_is_not_selection_eligible() -> None:
     consumed = _Ledger()
     consumed.outputs.append({"judge_output_id": uuid4(), "judge_run_id": consumed.judge_run_id})
@@ -1571,6 +1883,81 @@ async def test_consumed_or_downstream_target_is_not_selection_eligible() -> None
 
     assert await _CanaryRepository(consumed).select_latest_eligible_judge_call() is None
     assert await _CanaryRepository(downstream).select_latest_eligible_judge_call() is None
+
+
+@pytest.mark.asyncio
+async def test_retryable_target_with_existing_judge_output_is_not_eligible() -> None:
+    ledger = _mark_failed_retryable(_Ledger())
+    ledger.outputs.append({"judge_output_id": uuid4(), "judge_run_id": ledger.judge_run_id})
+
+    assert await _CanaryRepository(ledger).select_latest_retryable_judge_call() is None
+
+
+@pytest.mark.parametrize("downstream_kind", ["ready", "policy", "analysis", "notification"])
+@pytest.mark.asyncio
+async def test_retryable_target_with_downstream_rows_is_not_eligible(downstream_kind: str) -> None:
+    ledger = _mark_failed_retryable(_Ledger())
+    judge_output_id = uuid4()
+    if downstream_kind == "ready":
+        ledger._append_event(
+            event_type="judge.output.ready.v1",
+            aggregate_type="judge_run",
+            aggregate_id=ledger.judge_run_id,
+            dedupe_key="existing-ready",
+            payload_json={"judge_run_id": str(ledger.judge_run_id), "judge_output_id": str(judge_output_id)},
+            count_write=False,
+        )
+    elif downstream_kind == "policy":
+        ledger._append_event(
+            event_type="analysis.policy.apply.v1",
+            aggregate_type="judge_run",
+            aggregate_id=ledger.judge_run_id,
+            dedupe_key="existing-policy",
+            payload_json={
+                "judge_run_id": str(ledger.judge_run_id),
+                "judge_output_id": str(judge_output_id),
+                "candidate_group_id": str(ledger.candidate_group_id),
+                "bundle_id": str(ledger.bundle_id),
+            },
+            count_write=False,
+        )
+    else:
+        ledger.outputs.append({"judge_output_id": judge_output_id, "judge_run_id": ledger.judge_run_id})
+        if downstream_kind == "analysis":
+            ledger.analyses.append(
+                (
+                    uuid4(),
+                    AnalysisDraft(
+                        candidate_group_id=ledger.candidate_group_id,
+                        judge_output_id=judge_output_id,
+                        schema_version="analysis_v1",
+                        policy_version="verdict_policy_v1",
+                        prompt_version=ledger.runs[ledger.judge_run_id].prompt_version,
+                        delivery_policy_version="delivery_policy_v1",
+                        verdict="skip",
+                        delivery_decision="suppress",
+                        scores_json=_suppress_scores(),
+                        reason_codes_json=["low_score"],
+                        evidence_limitations_ko="limited",
+                        recommended_action_ko="skip",
+                        freshness_note_ko="fresh",
+                        model_proposed_verdict="skip",
+                        policy_reconciled_flag=False,
+                    ),
+                )
+            )
+        else:
+            _add_partial_notification_state(ledger, judge_output_id)
+
+    assert await _CanaryRepository(ledger).select_latest_retryable_judge_call() is None
+
+
+@pytest.mark.asyncio
+async def test_retryable_target_with_route_payload_conflict_is_not_eligible() -> None:
+    ledger = _mark_failed_retryable(_Ledger())
+    ledger.event_by_id(ledger.trigger_event_id)["payload_json"]["model"] = "other-model"
+
+    assert await _CanaryRepository(ledger).select_latest_retryable_judge_call() is None
 
 
 @pytest.mark.asyncio

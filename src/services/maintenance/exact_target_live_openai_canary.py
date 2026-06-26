@@ -37,6 +37,7 @@ POLICY_EVENT_TYPE = "analysis.policy.apply.v1"
 POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN = "post-judge-output-to-send-disabled-notification"
 NOTIFICATION_INTENT_PROOF_CONFIRM_TOKEN = "policy-notification-intent-to-send-disabled-proof"
 JUDGE_CALL_SELECTION_CONFIRM_TOKEN = "latest-eligible-judge-call"
+RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN = "latest-retryable-judge-call"
 
 
 RUNTIME_VALUE_KEYS = {
@@ -171,16 +172,37 @@ class NotificationIntentProofAuthority:
 class JudgeCallSelectionAuthority:
     select_latest_eligible_judge_call: bool = False
     selection_confirm: str | None = None
+    select_latest_retryable_judge_call: bool = False
+    retryable_selection_confirm: str | None = None
 
     @property
     def args_present(self) -> bool:
-        return self.select_latest_eligible_judge_call or self.selection_confirm is not None
+        return self.pending_args_present or self.retryable_args_present
 
     @property
     def opened(self) -> bool:
+        return self.pending_opened or self.retryable_opened
+
+    @property
+    def pending_args_present(self) -> bool:
+        return self.select_latest_eligible_judge_call or self.selection_confirm is not None
+
+    @property
+    def pending_opened(self) -> bool:
         return (
             self.select_latest_eligible_judge_call
             and self.selection_confirm == JUDGE_CALL_SELECTION_CONFIRM_TOKEN
+        )
+
+    @property
+    def retryable_args_present(self) -> bool:
+        return self.select_latest_retryable_judge_call or self.retryable_selection_confirm is not None
+
+    @property
+    def retryable_opened(self) -> bool:
+        return (
+            self.select_latest_retryable_judge_call
+            and self.retryable_selection_confirm == RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN
         )
 
 
@@ -194,6 +216,7 @@ class ExactTargetCanaryRequest:
     notification_intent_proof_authority: NotificationIntentProofAuthority = field(
         default_factory=NotificationIntentProofAuthority
     )
+    retryable_judge_call_retry: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -274,6 +297,8 @@ class NotificationReadback:
 
 class ExactTargetCanaryRepositoryProtocol(Protocol):
     async def select_latest_eligible_judge_call(self) -> UUID | None: ...
+    async def select_latest_retryable_judge_call(self) -> UUID | None: ...
+    async def reset_retryable_judge_call_for_retry(self, trigger_event_id: UUID) -> bool: ...
     async def load_preflight(self, trigger_event_id: UUID) -> ExactTargetPreflight: ...
     async def load_judge_readback(self, *, judge_run_id: UUID) -> JudgeReadback: ...
     async def load_policy_event_ids(self, *, judge_run_id: UUID, judge_output_id: UUID) -> list[UUID]: ...
@@ -416,6 +441,194 @@ class SqlExactTargetCanaryRepository:
             {},
         )
         return UUID(str(rows[0]["event_id"])) if rows else None
+
+    async def select_latest_retryable_judge_call(self) -> UUID | None:
+        rows = await self._rows(
+            """
+            SELECT eo.event_id
+            FROM event_outbox eo
+            JOIN judge_runs jr ON jr.judge_run_id = eo.aggregate_id
+            WHERE eo.event_type = 'judge.call.requested.v1'
+              AND eo.aggregate_type = 'judge_run'
+              AND jr.status = 'failed_retryable'
+              AND eo.payload_json->>'judge_run_id' = jr.judge_run_id::text
+              AND eo.payload_json->>'bundle_id' = jr.bundle_id::text
+              AND eo.payload_json->>'model' = jr.model
+              AND eo.payload_json->>'reasoning_effort' = jr.reasoning_effort
+              AND eo.payload_json->>'prompt_version' = jr.prompt_version
+              AND (
+                    eo.payload_json->>'prompt_cache_key' IS NULL
+                    OR jr.prompt_cache_key IS NULL
+                    OR eo.payload_json->>'prompt_cache_key' = jr.prompt_cache_key
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM judge_outputs jo
+                    WHERE jo.judge_run_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM event_outbox ready
+                    WHERE ready.event_type = 'judge.output.ready.v1'
+                      AND ready.aggregate_type = 'judge_run'
+                      AND ready.aggregate_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM event_outbox policy
+                    WHERE policy.event_type = 'analysis.policy.apply.v1'
+                      AND policy.aggregate_type = 'judge_run'
+                      AND policy.aggregate_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM analyses a
+                    JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                    WHERE jo.judge_run_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM event_outbox notification_intent
+                    JOIN analyses a ON a.analysis_id = notification_intent.aggregate_id
+                    JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                    WHERE notification_intent.event_type = 'notification.plan.created.v1'
+                      AND notification_intent.aggregate_type = 'analysis'
+                      AND jo.judge_run_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM notification_plans np
+                    JOIN analyses a ON a.analysis_id = np.analysis_id
+                    JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                    WHERE jo.judge_run_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM notification_renders nr
+                    JOIN notification_plans np ON np.notification_plan_id = nr.notification_plan_id
+                    JOIN analyses a ON a.analysis_id = np.analysis_id
+                    JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                    WHERE jo.judge_run_id = jr.judge_run_id
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM notification_delivery_records ndr
+                    JOIN notification_plans np ON np.notification_plan_id = ndr.notification_plan_id
+                    JOIN analyses a ON a.analysis_id = np.analysis_id
+                    JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                    WHERE jo.judge_run_id = jr.judge_run_id
+                  )
+            ORDER BY
+              GREATEST(
+                COALESCE(eo.created_at, '-infinity'::timestamptz),
+                COALESCE(jr.finished_at, jr.started_at, '-infinity'::timestamptz)
+              ) DESC,
+              eo.created_at DESC,
+              eo.event_id DESC
+            LIMIT 1
+            """,
+            {},
+        )
+        return UUID(str(rows[0]["event_id"])) if rows else None
+
+    async def reset_retryable_judge_call_for_retry(self, trigger_event_id: UUID) -> bool:
+        rows = await self._rows(
+            """
+            WITH retryable_target AS (
+                SELECT jr.judge_run_id
+                FROM event_outbox eo
+                JOIN judge_runs jr ON jr.judge_run_id = eo.aggregate_id
+                WHERE eo.event_id = CAST(:event_id AS uuid)
+                  AND eo.event_type = 'judge.call.requested.v1'
+                  AND eo.aggregate_type = 'judge_run'
+                  AND jr.status = 'failed_retryable'
+                  AND eo.payload_json->>'judge_run_id' = jr.judge_run_id::text
+                  AND eo.payload_json->>'bundle_id' = jr.bundle_id::text
+                  AND eo.payload_json->>'model' = jr.model
+                  AND eo.payload_json->>'reasoning_effort' = jr.reasoning_effort
+                  AND eo.payload_json->>'prompt_version' = jr.prompt_version
+                  AND (
+                        eo.payload_json->>'prompt_cache_key' IS NULL
+                        OR jr.prompt_cache_key IS NULL
+                        OR eo.payload_json->>'prompt_cache_key' = jr.prompt_cache_key
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM judge_outputs jo
+                        WHERE jo.judge_run_id = jr.judge_run_id
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM event_outbox ready
+                        WHERE ready.event_type = 'judge.output.ready.v1'
+                          AND ready.aggregate_type = 'judge_run'
+                          AND ready.aggregate_id = jr.judge_run_id
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM event_outbox policy
+                        WHERE policy.event_type = 'analysis.policy.apply.v1'
+                          AND policy.aggregate_type = 'judge_run'
+                          AND policy.aggregate_id = jr.judge_run_id
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM analyses a
+                        JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                        WHERE jo.judge_run_id = jr.judge_run_id
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM event_outbox notification_intent
+                        JOIN analyses a ON a.analysis_id = notification_intent.aggregate_id
+                        JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                        WHERE notification_intent.event_type = 'notification.plan.created.v1'
+                          AND notification_intent.aggregate_type = 'analysis'
+                          AND jo.judge_run_id = jr.judge_run_id
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM notification_plans np
+                        JOIN analyses a ON a.analysis_id = np.analysis_id
+                        JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                        WHERE jo.judge_run_id = jr.judge_run_id
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM notification_renders nr
+                        JOIN notification_plans np ON np.notification_plan_id = nr.notification_plan_id
+                        JOIN analyses a ON a.analysis_id = np.analysis_id
+                        JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                        WHERE jo.judge_run_id = jr.judge_run_id
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM notification_delivery_records ndr
+                        JOIN notification_plans np ON np.notification_plan_id = ndr.notification_plan_id
+                        JOIN analyses a ON a.analysis_id = np.analysis_id
+                        JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                        WHERE jo.judge_run_id = jr.judge_run_id
+                      )
+                LIMIT 1
+            )
+            UPDATE judge_runs jr
+            SET status = 'pending',
+                input_tokens = NULL,
+                cached_input_tokens = NULL,
+                output_tokens = NULL,
+                reasoning_tokens = NULL,
+                latency_ms = NULL,
+                finish_reason = NULL,
+                refusal_detected = false,
+                started_at = NULL,
+                finished_at = NULL
+            FROM retryable_target
+            WHERE jr.judge_run_id = retryable_target.judge_run_id
+            RETURNING jr.judge_run_id
+            """,
+            {"event_id": str(trigger_event_id)},
+        )
+        return len(rows) == 1
 
     async def load_preflight(self, trigger_event_id: UUID) -> ExactTargetPreflight:
         event = await self._load_target_event(trigger_event_id)
@@ -738,6 +951,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--notification-intent-proof-confirm", default=None)
     parser.add_argument("--select-latest-eligible-judge-call", action="store_true")
     parser.add_argument("--selection-confirm", default=None)
+    parser.add_argument("--select-latest-retryable-judge-call", action="store_true")
+    parser.add_argument("--retryable-selection-confirm", default=None)
     return parser
 
 
@@ -836,7 +1051,12 @@ async def run_cli(
     async with builder(runtime) as components:
         if selection_authority.opened:
             try:
-                trigger_event_id = await components.canary_repository.select_latest_eligible_judge_call()
+                if selection_authority.retryable_opened:
+                    trigger_event_id = await components.canary_repository.select_latest_retryable_judge_call()
+                    missing_reason_code = "retryable_judge_call_target_missing"
+                else:
+                    trigger_event_id = await components.canary_repository.select_latest_eligible_judge_call()
+                    missing_reason_code = "eligible_judge_call_target_missing"
             except Exception:
                 report = _report(
                     mode=args.mode,
@@ -850,7 +1070,7 @@ async def run_cli(
                 report = _report(
                     mode=args.mode,
                     status="blocked",
-                    reason_code="eligible_judge_call_target_missing",
+                    reason_code=missing_reason_code,
                     started_monotonic=started,
                 )
                 emit_json(_compact_json(asdict(report)))
@@ -862,6 +1082,7 @@ async def run_cli(
                 trigger_event_id=trigger_event_id,
                 post_judge_output_resume_authority=resume_authority,
                 notification_intent_proof_authority=notification_intent_authority,
+                retryable_judge_call_retry=selection_authority.retryable_opened,
             ),
             runtime=runtime,
             components=components,
@@ -891,6 +1112,28 @@ async def run_exact_target_canary(
     try:
         preflight = await components.canary_repository.load_preflight(request.trigger_event_id)
         report = _apply_preflight(report, preflight)
+        if request.retryable_judge_call_retry and not request.post_judge_output_resume_authority.opened:
+            retryable_block = _retryable_judge_call_preflight_block_reason(preflight)
+            if retryable_block is not None:
+                return replace(report, status="blocked", reason_code=retryable_block)
+            if request.mode == "plan":
+                return replace(
+                    report,
+                    status="pass",
+                    reason_code="retry_plan_ready",
+                    preflight_passed=True,
+                )
+            reset_ok = await components.canary_repository.reset_retryable_judge_call_for_retry(
+                request.trigger_event_id,
+            )
+            if not reset_ok:
+                return replace(
+                    report,
+                    status="blocked",
+                    reason_code="retryable_judge_call_target_missing",
+                )
+            preflight = await components.canary_repository.load_preflight(request.trigger_event_id)
+            report = _apply_preflight(report, preflight)
         if request.post_judge_output_resume_authority.opened:
             report = replace(report, post_judge_output_resume_attempted=True)
             resume_block = _post_judge_output_resume_preflight_block_reason(preflight)
@@ -1296,6 +1539,39 @@ def _post_judge_output_resume_downstream_block_reason(preflight: ExactTargetPref
     return None
 
 
+def _retryable_judge_call_preflight_block_reason(preflight: ExactTargetPreflight) -> str | None:
+    if preflight.event is None:
+        return preflight.reason_code or "target_event_missing"
+    if preflight.event.event_type != "judge.call.requested.v1":
+        return "wrong_event_type"
+    if preflight.job is None:
+        return "invalid_event_payload"
+    if preflight.judge_run is None:
+        return "judge_run_missing"
+    if preflight.judge_output_count or preflight.ready_event_count:
+        return "target_already_consumed"
+    if (
+        preflight.policy_event_count
+        or preflight.analysis_count
+        or preflight.notification_intent_count
+        or preflight.notification_plan_count
+        or preflight.notification_render_count
+        or preflight.notification_delivery_count
+    ):
+        return "downstream_already_completed"
+    if preflight.judge_run.status != "failed_retryable":
+        return "retryable_judge_call_target_missing"
+    if preflight.job.bundle_id != preflight.judge_run.bundle_id:
+        return "event_run_bundle_mismatch"
+    if _job_conflicts_with_run(preflight.job, preflight.judge_run):
+        return "event_run_config_conflict"
+    if preflight.bundle is None:
+        return "bundle_missing"
+    if not preflight.bundle.is_structurally_usable():
+        return "bundle_unusable"
+    return None
+
+
 def _validate_preflight_snapshot(snapshot: ExactTargetPreflight) -> ExactTargetPreflight:
     if snapshot.event is None or snapshot.job is None:
         return replace(snapshot, reason_code=snapshot.reason_code or "invalid_event_payload")
@@ -1466,9 +1742,11 @@ def _cli_request_error(args: argparse.Namespace) -> str | None:
     if not args.env_file:
         return "env_file_required"
     selection_authority = _judge_call_selection_authority_from_args(args)
-    if args.select_latest_eligible_judge_call and args.trigger_event_id:
+    if _target_selection_method_count(args) > 1:
         return "target_selection_conflict"
-    if selection_authority.args_present and not selection_authority.opened:
+    if selection_authority.retryable_args_present and not selection_authority.retryable_opened:
+        return "retryable_judge_call_selection_authority_required"
+    if selection_authority.pending_args_present and not selection_authority.pending_opened:
         return "judge_call_selection_authority_required"
     if selection_authority.opened:
         return None
@@ -1479,10 +1757,22 @@ def _cli_request_error(args: argparse.Namespace) -> str | None:
     return None
 
 
+def _target_selection_method_count(args: argparse.Namespace) -> int:
+    return sum(
+        [
+            bool(args.trigger_event_id),
+            bool(args.select_latest_eligible_judge_call),
+            bool(args.select_latest_retryable_judge_call),
+        ]
+    )
+
+
 def _judge_call_selection_authority_from_args(args: argparse.Namespace) -> JudgeCallSelectionAuthority:
     return JudgeCallSelectionAuthority(
         select_latest_eligible_judge_call=bool(args.select_latest_eligible_judge_call),
         selection_confirm=args.selection_confirm,
+        select_latest_retryable_judge_call=bool(args.select_latest_retryable_judge_call),
+        retryable_selection_confirm=args.retryable_selection_confirm,
     )
 
 
