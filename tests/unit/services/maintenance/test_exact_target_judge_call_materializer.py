@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -15,15 +16,20 @@ from src.services.analysis_router.models import (
     CandidateRouteState,
 )
 from src.services.maintenance.exact_target_judge_call_materializer import (
+    ANALYSIS_REQUEST_SELECTION_CONFIRM_TOKEN,
+    CONFIRM_TOKEN,
     DownstreamCounts,
     ExactTargetJudgeCallMaterializerComponents,
     ExactTargetJudgeCallMaterializerRequest,
     ExistingJudgeRunReadback,
     JudgeCallEventReadback,
     MaterializerEvent,
+    RuntimeConfigBundle,
     SqlExactTargetJudgeCallMaterializerRepository,
+    run_cli,
     run_exact_target_judge_call_materializer,
 )
+from src.services.maintenance import exact_target_judge_call_materializer as materializer
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -95,6 +101,36 @@ class FakeMaterializerRepository:
         self.load_bundle_calls: list[UUID] = []
         self.load_shape_calls: list[UUID] = []
         self.exact_judge_run_readback_counts: list[int] = []
+
+    async def select_latest_eligible_analysis_request(
+        self, router_config: AnalysisRouterConfig
+    ) -> UUID | None:
+        self.call_order.append("select_latest_eligible_analysis_request")
+        del router_config
+        if self.event is None or self.event.event_type != "analysis.requested.v1":
+            return None
+        candidate_group_id = UUID(str(self.event.payload_json.get("candidate_group_id")))
+        bundle_id = UUID(str(self.event.payload_json.get("bundle_id")))
+        if self.candidate_state is None or self.candidate_state.current_bundle_id != bundle_id:
+            return None
+        if self.bundle is None or self.bundle.candidate_group_id != candidate_group_id:
+            return None
+        if not self.bundle.ready_for_analysis or self.shape.member_count <= 0:
+            return None
+        if self.event.payload_json.get("judge_profile") not in {
+            "github_primary",
+            "x_primary",
+            "text_idea_primary",
+        }:
+            return None
+        if (
+            self.judge_run_id is not None
+            or self.judge_call_event_id is not None
+            or self.router_conflicting_judge_run_id is not None
+            or self.downstream_counts.total
+        ):
+            return None
+        return self.event.event_id
 
     async def load_event_by_id(self, event_id: UUID) -> MaterializerEvent | None:
         self.call_order.append("load_event_by_id")
@@ -323,6 +359,18 @@ async def _run(
             router_service=service,
         ),
     )
+
+
+def _runtime_bundle() -> RuntimeConfigBundle:
+    return RuntimeConfigBundle(
+        database_url=RAW_DATABASE_URL,
+        values={"DATABASE_URL": RAW_DATABASE_URL},
+        router_config=_router_config(),
+    )
+
+
+def _fail_runtime_loader(env_file: str) -> RuntimeConfigBundle:
+    raise AssertionError(f"runtime config must not be loaded: {env_file}")
 
 
 @pytest.mark.asyncio
@@ -565,6 +613,276 @@ async def test_preflight_transaction_close_failure_blocks_router_with_sanitized_
 
 
 @pytest.mark.asyncio
+async def test_selection_flag_without_confirm_blocks_before_env_load(tmp_path: Path) -> None:
+    outputs: list[str] = []
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            str(tmp_path / "missing-runtime.env"),
+            "--select-latest-eligible-analysis-request",
+        ],
+        emit_json=outputs.append,
+        runtime_config_loader=_fail_runtime_loader,
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["reason_code"] == "analysis_request_selection_authority_required"
+    assert payload["openai_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert payload["telegram_attempted"] is False
+    assert "missing-runtime" not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_selection_confirm_only_blocks_before_env_load(tmp_path: Path) -> None:
+    outputs: list[str] = []
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            str(tmp_path / "missing-runtime.env"),
+            "--selection-confirm",
+            ANALYSIS_REQUEST_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        runtime_config_loader=_fail_runtime_loader,
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["reason_code"] == "analysis_request_selection_authority_required"
+    assert "missing-runtime" not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_wrong_selection_confirm_blocks_before_env_load(tmp_path: Path) -> None:
+    outputs: list[str] = []
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            str(tmp_path / "missing-runtime.env"),
+            "--select-latest-eligible-analysis-request",
+            "--selection-confirm",
+            "latest",
+        ],
+        emit_json=outputs.append,
+        runtime_config_loader=_fail_runtime_loader,
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["reason_code"] == "analysis_request_selection_authority_required"
+    assert "missing-runtime" not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_trigger_event_id_conflicts_with_selection_before_env_load(
+    tmp_path: Path,
+) -> None:
+    outputs: list[str] = []
+    trigger_event_id = uuid4()
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--trigger-event-id",
+            str(trigger_event_id),
+            "--env-file",
+            str(tmp_path / "missing-runtime.env"),
+            "--select-latest-eligible-analysis-request",
+            "--selection-confirm",
+            ANALYSIS_REQUEST_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        runtime_config_loader=_fail_runtime_loader,
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["reason_code"] == "target_selection_conflict"
+    assert payload["analysis_request_fingerprint"] == materializer._fingerprint(
+        trigger_event_id
+    )
+    assert str(trigger_event_id) not in outputs[0]
+    assert "missing-runtime" not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_select_latest_eligible_blocks_when_no_analysis_request_target() -> None:
+    outputs: list[str] = []
+    repository = FakeMaterializerRepository(
+        event=None,
+        candidate_state=None,
+        bundle=None,
+    )
+    service = FakeRouterService(repository)
+
+    @asynccontextmanager
+    async def builder(runtime: RuntimeConfigBundle):
+        del runtime
+        yield ExactTargetJudgeCallMaterializerComponents(
+            materializer_repository=repository,
+            router_service=service,
+        )
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            "/tmp/materializer-runtime.env",
+            "--select-latest-eligible-analysis-request",
+            "--selection-confirm",
+            ANALYSIS_REQUEST_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        runtime_config_loader=lambda _env_file: _runtime_bundle(),
+        session_components_builder=builder,
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "eligible_analysis_request_target_missing"
+    assert payload["analysis_request_fingerprint"] is None
+    assert payload["router_attempted"] is False
+    assert payload["openai_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert payload["telegram_attempted"] is False
+    assert repository.call_order == ["select_latest_eligible_analysis_request"]
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_select_latest_eligible_plan_reaches_plan_ready_with_fingerprints_only() -> None:
+    outputs: list[str] = []
+    event_id, repository, service = _success_parts()
+
+    @asynccontextmanager
+    async def builder(runtime: RuntimeConfigBundle):
+        del runtime
+        yield ExactTargetJudgeCallMaterializerComponents(
+            materializer_repository=repository,
+            router_service=service,
+        )
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            "/tmp/materializer-runtime.env",
+            "--select-latest-eligible-analysis-request",
+            "--selection-confirm",
+            ANALYSIS_REQUEST_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        runtime_config_loader=lambda _env_file: _runtime_bundle(),
+        session_components_builder=builder,
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 0
+    assert payload["status"] == "pass"
+    assert payload["reason_code"] == "plan_ready"
+    assert payload["analysis_request_fingerprint"] == materializer._fingerprint(event_id)
+    assert payload["candidate_group_fingerprint"] == materializer._fingerprint(
+        repository.event.payload_json["candidate_group_id"]
+    )
+    assert payload["bundle_fingerprint"] == materializer._fingerprint(
+        repository.event.payload_json["bundle_id"]
+    )
+    assert payload["router_attempted"] is False
+    assert repository.call_order[0] == "select_latest_eligible_analysis_request"
+    for raw_value in (
+        str(event_id),
+        str(repository.event.payload_json["candidate_group_id"]),
+        str(repository.event.payload_json["bundle_id"]),
+    ):
+        assert raw_value not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_select_latest_eligible_execute_reuses_materializer_path_once() -> None:
+    outputs: list[str] = []
+    event_id, repository, service = _success_parts()
+
+    @asynccontextmanager
+    async def builder(runtime: RuntimeConfigBundle):
+        del runtime
+        yield ExactTargetJudgeCallMaterializerComponents(
+            materializer_repository=repository,
+            router_service=service,
+        )
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "execute",
+            "--env-file",
+            "/tmp/materializer-runtime.env",
+            "--confirm",
+            CONFIRM_TOKEN,
+            "--select-latest-eligible-analysis-request",
+            "--selection-confirm",
+            ANALYSIS_REQUEST_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        runtime_config_loader=lambda _env_file: _runtime_bundle(),
+        session_components_builder=builder,
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 0
+    assert payload["status"] == "pass"
+    assert payload["reason_code"] == "judge_call_materialized"
+    assert payload["analysis_request_fingerprint"] == materializer._fingerprint(event_id)
+    assert payload["router_attempted"] is True
+    assert payload["judge_run_created"] is True
+    assert payload["judge_call_event_created"] is True
+    assert payload["openai_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert payload["telegram_attempted"] is False
+    assert service.calls == [event_id]
+    assert repository.materialize_calls == 1
+    assert payload["bounded_counts"]["existing_judge_call_events"] == 1
+    assert str(event_id) not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_consumed_downstream_or_existing_judge_call_targets_are_not_selection_eligible() -> None:
+    existing_run_event_id, existing_run_repository, _ = _success_parts(
+        existing_judge_run_id=uuid4(),
+    )
+    existing_call_event_id, existing_call_repository, _ = _success_parts(
+        existing_judge_run_id=uuid4(),
+        existing_judge_call_event_id=uuid4(),
+    )
+    downstream_event_id, downstream_repository, _ = _success_parts(
+        existing_judge_run_id=uuid4(),
+        downstream_counts=DownstreamCounts(judge_outputs=1),
+    )
+
+    for event_id, repository in (
+        (existing_run_event_id, existing_run_repository),
+        (existing_call_event_id, existing_call_repository),
+        (downstream_event_id, downstream_repository),
+    ):
+        assert await repository.select_latest_eligible_analysis_request(_router_config()) is None
+        assert event_id not in repository.load_event_calls
+
+
+@pytest.mark.asyncio
 async def test_commit_failure_fails_closed_without_private_exception_text() -> None:
     event_id, repository, service = _success_parts(
         commit_error=RuntimeError(RAW_EXCEPTION_BODY),
@@ -659,6 +977,9 @@ def test_module_does_not_import_openai_redis_telegram_or_notifier_boundaries() -
     forbidden = {
         "redis",
         "redis.asyncio",
+        "subprocess",
+        "docker",
+        "systemd",
         "src.services.judge_openai",
         "..judge_openai",
         "src.services.notifier_telegram",

@@ -31,6 +31,7 @@ SCHEMA_VERSION = "exact_target_judge_call_materializer_report_v1"
 ANALYSIS_REQUESTED_EVENT_TYPE = "analysis.requested.v1"
 JUDGE_CALL_REQUESTED_EVENT_TYPE = "judge.call.requested.v1"
 CONFIRM_TOKEN = "materialize-judge-call"
+ANALYSIS_REQUEST_SELECTION_CONFIRM_TOKEN = "latest-eligible-analysis-request"
 PLACEHOLDER_REDIS_URL = "redis_locator_not_attempted"
 
 RUNTIME_VALUE_KEYS = {
@@ -88,6 +89,26 @@ class ExactTargetJudgeCallMaterializerReport:
 class ExactTargetJudgeCallMaterializerRequest:
     mode: str
     trigger_event_id: UUID
+
+
+@dataclass(slots=True, frozen=True)
+class AnalysisRequestSelectionAuthority:
+    select_latest_eligible_analysis_request: bool = False
+    selection_confirm: str | None = None
+
+    @property
+    def args_present(self) -> bool:
+        return (
+            self.select_latest_eligible_analysis_request
+            or self.selection_confirm is not None
+        )
+
+    @property
+    def opened(self) -> bool:
+        return (
+            self.select_latest_eligible_analysis_request
+            and self.selection_confirm == ANALYSIS_REQUEST_SELECTION_CONFIRM_TOKEN
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -182,6 +203,9 @@ class PreflightSnapshot:
 
 
 class MaterializerRepositoryProtocol(Protocol):
+    async def select_latest_eligible_analysis_request(
+        self, router_config: AnalysisRouterConfig
+    ) -> UUID | None: ...
     async def load_event_by_id(self, event_id: UUID) -> MaterializerEvent | None: ...
     async def load_candidate_route_state(
         self, candidate_group_id: UUID
@@ -216,6 +240,220 @@ class SqlExactTargetJudgeCallMaterializerRepository:
     def __init__(self, session: Any) -> None:
         self._session = session
         self._router_repository = AnalysisRouterRepository(session)
+
+    async def select_latest_eligible_analysis_request(
+        self, router_config: AnalysisRouterConfig
+    ) -> UUID | None:
+        rows = await self._rows(
+            """
+            WITH raw_candidates AS (
+                SELECT
+                    eo.event_id,
+                    eo.created_at,
+                    eo.aggregate_type,
+                    eo.aggregate_id,
+                    eo.payload_json,
+                    eo.payload_json->>'candidate_group_id' AS candidate_group_id_text,
+                    eo.payload_json->>'bundle_id' AS bundle_id_text,
+                    eo.payload_json->>'judge_profile' AS judge_profile,
+                    CASE
+                        WHEN jsonb_typeof(eo.payload_json->'escalation_allowed') = 'boolean'
+                        THEN (eo.payload_json->>'escalation_allowed')::boolean
+                        ELSE false
+                    END AS escalation_allowed
+                FROM event_outbox eo
+                WHERE eo.event_type = 'analysis.requested.v1'
+                  AND eo.aggregate_type = 'candidate_group'
+                  AND eo.payload_json ? 'candidate_group_id'
+                  AND eo.payload_json ? 'bundle_id'
+                  AND eo.payload_json ? 'judge_profile'
+                  AND eo.payload_json->>'candidate_group_id' ~* :uuid_re
+                  AND eo.payload_json->>'bundle_id' ~* :uuid_re
+                  AND eo.payload_json->>'judge_profile' IN (
+                      'github_primary',
+                      'x_primary',
+                      'text_idea_primary'
+                  )
+            ),
+            joined_candidates AS (
+                SELECT
+                    rc.event_id,
+                    rc.created_at,
+                    rc.candidate_group_id_text::uuid AS candidate_group_id,
+                    rc.bundle_id_text::uuid AS bundle_id,
+                    rc.judge_profile,
+                    rc.escalation_allowed,
+                    cgp.current_bundle_id,
+                    ceb.ready_for_analysis,
+                    ceb.reroot_count,
+                    ceb.token_budget_profile,
+                    COUNT(cem.candidate_evidence_member_id) AS member_count,
+                    COUNT(cem.candidate_evidence_member_id) FILTER (
+                        WHERE cem.member_role = 'supporting'
+                    ) AS supporting_count
+                FROM raw_candidates rc
+                JOIN candidate_group_proposals cgp
+                  ON cgp.candidate_group_id = rc.candidate_group_id_text::uuid
+                 AND cgp.candidate_group_id = rc.aggregate_id
+                JOIN candidate_evidence_bundles ceb
+                  ON ceb.bundle_id = rc.bundle_id_text::uuid
+                 AND ceb.candidate_group_id = cgp.candidate_group_id
+                LEFT JOIN candidate_evidence_members cem
+                  ON cem.bundle_id = ceb.bundle_id
+                WHERE cgp.current_bundle_id = ceb.bundle_id
+                  AND ceb.ready_for_analysis IS TRUE
+                GROUP BY
+                    rc.event_id,
+                    rc.created_at,
+                    rc.candidate_group_id_text,
+                    rc.bundle_id_text,
+                    rc.judge_profile,
+                    rc.escalation_allowed,
+                    cgp.current_bundle_id,
+                    ceb.ready_for_analysis,
+                    ceb.reroot_count,
+                    ceb.token_budget_profile
+                HAVING COUNT(cem.candidate_evidence_member_id) > 0
+            ),
+            routed_candidates AS (
+                SELECT
+                    jc.*,
+                    CASE
+                        WHEN jc.judge_profile = 'github_primary' THEN :github_prompt_version
+                        WHEN jc.judge_profile = 'x_primary' THEN :x_prompt_version
+                        ELSE :text_idea_prompt_version
+                    END AS route_prompt_version,
+                    CASE
+                        WHEN :enable_model_escalation
+                         AND jc.escalation_allowed
+                         AND (
+                            jc.reroot_count > 0
+                            OR jc.supporting_count >= 3
+                            OR jc.token_budget_profile IN ('large', 'xlarge')
+                         )
+                        THEN :escalation_model
+                        ELSE :default_model
+                    END AS route_model,
+                    CASE
+                        WHEN :enable_model_escalation
+                         AND jc.escalation_allowed
+                         AND (
+                            jc.reroot_count > 0
+                            OR jc.supporting_count >= 3
+                            OR jc.token_budget_profile IN ('large', 'xlarge')
+                         )
+                        THEN :escalation_reasoning_effort
+                        ELSE :default_reasoning_effort
+                    END AS route_reasoning_effort
+                FROM joined_candidates jc
+            )
+            SELECT rc.event_id
+            FROM routed_candidates rc
+            WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM judge_runs route_run
+                    WHERE route_run.bundle_id = rc.bundle_id
+                      AND route_run.model = rc.route_model
+                      AND route_run.reasoning_effort = rc.route_reasoning_effort
+                      AND route_run.prompt_version = rc.route_prompt_version
+                      AND (
+                        EXISTS (
+                            SELECT 1
+                            FROM judge_outputs jo
+                            WHERE jo.judge_run_id = route_run.judge_run_id
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM event_outbox ready
+                            WHERE ready.event_type = 'judge.output.ready.v1'
+                              AND ready.aggregate_type = 'judge_run'
+                              AND ready.aggregate_id = route_run.judge_run_id
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM event_outbox policy
+                            WHERE policy.event_type = 'analysis.policy.apply.v1'
+                              AND policy.aggregate_type = 'judge_run'
+                              AND policy.aggregate_id = route_run.judge_run_id
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM analyses a
+                            JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                            WHERE jo.judge_run_id = route_run.judge_run_id
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM event_outbox notification_intent
+                            JOIN analyses a ON a.analysis_id = notification_intent.aggregate_id
+                            JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                            WHERE notification_intent.event_type = 'notification.plan.created.v1'
+                              AND notification_intent.aggregate_type = 'analysis'
+                              AND jo.judge_run_id = route_run.judge_run_id
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM notification_plans np
+                            JOIN analyses a ON a.analysis_id = np.analysis_id
+                            JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                            WHERE jo.judge_run_id = route_run.judge_run_id
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM notification_renders nr
+                            JOIN notification_plans np
+                              ON np.notification_plan_id = nr.notification_plan_id
+                            JOIN analyses a ON a.analysis_id = np.analysis_id
+                            JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                            WHERE jo.judge_run_id = route_run.judge_run_id
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM notification_delivery_records ndr
+                            JOIN notification_plans np
+                              ON np.notification_plan_id = ndr.notification_plan_id
+                            JOIN analyses a ON a.analysis_id = np.analysis_id
+                            JOIN judge_outputs jo ON jo.judge_output_id = a.judge_output_id
+                            WHERE jo.judge_run_id = route_run.judge_run_id
+                        )
+                      )
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM judge_runs jr
+                    WHERE jr.bundle_id = rc.bundle_id
+                      AND jr.model = rc.route_model
+                      AND jr.reasoning_effort = rc.route_reasoning_effort
+                      AND jr.prompt_version = rc.route_prompt_version
+                  )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM event_outbox judge_call
+                    WHERE judge_call.event_type = 'judge.call.requested.v1'
+                      AND judge_call.payload_json->>'bundle_id' = rc.bundle_id::text
+                      AND judge_call.payload_json->>'model' = rc.route_model
+                      AND judge_call.payload_json->>'reasoning_effort' = rc.route_reasoning_effort
+                      AND judge_call.payload_json->>'prompt_version' = rc.route_prompt_version
+                  )
+            ORDER BY rc.created_at DESC, rc.event_id DESC
+            LIMIT 1
+            """,
+            {
+                "uuid_re": (
+                    "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+                    "[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+                ),
+                "enable_model_escalation": bool(router_config.enable_model_escalation),
+                "default_model": router_config.default_model,
+                "escalation_model": router_config.escalation_model,
+                "default_reasoning_effort": router_config.default_reasoning_effort,
+                "escalation_reasoning_effort": router_config.escalation_reasoning_effort,
+                "github_prompt_version": router_config.github_prompt_version,
+                "x_prompt_version": router_config.x_prompt_version,
+                "text_idea_prompt_version": router_config.text_idea_prompt_version,
+            },
+        )
+        return UUID(str(rows[0]["event_id"])) if rows else None
 
     async def load_event_by_id(self, event_id: UUID) -> MaterializerEvent | None:
         rows = await self._rows(
@@ -440,6 +678,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trigger-event-id", action="append", default=[])
     parser.add_argument("--env-file")
     parser.add_argument("--confirm", default=None)
+    parser.add_argument("--select-latest-eligible-analysis-request", action="store_true")
+    parser.add_argument("--selection-confirm", default=None)
     return parser
 
 
@@ -477,7 +717,9 @@ async def run_cli(
         )
         return 2
 
-    assert trigger_event_id is not None
+    selection_authority = _analysis_request_selection_authority_from_args(args)
+    if not selection_authority.opened:
+        assert trigger_event_id is not None
     if args.mode == "execute" and args.confirm != CONFIRM_TOKEN:
         emit_json(
             _compact_json(
@@ -526,6 +768,38 @@ async def run_cli(
 
     builder = session_components_builder or sql_session_components
     async with builder(runtime) as components:
+        if selection_authority.opened:
+            try:
+                trigger_event_id = await components.materializer_repository.select_latest_eligible_analysis_request(
+                    runtime.router_config
+                )
+            except Exception:
+                emit_json(
+                    _compact_json(
+                        asdict(
+                            _report(
+                                mode=args.mode,
+                                status="failed",
+                                reason_code="unhandled_error",
+                            )
+                        )
+                    )
+                )
+                return 2
+            if trigger_event_id is None:
+                emit_json(
+                    _compact_json(
+                        asdict(
+                            _report(
+                                mode=args.mode,
+                                status="blocked",
+                                reason_code="eligible_analysis_request_target_missing",
+                            )
+                        )
+                    )
+                )
+                return 2
+        assert trigger_event_id is not None
         report = await run_exact_target_judge_call_materializer(
             ExactTargetJudgeCallMaterializerRequest(
                 mode=args.mode,
@@ -1001,13 +1275,30 @@ def _report(
 def _cli_request_error(args: argparse.Namespace) -> str | None:
     if args.mode not in {"plan", "execute"}:
         return "mode_required"
-    if len(args.trigger_event_id) != 1:
-        return "exactly_one_trigger_event_id_required"
-    if _uuid_or_none(args.trigger_event_id[0]) is None:
-        return "invalid_trigger_event_id"
+    selection_authority = _analysis_request_selection_authority_from_args(args)
+    if args.select_latest_eligible_analysis_request and args.trigger_event_id:
+        return "target_selection_conflict"
+    if selection_authority.args_present and not selection_authority.opened:
+        return "analysis_request_selection_authority_required"
+    if not selection_authority.opened:
+        if len(args.trigger_event_id) != 1:
+            return "exactly_one_trigger_event_id_required"
+        if _uuid_or_none(args.trigger_event_id[0]) is None:
+            return "invalid_trigger_event_id"
     if not args.env_file:
         return "env_file_required"
     return None
+
+
+def _analysis_request_selection_authority_from_args(
+    args: argparse.Namespace,
+) -> AnalysisRequestSelectionAuthority:
+    return AnalysisRequestSelectionAuthority(
+        select_latest_eligible_analysis_request=bool(
+            args.select_latest_eligible_analysis_request
+        ),
+        selection_confirm=args.selection_confirm,
+    )
 
 
 def _read_runtime_env_file(env_file: str) -> dict[str, str]:
@@ -1124,6 +1415,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "ANALYSIS_REQUEST_SELECTION_CONFIRM_TOKEN",
+    "AnalysisRequestSelectionAuthority",
     "CONFIRM_TOKEN",
     "DownstreamCounts",
     "ExactTargetJudgeCallMaterializerComponents",
