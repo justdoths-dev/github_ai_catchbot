@@ -19,7 +19,11 @@ from ..analysis_validator.repositories import AnalysisValidatorRepository
 from ..analysis_validator.service import AnalysisValidatorService
 from ..judge_openai.config import JudgeOpenAIConfig, JudgeOpenAIConfigurationError
 from ..judge_openai.models import BundleJudgeContext, JudgeCallJob, JudgeRunRecord
-from ..judge_openai.openai_client import OpenAIJudgeClient
+from ..judge_openai.openai_client import (
+    OpenAIJudgeClient,
+    PERMANENT_OPENAI_SAFE_CODES,
+    RETRYABLE_OPENAI_SAFE_CODES,
+)
 from ..judge_openai.repositories import JudgeOpenAIRepository
 from ..judge_openai.service import JudgeOpenAIService
 from ..notifier_telegram.config import NotifierTelegramConfig
@@ -1646,12 +1650,31 @@ def _judge_readback_block_reason(readback: JudgeReadback) -> str | None:
     if readback.judge_status == "failed_retryable":
         if readback.judge_output_count or readback.ready_event_count:
             return "failed_judge_created_downstream_rows"
-        return "judge_failed_retryable"
+        return _judge_failure_reason_code(
+            fallback="judge_failed_retryable",
+            finish_reason=readback.finish_reason,
+            safe_codes=RETRYABLE_OPENAI_SAFE_CODES,
+        )
     if readback.judge_status == "failed_terminal":
         if readback.judge_output_count or readback.ready_event_count:
             return "failed_judge_created_downstream_rows"
-        return "judge_failed_terminal"
+        return _judge_failure_reason_code(
+            fallback="judge_failed_terminal",
+            finish_reason=readback.finish_reason,
+            safe_codes=PERMANENT_OPENAI_SAFE_CODES,
+        )
     return "judge_status_unexpected"
+
+
+def _judge_failure_reason_code(
+    *,
+    fallback: str,
+    finish_reason: str | None,
+    safe_codes: frozenset[str],
+) -> str:
+    if finish_reason in safe_codes:
+        return f"{fallback}_{finish_reason}"
+    return fallback
 
 
 def _apply_preflight(report: ExactTargetCanaryReport, preflight: ExactTargetPreflight) -> ExactTargetCanaryReport:
@@ -1985,6 +2008,10 @@ def _compact_json(payload: Mapping[str, Any]) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     return asyncio.run(run_cli(argv))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
 __all__ = [

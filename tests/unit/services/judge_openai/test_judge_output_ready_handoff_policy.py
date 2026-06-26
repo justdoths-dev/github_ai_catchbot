@@ -280,15 +280,24 @@ async def test_transient_openai_error_maps_to_failed_retryable_without_output_or
     run = _run(bundle)
     job = _job(run)
     repo = FakeRepository(job=job, judge_run=run, bundle=bundle)
-    client = FakeClient([OpenAITransientError("RateLimitError")])
+    private_body = "private provider response body"
+    client = FakeClient(
+        [
+            OpenAITransientError(
+                private_body,
+                safe_code="openai_retryable_rate_limited",
+            )
+        ]
+    )
 
     await _handle(repo, client, job)
 
     assert len(client.calls) == 1
     assert repo.finished[-1]["status"] == "failed_retryable"
-    assert repo.finished[-1]["finish_reason"] == "openai_transport_retryable"
+    assert repo.finished[-1]["finish_reason"] == "openai_retryable_rate_limited"
     assert repo.outputs == []
     assert repo.outbox == []
+    assert private_body not in repr(repo.finished)
 
 
 @pytest.mark.asyncio

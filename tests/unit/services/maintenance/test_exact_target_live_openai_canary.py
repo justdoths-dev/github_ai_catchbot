@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -2768,28 +2771,113 @@ async def test_openai_failure_mapping_is_sanitized(tmp_path: Path) -> None:
     private_exception_body = _joined("sentinel", "-", "private", "-", "exception", "-", "body")
     report, _fake_client = await _run_execute(
         retryable,
-        [OpenAITransientError(private_exception_body)],
+        [
+            OpenAITransientError(
+                private_exception_body,
+                safe_code="openai_retryable_rate_limited",
+            )
+        ],
         tmp_path,
     )
     rendered = json.dumps(asdict(report), default=str)
     assert report.status == "failed"
-    assert report.reason_code == "judge_failed_retryable"
+    assert report.reason_code == "judge_failed_retryable_openai_retryable_rate_limited"
     assert report.judge_status == "failed_retryable"
+    assert report.openai_call_attempted is True
+    assert report.openai_request_count == 1
     assert report.validator_attempted is False
+    assert report.telegram_transport_attempted is False
+    assert report.redis_attempted is False
     assert private_exception_body not in rendered
+    assert str(retryable.trigger_event_id) not in rendered
+    assert str(retryable.judge_run_id) not in rendered
 
     permanent = _Ledger()
     report, _fake_client = await _run_execute(
         permanent,
-        [OpenAIPermanentError(private_exception_body)],
+        [
+            OpenAIPermanentError(
+                private_exception_body,
+                safe_code="openai_permanent_permission",
+            )
+        ],
         tmp_path,
     )
     rendered = json.dumps(asdict(report), default=str)
     assert report.status == "failed"
-    assert report.reason_code == "judge_failed_terminal"
+    assert report.reason_code == "judge_failed_terminal_openai_permanent_permission"
     assert report.judge_status == "failed_terminal"
     assert report.validator_attempted is False
     assert private_exception_body not in rendered
+
+
+def test_judge_readback_legacy_openai_transport_retryable_stays_generic() -> None:
+    reason_code = canary._judge_readback_block_reason(
+        JudgeReadback(
+            judge_status="failed_retryable",
+            finish_reason="openai_transport_retryable",
+            refusal_detected=False,
+            judge_output_count=0,
+            judge_output_id=None,
+            ready_event_count=0,
+            ready_event_id=None,
+        )
+    )
+
+    assert reason_code == "judge_failed_retryable"
+
+
+def test_judge_readback_safe_permanent_finish_reason_is_specific() -> None:
+    reason_code = canary._judge_readback_block_reason(
+        JudgeReadback(
+            judge_status="failed_terminal",
+            finish_reason="openai_permanent_auth",
+            refusal_detected=False,
+            judge_output_count=0,
+            judge_output_id=None,
+            ready_event_count=0,
+            ready_event_id=None,
+        )
+    )
+
+    assert reason_code == "judge_failed_terminal_openai_permanent_auth"
+
+
+def test_module_entrypoint_emits_json_for_missing_env_file(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    missing_env = tmp_path / "definitely-missing-runtime.env"
+    env = dict(os.environ)
+    env["PYTHONPATH"] = "src"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "services.maintenance.exact_target_live_openai_canary",
+            "--mode",
+            "plan",
+            "--env-file",
+            str(missing_env),
+            "--select-latest-retryable-judge-call",
+            "--retryable-selection-confirm",
+            RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+        ],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode == 2
+    assert result.stderr == ""
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "env_file_missing"
+    assert payload["openai_request_count"] == 0
+    assert payload["telegram_transport_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert str(missing_env) not in result.stdout
 
 
 @pytest.mark.asyncio

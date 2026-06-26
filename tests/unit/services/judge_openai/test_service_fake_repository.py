@@ -10,7 +10,7 @@ import pytest
 
 from services.judge_openai.config import JudgeOpenAIConfig
 from services.judge_openai.models import BundleJudgeContext, JudgeCallJob, JudgeRunRecord, OpenAIJudgeUsage
-from services.judge_openai.openai_client import OpenAIRequestShapeError, OpenAITransientError
+from services.judge_openai.openai_client import OpenAIPermanentError, OpenAIRequestShapeError, OpenAITransientError
 from services.judge_openai.service import JudgeOpenAIService
 
 
@@ -421,15 +421,52 @@ async def test_fake_transport_failure_marks_retryable_and_emits_no_output_or_out
     judge_run = _judge_run(bundle)
     job = _job(judge_run)
     repo = FakeRepository(job=job, judge_run=judge_run, bundle=bundle)
-    service, client = _subject(repo=repo, responses=[OpenAITransientError("raw transport detail")])
+    private_body = "raw transport detail"
+    service, client = _subject(
+        repo=repo,
+        responses=[
+            OpenAITransientError(
+                private_body,
+                safe_code="openai_retryable_connection",
+            )
+        ],
+    )
 
     await service.handle_job(job)
 
     assert len(client.calls) == 1
     assert repo.finished[-1]["status"] == "failed_retryable"
-    assert repo.finished[-1]["finish_reason"] == "openai_transport_retryable"
+    assert repo.finished[-1]["finish_reason"] == "openai_retryable_connection"
     assert repo.judge_outputs == []
     assert repo.outbox == []
+    assert private_body not in repr(repo.finished)
+
+
+@pytest.mark.asyncio
+async def test_fake_permanent_failure_marks_terminal_with_safe_finish_reason_without_output_or_outbox() -> None:
+    bundle = _bundle()
+    judge_run = _judge_run(bundle)
+    job = _job(judge_run)
+    repo = FakeRepository(job=job, judge_run=judge_run, bundle=bundle)
+    private_body = "raw provider permission detail"
+    service, client = _subject(
+        repo=repo,
+        responses=[
+            OpenAIPermanentError(
+                private_body,
+                safe_code="openai_permanent_permission",
+            )
+        ],
+    )
+
+    await service.handle_job(job)
+
+    assert len(client.calls) == 1
+    assert repo.finished[-1]["status"] == "failed_terminal"
+    assert repo.finished[-1]["finish_reason"] == "openai_permanent_permission"
+    assert repo.judge_outputs == []
+    assert repo.outbox == []
+    assert private_body not in repr(repo.finished)
 
 
 @pytest.mark.asyncio

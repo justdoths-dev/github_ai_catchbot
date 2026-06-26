@@ -5,21 +5,53 @@ from typing import Any
 from .request_shape import build_responses_request, validate_responses_request_shape
 
 
+RETRYABLE_OPENAI_SAFE_CODES = frozenset(
+    {
+        "openai_retryable_rate_limited",
+        "openai_retryable_timeout",
+        "openai_retryable_connection",
+        "openai_retryable_server_error",
+        "openai_retryable_unknown",
+    }
+)
+PERMANENT_OPENAI_SAFE_CODES = frozenset(
+    {
+        "openai_permanent_auth",
+        "openai_permanent_permission",
+        "openai_permanent_bad_request",
+        "openai_permanent_not_found",
+        "openai_permanent_client_error",
+        "openai_permanent_unknown",
+    }
+)
+OPENAI_SAFE_CODES = RETRYABLE_OPENAI_SAFE_CODES | PERMANENT_OPENAI_SAFE_CODES
+
+
 class OpenAIClientConfigurationError(RuntimeError):
     pass
 
 
 class OpenAITransientError(RuntimeError):
-    pass
+    default_safe_code = "openai_retryable_unknown"
+
+    def __init__(self, message: str = "openai_retryable_error", *, safe_code: str | None = None) -> None:
+        resolved_safe_code = safe_code if safe_code in RETRYABLE_OPENAI_SAFE_CODES else self.default_safe_code
+        super().__init__(message)
+        self.safe_code = resolved_safe_code
 
 
 class OpenAIPermanentError(RuntimeError):
-    pass
+    default_safe_code = "openai_permanent_unknown"
+
+    def __init__(self, message: str = "openai_permanent_error", *, safe_code: str | None = None) -> None:
+        resolved_safe_code = safe_code if safe_code in PERMANENT_OPENAI_SAFE_CODES else self.default_safe_code
+        super().__init__(message)
+        self.safe_code = resolved_safe_code
 
 
 class OpenAIRequestShapeError(OpenAIPermanentError):
     def __init__(self, issue_codes: tuple[str, ...]) -> None:
-        super().__init__("invalid_request_shape")
+        super().__init__("invalid_request_shape", safe_code="openai_permanent_bad_request")
         self.issue_codes = issue_codes
 
 
@@ -103,12 +135,31 @@ class OpenAIJudgeClient:
 
     @staticmethod
     def _raise_mapped_exception(exc: Exception) -> None:
+        mapped = _classify_openai_exception(exc)
+        if mapped[0] == "retryable":
+            raise OpenAITransientError(mapped[1], safe_code=mapped[1]) from exc
+        raise OpenAIPermanentError(mapped[1], safe_code=mapped[1]) from exc
+
+
+def _classify_openai_exception(exc: Exception) -> tuple[str, str]:
         status_code = getattr(exc, "status_code", None)
         name = type(exc).__name__
-        if name in {"RateLimitError", "APITimeoutError", "APIConnectionError"}:
-            raise OpenAITransientError(name) from exc
+        if name == "RateLimitError" or status_code == 429:
+            return ("retryable", "openai_retryable_rate_limited")
+        if name == "APITimeoutError":
+            return ("retryable", "openai_retryable_timeout")
+        if name == "APIConnectionError":
+            return ("retryable", "openai_retryable_connection")
         if isinstance(status_code, int) and status_code >= 500:
-            raise OpenAITransientError(f"{name}:{status_code}") from exc
+            return ("retryable", "openai_retryable_server_error")
+        if name == "AuthenticationError" or status_code == 401:
+            return ("permanent", "openai_permanent_auth")
+        if name == "PermissionDeniedError" or status_code == 403:
+            return ("permanent", "openai_permanent_permission")
+        if name == "BadRequestError" or status_code == 400:
+            return ("permanent", "openai_permanent_bad_request")
+        if name == "NotFoundError" or status_code == 404:
+            return ("permanent", "openai_permanent_not_found")
         if isinstance(status_code, int) and status_code >= 400:
-            raise OpenAIPermanentError(f"{name}:{status_code}") from exc
-        raise OpenAITransientError(name) from exc
+            return ("permanent", "openai_permanent_client_error")
+        return ("retryable", "openai_retryable_unknown")

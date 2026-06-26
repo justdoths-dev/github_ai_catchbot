@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from services.judge_openai.openai_client import OpenAIJudgeClient, OpenAIRequestShapeError
+from services.judge_openai.openai_client import (
+    OpenAIJudgeClient,
+    OpenAIPermanentError,
+    OpenAIRequestShapeError,
+    OpenAITransientError,
+)
 from services.judge_openai.request_shape import (
     summarize_responses_request_shape,
     validate_responses_request_shape,
@@ -141,6 +146,59 @@ def test_openai_client_omits_none_optional_generation_controls() -> None:
     assert summary["prompt_cache_key_presence_bucket"] == "zero"
     assert summary["optional_null_field_count_bucket"] == "zero"
     assert summary["optional_null_field_name_buckets"] == []
+
+
+@pytest.mark.parametrize(
+    ("exception_name", "status_code", "expected_error", "expected_safe_code"),
+    [
+        ("RateLimitError", None, OpenAITransientError, "openai_retryable_rate_limited"),
+        ("OtherError", 429, OpenAITransientError, "openai_retryable_rate_limited"),
+        ("APITimeoutError", None, OpenAITransientError, "openai_retryable_timeout"),
+        ("APIConnectionError", None, OpenAITransientError, "openai_retryable_connection"),
+        ("InternalServerError", 500, OpenAITransientError, "openai_retryable_server_error"),
+        ("AuthenticationError", None, OpenAIPermanentError, "openai_permanent_auth"),
+        ("OtherError", 401, OpenAIPermanentError, "openai_permanent_auth"),
+        ("PermissionDeniedError", None, OpenAIPermanentError, "openai_permanent_permission"),
+        ("OtherError", 403, OpenAIPermanentError, "openai_permanent_permission"),
+        ("BadRequestError", None, OpenAIPermanentError, "openai_permanent_bad_request"),
+        ("OtherError", 400, OpenAIPermanentError, "openai_permanent_bad_request"),
+        ("NotFoundError", None, OpenAIPermanentError, "openai_permanent_not_found"),
+        ("OtherError", 404, OpenAIPermanentError, "openai_permanent_not_found"),
+        ("ConflictError", 409, OpenAIPermanentError, "openai_permanent_client_error"),
+        ("UnexpectedError", None, OpenAITransientError, "openai_retryable_unknown"),
+    ],
+)
+def test_openai_client_classifies_provider_errors_to_safe_codes(
+    exception_name: str,
+    status_code: int | None,
+    expected_error: type[Exception],
+    expected_safe_code: str,
+) -> None:
+    exc_cls = type(exception_name, (Exception,), {})
+    exc = exc_cls("private provider response body")
+    if status_code is not None:
+        exc.status_code = status_code
+
+    with pytest.raises(expected_error) as exc_info:
+        OpenAIJudgeClient._raise_mapped_exception(exc)
+
+    assert exc_info.value.safe_code == expected_safe_code
+    assert str(exc_info.value) == expected_safe_code
+    assert "private provider response body" not in str(exc_info.value)
+
+
+def test_openai_error_safe_code_rejects_raw_caller_value() -> None:
+    retryable = OpenAITransientError(
+        "private provider response body",
+        safe_code="private provider response body",
+    )
+    permanent = OpenAIPermanentError(
+        "private provider response body",
+        safe_code="private provider response body",
+    )
+
+    assert retryable.safe_code == "openai_retryable_unknown"
+    assert permanent.safe_code == "openai_permanent_unknown"
 
 
 def test_request_shape_validator_rejects_injected_optional_null_fields() -> None:

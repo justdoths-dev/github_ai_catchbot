@@ -153,18 +153,18 @@ class JudgeOpenAIService:
                 finish_reason="openai_request_shape_invalid",
             )
             return
-        except OpenAITransientError:
+        except OpenAITransientError as exc:
             await self._finish_without_output(
                 judge_run=judge_run,
                 status="failed_retryable",
-                finish_reason="openai_transport_retryable",
+                finish_reason=exc.safe_code,
             )
             return
-        except OpenAIPermanentError:
+        except OpenAIPermanentError as exc:
             await self._finish_without_output(
                 judge_run=judge_run,
                 status="failed_terminal",
-                finish_reason="openai_permanent_error",
+                finish_reason=exc.safe_code,
             )
             return
 
