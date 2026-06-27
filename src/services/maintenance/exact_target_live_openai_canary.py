@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Protocol
 from uuid import UUID
@@ -42,6 +43,10 @@ POST_JUDGE_OUTPUT_RESUME_CONFIRM_TOKEN = "post-judge-output-to-send-disabled-not
 NOTIFICATION_INTENT_PROOF_CONFIRM_TOKEN = "policy-notification-intent-to-send-disabled-proof"
 JUDGE_CALL_SELECTION_CONFIRM_TOKEN = "latest-eligible-judge-call"
 RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN = "latest-retryable-judge-call"
+RATE_LIMIT_RETRYABLE_FINISH_REASON = "openai_retryable_rate_limited"
+DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES = 60
+MIN_RATE_LIMIT_COOLDOWN_MINUTES = 1
+MAX_RATE_LIMIT_COOLDOWN_MINUTES = 1440
 
 
 RUNTIME_VALUE_KEYS = {
@@ -221,6 +226,7 @@ class ExactTargetCanaryRequest:
         default_factory=NotificationIntentProofAuthority
     )
     retryable_judge_call_retry: bool = False
+    rate_limit_cooldown_minutes: int = DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES
 
 
 @dataclass(slots=True, frozen=True)
@@ -257,6 +263,8 @@ class ExactTargetPreflight:
     job: JudgeCallJob | None
     judge_run: JudgeRunRecord | None
     bundle: BundleJudgeContext | None
+    judge_finish_reason: str | None = None
+    judge_finished_at: datetime | None = None
     judge_output_count: int = 0
     ready_event_count: int = 0
     policy_event_count: int = 0
@@ -651,11 +659,14 @@ class SqlExactTargetCanaryRepository:
 
         bundle = await self._judge_repository.load_bundle_context(judge_run.bundle_id)
         counts = await self._downstream_counts(judge_run.judge_run_id)
+        finish_state = await self._judge_run_finish_state(judge_run.judge_run_id)
         snapshot = ExactTargetPreflight(
             event=event,
             job=job,
             judge_run=judge_run,
             bundle=bundle,
+            judge_finish_reason=finish_state["finish_reason"],
+            judge_finished_at=finish_state["finished_at"],
             **counts,
         )
         return _validate_preflight_snapshot(snapshot)
@@ -921,11 +932,19 @@ class SqlExactTargetCanaryRepository:
         )
 
     async def _judge_run_finish_reason(self, judge_run_id: UUID) -> str | None:
+        return (await self._judge_run_finish_state(judge_run_id))["finish_reason"]
+
+    async def _judge_run_finish_state(self, judge_run_id: UUID) -> dict[str, Any]:
         rows = await self._rows(
-            "SELECT finish_reason FROM judge_runs WHERE judge_run_id = CAST(:judge_run_id AS uuid)",
+            "SELECT finish_reason, finished_at FROM judge_runs WHERE judge_run_id = CAST(:judge_run_id AS uuid)",
             {"judge_run_id": str(judge_run_id)},
         )
-        return str(rows[0]["finish_reason"]) if rows and rows[0]["finish_reason"] is not None else None
+        if not rows:
+            return {"finish_reason": None, "finished_at": None}
+        return {
+            "finish_reason": str(rows[0]["finish_reason"]) if rows[0]["finish_reason"] is not None else None,
+            "finished_at": _as_utc_datetime(rows[0]["finished_at"]),
+        }
 
     async def _judge_run_refusal_detected(self, judge_run_id: UUID) -> bool:
         rows = await self._rows(
@@ -957,6 +976,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--selection-confirm", default=None)
     parser.add_argument("--select-latest-retryable-judge-call", action="store_true")
     parser.add_argument("--retryable-selection-confirm", default=None)
+    parser.add_argument(
+        "--rate-limit-cooldown-minutes",
+        type=int,
+        default=DEFAULT_RATE_LIMIT_COOLDOWN_MINUTES,
+    )
     return parser
 
 
@@ -1087,6 +1111,7 @@ async def run_cli(
                 post_judge_output_resume_authority=resume_authority,
                 notification_intent_proof_authority=notification_intent_authority,
                 retryable_judge_call_retry=selection_authority.retryable_opened,
+                rate_limit_cooldown_minutes=args.rate_limit_cooldown_minutes,
             ),
             runtime=runtime,
             components=components,
@@ -1114,12 +1139,26 @@ async def run_exact_target_canary(
         target_event_id=request.trigger_event_id,
     )
     try:
+        cooldown_validation_error = _rate_limit_cooldown_minutes_error(request.rate_limit_cooldown_minutes)
+        if cooldown_validation_error is not None:
+            return replace(report, status="blocked", reason_code=cooldown_validation_error)
         preflight = await components.canary_repository.load_preflight(request.trigger_event_id)
         report = _apply_preflight(report, preflight)
         if request.retryable_judge_call_retry and not request.post_judge_output_resume_authority.opened:
             retryable_block = _retryable_judge_call_preflight_block_reason(preflight)
             if retryable_block is not None:
                 return replace(report, status="blocked", reason_code=retryable_block)
+            cooldown_block = _retryable_rate_limit_cooldown_block_reason(
+                preflight,
+                cooldown_minutes=request.rate_limit_cooldown_minutes,
+            )
+            if cooldown_block is not None:
+                return replace(
+                    report,
+                    status="blocked",
+                    reason_code=cooldown_block,
+                    preflight_passed=True,
+                )
             if request.mode == "plan":
                 return replace(
                     report,
@@ -1576,6 +1615,27 @@ def _retryable_judge_call_preflight_block_reason(preflight: ExactTargetPreflight
     return None
 
 
+def _retryable_rate_limit_cooldown_block_reason(
+    preflight: ExactTargetPreflight,
+    *,
+    cooldown_minutes: int,
+    now_utc: datetime | None = None,
+) -> str | None:
+    if preflight.judge_run is None:
+        return None
+    if preflight.judge_run.status != "failed_retryable":
+        return None
+    if preflight.judge_finish_reason != RATE_LIMIT_RETRYABLE_FINISH_REASON:
+        return None
+    finished_at = _as_utc_datetime(preflight.judge_finished_at)
+    if finished_at is None:
+        return "retryable_rate_limit_finished_at_missing"
+    current_time = now_utc or datetime.now(timezone.utc)
+    if current_time < finished_at + timedelta(minutes=cooldown_minutes):
+        return "retryable_rate_limit_cooldown_not_elapsed"
+    return None
+
+
 def _validate_preflight_snapshot(snapshot: ExactTargetPreflight) -> ExactTargetPreflight:
     if snapshot.event is None or snapshot.job is None:
         return replace(snapshot, reason_code=snapshot.reason_code or "invalid_event_payload")
@@ -1762,6 +1822,9 @@ def _report(
 def _cli_request_error(args: argparse.Namespace) -> str | None:
     if args.mode not in {"plan", "execute"}:
         return "mode_required"
+    cooldown_error = _rate_limit_cooldown_minutes_error(args.rate_limit_cooldown_minutes)
+    if cooldown_error is not None:
+        return cooldown_error
     if not args.env_file:
         return "env_file_required"
     selection_authority = _judge_call_selection_authority_from_args(args)
@@ -1777,6 +1840,14 @@ def _cli_request_error(args: argparse.Namespace) -> str | None:
         return "exactly_one_trigger_event_id_required"
     if _uuid_or_none(args.trigger_event_id[0]) is None:
         return "invalid_trigger_event_id"
+    return None
+
+
+def _rate_limit_cooldown_minutes_error(value: Any) -> str | None:
+    if not isinstance(value, int):
+        return "rate_limit_cooldown_minutes_invalid"
+    if value < MIN_RATE_LIMIT_COOLDOWN_MINUTES or value > MAX_RATE_LIMIT_COOLDOWN_MINUTES:
+        return "rate_limit_cooldown_minutes_invalid"
     return None
 
 
@@ -1987,6 +2058,14 @@ def _json_loads(value: Any) -> Any:
         except json.JSONDecodeError:
             return None
     return value
+
+
+def _as_utc_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _fingerprint(value: UUID | str | None) -> str | None:

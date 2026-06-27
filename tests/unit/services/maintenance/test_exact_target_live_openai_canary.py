@@ -8,7 +8,7 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -146,6 +146,7 @@ class _Ledger:
             )
         }
         self.finish_reason: str | None = None
+        self.finished_at: datetime | None = None
         self.refusal_detected = False
         self.bundles = {
             self.bundle_id: BundleJudgeContext(
@@ -384,6 +385,7 @@ class _CanaryRepository:
         judge_run_id = row["aggregate_id"]
         self.ledger.runs[judge_run_id] = replace(self.ledger.runs[judge_run_id], status="pending")
         self.ledger.finish_reason = None
+        self.ledger.finished_at = None
         self.ledger.refusal_detected = False
         self.ledger.reset_retryable_count += 1
         self.ledger.write_count += 1
@@ -446,6 +448,8 @@ class _CanaryRepository:
             job=job,
             judge_run=run,
             bundle=self.ledger.bundles.get(run.bundle_id),
+            judge_finish_reason=self.ledger.finish_reason,
+            judge_finished_at=self.ledger.finished_at,
             judge_output_count=output_count,
             ready_event_count=ready_count,
             policy_event_count=policy_count,
@@ -601,6 +605,7 @@ class _JudgeRepository:
         del usage
         self.ledger.runs[judge_run_id] = replace(self.ledger.runs[judge_run_id], status=status)
         self.ledger.finish_reason = finish_reason
+        self.ledger.finished_at = datetime.now(timezone.utc)
         self.ledger.refusal_detected = refusal_detected
         self.ledger.write_count += 1
 
@@ -1150,9 +1155,15 @@ def _notification_intent_authority() -> NotificationIntentProofAuthority:
     )
 
 
-def _mark_failed_retryable(ledger: _Ledger) -> _Ledger:
+def _mark_failed_retryable(
+    ledger: _Ledger,
+    *,
+    finish_reason: str = "openai_retryable_timeout",
+    finished_at: datetime | None = None,
+) -> _Ledger:
     ledger.runs[ledger.judge_run_id] = replace(ledger.runs[ledger.judge_run_id], status="failed_retryable")
-    ledger.finish_reason = "openai_transport_retryable"
+    ledger.finish_reason = finish_reason
+    ledger.finished_at = finished_at
     ledger.refusal_detected = True
     return ledger
 
@@ -1162,6 +1173,7 @@ def _materialize_existing_judge_output(ledger: _Ledger) -> UUID:
     ledger.judge_output_id = judge_output_id
     ledger.runs[ledger.judge_run_id] = replace(ledger.runs[ledger.judge_run_id], status="succeeded")
     ledger.finish_reason = "stop"
+    ledger.finished_at = datetime.now(timezone.utc)
     ledger.refusal_detected = False
     ledger.outputs.append(
         {
@@ -1598,6 +1610,45 @@ async def test_pending_selector_conflicts_with_retryable_selector_before_env_loa
     assert "missing-runtime" not in outputs[0]
 
 
+@pytest.mark.parametrize("cooldown_minutes", ["0", "1441"])
+@pytest.mark.asyncio
+async def test_rate_limit_cooldown_minutes_range_invalid_blocks_before_env_or_db(
+    cooldown_minutes: str,
+    tmp_path: Path,
+) -> None:
+    outputs: list[str] = []
+
+    async def fail_builder(runtime):
+        raise AssertionError("DB/session builder must not be called on cooldown validation failure")
+        yield runtime
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            str(tmp_path / "missing-runtime.env"),
+            "--select-latest-retryable-judge-call",
+            "--retryable-selection-confirm",
+            RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+            "--rate-limit-cooldown-minutes",
+            cooldown_minutes,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=asynccontextmanager(fail_builder),
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "rate_limit_cooldown_minutes_invalid"
+    assert payload["openai_request_count"] == 0
+    assert payload["telegram_transport_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert "missing-runtime" not in outputs[0]
+
+
 @pytest.mark.asyncio
 async def test_select_latest_eligible_blocks_when_no_target_exists(tmp_path: Path) -> None:
     ledger = _Ledger()
@@ -1764,6 +1815,270 @@ async def test_select_latest_retryable_blocks_when_no_target_exists(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_select_latest_retryable_plan_blocks_rate_limit_within_default_cooldown_without_raw_uuid_output(
+    tmp_path: Path,
+) -> None:
+    ledger = _mark_failed_retryable(
+        _Ledger(),
+        finish_reason="openai_retryable_rate_limited",
+        finished_at=datetime.now(timezone.utc),
+    )
+    env_file = _write_cli_runtime_env(tmp_path, require_openai_key=False)
+    outputs: list[str] = []
+
+    @asynccontextmanager
+    async def builder(runtime):
+        del runtime
+        yield _components(ledger)
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            str(env_file),
+            "--select-latest-retryable-judge-call",
+            "--retryable-selection-confirm",
+            RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=builder,
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "retryable_rate_limit_cooldown_not_elapsed"
+    assert payload["target_event_fingerprint"] == canary._fingerprint(ledger.trigger_event_id)
+    assert payload["target_run_fingerprint"] == canary._fingerprint(ledger.judge_run_id)
+    assert payload["judge_status"] == "failed_retryable"
+    assert payload["openai_request_count"] == 0
+    assert payload["telegram_transport_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert payload["cleanup_completed"] is True
+    assert payload["redactions_applied"] is True
+    assert ledger.reset_retryable_count == 0
+    assert len(ledger.outputs) == 0
+    assert len(ledger.events("judge.output.ready.v1", judge_run_id=ledger.judge_run_id)) == 0
+    for forbidden in [
+        str(ledger.trigger_event_id),
+        str(ledger.judge_run_id),
+        _test_database_url(),
+        _test_redis_url(),
+    ]:
+        assert forbidden not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_select_latest_retryable_execute_blocks_rate_limit_within_cooldown_before_reset_or_openai(
+    tmp_path: Path,
+) -> None:
+    ledger = _mark_failed_retryable(
+        _Ledger(),
+        finish_reason="openai_retryable_rate_limited",
+        finished_at=datetime.now(timezone.utc),
+    )
+    env_file = _write_cli_runtime_env(tmp_path, require_openai_key=True)
+    fake_client = _FakeOpenAIClient([_structured_response(ledger.payload)])
+    outputs: list[str] = []
+
+    @asynccontextmanager
+    async def builder(runtime):
+        del runtime
+        yield _components(ledger)
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "execute",
+            "--env-file",
+            str(env_file),
+            "--confirm",
+            "live-openai",
+            "--select-latest-retryable-judge-call",
+            "--retryable-selection-confirm",
+            RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=builder,
+        openai_client_builder=lambda _config: fake_client,
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "retryable_rate_limit_cooldown_not_elapsed"
+    assert payload["openai_request_count"] == 0
+    assert payload["openai_call_attempted"] is False
+    assert payload["validator_attempted"] is False
+    assert payload["policy_attempted"] is False
+    assert payload["notifier_attempted"] is False
+    assert payload["telegram_transport_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert fake_client.calls == []
+    assert ledger.reset_retryable_count == 0
+    assert len(ledger.outputs) == 0
+    assert len(ledger.analyses) == 0
+    assert len(ledger.plans) == 0
+    assert len(ledger.renders) == 0
+    assert len(ledger.delivery_records) == 0
+    assert str(ledger.trigger_event_id) not in outputs[0]
+    assert str(ledger.judge_run_id) not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_select_latest_retryable_execute_rate_limit_elapsed_reuses_existing_judge_path(
+    tmp_path: Path,
+) -> None:
+    ledger = _mark_failed_retryable(
+        _Ledger(),
+        finish_reason="openai_retryable_rate_limited",
+        finished_at=datetime.now(timezone.utc) - timedelta(minutes=61),
+    )
+    env_file = _write_cli_runtime_env(tmp_path, require_openai_key=True)
+    fake_client = _FakeOpenAIClient([_structured_response(ledger.payload)])
+    outputs: list[str] = []
+
+    @asynccontextmanager
+    async def builder(runtime):
+        del runtime
+        yield _components(ledger)
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "execute",
+            "--env-file",
+            str(env_file),
+            "--confirm",
+            "live-openai",
+            "--select-latest-retryable-judge-call",
+            "--retryable-selection-confirm",
+            RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=builder,
+        openai_client_builder=lambda _config: fake_client,
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 0
+    assert payload["status"] == "pass"
+    assert payload["reason_code"] == "notification_send_disabled_suppressed"
+    assert payload["openai_request_count"] == 1
+    assert len(fake_client.calls) == 1
+    assert ledger.reset_retryable_count == 1
+    assert ledger.status_before_mark_running == ["pending"]
+    assert payload["judge_output_created"] is True
+    assert payload["validator_forwarded_policy"] is True
+    assert payload["notification_plan_created"] is True
+    assert payload["send_disabled_delivery_record_created"] is True
+    assert payload["telegram_transport_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert str(ledger.trigger_event_id) not in outputs[0]
+    assert str(ledger.judge_run_id) not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_select_latest_retryable_rate_limit_missing_finished_at_fails_closed(
+    tmp_path: Path,
+) -> None:
+    ledger = _mark_failed_retryable(
+        _Ledger(),
+        finish_reason="openai_retryable_rate_limited",
+        finished_at=None,
+    )
+    env_file = _write_cli_runtime_env(tmp_path, require_openai_key=False)
+    outputs: list[str] = []
+
+    @asynccontextmanager
+    async def builder(runtime):
+        del runtime
+        yield _components(ledger)
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "plan",
+            "--env-file",
+            str(env_file),
+            "--select-latest-retryable-judge-call",
+            "--retryable-selection-confirm",
+            RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+        ],
+        emit_json=outputs.append,
+        session_components_builder=builder,
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    payload = json.loads(outputs[0])
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == "retryable_rate_limit_finished_at_missing"
+    assert payload["openai_request_count"] == 0
+    assert payload["openai_call_attempted"] is False
+    assert payload["telegram_transport_attempted"] is False
+    assert payload["redis_attempted"] is False
+    assert ledger.reset_retryable_count == 0
+    assert len(ledger.outputs) == 0
+    assert str(ledger.trigger_event_id) not in outputs[0]
+    assert str(ledger.judge_run_id) not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_select_latest_retryable_custom_cooldown_changes_rate_limit_plan_behavior(
+    tmp_path: Path,
+) -> None:
+    ledger = _mark_failed_retryable(
+        _Ledger(),
+        finish_reason="openai_retryable_rate_limited",
+        finished_at=datetime.now(timezone.utc) - timedelta(minutes=90),
+    )
+    env_file = _write_cli_runtime_env(tmp_path, require_openai_key=False)
+    outputs: list[str] = []
+
+    @asynccontextmanager
+    async def builder(runtime):
+        del runtime
+        yield _components(ledger)
+
+    base_args = [
+        "--mode",
+        "plan",
+        "--env-file",
+        str(env_file),
+        "--select-latest-retryable-judge-call",
+        "--retryable-selection-confirm",
+        RETRYABLE_JUDGE_CALL_SELECTION_CONFIRM_TOKEN,
+    ]
+    default_exit = await run_cli(
+        base_args,
+        emit_json=outputs.append,
+        session_components_builder=builder,
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+    custom_exit = await run_cli(
+        [*base_args, "--rate-limit-cooldown-minutes", "120"],
+        emit_json=outputs.append,
+        session_components_builder=builder,
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    default_payload = json.loads(outputs[0])
+    custom_payload = json.loads(outputs[1])
+    assert default_exit == 0
+    assert default_payload["status"] == "pass"
+    assert default_payload["reason_code"] == "retry_plan_ready"
+    assert custom_exit == 2
+    assert custom_payload["status"] == "blocked"
+    assert custom_payload["reason_code"] == "retryable_rate_limit_cooldown_not_elapsed"
+    assert default_payload["openai_request_count"] == 0
+    assert custom_payload["openai_request_count"] == 0
+    assert ledger.reset_retryable_count == 0
+
+
+@pytest.mark.asyncio
 async def test_select_latest_retryable_plan_reaches_retry_plan_ready_without_raw_uuid_output(
     tmp_path: Path,
 ) -> None:
@@ -1805,6 +2120,53 @@ async def test_select_latest_retryable_plan_reaches_retry_plan_ready_without_raw
     assert ledger.reset_retryable_count == 0
     assert str(ledger.trigger_event_id) not in outputs[0]
     assert str(ledger.judge_run_id) not in outputs[0]
+
+
+@pytest.mark.asyncio
+async def test_select_latest_retryable_non_rate_limit_recent_failure_preserves_retry_path(
+    tmp_path: Path,
+) -> None:
+    plan_ledger = _mark_failed_retryable(
+        _Ledger(),
+        finish_reason="openai_retryable_connection",
+        finished_at=datetime.now(timezone.utc),
+    )
+    plan = await run_exact_target_canary(
+        ExactTargetCanaryRequest(
+            mode="plan",
+            trigger_event_id=plan_ledger.trigger_event_id,
+            retryable_judge_call_retry=True,
+        ),
+        runtime=RuntimeConfigBundle(database_url=_test_database_url(), values={}),
+        components=_components(plan_ledger),
+        openai_client_builder=lambda _config: (_ for _ in ()).throw(AssertionError("OpenAI must not be built")),
+    )
+
+    execute_ledger = _mark_failed_retryable(
+        _Ledger(),
+        finish_reason="openai_retryable_connection",
+        finished_at=datetime.now(timezone.utc),
+    )
+    execute, fake_client = await _run_execute(
+        execute_ledger,
+        [_structured_response(execute_ledger.payload)],
+        tmp_path,
+        request=ExactTargetCanaryRequest(
+            mode="execute",
+            trigger_event_id=execute_ledger.trigger_event_id,
+            retryable_judge_call_retry=True,
+        ),
+    )
+
+    assert plan.status == "pass"
+    assert plan.reason_code == "retry_plan_ready"
+    assert plan.openai_request_count == 0
+    assert plan_ledger.reset_retryable_count == 0
+    assert execute.status == "pass"
+    assert execute.reason_code == "notification_send_disabled_suppressed"
+    assert execute.openai_request_count == 1
+    assert len(fake_client.calls) == 1
+    assert execute_ledger.reset_retryable_count == 1
 
 
 @pytest.mark.asyncio
