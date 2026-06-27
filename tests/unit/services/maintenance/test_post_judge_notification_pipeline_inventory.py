@@ -11,6 +11,7 @@ import pytest
 from services.analysis_validator.config import AnalysisValidatorConfig
 from services.maintenance.post_judge_notification_pipeline_inventory import (
     JUDGE_OUTPUT_SELECTION_CONFIRM_TOKEN,
+    MACRO_CONFIRM_TOKEN,
     NOTIFICATION_INTENT_SELECTION_CONFIRM_TOKEN,
     NOTIFIER_CONFIRM_TOKEN,
     POLICY_APPLY_SELECTION_CONFIRM_TOKEN,
@@ -349,13 +350,18 @@ def _target() -> SelectedTarget:
     )
 
 
-def _notification_target(*, delivery_decision: str = "send_now") -> SelectedNotificationIntentTarget:
+def _notification_target(
+    *,
+    delivery_decision: str = "send_now",
+    judge_output_id: UUID | None = None,
+    candidate_group_id: UUID | None = None,
+) -> SelectedNotificationIntentTarget:
     return SelectedNotificationIntentTarget(
         event_id=uuid4(),
         analysis_id=uuid4(),
         notification_plan_id=uuid4(),
-        judge_output_id=uuid4(),
-        candidate_group_id=uuid4(),
+        judge_output_id=judge_output_id or uuid4(),
+        candidate_group_id=candidate_group_id or uuid4(),
         verdict="inspect_now",
         delivery_decision=delivery_decision,
     )
@@ -537,6 +543,32 @@ async def _run_with_notifier(
             "expected_policy_apply_fingerprint_invalid",
         ),
         (["--mode", "execute-notifier", "--env-file", "/tmp/runtime.env"], "exact_notifier_send_disabled_confirm_missing"),
+        (["--mode", "execute-macro", "--env-file", "/tmp/runtime.env"], "macro_send_worthy_confirm_missing"),
+        (
+            [
+                "--mode",
+                "execute-macro",
+                "--env-file",
+                "/tmp/runtime.env",
+                "--confirm",
+                MACRO_CONFIRM_TOKEN,
+            ],
+            "macro_exactly_one_selector_required",
+        ),
+        (
+            [
+                "--mode",
+                "execute-macro",
+                "--env-file",
+                "/tmp/runtime.env",
+                "--confirm",
+                MACRO_CONFIRM_TOKEN,
+                "--select-latest-eligible-judge-output-ready",
+                "--judge-output-selection-confirm",
+                JUDGE_OUTPUT_SELECTION_CONFIRM_TOKEN,
+            ],
+            "expected_judge_output_ready_fingerprint_missing",
+        ),
         (
             [
                 "--mode",
@@ -1048,6 +1080,127 @@ async def test_execute_notifier_transport_attempt_fails_closed() -> None:
     assert report.telegram_transport_attempted is True
     assert notifier.calls == [selected.event_id]
     assert commit.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_macro_from_ready_target_reuses_existing_services_to_send_disabled_proof() -> None:
+    selected_ready = _target()
+    selected_policy = SelectedTarget(
+        event_id=uuid4(),
+        judge_run_id=selected_ready.judge_run_id,
+        judge_output_id=selected_ready.judge_output_id,
+        candidate_group_id=selected_ready.candidate_group_id,
+        bundle_id=selected_ready.bundle_id,
+    )
+    selected_notification = _notification_target(
+        judge_output_id=selected_ready.judge_output_id,
+        candidate_group_id=selected_ready.candidate_group_id,
+    )
+    repository = FakeRepository(
+        counts=_counts(
+            judge_output_ready_v1_count=1,
+            eligible_judge_output_ready_count=1,
+            analysis_policy_apply_v1_count=0,
+            eligible_policy_apply_count=0,
+            notification_plan_created_v1_count=0,
+            send_worthy_notification_intent_count=0,
+        ),
+        selected_ready=selected_ready,
+        selected_policy=selected_policy,
+        selected_notification=selected_notification,
+        validator_readback=ValidatorReadback(
+            policy_event_count=1,
+            policy_event_id=selected_policy.event_id,
+            validator_passed_transition_count=1,
+            active_analysis_count=0,
+        ),
+        policy_readback=PolicyReadback(
+            analysis_count=1,
+            analysis_id=selected_notification.analysis_id,
+            verdict="inspect_now",
+            delivery_decision="send_now",
+            notification_intent_event_count=1,
+            notification_plan_count=0,
+        ),
+        notification_readbacks=[
+            NotificationProofReadback(notification_intent_event_count=1),
+            NotificationProofReadback(
+                notification_intent_event_count=1,
+                notification_plan_count=1,
+                notification_render_count=1,
+                send_disabled_delivery_record_count=1,
+                notification_delivery_result_event_count=1,
+            ),
+        ],
+    )
+
+    report, validator, policy, notifier, commit = await _run_with_notifier(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-macro",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_eligible_judge_output_ready=True,
+            expected_judge_output_ready_fingerprint=_fingerprint(selected_ready.event_id),
+        ),
+        repository,
+    )
+
+    assert report.status == "pass"
+    assert report.reason_code == "notification_send_disabled_suppressed"
+    assert report.validator_attempted is True
+    assert report.policy_attempted is True
+    assert report.notifier_attempted is True
+    assert report.policy_event_created_or_present is True
+    assert report.analysis_created_or_present is True
+    assert report.notification_intent_created_or_present is True
+    assert report.notification_plan_created_or_present is True
+    assert report.notification_render_created_or_present is True
+    assert report.send_disabled_delivery_record_created_or_present is True
+    assert report.notification_delivery_result_event_created_or_present is True
+    assert report.redis_attempted is False
+    assert report.telegram_transport_attempted is False
+    assert report.openai_attempted is False
+    assert validator.calls == [selected_ready.event_id]
+    assert policy.calls == [selected_policy.event_id]
+    assert notifier.calls == [selected_notification.event_id]
+    assert commit.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_macro_blocks_with_precise_missing_upstream_stage_when_no_target_exists() -> None:
+    repository = FakeRepository(
+        counts=_counts(
+            judge_call_requested_v1_count=0,
+            judge_run_status_counts={},
+            judge_outputs_count=0,
+            judge_output_ready_v1_count=0,
+            analysis_policy_apply_v1_count=0,
+            eligible_judge_output_ready_count=0,
+            eligible_policy_apply_count=0,
+            notification_plan_created_v1_count=0,
+            send_worthy_notification_intent_count=0,
+        ),
+        selected_ready=None,
+    )
+
+    report, validator, policy, notifier, commit = await _run_with_notifier(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-macro",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_eligible_judge_output_ready=True,
+            expected_judge_output_ready_fingerprint="abc",
+        ),
+        repository,
+    )
+
+    assert report.status == "blocked"
+    assert report.reason_code == "send_worthy_target_requires_exact_source_or_live_openai"
+    assert report.nearest_send_worthy_missing_stage == "source_or_live_openai"
+    assert validator.calls == []
+    assert policy.calls == []
+    assert notifier.calls == []
+    assert commit.calls == 0
 
 
 @pytest.mark.asyncio

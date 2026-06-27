@@ -37,7 +37,9 @@ NOTIFICATION_INTENT_SELECTION_CONFIRM_TOKEN = "latest-send-worthy-notification-i
 VALIDATOR_CONFIRM_TOKEN = "exact-validator-apply"
 POLICY_CONFIRM_TOKEN = "exact-policy-apply"
 NOTIFIER_CONFIRM_TOKEN = "send-worthy-notification-intent-to-send-disabled-proof"
+MACRO_CONFIRM_TOKEN = "macro-send-worthy-to-send-disabled-proof"
 PLACEHOLDER_REDIS_URL = "redis_locator_not_attempted"
+VALID_MODES = {"plan", "execute-validator", "execute-policy", "execute-notifier", "execute-macro"}
 STRICT_UUID_TEXT_SQL_RE = (
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -214,6 +216,7 @@ class PostJudgeNotificationPipelineInventoryReport:
     selected_analysis_fingerprint: str | None
     selected_notification_intent_fingerprint: str | None
     selected_notification_plan_fingerprint: str | None
+    nearest_send_worthy_missing_stage: str | None
     final_verdict: str | None
     delivery_decision: str | None
     validator_attempted: bool
@@ -1251,6 +1254,18 @@ async def run_post_judge_notification_pipeline_inventory(
                 selected_notification=selected_notification,
             )
 
+        if request.mode == "execute-macro":
+            return await _execute_macro(
+                request=request,
+                validator_config=validator_config,
+                policy_config=policy_config,
+                components=components,
+                report=report,
+                selected_ready=selected_ready,
+                selected_policy=selected_policy,
+                selected_notification=selected_notification,
+            )
+
         return replace(report, status="blocked", reason_code="invalid_mode")
     except PostJudgeNotificationPipelineInventoryConfigError as exc:
         return replace(report, status="blocked", reason_code=_safe_reason_code_value(exc))
@@ -1459,6 +1474,152 @@ async def _execute_notifier(
     return replace(report, status="failed", reason_code="notification_readback_invalid")
 
 
+async def _execute_macro(
+    *,
+    request: PostJudgeNotificationPipelineInventoryRequest,
+    validator_config: AnalysisValidatorConfig,
+    policy_config: PolicyEngineConfig,
+    components: PostJudgeNotificationPipelineInventoryComponents,
+    report: PostJudgeNotificationPipelineInventoryReport,
+    selected_ready: SelectedTarget | None,
+    selected_policy: SelectedTarget | None,
+    selected_notification: SelectedNotificationIntentTarget | None,
+) -> PostJudgeNotificationPipelineInventoryReport:
+    if request.select_latest_send_worthy_notification_intent:
+        return await _execute_notifier(
+            request=request,
+            policy_config=policy_config,
+            components=components,
+            report=report,
+            selected_notification=selected_notification,
+        )
+
+    if request.select_latest_eligible_policy_apply:
+        if selected_policy is None:
+            return replace(report, status="blocked", reason_code=_macro_no_send_worthy_target_reason(report.counts))
+        policy_report = await _execute_policy(
+            request=request,
+            policy_config=policy_config,
+            components=components,
+            report=report,
+            selected_policy=selected_policy,
+        )
+        return await _execute_macro_notifier_after_policy(
+            request=request,
+            policy_config=policy_config,
+            components=components,
+            report=policy_report,
+            selected_policy=selected_policy,
+        )
+
+    if request.select_latest_eligible_judge_output_ready:
+        if selected_ready is None:
+            return replace(report, status="blocked", reason_code=_macro_no_send_worthy_target_reason(report.counts))
+        validator_report = await _execute_validator(
+            request=request,
+            validator_config=validator_config,
+            policy_config=policy_config,
+            components=components,
+            report=report,
+            selected_ready=selected_ready,
+        )
+        if validator_report.status != "pass":
+            return validator_report
+        if validator_report.reason_code != "validator_policy_apply_materialized":
+            return replace(validator_report, status="blocked", reason_code=validator_report.reason_code)
+
+        selected_policy_after_validator = await components.inventory_repository.select_latest_eligible_policy_apply(
+            lookback_hours=request.lookback_hours,
+            sample_limit=request.sample_limit,
+            policy_version=policy_config.policy_version,
+            delivery_policy_version=policy_config.delivery_policy_version,
+        )
+        if selected_policy_after_validator is None:
+            return replace(validator_report, status="blocked", reason_code="policy_target_missing_after_validator")
+        if not _same_judge_target(selected_policy_after_validator, selected_ready):
+            return replace(validator_report, status="blocked", reason_code="policy_target_changed_after_validator")
+
+        policy_request = replace(
+            request,
+            select_latest_eligible_judge_output_ready=False,
+            expected_judge_output_ready_fingerprint=None,
+            select_latest_eligible_policy_apply=True,
+            expected_policy_apply_fingerprint=selected_policy_after_validator.event_fingerprint,
+        )
+        policy_report = await _execute_policy(
+            request=policy_request,
+            policy_config=policy_config,
+            components=components,
+            report=_apply_selected_policy(validator_report, selected_policy_after_validator),
+            selected_policy=selected_policy_after_validator,
+        )
+        return await _execute_macro_notifier_after_policy(
+            request=request,
+            policy_config=policy_config,
+            components=components,
+            report=policy_report,
+            selected_policy=selected_policy_after_validator,
+        )
+
+    return replace(report, status="blocked", reason_code="macro_selector_required")
+
+
+async def _execute_macro_notifier_after_policy(
+    *,
+    request: PostJudgeNotificationPipelineInventoryRequest,
+    policy_config: PolicyEngineConfig,
+    components: PostJudgeNotificationPipelineInventoryComponents,
+    report: PostJudgeNotificationPipelineInventoryReport,
+    selected_policy: SelectedTarget,
+) -> PostJudgeNotificationPipelineInventoryReport:
+    if report.status != "pass":
+        return report
+    if report.reason_code == "policy_suppressed_no_notification_intent_required":
+        return replace(report, status="blocked", reason_code="send_worthy_target_policy_suppressed")
+    if report.reason_code != "policy_analysis_notification_intent_materialized":
+        return replace(report, status="blocked", reason_code=report.reason_code)
+
+    selected_notification = await components.inventory_repository.select_latest_send_worthy_notification_intent(
+        lookback_hours=request.lookback_hours,
+        sample_limit=request.sample_limit,
+        policy_version=policy_config.policy_version,
+        delivery_policy_version=policy_config.delivery_policy_version,
+    )
+    if selected_notification is None:
+        return replace(report, status="blocked", reason_code="notification_intent_missing_after_policy")
+    if (
+        selected_notification.judge_output_id != selected_policy.judge_output_id
+        or selected_notification.candidate_group_id != selected_policy.candidate_group_id
+    ):
+        return replace(report, status="blocked", reason_code="notification_intent_not_from_selected_policy")
+
+    notifier_request = replace(
+        request,
+        select_latest_eligible_judge_output_ready=False,
+        expected_judge_output_ready_fingerprint=None,
+        select_latest_eligible_policy_apply=False,
+        expected_policy_apply_fingerprint=None,
+        select_latest_send_worthy_notification_intent=True,
+        expected_notification_intent_fingerprint=selected_notification.event_fingerprint,
+    )
+    return await _execute_notifier(
+        request=notifier_request,
+        policy_config=policy_config,
+        components=components,
+        report=_apply_selected_notification(report, selected_notification),
+        selected_notification=selected_notification,
+    )
+
+
+def _same_judge_target(left: SelectedTarget, right: SelectedTarget) -> bool:
+    return (
+        left.judge_run_id == right.judge_run_id
+        and left.judge_output_id == right.judge_output_id
+        and left.candidate_group_id == right.candidate_group_id
+        and left.bundle_id == right.bundle_id
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = SilentArgumentParser(prog="post-judge-notification-pipeline-inventory", allow_abbrev=False)
     parser.add_argument("--mode")
@@ -1492,7 +1653,7 @@ async def run_cli(
         emit_json(_compact_json(asdict(_argument_report(str(exc)))))
         return 2
 
-    mode = str(args.mode) if args.mode in {"plan", "execute-validator", "execute-policy", "execute-notifier"} else "unknown"
+    mode = str(args.mode) if args.mode in VALID_MODES else "unknown"
     validation_error = _cli_request_error(args)
     if validation_error is not None:
         emit_json(
@@ -1698,7 +1859,7 @@ async def sql_inventory_components(
 
 
 def _cli_request_error(args: argparse.Namespace) -> str | None:
-    if args.mode not in {"plan", "execute-validator", "execute-policy", "execute-notifier"}:
+    if args.mode not in VALID_MODES:
         return "invalid_mode"
     if not args.env_file:
         return "env_file_required"
@@ -1731,6 +1892,29 @@ def _cli_request_error(args: argparse.Namespace) -> str | None:
         if not args.select_latest_send_worthy_notification_intent:
             return "notification_intent_selector_required"
         if not _optional_str(args.expected_notification_intent_fingerprint):
+            return "expected_notification_intent_fingerprint_missing"
+    if args.mode == "execute-macro":
+        if args.confirm != MACRO_CONFIRM_TOKEN:
+            return "macro_send_worthy_confirm_missing"
+        selector_count = sum(
+            bool(value)
+            for value in (
+                args.select_latest_eligible_judge_output_ready,
+                args.select_latest_eligible_policy_apply,
+                args.select_latest_send_worthy_notification_intent,
+            )
+        )
+        if selector_count != 1:
+            return "macro_exactly_one_selector_required"
+        if args.select_latest_eligible_judge_output_ready and not _optional_str(
+            args.expected_judge_output_ready_fingerprint
+        ):
+            return "expected_judge_output_ready_fingerprint_missing"
+        if args.select_latest_eligible_policy_apply and not _optional_str(args.expected_policy_apply_fingerprint):
+            return "expected_policy_apply_fingerprint_missing"
+        if args.select_latest_send_worthy_notification_intent and not _optional_str(
+            args.expected_notification_intent_fingerprint
+        ):
             return "expected_notification_intent_fingerprint_missing"
     return None
 
@@ -1847,7 +2031,12 @@ def _apply_counts(
     report: PostJudgeNotificationPipelineInventoryReport,
     counts: InventoryCounts,
 ) -> PostJudgeNotificationPipelineInventoryReport:
-    return replace(report, counts=_counts_to_report(counts))
+    report_counts = _counts_to_report(counts)
+    return replace(
+        report,
+        counts=report_counts,
+        nearest_send_worthy_missing_stage=_nearest_send_worthy_missing_stage(report_counts),
+    )
 
 
 def _apply_selected_ready(
@@ -2060,6 +2249,7 @@ def _report(
         selected_analysis_fingerprint=None,
         selected_notification_intent_fingerprint=None,
         selected_notification_plan_fingerprint=None,
+        nearest_send_worthy_missing_stage=None,
         final_verdict=None,
         delivery_decision=None,
         validator_attempted=False,
@@ -2137,6 +2327,40 @@ def _no_send_worthy_target_reason(counts: Mapping[str, Any]) -> str:
     if _int(counts.get("send_worthy_notification_intent_count")) == 0:
         return "send_worthy_target_missing"
     return "no_eligible_send_worthy_notification_intent_target"
+
+
+def _macro_no_send_worthy_target_reason(counts: Mapping[str, Any]) -> str:
+    if _int(counts.get("send_worthy_notification_intent_count")) > 0:
+        return "no_eligible_send_worthy_notification_intent_target"
+    if _int(counts.get("eligible_policy_apply_count")) > 0:
+        return "send_worthy_target_requires_policy_execute"
+    if _int(counts.get("eligible_judge_output_ready_count")) > 0:
+        return "send_worthy_target_requires_validator_execute"
+    if _int(counts.get("analysis_policy_apply_v1_count")) > 0:
+        return "send_worthy_target_requires_non_suppress_policy_output"
+    if _int(counts.get("judge_output_ready_v1_count")) > 0:
+        return "send_worthy_target_requires_validator_or_policy_recovery"
+    if _int(counts.get("judge_call_requested_v1_count")) > 0:
+        return "send_worthy_target_requires_live_openai_or_judge_recovery"
+    return "send_worthy_target_requires_exact_source_or_live_openai"
+
+
+def _nearest_send_worthy_missing_stage(counts: Mapping[str, Any]) -> str | None:
+    if _int(counts.get("send_worthy_notification_intent_count")) > 0:
+        return None
+    if _int(counts.get("eligible_policy_apply_count")) > 0:
+        return "analysis.policy.apply.v1"
+    if _int(counts.get("eligible_judge_output_ready_count")) > 0:
+        return "judge.output.ready.v1"
+    if _int(counts.get("analysis_policy_apply_v1_count")) > 0:
+        return "policy_engine_non_suppress_output"
+    if _int(counts.get("judge_output_ready_v1_count")) > 0:
+        return "analysis_validator_or_policy_recovery"
+    if _int(counts.get("judge_outputs_count")) > 0:
+        return "judge.output.ready.v1"
+    if _int(counts.get("judge_call_requested_v1_count")) > 0:
+        return "judge_openai"
+    return "source_or_live_openai"
 
 
 def _notification_proof_exactly_once(readback: NotificationProofReadback) -> bool:
@@ -2230,6 +2454,7 @@ if __name__ == "__main__":  # pragma: no cover
 
 __all__ = [
     "JUDGE_OUTPUT_SELECTION_CONFIRM_TOKEN",
+    "MACRO_CONFIRM_TOKEN",
     "NOTIFICATION_INTENT_SELECTION_CONFIRM_TOKEN",
     "NOTIFIER_CONFIRM_TOKEN",
     "POLICY_APPLY_SELECTION_CONFIRM_TOKEN",
