@@ -11,24 +11,30 @@ import pytest
 from services.analysis_validator.config import AnalysisValidatorConfig
 from services.maintenance.post_judge_notification_pipeline_inventory import (
     JUDGE_OUTPUT_SELECTION_CONFIRM_TOKEN,
+    NOTIFICATION_INTENT_SELECTION_CONFIRM_TOKEN,
+    NOTIFIER_CONFIRM_TOKEN,
     POLICY_APPLY_SELECTION_CONFIRM_TOKEN,
     POLICY_CONFIRM_TOKEN,
     STRICT_UUID_TEXT_SQL_RE,
     VALIDATOR_CONFIRM_TOKEN,
     InventoryCounts,
+    NotificationProofReadback,
     PolicyReadback,
     PostJudgeNotificationPipelineInventoryComponents,
     PostJudgeNotificationPipelineInventoryRequest,
     RuntimeConfigBundle,
+    SelectedNotificationIntentTarget,
     SelectedTarget,
     SqlPostJudgeNotificationPipelineInventoryRepository,
     ValidatorReadback,
     _ELIGIBLE_POLICY_SQL,
     _ELIGIBLE_READY_SQL,
+    _SEND_WORTHY_NOTIFICATION_INTENT_SQL,
     _fingerprint,
     run_cli,
     run_post_judge_notification_pipeline_inventory,
 )
+from services.notifier_telegram.config import NotifierTelegramConfig
 from services.policy_engine.config import PolicyEngineConfig
 
 
@@ -50,19 +56,25 @@ class FakeRepository:
         counts: InventoryCounts | None = None,
         selected_ready: SelectedTarget | None = None,
         selected_policy: SelectedTarget | None = None,
+        selected_notification: SelectedNotificationIntentTarget | None = None,
         validator_readback: ValidatorReadback | None = None,
         policy_readback: PolicyReadback | None = None,
+        notification_readbacks: list[NotificationProofReadback] | None = None,
     ) -> None:
         self.counts = counts or InventoryCounts()
         self.selected_ready = selected_ready
         self.selected_policy = selected_policy
+        self.selected_notification = selected_notification
         self.validator_readback = validator_readback or ValidatorReadback()
         self.policy_readback = policy_readback or PolicyReadback()
+        self.notification_readbacks = list(notification_readbacks or [NotificationProofReadback()])
         self.inventory_calls = 0
         self.ready_select_calls = 0
         self.policy_select_calls = 0
+        self.notification_select_calls = 0
         self.validator_readback_calls = 0
         self.policy_readback_calls = 0
+        self.notification_readback_calls = 0
         self.raw_values = [
             SENSITIVE_TEXT_SENTINEL,
             SENSITIVE_URL_SENTINEL,
@@ -120,6 +132,21 @@ class FakeRepository:
         self.policy_select_calls += 1
         return self.selected_policy
 
+    async def select_latest_send_worthy_notification_intent(
+        self,
+        *,
+        lookback_hours: int,
+        sample_limit: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> SelectedNotificationIntentTarget | None:
+        assert 1 <= lookback_hours <= 720
+        assert 1 <= sample_limit <= 500
+        assert policy_version == "verdict_policy_v1"
+        assert delivery_policy_version == "delivery_policy_v1"
+        self.notification_select_calls += 1
+        return self.selected_notification
+
     async def load_validator_readback(
         self,
         *,
@@ -148,6 +175,21 @@ class FakeRepository:
         self.policy_readback_calls += 1
         return self.policy_readback
 
+    async def load_notification_proof_readback(
+        self,
+        *,
+        notification_intent_event_id: UUID,
+        analysis_id: UUID,
+        notification_plan_id: UUID,
+    ) -> NotificationProofReadback:
+        assert notification_intent_event_id
+        assert analysis_id
+        assert notification_plan_id
+        self.notification_readback_calls += 1
+        if len(self.notification_readbacks) > 1:
+            return self.notification_readbacks.pop(0)
+        return self.notification_readbacks[0]
+
 
 class FakeTriggerService:
     def __init__(self) -> None:
@@ -155,6 +197,10 @@ class FakeTriggerService:
 
     async def handle_trigger_event(self, trigger_event_id: str | UUID) -> None:
         self.calls.append(UUID(str(trigger_event_id)))
+
+
+class FakeNotifierService(FakeTriggerService):
+    pass
 
 
 class CommitRecorder:
@@ -227,12 +273,36 @@ def _policy_config() -> PolicyEngineConfig:
     )
 
 
+def _notifier_config() -> NotifierTelegramConfig:
+    return NotifierTelegramConfig(
+        app_env="test",
+        database_url=SENSITIVE_DB_LOCATOR_SENTINEL,
+        redis_url="redis_locator_not_attempted",
+        telegram_bot_token="",
+        queue_name="q.notification.send",
+        consumer_group="notifier-telegram",
+        consumer_name="test",
+        batch_size=1,
+        block_ms=1,
+        dry_run=True,
+        allow_edits=False,
+        enable_notification_send=False,
+        enable_digest_runtime=False,
+        max_message_chars=3800,
+        edit_window_minutes=180,
+        telegram_api_base_url="https://api.telegram.org",
+        request_timeout_sec=1.0,
+        log_level="INFO",
+    )
+
+
 def _runtime_bundle() -> RuntimeConfigBundle:
     return RuntimeConfigBundle(
         database_url=SENSITIVE_DB_LOCATOR_SENTINEL,
         values={},
         validator_config=_validator_config(),
         policy_config=_policy_config(),
+        notifier_config=_notifier_config(),
     )
 
 
@@ -241,20 +311,30 @@ def _components(
     *,
     validator: FakeTriggerService | None = None,
     policy: FakeTriggerService | None = None,
+    notifier: FakeNotifierService | None = None,
     commit: CommitRecorder | None = None,
-) -> tuple[PostJudgeNotificationPipelineInventoryComponents, FakeTriggerService, FakeTriggerService, CommitRecorder]:
+) -> tuple[
+    PostJudgeNotificationPipelineInventoryComponents,
+    FakeTriggerService,
+    FakeTriggerService,
+    FakeNotifierService,
+    CommitRecorder,
+]:
     validator_service = validator or FakeTriggerService()
     policy_service = policy or FakeTriggerService()
+    notifier_service = notifier or FakeNotifierService()
     commit_recorder = commit or CommitRecorder()
     return (
         PostJudgeNotificationPipelineInventoryComponents(
             inventory_repository=repository,
             validator_service=validator_service,
             policy_service=policy_service,
+            notifier_service=notifier_service,
             commit_active_transaction=commit_recorder,
         ),
         validator_service,
         policy_service,
+        notifier_service,
         commit_recorder,
     )
 
@@ -266,6 +346,18 @@ def _target() -> SelectedTarget:
         judge_output_id=uuid4(),
         candidate_group_id=uuid4(),
         bundle_id=uuid4(),
+    )
+
+
+def _notification_target(*, delivery_decision: str = "send_now") -> SelectedNotificationIntentTarget:
+    return SelectedNotificationIntentTarget(
+        event_id=uuid4(),
+        analysis_id=uuid4(),
+        notification_plan_id=uuid4(),
+        judge_output_id=uuid4(),
+        candidate_group_id=uuid4(),
+        verdict="inspect_now",
+        delivery_decision=delivery_decision,
     )
 
 
@@ -294,6 +386,8 @@ def _counts(**overrides: object) -> InventoryCounts:
         "eligible_judge_output_ready_count": 1,
         "eligible_policy_apply_count": 0,
         "policy_apply_already_materialized_count": 0,
+        "send_worthy_notification_intent_count": 0,
+        "send_worthy_notification_intent_already_materialized_count": 0,
     }
     values.update(overrides)
     return InventoryCounts(**values)  # type: ignore[arg-type]
@@ -314,6 +408,7 @@ def test_old_loose_uuid_predicate_is_absent_from_payload_sql_guards() -> None:
     sql_surfaces = [
         _ELIGIBLE_READY_SQL,
         _ELIGIBLE_POLICY_SQL,
+        _SEND_WORTHY_NOTIFICATION_INTENT_SQL,
         policy_materialized_sql_source,
     ]
 
@@ -341,11 +436,19 @@ async def test_policy_materialized_count_runtime_sql_uses_strict_uuid_payload_gu
     assert "~* '^[0-9a-f-" not in query
 
 
+def test_send_worthy_notification_intent_sql_stays_on_existing_intent_and_non_suppress_analysis() -> None:
+    assert "event_type = 'notification.plan.created.v1'" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "aggregate_type = 'analysis'" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "a.delivery_decision::text <> 'suppress'" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "notification.delivery.result.v1" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "telegram_response_json->>'send_disabled' = 'true'" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+
+
 async def _run(
     request: PostJudgeNotificationPipelineInventoryRequest,
     repository: FakeRepository,
 ) -> tuple[object, FakeTriggerService, FakeTriggerService, CommitRecorder]:
-    components, validator, policy, commit = _components(repository)
+    components, validator, policy, _notifier, commit = _components(repository)
     report = await run_post_judge_notification_pipeline_inventory(
         request,
         validator_config=_validator_config(),
@@ -353,6 +456,34 @@ async def _run(
         components=components,
     )
     return report, validator, policy, commit
+
+
+async def _run_with_notifier(
+    request: PostJudgeNotificationPipelineInventoryRequest,
+    repository: FakeRepository,
+    *,
+    notifier: FakeNotifierService | None = None,
+    telegram_attempted: bool = False,
+) -> tuple[object, FakeTriggerService, FakeTriggerService, FakeNotifierService, CommitRecorder]:
+    components, validator, policy, notifier_service, commit = _components(
+        repository,
+        notifier=notifier,
+    )
+    components = PostJudgeNotificationPipelineInventoryComponents(
+        inventory_repository=components.inventory_repository,
+        validator_service=components.validator_service,
+        policy_service=components.policy_service,
+        commit_active_transaction=components.commit_active_transaction,
+        notifier_service=components.notifier_service,
+        telegram_transport_attempted=lambda: telegram_attempted,
+    )
+    report = await run_post_judge_notification_pipeline_inventory(
+        request,
+        validator_config=_validator_config(),
+        policy_config=_policy_config(),
+        components=components,
+    )
+    return report, validator, policy, notifier_service, commit
 
 
 @pytest.mark.asyncio
@@ -404,6 +535,35 @@ async def _run(
                 "bad/value",
             ],
             "expected_policy_apply_fingerprint_invalid",
+        ),
+        (["--mode", "execute-notifier", "--env-file", "/tmp/runtime.env"], "exact_notifier_send_disabled_confirm_missing"),
+        (
+            [
+                "--mode",
+                "execute-notifier",
+                "--env-file",
+                "/tmp/runtime.env",
+                "--confirm",
+                NOTIFIER_CONFIRM_TOKEN,
+                "--select-latest-send-worthy-notification-intent",
+            ],
+            "notification_intent_selection_confirm_missing",
+        ),
+        (
+            [
+                "--mode",
+                "execute-notifier",
+                "--env-file",
+                "/tmp/runtime.env",
+                "--confirm",
+                NOTIFIER_CONFIRM_TOKEN,
+                "--select-latest-send-worthy-notification-intent",
+                "--notification-intent-selection-confirm",
+                NOTIFICATION_INTENT_SELECTION_CONFIRM_TOKEN,
+                "--expected-notification-intent-fingerprint",
+                "bad/value",
+            ],
+            "expected_notification_intent_fingerprint_invalid",
         ),
     ],
 )
@@ -705,6 +865,189 @@ async def test_execute_policy_suppress_requires_no_notification_intent() -> None
     assert policy.calls == [selected.event_id]
     assert commit.calls == 1
     assert validator.calls == []
+
+
+@pytest.mark.asyncio
+async def test_plan_selects_latest_send_worthy_notification_intent_target() -> None:
+    selected = _notification_target()
+    repository = FakeRepository(
+        counts=_counts(
+            notification_plan_created_v1_count=1,
+            send_worthy_notification_intent_count=1,
+        ),
+        selected_notification=selected,
+    )
+
+    report, validator, policy, commit = await _run(
+        PostJudgeNotificationPipelineInventoryRequest(mode="plan", lookback_hours=72, sample_limit=100),
+        repository,
+    )
+
+    assert report.status == "pass"
+    assert report.selected_notification_intent_fingerprint == _fingerprint(selected.event_id)
+    assert report.selected_analysis_fingerprint == _fingerprint(selected.analysis_id)
+    assert report.selected_notification_plan_fingerprint == _fingerprint(selected.notification_plan_id)
+    assert report.selected_judge_output_fingerprint == _fingerprint(selected.judge_output_id)
+    assert report.selected_candidate_group_fingerprint == _fingerprint(selected.candidate_group_id)
+    assert report.final_verdict == "inspect_now"
+    assert report.delivery_decision == "send_now"
+    assert validator.calls == []
+    assert policy.calls == []
+    assert commit.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_notifier_calls_existing_service_once_and_proves_send_disabled_readback() -> None:
+    selected = _notification_target()
+    repository = FakeRepository(
+        counts=_counts(
+            notification_plan_created_v1_count=1,
+            send_worthy_notification_intent_count=1,
+        ),
+        selected_notification=selected,
+        notification_readbacks=[
+            NotificationProofReadback(notification_intent_event_count=1),
+            NotificationProofReadback(
+                notification_intent_event_count=1,
+                notification_plan_count=1,
+                notification_render_count=1,
+                send_disabled_delivery_record_count=1,
+                notification_delivery_result_event_count=1,
+            ),
+        ],
+    )
+
+    report, validator, policy, notifier, commit = await _run_with_notifier(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-notifier",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_send_worthy_notification_intent=True,
+            expected_notification_intent_fingerprint=_fingerprint(selected.event_id),
+        ),
+        repository,
+    )
+
+    assert report.status == "pass"
+    assert report.reason_code == "notification_send_disabled_suppressed"
+    assert report.notifier_attempted is True
+    assert report.db_write_attempted is True
+    assert report.notification_intent_created_or_present is True
+    assert report.notification_plan_created_or_present is True
+    assert report.notification_render_created_or_present is True
+    assert report.send_disabled_delivery_record_created_or_present is True
+    assert report.notification_delivery_result_event_created_or_present is True
+    assert report.telegram_transport_attempted is False
+    assert report.redis_attempted is False
+    assert report.openai_attempted is False
+    assert report.external_network_attempted is False
+    assert validator.calls == []
+    assert policy.calls == []
+    assert notifier.calls == [selected.event_id]
+    assert commit.calls == 1
+    assert repository.notification_select_calls == 2
+    assert repository.notification_readback_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_execute_notifier_already_materialized_short_circuits_without_duplicate_writes() -> None:
+    selected = _notification_target()
+    repository = FakeRepository(
+        counts=_counts(
+            notification_plan_created_v1_count=1,
+            send_worthy_notification_intent_count=1,
+            send_worthy_notification_intent_already_materialized_count=1,
+        ),
+        selected_notification=selected,
+        notification_readbacks=[
+            NotificationProofReadback(
+                notification_intent_event_count=1,
+                notification_plan_count=1,
+                notification_render_count=1,
+                send_disabled_delivery_record_count=1,
+                notification_delivery_result_event_count=1,
+            ),
+        ],
+    )
+
+    report, _validator, _policy, notifier, commit = await _run_with_notifier(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-notifier",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_send_worthy_notification_intent=True,
+            expected_notification_intent_fingerprint=_fingerprint(selected.event_id),
+        ),
+        repository,
+    )
+
+    assert report.status == "pass"
+    assert report.reason_code == "already_materialized"
+    assert report.notifier_attempted is False
+    assert report.db_write_attempted is False
+    assert report.notification_plan_created_or_present is True
+    assert report.notification_render_created_or_present is True
+    assert report.send_disabled_delivery_record_created_or_present is True
+    assert report.notification_delivery_result_event_created_or_present is True
+    assert notifier.calls == []
+    assert commit.calls == 0
+    assert repository.notification_readback_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_notifier_blocks_when_send_worthy_target_missing() -> None:
+    repository = FakeRepository(
+        counts=_counts(notification_plan_created_v1_count=1, send_worthy_notification_intent_count=0),
+        selected_notification=None,
+    )
+
+    report, _validator, _policy, notifier, commit = await _run_with_notifier(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-notifier",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_send_worthy_notification_intent=True,
+            expected_notification_intent_fingerprint="abc",
+        ),
+        repository,
+    )
+
+    assert report.status == "blocked"
+    assert report.reason_code == "send_worthy_target_missing"
+    assert report.notifier_attempted is False
+    assert notifier.calls == []
+    assert commit.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_notifier_transport_attempt_fails_closed() -> None:
+    selected = _notification_target()
+    repository = FakeRepository(
+        counts=_counts(
+            notification_plan_created_v1_count=1,
+            send_worthy_notification_intent_count=1,
+        ),
+        selected_notification=selected,
+        notification_readbacks=[NotificationProofReadback(notification_intent_event_count=1)],
+    )
+
+    report, _validator, _policy, notifier, commit = await _run_with_notifier(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-notifier",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_send_worthy_notification_intent=True,
+            expected_notification_intent_fingerprint=_fingerprint(selected.event_id),
+        ),
+        repository,
+        telegram_attempted=True,
+    )
+
+    assert report.status == "failed"
+    assert report.reason_code == "telegram_transport_attempted"
+    assert report.telegram_transport_attempted is True
+    assert notifier.calls == [selected.event_id]
+    assert commit.calls == 1
 
 
 @pytest.mark.asyncio

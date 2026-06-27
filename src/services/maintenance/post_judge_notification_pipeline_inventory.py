@@ -17,6 +17,10 @@ import sqlalchemy as sa
 from ..analysis_validator.config import AnalysisValidatorConfig
 from ..analysis_validator.repositories import AnalysisValidatorRepository
 from ..analysis_validator.service import AnalysisValidatorService
+from ..notifier_telegram.config import NotifierTelegramConfig
+from ..notifier_telegram.repositories import NotifierTelegramRepository
+from ..notifier_telegram.service import NotifierTelegramService
+from ..notifier_telegram.transport import TelegramTransportTerminalError
 from ..policy_engine.config import PolicyEngineConfig
 from ..policy_engine.repositories import PolicyEngineRepository
 from ..policy_engine.service import PolicyEngineService
@@ -26,10 +30,13 @@ SCHEMA_VERSION = "post_judge_notification_pipeline_inventory_report_v1"
 READY_EVENT_TYPE = "judge.output.ready.v1"
 POLICY_EVENT_TYPE = "analysis.policy.apply.v1"
 NOTIFICATION_EVENT_TYPE = "notification.plan.created.v1"
+DELIVERY_RESULT_EVENT_TYPE = "notification.delivery.result.v1"
 JUDGE_OUTPUT_SELECTION_CONFIRM_TOKEN = "latest-eligible-judge-output-ready"
 POLICY_APPLY_SELECTION_CONFIRM_TOKEN = "latest-eligible-policy-apply"
+NOTIFICATION_INTENT_SELECTION_CONFIRM_TOKEN = "latest-send-worthy-notification-intent"
 VALIDATOR_CONFIRM_TOKEN = "exact-validator-apply"
 POLICY_CONFIRM_TOKEN = "exact-policy-apply"
+NOTIFIER_CONFIRM_TOKEN = "send-worthy-notification-intent-to-send-disabled-proof"
 PLACEHOLDER_REDIS_URL = "redis_locator_not_attempted"
 STRICT_UUID_TEXT_SQL_RE = (
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -58,8 +65,18 @@ RUNTIME_VALUE_KEYS = {
     "ENABLE_LATER_DELIVERY",
     "ENABLE_SILENT_LATER",
     "ENABLE_NOTIFICATION_SEND",
+    "ENABLE_DIGEST_RUNTIME",
     "NOTIFY_RENDER_PROFILE_HIGH",
     "NOTIFY_RENDER_PROFILE_NORMAL",
+    "NOTIFIER_TELEGRAM_QUEUE_NAME",
+    "NOTIFIER_TELEGRAM_CONSUMER_GROUP",
+    "NOTIFIER_TELEGRAM_CONSUMER_NAME",
+    "NOTIFIER_TELEGRAM_BATCH_SIZE",
+    "NOTIFIER_TELEGRAM_BLOCK_MS",
+    "NOTIFIER_TELEGRAM_MAX_MESSAGE_CHARS",
+    "NOTIFIER_TELEGRAM_EDIT_WINDOW_MINUTES",
+    "TELEGRAM_API_BASE_URL",
+    "NOTIFIER_TELEGRAM_REQUEST_TIMEOUT_SEC",
     "LOG_LEVEL",
 }
 RUNTIME_FILE_KEYS = {"DATABASE_URL_FILE"}
@@ -96,6 +113,8 @@ class InventoryCounts:
     eligible_judge_output_ready_count: int = 0
     eligible_policy_apply_count: int = 0
     policy_apply_already_materialized_count: int = 0
+    send_worthy_notification_intent_count: int = 0
+    send_worthy_notification_intent_already_materialized_count: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -105,6 +124,21 @@ class SelectedTarget:
     judge_output_id: UUID
     candidate_group_id: UUID
     bundle_id: UUID
+
+    @property
+    def event_fingerprint(self) -> str:
+        return _fingerprint(self.event_id)
+
+
+@dataclass(slots=True, frozen=True)
+class SelectedNotificationIntentTarget:
+    event_id: UUID
+    analysis_id: UUID
+    notification_plan_id: UUID
+    judge_output_id: UUID
+    candidate_group_id: UUID
+    verdict: str
+    delivery_decision: str
 
     @property
     def event_fingerprint(self) -> str:
@@ -132,11 +166,21 @@ class PolicyReadback:
 
 
 @dataclass(slots=True, frozen=True)
+class NotificationProofReadback:
+    notification_intent_event_count: int = 0
+    notification_plan_count: int = 0
+    notification_render_count: int = 0
+    send_disabled_delivery_record_count: int = 0
+    notification_delivery_result_event_count: int = 0
+
+
+@dataclass(slots=True, frozen=True)
 class RuntimeConfigBundle:
     database_url: str
     values: Mapping[str, str]
     validator_config: AnalysisValidatorConfig
     policy_config: PolicyEngineConfig
+    notifier_config: NotifierTelegramConfig
 
 
 @dataclass(slots=True, frozen=True)
@@ -148,6 +192,8 @@ class PostJudgeNotificationPipelineInventoryRequest:
     expected_judge_output_ready_fingerprint: str | None = None
     select_latest_eligible_policy_apply: bool = False
     expected_policy_apply_fingerprint: str | None = None
+    select_latest_send_worthy_notification_intent: bool = False
+    expected_notification_intent_fingerprint: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -165,16 +211,27 @@ class PostJudgeNotificationPipelineInventoryReport:
     selected_judge_output_fingerprint: str | None
     selected_bundle_fingerprint: str | None
     selected_candidate_group_fingerprint: str | None
+    selected_analysis_fingerprint: str | None
+    selected_notification_intent_fingerprint: str | None
+    selected_notification_plan_fingerprint: str | None
+    final_verdict: str | None
+    delivery_decision: str | None
     validator_attempted: bool
     policy_attempted: bool
+    notifier_attempted: bool
     policy_event_created_or_present: bool
     analysis_created_or_present: bool
     notification_intent_created_or_present: bool
     notification_plan_created_or_present: bool
+    notification_render_created_or_present: bool
+    send_disabled_delivery_record_created_or_present: bool
+    notification_delivery_result_event_created_or_present: bool
     redis_attempted: bool
     telegram_attempted: bool
+    telegram_transport_attempted: bool
     openai_attempted: bool
     external_network_attempted: bool
+    db_write_attempted: bool
     redactions_applied: bool
     cleanup_completed: bool
 
@@ -207,6 +264,15 @@ class InventoryRepositoryProtocol(Protocol):
         delivery_policy_version: str,
     ) -> SelectedTarget | None: ...
 
+    async def select_latest_send_worthy_notification_intent(
+        self,
+        *,
+        lookback_hours: int,
+        sample_limit: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> SelectedNotificationIntentTarget | None: ...
+
     async def load_validator_readback(
         self,
         *,
@@ -224,9 +290,38 @@ class InventoryRepositoryProtocol(Protocol):
         delivery_policy_version: str,
     ) -> PolicyReadback: ...
 
+    async def load_notification_proof_readback(
+        self,
+        *,
+        notification_intent_event_id: UUID,
+        analysis_id: UUID,
+        notification_plan_id: UUID,
+    ) -> NotificationProofReadback: ...
+
 
 class TriggerServiceProtocol(Protocol):
     async def handle_trigger_event(self, trigger_event_id: str | UUID) -> None: ...
+
+
+class FailClosedTelegramTransport:
+    def __init__(self) -> None:
+        self.attempted = False
+
+    async def send_message(self, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        self.attempted = True
+        raise TelegramTransportTerminalError(
+            "telegram_transport_forbidden",
+            error_code="telegram_transport_forbidden",
+        )
+
+    async def edit_message_text(self, **kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        self.attempted = True
+        raise TelegramTransportTerminalError(
+            "telegram_transport_forbidden",
+            error_code="telegram_transport_forbidden",
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -235,6 +330,8 @@ class PostJudgeNotificationPipelineInventoryComponents:
     validator_service: TriggerServiceProtocol
     policy_service: TriggerServiceProtocol
     commit_active_transaction: Callable[[], Awaitable[None]]
+    notifier_service: TriggerServiceProtocol | None = None
+    telegram_transport_attempted: Callable[[], bool] | None = None
 
 
 class SqlPostJudgeNotificationPipelineInventoryRepository:
@@ -395,6 +492,16 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
             policy_version=policy_version,
             delivery_policy_version=delivery_policy_version,
         )
+        send_worthy_intent_count = await self._send_worthy_notification_intent_count(
+            lookback_hours=lookback_hours,
+            policy_version=policy_version,
+            delivery_policy_version=delivery_policy_version,
+        )
+        materialized_notification_count = await self._send_worthy_notification_intent_already_materialized_count(
+            lookback_hours=lookback_hours,
+            policy_version=policy_version,
+            delivery_policy_version=delivery_policy_version,
+        )
         return InventoryCounts(
             judge_call_requested_v1_count=_int(row["judge_call_requested_count"]),
             judge_run_status_counts={
@@ -425,6 +532,8 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
             eligible_judge_output_ready_count=eligible_ready_count,
             eligible_policy_apply_count=eligible_policy_count,
             policy_apply_already_materialized_count=materialized_policy_count,
+            send_worthy_notification_intent_count=send_worthy_intent_count,
+            send_worthy_notification_intent_already_materialized_count=materialized_notification_count,
         )
 
     async def select_latest_eligible_judge_output_ready(
@@ -458,6 +567,22 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
             delivery_policy_version=delivery_policy_version,
         )
         return _selected_from_row(rows[0]) if rows else None
+
+    async def select_latest_send_worthy_notification_intent(
+        self,
+        *,
+        lookback_hours: int,
+        sample_limit: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> SelectedNotificationIntentTarget | None:
+        rows = await self._send_worthy_notification_intent_rows(
+            lookback_hours=lookback_hours,
+            sample_limit=sample_limit,
+            policy_version=policy_version,
+            delivery_policy_version=delivery_policy_version,
+        )
+        return _selected_notification_intent_from_row(rows[0]) if rows else None
 
     async def load_validator_readback(
         self,
@@ -569,6 +694,69 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
             notification_plan_count=notification_plans,
         )
 
+    async def load_notification_proof_readback(
+        self,
+        *,
+        notification_intent_event_id: UUID,
+        analysis_id: UUID,
+        notification_plan_id: UUID,
+    ) -> NotificationProofReadback:
+        row = await self._one(
+            """
+            SELECT
+                (
+                    SELECT count(*)
+                    FROM event_outbox
+                    WHERE event_id = CAST(:notification_intent_event_id AS uuid)
+                      AND event_type = 'notification.plan.created.v1'
+                      AND aggregate_type = 'analysis'
+                      AND aggregate_id = CAST(:analysis_id AS uuid)
+                      AND payload_json->>'analysis_id' = :analysis_id_text
+                      AND payload_json->>'notification_plan_id' = :notification_plan_id_text
+                ) AS notification_intent_event_count,
+                (
+                    SELECT count(*)
+                    FROM notification_plans
+                    WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                      AND analysis_id = CAST(:analysis_id AS uuid)
+                ) AS notification_plan_count,
+                (
+                    SELECT count(*)
+                    FROM notification_renders
+                    WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                ) AS notification_render_count,
+                (
+                    SELECT count(*)
+                    FROM notification_delivery_records
+                    WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                      AND delivery_status::text = 'suppressed'
+                      AND telegram_response_json->>'send_disabled' = 'true'
+                      AND telegram_response_json->>'dry_run' = 'true'
+                ) AS send_disabled_delivery_record_count,
+                (
+                    SELECT count(*)
+                    FROM event_outbox
+                    WHERE event_type = 'notification.delivery.result.v1'
+                      AND aggregate_type = 'notification_plan'
+                      AND aggregate_id = CAST(:notification_plan_id AS uuid)
+                ) AS notification_delivery_result_event_count
+            """,
+            {
+                "notification_intent_event_id": str(notification_intent_event_id),
+                "analysis_id": str(analysis_id),
+                "analysis_id_text": str(analysis_id),
+                "notification_plan_id": str(notification_plan_id),
+                "notification_plan_id_text": str(notification_plan_id),
+            },
+        )
+        return NotificationProofReadback(
+            notification_intent_event_count=_int(row["notification_intent_event_count"]),
+            notification_plan_count=_int(row["notification_plan_count"]),
+            notification_render_count=_int(row["notification_render_count"]),
+            send_disabled_delivery_record_count=_int(row["send_disabled_delivery_record_count"]),
+            notification_delivery_result_event_count=_int(row["notification_delivery_result_event_count"]),
+        )
+
     async def _eligible_judge_output_ready_count(
         self,
         *,
@@ -650,6 +838,62 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
         )
         return _int(row["materialized_count"])
 
+    async def _send_worthy_notification_intent_count(
+        self,
+        *,
+        lookback_hours: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> int:
+        return _int(
+            (
+                await self._one(
+                    f"SELECT count(*) AS target_count FROM ({_SEND_WORTHY_NOTIFICATION_INTENT_SQL}) notification_targets",
+                    {
+                        "lookback_hours": lookback_hours,
+                        "sample_limit": 500,
+                        "policy_version": policy_version,
+                        "delivery_policy_version": delivery_policy_version,
+                    },
+                )
+            )["target_count"]
+        )
+
+    async def _send_worthy_notification_intent_already_materialized_count(
+        self,
+        *,
+        lookback_hours: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> int:
+        row = await self._one(
+            f"""
+            WITH send_worthy AS (
+                {_SEND_WORTHY_NOTIFICATION_INTENT_SQL}
+            )
+            SELECT count(DISTINCT sw.event_id) AS materialized_count
+            FROM send_worthy sw
+            JOIN notification_renders nr
+              ON nr.notification_plan_id = sw.notification_plan_id
+            JOIN notification_delivery_records ndr
+              ON ndr.notification_plan_id = sw.notification_plan_id
+             AND ndr.delivery_status::text = 'suppressed'
+             AND ndr.telegram_response_json->>'send_disabled' = 'true'
+             AND ndr.telegram_response_json->>'dry_run' = 'true'
+            JOIN event_outbox delivery_result
+              ON delivery_result.event_type = 'notification.delivery.result.v1'
+             AND delivery_result.aggregate_type = 'notification_plan'
+             AND delivery_result.aggregate_id = sw.notification_plan_id
+            """,
+            {
+                "lookback_hours": lookback_hours,
+                "sample_limit": 500,
+                "policy_version": policy_version,
+                "delivery_policy_version": delivery_policy_version,
+            },
+        )
+        return _int(row["materialized_count"])
+
     async def _eligible_judge_output_ready_rows(
         self,
         *,
@@ -678,6 +922,24 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
     ) -> list[Mapping[str, Any]]:
         return await self._rows(
             _ELIGIBLE_POLICY_SQL,
+            {
+                "lookback_hours": lookback_hours,
+                "sample_limit": sample_limit,
+                "policy_version": policy_version,
+                "delivery_policy_version": delivery_policy_version,
+            },
+        )
+
+    async def _send_worthy_notification_intent_rows(
+        self,
+        *,
+        lookback_hours: int,
+        sample_limit: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> list[Mapping[str, Any]]:
+        return await self._rows(
+            _SEND_WORTHY_NOTIFICATION_INTENT_SQL,
             {
                 "lookback_hours": lookback_hours,
                 "sample_limit": sample_limit,
@@ -838,6 +1100,82 @@ LIMIT :sample_limit
 """
 
 
+_SEND_WORTHY_NOTIFICATION_INTENT_SQL = f"""
+WITH candidate_events AS (
+    SELECT
+        eo.event_id,
+        eo.aggregate_id,
+        eo.created_at,
+        eo.payload_json->>'notification_plan_id' AS notification_plan_id_text,
+        eo.payload_json->>'analysis_id' AS analysis_id_text,
+        eo.payload_json->>'candidate_group_id' AS candidate_group_id_text,
+        eo.payload_json->>'delivery_decision' AS delivery_decision_text,
+        eo.payload_json->>'target_chat_id' AS target_chat_id_text,
+        eo.payload_json->>'material_change_hash' AS material_change_hash
+    FROM event_outbox eo
+    WHERE eo.event_type = 'notification.plan.created.v1'
+      AND eo.aggregate_type = 'analysis'
+      AND eo.created_at >= now() - make_interval(hours => :lookback_hours)
+      AND eo.payload_json->>'notification_plan_id' ~ '{STRICT_UUID_TEXT_SQL_RE}'
+      AND eo.payload_json->>'analysis_id' ~ '{STRICT_UUID_TEXT_SQL_RE}'
+      AND eo.payload_json->>'candidate_group_id' ~ '{STRICT_UUID_TEXT_SQL_RE}'
+      AND COALESCE(eo.payload_json->>'delivery_decision', '') <> 'suppress'
+      AND COALESCE(eo.payload_json->>'target_chat_id', '') ~ '^[0-9]+$'
+      AND COALESCE(eo.payload_json->>'material_change_hash', '') <> ''
+)
+SELECT
+    ce.event_id,
+    a.analysis_id,
+    CAST(ce.notification_plan_id_text AS uuid) AS notification_plan_id,
+    a.judge_output_id,
+    a.candidate_group_id,
+    a.verdict::text AS verdict,
+    a.delivery_decision::text AS delivery_decision
+FROM candidate_events ce
+JOIN analyses a
+  ON a.analysis_id = CAST(ce.analysis_id_text AS uuid)
+WHERE ce.aggregate_id = a.analysis_id
+  AND ce.analysis_id_text = a.analysis_id::text
+  AND ce.candidate_group_id_text = a.candidate_group_id::text
+  AND ce.delivery_decision_text = a.delivery_decision::text
+  AND a.policy_version = :policy_version
+  AND a.delivery_policy_version = :delivery_policy_version
+  AND a.delivery_decision::text <> 'suppress'
+  AND NOT EXISTS (
+        SELECT 1
+        FROM notification_plans sent_plan
+        JOIN notification_delivery_records sent_delivery
+          ON sent_delivery.notification_plan_id = sent_plan.notification_plan_id
+        WHERE sent_plan.analysis_id = a.analysis_id
+          AND sent_plan.target_chat_id = CAST(ce.target_chat_id_text AS bigint)
+          AND sent_plan.material_change_hash = ce.material_change_hash
+          AND sent_delivery.delivery_status::text IN ('sent', 'edited')
+  )
+ORDER BY
+    CASE
+        WHEN EXISTS (
+            SELECT 1
+            FROM notification_renders nr
+            JOIN notification_delivery_records ndr
+              ON ndr.notification_plan_id = CAST(ce.notification_plan_id_text AS uuid)
+             AND ndr.delivery_status::text = 'suppressed'
+             AND ndr.telegram_response_json->>'send_disabled' = 'true'
+             AND ndr.telegram_response_json->>'dry_run' = 'true'
+            JOIN event_outbox delivery_result
+              ON delivery_result.event_type = 'notification.delivery.result.v1'
+             AND delivery_result.aggregate_type = 'notification_plan'
+             AND delivery_result.aggregate_id = CAST(ce.notification_plan_id_text AS uuid)
+            WHERE nr.notification_plan_id = CAST(ce.notification_plan_id_text AS uuid)
+        )
+        THEN 1
+        ELSE 0
+    END ASC,
+    ce.created_at DESC,
+    ce.event_id DESC
+LIMIT :sample_limit
+"""
+
+
 async def run_post_judge_notification_pipeline_inventory(
     request: PostJudgeNotificationPipelineInventoryRequest,
     *,
@@ -872,8 +1210,15 @@ async def run_post_judge_notification_pipeline_inventory(
             policy_version=policy_config.policy_version,
             delivery_policy_version=policy_config.delivery_policy_version,
         )
+        selected_notification = await components.inventory_repository.select_latest_send_worthy_notification_intent(
+            lookback_hours=request.lookback_hours,
+            sample_limit=request.sample_limit,
+            policy_version=policy_config.policy_version,
+            delivery_policy_version=policy_config.delivery_policy_version,
+        )
         report = _apply_selected_ready(report, selected_ready)
         report = _apply_selected_policy(report, selected_policy)
+        report = _apply_selected_notification(report, selected_notification)
 
         if request.mode == "plan":
             return replace(report, status="pass", reason_code="inventory_plan_complete")
@@ -895,6 +1240,15 @@ async def run_post_judge_notification_pipeline_inventory(
                 components=components,
                 report=report,
                 selected_policy=selected_policy,
+            )
+
+        if request.mode == "execute-notifier":
+            return await _execute_notifier(
+                request=request,
+                policy_config=policy_config,
+                components=components,
+                report=report,
+                selected_notification=selected_notification,
             )
 
         return replace(report, status="blocked", reason_code="invalid_mode")
@@ -1013,6 +1367,98 @@ async def _execute_policy(
     return replace(report, status="failed", reason_code="policy_notification_intent_missing")
 
 
+async def _execute_notifier(
+    *,
+    request: PostJudgeNotificationPipelineInventoryRequest,
+    policy_config: PolicyEngineConfig,
+    components: PostJudgeNotificationPipelineInventoryComponents,
+    report: PostJudgeNotificationPipelineInventoryReport,
+    selected_notification: SelectedNotificationIntentTarget | None,
+) -> PostJudgeNotificationPipelineInventoryReport:
+    if not request.select_latest_send_worthy_notification_intent:
+        return replace(report, status="blocked", reason_code="notification_intent_selector_required")
+    if selected_notification is None:
+        return replace(report, status="blocked", reason_code=_no_send_worthy_target_reason(report.counts))
+    if request.expected_notification_intent_fingerprint != selected_notification.event_fingerprint:
+        return replace(report, status="blocked", reason_code="notification_intent_fingerprint_mismatch")
+    if selected_notification.delivery_decision == "suppress":
+        return replace(report, status="blocked", reason_code="send_worthy_target_suppress_worthy")
+    if components.notifier_service is None:
+        return replace(report, status="blocked", reason_code="notifier_service_missing")
+
+    preflight = await components.inventory_repository.select_latest_send_worthy_notification_intent(
+        lookback_hours=request.lookback_hours,
+        sample_limit=request.sample_limit,
+        policy_version=policy_config.policy_version,
+        delivery_policy_version=policy_config.delivery_policy_version,
+    )
+    if preflight is None:
+        return replace(report, status="blocked", reason_code="notification_intent_preflight_target_missing")
+    if preflight.event_fingerprint != selected_notification.event_fingerprint:
+        return replace(report, status="blocked", reason_code="notification_intent_preflight_target_changed")
+
+    before = await components.inventory_repository.load_notification_proof_readback(
+        notification_intent_event_id=preflight.event_id,
+        analysis_id=preflight.analysis_id,
+        notification_plan_id=preflight.notification_plan_id,
+    )
+    report = _apply_notification_readback(report, before)
+    if _notification_proof_exactly_once(before):
+        return replace(report, status="pass", reason_code="already_materialized")
+    if _notification_proof_ambiguous(before):
+        return replace(report, status="failed", reason_code="notification_proof_state_ambiguous")
+
+    report = replace(report, notifier_attempted=True, db_write_attempted=True)
+    try:
+        await components.notifier_service.handle_trigger_event(preflight.event_id)
+    except TelegramTransportTerminalError:
+        attempted = _telegram_transport_attempted(components)
+        return replace(
+            report,
+            telegram_attempted=attempted,
+            telegram_transport_attempted=attempted,
+            status="failed",
+            reason_code="telegram_transport_attempted",
+        )
+    except Exception:
+        return replace(report, status="failed", reason_code="notifier_execute_failed")
+
+    try:
+        await components.commit_active_transaction()
+    except Exception:
+        return replace(report, status="failed", reason_code="notifier_commit_failed")
+
+    attempted = _telegram_transport_attempted(components)
+    if attempted:
+        return replace(
+            report,
+            telegram_attempted=True,
+            telegram_transport_attempted=True,
+            status="failed",
+            reason_code="telegram_transport_attempted",
+        )
+
+    readback = await components.inventory_repository.load_notification_proof_readback(
+        notification_intent_event_id=preflight.event_id,
+        analysis_id=preflight.analysis_id,
+        notification_plan_id=preflight.notification_plan_id,
+    )
+    report = _apply_notification_readback(
+        replace(report, telegram_attempted=False, telegram_transport_attempted=False),
+        readback,
+    )
+    if _notification_proof_exactly_once(readback):
+        return replace(report, status="pass", reason_code="notification_send_disabled_suppressed")
+    if readback.notification_plan_count != 1 or readback.notification_render_count != 1:
+        return replace(report, status="failed", reason_code="notification_readback_invalid")
+    if (
+        readback.send_disabled_delivery_record_count != 1
+        or readback.notification_delivery_result_event_count != 1
+    ):
+        return replace(report, status="failed", reason_code="send_disabled_delivery_missing")
+    return replace(report, status="failed", reason_code="notification_readback_invalid")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = SilentArgumentParser(prog="post-judge-notification-pipeline-inventory", allow_abbrev=False)
     parser.add_argument("--mode")
@@ -1025,6 +1471,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--select-latest-eligible-policy-apply", action="store_true")
     parser.add_argument("--policy-apply-selection-confirm", default=None)
     parser.add_argument("--expected-policy-apply-fingerprint", default=None)
+    parser.add_argument("--select-latest-send-worthy-notification-intent", action="store_true")
+    parser.add_argument("--notification-intent-selection-confirm", default=None)
+    parser.add_argument("--expected-notification-intent-fingerprint", default=None)
     parser.add_argument("--confirm", default=None)
     return parser
 
@@ -1043,7 +1492,7 @@ async def run_cli(
         emit_json(_compact_json(asdict(_argument_report(str(exc)))))
         return 2
 
-    mode = str(args.mode) if args.mode in {"plan", "execute-validator", "execute-policy"} else "unknown"
+    mode = str(args.mode) if args.mode in {"plan", "execute-validator", "execute-policy", "execute-notifier"} else "unknown"
     validation_error = _cli_request_error(args)
     if validation_error is not None:
         emit_json(
@@ -1087,6 +1536,10 @@ async def run_cli(
         expected_judge_output_ready_fingerprint=_optional_str(args.expected_judge_output_ready_fingerprint),
         select_latest_eligible_policy_apply=bool(args.select_latest_eligible_policy_apply),
         expected_policy_apply_fingerprint=_optional_str(args.expected_policy_apply_fingerprint),
+        select_latest_send_worthy_notification_intent=bool(
+            args.select_latest_send_worthy_notification_intent
+        ),
+        expected_notification_intent_fingerprint=_optional_str(args.expected_notification_intent_fingerprint),
     )
 
     builder = components_builder or sql_inventory_components
@@ -1169,11 +1622,40 @@ def load_runtime_config(env_file: str) -> RuntimeConfigBundle:
         policy_config.validate()
     except (TypeError, ValueError):
         raise PostJudgeNotificationPipelineInventoryConfigError("policy_engine_config_invalid") from None
+    try:
+        notifier_config = NotifierTelegramConfig(
+            app_env=_read(resolved_values, "APP_ENV", "dev").lower(),
+            database_url=database_url,
+            redis_url=PLACEHOLDER_REDIS_URL,
+            telegram_bot_token="",
+            queue_name=_read(resolved_values, "NOTIFIER_TELEGRAM_QUEUE_NAME", "q.notification.send"),
+            consumer_group=_read(resolved_values, "NOTIFIER_TELEGRAM_CONSUMER_GROUP", "notifier-telegram"),
+            consumer_name=_read(
+                resolved_values,
+                "NOTIFIER_TELEGRAM_CONSUMER_NAME",
+                "post-judge-notification-pipeline-inventory",
+            ),
+            batch_size=int(_read(resolved_values, "NOTIFIER_TELEGRAM_BATCH_SIZE", "20")),
+            block_ms=int(_read(resolved_values, "NOTIFIER_TELEGRAM_BLOCK_MS", "5000")),
+            dry_run=True,
+            allow_edits=False,
+            enable_notification_send=False,
+            enable_digest_runtime=_bool_value(_read(resolved_values, "ENABLE_DIGEST_RUNTIME", "false")),
+            max_message_chars=int(_read(resolved_values, "NOTIFIER_TELEGRAM_MAX_MESSAGE_CHARS", "3800")),
+            edit_window_minutes=int(_read(resolved_values, "NOTIFIER_TELEGRAM_EDIT_WINDOW_MINUTES", "180")),
+            telegram_api_base_url=_read(resolved_values, "TELEGRAM_API_BASE_URL", "https://api.telegram.org"),
+            request_timeout_sec=float(_read(resolved_values, "NOTIFIER_TELEGRAM_REQUEST_TIMEOUT_SEC", "10")),
+            log_level=_read(resolved_values, "LOG_LEVEL", "INFO").upper(),
+        )
+        notifier_config.validate(require_transport_token=False)
+    except (TypeError, ValueError):
+        raise PostJudgeNotificationPipelineInventoryConfigError("notifier_config_invalid") from None
     return RuntimeConfigBundle(
         database_url=database_url,
         values=resolved_values,
         validator_config=validator_config,
         policy_config=policy_config,
+        notifier_config=notifier_config,
     )
 
 
@@ -1187,6 +1669,8 @@ async def sql_inventory_components(
     session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     try:
         async with session_factory() as session:
+            notifier_transport = FailClosedTelegramTransport()
+
             async def commit_active_transaction() -> None:
                 if session.in_transaction():
                     await session.commit()
@@ -1201,14 +1685,20 @@ async def sql_inventory_components(
                     runtime.policy_config,
                     repository=PolicyEngineRepository(session),
                 ),
+                notifier_service=NotifierTelegramService(
+                    runtime.notifier_config,
+                    repository=NotifierTelegramRepository(session),
+                    telegram_client=notifier_transport,
+                ),
                 commit_active_transaction=commit_active_transaction,
+                telegram_transport_attempted=lambda: notifier_transport.attempted,
             )
     finally:
         await engine.dispose()
 
 
 def _cli_request_error(args: argparse.Namespace) -> str | None:
-    if args.mode not in {"plan", "execute-validator", "execute-policy"}:
+    if args.mode not in {"plan", "execute-validator", "execute-policy", "execute-notifier"}:
         return "invalid_mode"
     if not args.env_file:
         return "env_file_required"
@@ -1235,6 +1725,13 @@ def _cli_request_error(args: argparse.Namespace) -> str | None:
             return "policy_selector_required"
         if not _optional_str(args.expected_policy_apply_fingerprint):
             return "expected_policy_apply_fingerprint_missing"
+    if args.mode == "execute-notifier":
+        if args.confirm != NOTIFIER_CONFIRM_TOKEN:
+            return "exact_notifier_send_disabled_confirm_missing"
+        if not args.select_latest_send_worthy_notification_intent:
+            return "notification_intent_selector_required"
+        if not _optional_str(args.expected_notification_intent_fingerprint):
+            return "expected_notification_intent_fingerprint_missing"
     return None
 
 
@@ -1249,10 +1746,23 @@ def _selector_args_error(args: argparse.Namespace) -> str | None:
         or args.policy_apply_selection_confirm is not None
         or args.expected_policy_apply_fingerprint is not None
     )
+    notification_args = (
+        args.select_latest_send_worthy_notification_intent
+        or args.notification_intent_selection_confirm is not None
+        or args.expected_notification_intent_fingerprint is not None
+    )
     if args.mode == "execute-validator" and policy_args:
         return "policy_selector_not_allowed_for_validator_execute"
+    if args.mode == "execute-validator" and notification_args:
+        return "notification_selector_not_allowed_for_validator_execute"
     if args.mode == "execute-policy" and ready_args:
         return "judge_output_selector_not_allowed_for_policy_execute"
+    if args.mode == "execute-policy" and notification_args:
+        return "notification_selector_not_allowed_for_policy_execute"
+    if args.mode == "execute-notifier" and ready_args:
+        return "judge_output_selector_not_allowed_for_notifier_execute"
+    if args.mode == "execute-notifier" and policy_args:
+        return "policy_selector_not_allowed_for_notifier_execute"
     if args.select_latest_eligible_judge_output_ready:
         if args.judge_output_selection_confirm != JUDGE_OUTPUT_SELECTION_CONFIRM_TOKEN:
             return "judge_output_selection_confirm_missing"
@@ -1263,9 +1773,15 @@ def _selector_args_error(args: argparse.Namespace) -> str | None:
             return "policy_apply_selection_confirm_missing"
     elif args.policy_apply_selection_confirm is not None:
         return "policy_apply_selection_confirm_without_selector"
+    if args.select_latest_send_worthy_notification_intent:
+        if args.notification_intent_selection_confirm != NOTIFICATION_INTENT_SELECTION_CONFIRM_TOKEN:
+            return "notification_intent_selection_confirm_missing"
+    elif args.notification_intent_selection_confirm is not None:
+        return "notification_intent_selection_confirm_without_selector"
     for value, reason in (
         (args.expected_judge_output_ready_fingerprint, "expected_judge_output_ready_fingerprint_invalid"),
         (args.expected_policy_apply_fingerprint, "expected_policy_apply_fingerprint_invalid"),
+        (args.expected_notification_intent_fingerprint, "expected_notification_intent_fingerprint_invalid"),
     ):
         if value is not None and not EXPECTED_FINGERPRINT_RE.fullmatch(str(value)):
             return reason
@@ -1370,6 +1886,28 @@ def _apply_selected_policy(
     )
 
 
+def _apply_selected_notification(
+    report: PostJudgeNotificationPipelineInventoryReport,
+    selected: SelectedNotificationIntentTarget | None,
+) -> PostJudgeNotificationPipelineInventoryReport:
+    if selected is None:
+        return report
+    return replace(
+        report,
+        selected_notification_intent_fingerprint=selected.event_fingerprint,
+        selected_analysis_fingerprint=_fingerprint(selected.analysis_id),
+        selected_notification_plan_fingerprint=_fingerprint(selected.notification_plan_id),
+        selected_judge_output_fingerprint=report.selected_judge_output_fingerprint
+        or _fingerprint(selected.judge_output_id),
+        selected_candidate_group_fingerprint=report.selected_candidate_group_fingerprint
+        or _fingerprint(selected.candidate_group_id),
+        final_verdict=_safe_bucket_value(selected.verdict),
+        delivery_decision=_safe_bucket_value(selected.delivery_decision),
+        analysis_created_or_present=True,
+        notification_intent_created_or_present=True,
+    )
+
+
 def _apply_validator_readback(
     report: PostJudgeNotificationPipelineInventoryReport,
     readback: ValidatorReadback,
@@ -1418,9 +1956,47 @@ def _apply_policy_readback(
     return replace(
         report,
         counts=counts,
+        selected_analysis_fingerprint=_fingerprint(readback.analysis_id) or report.selected_analysis_fingerprint,
+        final_verdict=_safe_bucket_value(readback.verdict) if readback.verdict is not None else report.final_verdict,
+        delivery_decision=(
+            _safe_bucket_value(readback.delivery_decision)
+            if readback.delivery_decision is not None
+            else report.delivery_decision
+        ),
         analysis_created_or_present=readback.analysis_count == 1,
         notification_intent_created_or_present=readback.notification_intent_event_count == 1,
         notification_plan_created_or_present=readback.notification_plan_count == 1,
+    )
+
+
+def _apply_notification_readback(
+    report: PostJudgeNotificationPipelineInventoryReport,
+    readback: NotificationProofReadback,
+) -> PostJudgeNotificationPipelineInventoryReport:
+    counts = dict(report.counts)
+    counts.update(
+        {
+            "selected_notification_intent_event_count": _int(readback.notification_intent_event_count),
+            "selected_notification_plan_count": _int(readback.notification_plan_count),
+            "selected_notification_render_count": _int(readback.notification_render_count),
+            "selected_send_disabled_delivery_record_count": _int(
+                readback.send_disabled_delivery_record_count
+            ),
+            "selected_notification_delivery_result_event_count": _int(
+                readback.notification_delivery_result_event_count
+            ),
+        }
+    )
+    return replace(
+        report,
+        counts=counts,
+        notification_intent_created_or_present=readback.notification_intent_event_count == 1,
+        notification_plan_created_or_present=readback.notification_plan_count == 1,
+        notification_render_created_or_present=readback.notification_render_count == 1,
+        send_disabled_delivery_record_created_or_present=readback.send_disabled_delivery_record_count == 1,
+        notification_delivery_result_event_created_or_present=(
+            readback.notification_delivery_result_event_count == 1
+        ),
     )
 
 
@@ -1452,6 +2028,10 @@ def _counts_to_report(counts: InventoryCounts) -> dict[str, Any]:
         "eligible_judge_output_ready_count": _int(counts.eligible_judge_output_ready_count),
         "eligible_policy_apply_count": _int(counts.eligible_policy_apply_count),
         "policy_apply_already_materialized_count": _int(counts.policy_apply_already_materialized_count),
+        "send_worthy_notification_intent_count": _int(counts.send_worthy_notification_intent_count),
+        "send_worthy_notification_intent_already_materialized_count": _int(
+            counts.send_worthy_notification_intent_already_materialized_count
+        ),
     }
 
 
@@ -1477,16 +2057,27 @@ def _report(
         selected_judge_output_fingerprint=None,
         selected_bundle_fingerprint=None,
         selected_candidate_group_fingerprint=None,
+        selected_analysis_fingerprint=None,
+        selected_notification_intent_fingerprint=None,
+        selected_notification_plan_fingerprint=None,
+        final_verdict=None,
+        delivery_decision=None,
         validator_attempted=False,
         policy_attempted=False,
+        notifier_attempted=False,
         policy_event_created_or_present=False,
         analysis_created_or_present=False,
         notification_intent_created_or_present=False,
         notification_plan_created_or_present=False,
+        notification_render_created_or_present=False,
+        send_disabled_delivery_record_created_or_present=False,
+        notification_delivery_result_event_created_or_present=False,
         redis_attempted=False,
         telegram_attempted=False,
+        telegram_transport_attempted=False,
         openai_attempted=False,
         external_network_attempted=False,
+        db_write_attempted=False,
         redactions_applied=True,
         cleanup_completed=True,
     )
@@ -1512,6 +2103,18 @@ def _selected_from_row(row: Mapping[str, Any]) -> SelectedTarget:
     )
 
 
+def _selected_notification_intent_from_row(row: Mapping[str, Any]) -> SelectedNotificationIntentTarget:
+    return SelectedNotificationIntentTarget(
+        event_id=UUID(str(row["event_id"])),
+        analysis_id=UUID(str(row["analysis_id"])),
+        notification_plan_id=UUID(str(row["notification_plan_id"])),
+        judge_output_id=UUID(str(row["judge_output_id"])),
+        candidate_group_id=UUID(str(row["candidate_group_id"])),
+        verdict=_safe_bucket_value(row["verdict"]),
+        delivery_decision=_safe_bucket_value(row["delivery_decision"]),
+    )
+
+
 def _no_ready_target_reason(counts: Mapping[str, Any]) -> str:
     if _int(counts.get("judge_output_ready_v1_count")) == 0:
         return "no_judge_output_ready_events_in_lookback"
@@ -1526,6 +2129,43 @@ def _no_policy_target_reason(counts: Mapping[str, Any]) -> str:
     if _int(counts.get("policy_apply_already_materialized_count")) > 0:
         return "policy_apply_already_materialized"
     return "no_eligible_policy_apply_target"
+
+
+def _no_send_worthy_target_reason(counts: Mapping[str, Any]) -> str:
+    if _int(counts.get("notification_plan_created_v1_count")) == 0:
+        return "notification_intent_missing"
+    if _int(counts.get("send_worthy_notification_intent_count")) == 0:
+        return "send_worthy_target_missing"
+    return "no_eligible_send_worthy_notification_intent_target"
+
+
+def _notification_proof_exactly_once(readback: NotificationProofReadback) -> bool:
+    return (
+        readback.notification_intent_event_count == 1
+        and readback.notification_plan_count == 1
+        and readback.notification_render_count == 1
+        and readback.send_disabled_delivery_record_count == 1
+        and readback.notification_delivery_result_event_count == 1
+    )
+
+
+def _notification_proof_ambiguous(readback: NotificationProofReadback) -> bool:
+    return (
+        readback.notification_intent_event_count > 1
+        or readback.notification_plan_count > 1
+        or readback.notification_render_count > 1
+        or readback.send_disabled_delivery_record_count > 1
+        or readback.notification_delivery_result_event_count > 1
+    )
+
+
+def _telegram_transport_attempted(components: PostJudgeNotificationPipelineInventoryComponents) -> bool:
+    if components.telegram_transport_attempted is None:
+        return False
+    try:
+        return bool(components.telegram_transport_attempted())
+    except Exception:
+        return True
 
 
 def _read(values: Mapping[str, str], key: str, default: str = "") -> str:
@@ -1590,20 +2230,27 @@ if __name__ == "__main__":  # pragma: no cover
 
 __all__ = [
     "JUDGE_OUTPUT_SELECTION_CONFIRM_TOKEN",
+    "NOTIFICATION_INTENT_SELECTION_CONFIRM_TOKEN",
+    "NOTIFIER_CONFIRM_TOKEN",
     "POLICY_APPLY_SELECTION_CONFIRM_TOKEN",
     "POLICY_CONFIRM_TOKEN",
     "READY_EVENT_TYPE",
     "POLICY_EVENT_TYPE",
+    "DELIVERY_RESULT_EVENT_TYPE",
+    "FailClosedTelegramTransport",
     "PostJudgeNotificationPipelineInventoryComponents",
     "PostJudgeNotificationPipelineInventoryConfigError",
     "PostJudgeNotificationPipelineInventoryReport",
     "PostJudgeNotificationPipelineInventoryRequest",
     "RuntimeConfigBundle",
     "SCHEMA_VERSION",
+    "SelectedNotificationIntentTarget",
     "SelectedTarget",
     "VALIDATOR_CONFIRM_TOKEN",
     "ValidatorReadback",
+    "NotificationProofReadback",
     "PolicyReadback",
+    "_SEND_WORTHY_NOTIFICATION_INTENT_SQL",
     "_fingerprint",
     "build_parser",
     "load_runtime_config",
