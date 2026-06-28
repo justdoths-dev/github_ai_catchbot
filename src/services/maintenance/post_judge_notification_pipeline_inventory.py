@@ -180,6 +180,16 @@ class LiveDeliveredNotificationProofTarget:
 
 
 @dataclass(slots=True, frozen=True)
+class SelectedPolicyOutcome:
+    analysis_id: UUID
+    judge_output_id: UUID
+    candidate_group_id: UUID
+    verdict: str
+    delivery_decision: str
+    notification_intent_count: int
+
+
+@dataclass(slots=True, frozen=True)
 class ValidatorReadback:
     policy_event_count: int = 0
     policy_event_id: UUID | None = None
@@ -246,6 +256,12 @@ class PostJudgeNotificationPipelineInventoryReport:
     selected_bundle_fingerprint: str | None
     selected_candidate_group_fingerprint: str | None
     selected_analysis_fingerprint: str | None
+    selected_policy_outcome_analysis_fingerprint: str | None
+    selected_policy_outcome_judge_output_fingerprint: str | None
+    selected_policy_outcome_candidate_group_fingerprint: str | None
+    selected_policy_outcome_verdict: str | None
+    selected_policy_outcome_delivery_decision: str | None
+    selected_policy_outcome_notification_intent_count: int
     selected_notification_intent_fingerprint: str | None
     selected_notification_plan_fingerprint: str | None
     selected_live_delivered_notification_intent_fingerprint: str | None
@@ -325,6 +341,15 @@ class InventoryRepositoryProtocol(Protocol):
         policy_version: str,
         delivery_policy_version: str,
     ) -> LiveDeliveredNotificationProofTarget | None: ...
+
+    async def select_latest_policy_outcome(
+        self,
+        *,
+        lookback_hours: int,
+        sample_limit: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> SelectedPolicyOutcome | None: ...
 
     async def load_validator_readback(
         self,
@@ -664,6 +689,22 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
             delivery_policy_version=delivery_policy_version,
         )
         return _live_delivered_notification_proof_from_row(rows[0]) if rows else None
+
+    async def select_latest_policy_outcome(
+        self,
+        *,
+        lookback_hours: int,
+        sample_limit: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> SelectedPolicyOutcome | None:
+        rows = await self._selected_policy_outcome_rows(
+            lookback_hours=lookback_hours,
+            sample_limit=sample_limit,
+            policy_version=policy_version,
+            delivery_policy_version=delivery_policy_version,
+        )
+        return _selected_policy_outcome_from_row(rows[0]) if rows else None
 
     async def load_validator_readback(
         self,
@@ -1138,6 +1179,24 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
             },
         )
 
+    async def _selected_policy_outcome_rows(
+        self,
+        *,
+        lookback_hours: int,
+        sample_limit: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> list[Mapping[str, Any]]:
+        return await self._rows(
+            _SELECTED_POLICY_OUTCOME_SQL,
+            {
+                "lookback_hours": lookback_hours,
+                "sample_limit": sample_limit,
+                "policy_version": policy_version,
+                "delivery_policy_version": delivery_policy_version,
+            },
+        )
+
     async def _policy_event_rows(self, *, judge_run_id: UUID, judge_output_id: UUID) -> list[Mapping[str, Any]]:
         return await self._rows(
             """
@@ -1381,6 +1440,33 @@ LIMIT :sample_limit
 """
 
 
+_SELECTED_POLICY_OUTCOME_SQL = """
+SELECT
+    a.analysis_id,
+    a.judge_output_id,
+    a.candidate_group_id,
+    a.verdict::text AS verdict,
+    a.delivery_decision::text AS delivery_decision,
+    (
+        SELECT count(*)
+        FROM event_outbox notification_intent
+        WHERE notification_intent.event_type = 'notification.plan.created.v1'
+          AND notification_intent.aggregate_type = 'analysis'
+          AND notification_intent.aggregate_id = a.analysis_id
+          AND notification_intent.payload_json->>'analysis_id' = a.analysis_id::text
+    ) AS notification_intent_count
+FROM analyses a
+JOIN judge_outputs jo
+  ON jo.judge_output_id = a.judge_output_id
+ AND jo.candidate_group_id = a.candidate_group_id
+WHERE a.created_at >= now() - make_interval(hours => :lookback_hours)
+  AND a.policy_version = :policy_version
+  AND a.delivery_policy_version = :delivery_policy_version
+ORDER BY a.created_at DESC, a.analysis_id DESC
+LIMIT :sample_limit
+"""
+
+
 _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL = f"""
 WITH candidate_events AS (
     SELECT
@@ -1515,6 +1601,12 @@ async def run_post_judge_notification_pipeline_inventory(
             policy_version=policy_config.policy_version,
             delivery_policy_version=policy_config.delivery_policy_version,
         )
+        selected_policy_outcome = await components.inventory_repository.select_latest_policy_outcome(
+            lookback_hours=request.lookback_hours,
+            sample_limit=request.sample_limit,
+            policy_version=policy_config.policy_version,
+            delivery_policy_version=policy_config.delivery_policy_version,
+        )
         selected_notification = await components.inventory_repository.select_latest_send_worthy_notification_intent(
             lookback_hours=request.lookback_hours,
             sample_limit=request.sample_limit,
@@ -1531,10 +1623,13 @@ async def run_post_judge_notification_pipeline_inventory(
         )
         report = _apply_selected_ready(report, selected_ready)
         report = _apply_selected_policy(report, selected_policy)
+        report = _apply_selected_policy_outcome(report, selected_policy_outcome)
         report = _apply_selected_notification(report, selected_notification)
         report = _apply_selected_live_delivered_notification_proof(report, selected_live_delivered)
 
         if request.mode == "plan":
+            if selected_notification is not None:
+                return replace(report, status="pass", reason_code="inventory_plan_complete")
             if (
                 selected_notification is None
                 and selected_live_delivered is not None
@@ -1547,6 +1642,9 @@ async def run_post_judge_notification_pipeline_inventory(
                     status="pass",
                     reason_code="sent_or_edited_notification_proof_already_closed",
                 )
+            policy_outcome_report = _selected_policy_outcome_plan_report(report, selected_policy_outcome)
+            if policy_outcome_report is not None:
+                return policy_outcome_report
             return replace(report, status="pass", reason_code="inventory_plan_complete")
 
         if request.mode == "execute-validator":
@@ -1588,6 +1686,7 @@ async def run_post_judge_notification_pipeline_inventory(
                 selected_policy=selected_policy,
                 selected_notification=selected_notification,
                 selected_live_delivered=selected_live_delivered,
+                selected_policy_outcome=selected_policy_outcome,
             )
 
         return replace(report, status="blocked", reason_code="invalid_mode")
@@ -1809,6 +1908,7 @@ async def _execute_macro(
     selected_policy: SelectedTarget | None,
     selected_notification: SelectedNotificationIntentTarget | None,
     selected_live_delivered: LiveDeliveredNotificationProofTarget | None,
+    selected_policy_outcome: SelectedPolicyOutcome | None,
 ) -> PostJudgeNotificationPipelineInventoryReport:
     if request.select_latest_send_worthy_notification_intent:
         if selected_notification is None:
@@ -1819,6 +1919,9 @@ async def _execute_macro(
             )
             if closed is not None:
                 return closed
+            policy_outcome_report = _selected_policy_outcome_plan_report(report, selected_policy_outcome)
+            if policy_outcome_report is not None:
+                return policy_outcome_report
         return await _execute_notifier(
             request=request,
             policy_config=policy_config,
@@ -2423,6 +2526,41 @@ def _apply_selected_policy(
     )
 
 
+def _apply_selected_policy_outcome(
+    report: PostJudgeNotificationPipelineInventoryReport,
+    selected: SelectedPolicyOutcome | None,
+) -> PostJudgeNotificationPipelineInventoryReport:
+    if selected is None:
+        return report
+    nearest_stage = report.nearest_send_worthy_missing_stage
+    if nearest_stage == "policy_outcome_unselected":
+        if selected.delivery_decision == "suppress":
+            nearest_stage = "policy_suppressed_candidate"
+        elif selected.notification_intent_count == 0:
+            nearest_stage = "policy_non_suppress_notification_intent_missing"
+        else:
+            nearest_stage = "notification_intent_non_send_worthy"
+    return replace(
+        report,
+        selected_policy_outcome_analysis_fingerprint=_fingerprint(selected.analysis_id),
+        selected_policy_outcome_judge_output_fingerprint=_fingerprint(selected.judge_output_id),
+        selected_policy_outcome_candidate_group_fingerprint=_fingerprint(selected.candidate_group_id),
+        selected_policy_outcome_verdict=_safe_bucket_value(selected.verdict),
+        selected_policy_outcome_delivery_decision=_safe_bucket_value(selected.delivery_decision),
+        selected_policy_outcome_notification_intent_count=_int(selected.notification_intent_count),
+        selected_analysis_fingerprint=report.selected_analysis_fingerprint or _fingerprint(selected.analysis_id),
+        selected_judge_output_fingerprint=report.selected_judge_output_fingerprint
+        or _fingerprint(selected.judge_output_id),
+        selected_candidate_group_fingerprint=report.selected_candidate_group_fingerprint
+        or _fingerprint(selected.candidate_group_id),
+        final_verdict=report.final_verdict or _safe_bucket_value(selected.verdict),
+        delivery_decision=report.delivery_decision or _safe_bucket_value(selected.delivery_decision),
+        nearest_send_worthy_missing_stage=nearest_stage,
+        analysis_created_or_present=True,
+        notification_intent_created_or_present=selected.notification_intent_count > 0,
+    )
+
+
 def _apply_selected_notification(
     report: PostJudgeNotificationPipelineInventoryReport,
     selected: SelectedNotificationIntentTarget | None,
@@ -2668,6 +2806,12 @@ def _report(
         selected_bundle_fingerprint=None,
         selected_candidate_group_fingerprint=None,
         selected_analysis_fingerprint=None,
+        selected_policy_outcome_analysis_fingerprint=None,
+        selected_policy_outcome_judge_output_fingerprint=None,
+        selected_policy_outcome_candidate_group_fingerprint=None,
+        selected_policy_outcome_verdict=None,
+        selected_policy_outcome_delivery_decision=None,
+        selected_policy_outcome_notification_intent_count=0,
         selected_notification_intent_fingerprint=None,
         selected_notification_plan_fingerprint=None,
         selected_live_delivered_notification_intent_fingerprint=None,
@@ -2752,6 +2896,54 @@ def _live_delivered_notification_proof_from_row(
     )
 
 
+def _selected_policy_outcome_from_row(row: Mapping[str, Any]) -> SelectedPolicyOutcome:
+    return SelectedPolicyOutcome(
+        analysis_id=UUID(str(row["analysis_id"])),
+        judge_output_id=UUID(str(row["judge_output_id"])),
+        candidate_group_id=UUID(str(row["candidate_group_id"])),
+        verdict=_safe_bucket_value(row["verdict"]),
+        delivery_decision=_safe_bucket_value(row["delivery_decision"]),
+        notification_intent_count=_int(row["notification_intent_count"]),
+    )
+
+
+def _selected_policy_outcome_plan_report(
+    report: PostJudgeNotificationPipelineInventoryReport,
+    selected: SelectedPolicyOutcome | None,
+) -> PostJudgeNotificationPipelineInventoryReport | None:
+    if selected is None:
+        return None
+    if _closed_live_delivered_notification_proof_count(report.counts) != 0:
+        return None
+    if selected.delivery_decision == "suppress":
+        if selected.notification_intent_count == 0:
+            return replace(
+                report,
+                status="pass",
+                reason_code="policy_suppressed_no_notification_intent_required",
+                nearest_send_worthy_missing_stage="policy_suppressed_candidate",
+                runtime_rollout_readiness=None,
+                notification_intent_created_or_present=False,
+            )
+        return replace(
+            report,
+            status="failed",
+            reason_code="policy_suppress_notification_intent_unexpected",
+            nearest_send_worthy_missing_stage="policy_suppressed_candidate",
+            runtime_rollout_readiness=None,
+        )
+    if selected.notification_intent_count == 0:
+        return replace(
+            report,
+            status="blocked",
+            reason_code="policy_non_suppress_notification_intent_missing",
+            nearest_send_worthy_missing_stage="policy_non_suppress_notification_intent_missing",
+            runtime_rollout_readiness=None,
+            notification_intent_created_or_present=False,
+        )
+    return None
+
+
 def _no_ready_target_reason(counts: Mapping[str, Any]) -> str:
     if _int(counts.get("judge_output_ready_v1_count")) == 0:
         return "no_judge_output_ready_events_in_lookback"
@@ -2786,7 +2978,7 @@ def _macro_no_send_worthy_target_reason(counts: Mapping[str, Any]) -> str:
     if _int(counts.get("eligible_judge_output_ready_count")) > 0:
         return "send_worthy_target_requires_validator_execute"
     if _int(counts.get("analysis_policy_apply_v1_count")) > 0:
-        return "send_worthy_target_requires_non_suppress_policy_output"
+        return "send_worthy_target_requires_policy_outcome"
     if _int(counts.get("judge_output_ready_v1_count")) > 0:
         if _all_ready_targets_validator_processed(counts):
             if _int(counts.get("judge_call_requested_v1_count")) > 0:
@@ -2808,7 +3000,7 @@ def _nearest_send_worthy_missing_stage(counts: Mapping[str, Any]) -> str | None:
     if _int(counts.get("eligible_judge_output_ready_count")) > 0:
         return "judge.output.ready.v1"
     if _int(counts.get("analysis_policy_apply_v1_count")) > 0:
-        return "policy_engine_non_suppress_output"
+        return "policy_outcome_unselected"
     if _int(counts.get("judge_output_ready_v1_count")) > 0:
         if _all_ready_targets_validator_processed(counts):
             if _int(counts.get("judge_call_requested_v1_count")) > 0:
@@ -2967,6 +3159,7 @@ __all__ = [
     "PostJudgeNotificationPipelineInventoryRequest",
     "RuntimeConfigBundle",
     "SCHEMA_VERSION",
+    "SelectedPolicyOutcome",
     "SIGNED_BIGINT_TEXT_SQL_RE",
     "SelectedNotificationIntentTarget",
     "SelectedTarget",
@@ -2975,6 +3168,7 @@ __all__ = [
     "NotificationProofReadback",
     "PolicyReadback",
     "_LIVE_DELIVERED_NOTIFICATION_PROOF_SQL",
+    "_SELECTED_POLICY_OUTCOME_SQL",
     "_SEND_WORTHY_NOTIFICATION_INTENT_SQL",
     "_fingerprint",
     "build_parser",
