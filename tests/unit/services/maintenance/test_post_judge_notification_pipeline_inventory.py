@@ -17,6 +17,7 @@ from services.maintenance.post_judge_notification_pipeline_inventory import (
     POLICY_APPLY_SELECTION_CONFIRM_TOKEN,
     POLICY_CONFIRM_TOKEN,
     STRICT_UUID_TEXT_SQL_RE,
+    SIGNED_BIGINT_TEXT_SQL_RE,
     VALIDATOR_CONTROL_FLOW_REASON_CODES,
     VALIDATOR_CONFIRM_TOKEN,
     InventoryCounts,
@@ -409,6 +410,51 @@ def test_strict_uuid_payload_predicate_rejects_malformed_36_character_uuid_like_
     assert re.fullmatch(STRICT_UUID_TEXT_SQL_RE, "01234567-89ab-cdef-ABCD-0123456789ab")
 
 
+def test_send_worthy_target_chat_id_predicate_accepts_signed_bigint_text() -> None:
+    accepted_values = [
+        "0",
+        "42",
+        "-42",
+        "9223372036854775807",
+        "-9223372036854775808",
+    ]
+
+    for value in accepted_values:
+        assert re.fullmatch(SIGNED_BIGINT_TEXT_SQL_RE, value)
+
+
+def test_send_worthy_target_chat_id_predicate_rejects_malformed_values_before_bigint_cast() -> None:
+    rejected_values = [
+        "",
+        "-",
+        "+42",
+        " 42",
+        "42 ",
+        "42.0",
+        "42x",
+        "001",
+        "--42",
+    ]
+
+    for value in rejected_values:
+        assert re.fullmatch(SIGNED_BIGINT_TEXT_SQL_RE, value) is None
+
+    target_chat_id_guard = (
+        "COALESCE(eo.payload_json->>'target_chat_id', '') "
+        f"~ '{SIGNED_BIGINT_TEXT_SQL_RE}'"
+    )
+    bigint_cast = "CAST(ce.target_chat_id_text AS bigint)"
+
+    assert target_chat_id_guard in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "^[0-9]+$" not in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "ltrim(COALESCE(eo.payload_json->>'target_chat_id', ''), '-')" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "9223372036854775807" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "9223372036854775808" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert _SEND_WORTHY_NOTIFICATION_INTENT_SQL.index(target_chat_id_guard) < (
+        _SEND_WORTHY_NOTIFICATION_INTENT_SQL.index(bigint_cast)
+    )
+
+
 def test_old_loose_uuid_predicate_is_absent_from_payload_sql_guards() -> None:
     policy_materialized_sql_source = inspect.getsource(
         SqlPostJudgeNotificationPipelineInventoryRepository._policy_apply_already_materialized_count
@@ -447,7 +493,16 @@ async def test_policy_materialized_count_runtime_sql_uses_strict_uuid_payload_gu
 def test_send_worthy_notification_intent_sql_stays_on_existing_intent_and_non_suppress_analysis() -> None:
     assert "event_type = 'notification.plan.created.v1'" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
     assert "aggregate_type = 'analysis'" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "eo.payload_json->>'notification_plan_id' ~" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "eo.payload_json->>'analysis_id' ~" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "eo.payload_json->>'candidate_group_id' ~" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "COALESCE(eo.payload_json->>'material_change_hash', '') <> ''" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "WHERE ce.aggregate_id = a.analysis_id" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "ce.analysis_id_text = a.analysis_id::text" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "ce.candidate_group_id_text = a.candidate_group_id::text" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
     assert "a.delivery_decision::text <> 'suppress'" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "sent_plan.target_chat_id = CAST(ce.target_chat_id_text AS bigint)" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+    assert "sent_delivery.delivery_status::text IN ('sent', 'edited')" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
     assert "notification.delivery.result.v1" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
     assert "telegram_response_json->>'send_disabled' = 'true'" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
 
@@ -988,6 +1043,38 @@ async def test_plan_selects_latest_send_worthy_notification_intent_target() -> N
     assert report.selected_candidate_group_fingerprint == _fingerprint(selected.candidate_group_id)
     assert report.final_verdict == "inspect_now"
     assert report.delivery_decision == "send_now"
+    assert validator.calls == []
+    assert policy.calls == []
+    assert commit.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_can_surface_send_worthy_notification_intent_with_negative_chat_id_sql_guard() -> None:
+    selected = _notification_target()
+    negative_chat_id_text = "-42"
+    repository = FakeRepository(
+        counts=_counts(
+            analyses_count=9,
+            analyses_by_delivery_decision_count={"send_now": 2, "suppress": 7},
+            notification_plan_created_v1_count=4,
+            send_worthy_notification_intent_count=1,
+        ),
+        selected_notification=selected,
+    )
+
+    report, validator, policy, commit = await _run(
+        PostJudgeNotificationPipelineInventoryRequest(mode="plan", lookback_hours=72, sample_limit=100),
+        repository,
+    )
+
+    payload = json.dumps(asdict(report), sort_keys=True)
+    assert re.fullmatch(SIGNED_BIGINT_TEXT_SQL_RE, negative_chat_id_text)
+    assert report.status == "pass"
+    assert report.selected_notification_intent_fingerprint == _fingerprint(selected.event_id)
+    assert report.counts["analyses_by_delivery_decision_count"] == {"send_now": 2, "suppress": 7}
+    assert report.counts["notification_plan_created_v1_count"] == 4
+    assert report.counts["send_worthy_notification_intent_count"] == 1
+    assert negative_chat_id_text not in payload
     assert validator.calls == []
     assert policy.calls == []
     assert commit.calls == 0

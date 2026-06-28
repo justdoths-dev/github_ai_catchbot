@@ -44,6 +44,7 @@ STRICT_UUID_TEXT_SQL_RE = (
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
+SIGNED_BIGINT_TEXT_SQL_RE = r"^-?(0|[1-9][0-9]{0,18})$"
 
 RUNTIME_VALUE_KEYS = {
     "APP_ENV",
@@ -1218,7 +1219,15 @@ WITH candidate_events AS (
       AND eo.payload_json->>'analysis_id' ~ '{STRICT_UUID_TEXT_SQL_RE}'
       AND eo.payload_json->>'candidate_group_id' ~ '{STRICT_UUID_TEXT_SQL_RE}'
       AND COALESCE(eo.payload_json->>'delivery_decision', '') <> 'suppress'
-      AND COALESCE(eo.payload_json->>'target_chat_id', '') ~ '^[0-9]+$'
+      AND COALESCE(eo.payload_json->>'target_chat_id', '') ~ '{SIGNED_BIGINT_TEXT_SQL_RE}'
+      AND (
+            length(ltrim(COALESCE(eo.payload_json->>'target_chat_id', ''), '-')) < 19
+            OR ltrim(COALESCE(eo.payload_json->>'target_chat_id', ''), '-') <= CASE
+                WHEN left(COALESCE(eo.payload_json->>'target_chat_id', ''), 1) = '-'
+                THEN '9223372036854775808'
+                ELSE '9223372036854775807'
+            END
+      )
       AND COALESCE(eo.payload_json->>'material_change_hash', '') <> ''
 )
 SELECT
@@ -2589,6 +2598,7 @@ __all__ = [
     "PostJudgeNotificationPipelineInventoryRequest",
     "RuntimeConfigBundle",
     "SCHEMA_VERSION",
+    "SIGNED_BIGINT_TEXT_SQL_RE",
     "SelectedNotificationIntentTarget",
     "SelectedTarget",
     "VALIDATOR_CONFIRM_TOKEN",
