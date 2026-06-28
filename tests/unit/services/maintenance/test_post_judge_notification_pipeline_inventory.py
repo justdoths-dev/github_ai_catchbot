@@ -21,6 +21,7 @@ from services.maintenance.post_judge_notification_pipeline_inventory import (
     VALIDATOR_CONTROL_FLOW_REASON_CODES,
     VALIDATOR_CONFIRM_TOKEN,
     InventoryCounts,
+    LiveDeliveredNotificationProofTarget,
     NotificationProofReadback,
     PolicyReadback,
     PostJudgeNotificationPipelineInventoryComponents,
@@ -32,6 +33,7 @@ from services.maintenance.post_judge_notification_pipeline_inventory import (
     ValidatorReadback,
     _ELIGIBLE_POLICY_SQL,
     _ELIGIBLE_READY_SQL,
+    _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL,
     _SEND_WORTHY_NOTIFICATION_INTENT_SQL,
     _fingerprint,
     run_cli,
@@ -60,6 +62,7 @@ class FakeRepository:
         selected_ready: SelectedTarget | None = None,
         selected_policy: SelectedTarget | None = None,
         selected_notification: SelectedNotificationIntentTarget | None = None,
+        selected_live_delivered: LiveDeliveredNotificationProofTarget | None = None,
         validator_readback: ValidatorReadback | None = None,
         policy_readback: PolicyReadback | None = None,
         notification_readbacks: list[NotificationProofReadback] | None = None,
@@ -68,6 +71,7 @@ class FakeRepository:
         self.selected_ready = selected_ready
         self.selected_policy = selected_policy
         self.selected_notification = selected_notification
+        self.selected_live_delivered = selected_live_delivered
         self.validator_readback = validator_readback or ValidatorReadback()
         self.policy_readback = policy_readback or PolicyReadback()
         self.notification_readbacks = list(notification_readbacks or [NotificationProofReadback()])
@@ -75,6 +79,7 @@ class FakeRepository:
         self.ready_select_calls = 0
         self.policy_select_calls = 0
         self.notification_select_calls = 0
+        self.live_delivered_select_calls = 0
         self.validator_readback_calls = 0
         self.policy_readback_calls = 0
         self.notification_readback_calls = 0
@@ -149,6 +154,21 @@ class FakeRepository:
         assert delivery_policy_version == "delivery_policy_v1"
         self.notification_select_calls += 1
         return self.selected_notification
+
+    async def select_latest_live_delivered_notification_proof(
+        self,
+        *,
+        lookback_hours: int,
+        sample_limit: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> LiveDeliveredNotificationProofTarget | None:
+        assert 1 <= lookback_hours <= 720
+        assert 1 <= sample_limit <= 500
+        assert policy_version == "verdict_policy_v1"
+        assert delivery_policy_version == "delivery_policy_v1"
+        self.live_delivered_select_calls += 1
+        return self.selected_live_delivered
 
     async def load_validator_readback(
         self,
@@ -369,6 +389,28 @@ def _notification_target(
     )
 
 
+def _live_delivered_target(
+    *,
+    render_count: int = 1,
+    sent_or_edited_delivery_count: int = 1,
+    delivery_result_event_count: int = 1,
+    judge_output_id: UUID | None = None,
+    candidate_group_id: UUID | None = None,
+) -> LiveDeliveredNotificationProofTarget:
+    return LiveDeliveredNotificationProofTarget(
+        event_id=uuid4(),
+        analysis_id=uuid4(),
+        notification_plan_id=uuid4(),
+        judge_output_id=judge_output_id or uuid4(),
+        candidate_group_id=candidate_group_id or uuid4(),
+        verdict="inspect_now",
+        delivery_decision="send_now",
+        render_count=render_count,
+        sent_or_edited_delivery_count=sent_or_edited_delivery_count,
+        delivery_result_event_count=delivery_result_event_count,
+    )
+
+
 def _counts(**overrides: object) -> InventoryCounts:
     values = {
         "judge_call_requested_v1_count": 1,
@@ -397,6 +439,7 @@ def _counts(**overrides: object) -> InventoryCounts:
         "policy_apply_already_materialized_count": 0,
         "send_worthy_notification_intent_count": 0,
         "send_worthy_notification_intent_already_materialized_count": 0,
+        "live_delivered_notification_proof_count": 0,
     }
     values.update(overrides)
     return InventoryCounts(**values)  # type: ignore[arg-type]
@@ -463,6 +506,7 @@ def test_old_loose_uuid_predicate_is_absent_from_payload_sql_guards() -> None:
         _ELIGIBLE_READY_SQL,
         _ELIGIBLE_POLICY_SQL,
         _SEND_WORTHY_NOTIFICATION_INTENT_SQL,
+        _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL,
         policy_materialized_sql_source,
     ]
 
@@ -505,6 +549,26 @@ def test_send_worthy_notification_intent_sql_stays_on_existing_intent_and_non_su
     assert "sent_delivery.delivery_status::text IN ('sent', 'edited')" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
     assert "notification.delivery.result.v1" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
     assert "telegram_response_json->>'send_disabled' = 'true'" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+
+
+def test_live_delivered_notification_proof_sql_requires_exact_sent_or_edited_durable_proof() -> None:
+    assert "event_type = 'notification.plan.created.v1'" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "aggregate_type = 'analysis'" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "eo.payload_json->>'notification_plan_id' ~" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "eo.payload_json->>'analysis_id' ~" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "eo.payload_json->>'candidate_group_id' ~" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert f"~ '{SIGNED_BIGINT_TEXT_SQL_RE}'" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "a.policy_version = :policy_version" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "a.delivery_policy_version = :delivery_policy_version" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "a.delivery_decision::text <> 'suppress'" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "np.analysis_id = a.analysis_id" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "np.target_chat_id = CAST(ce.target_chat_id_text AS bigint)" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "np.material_change_hash = ce.material_change_hash" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "sent_delivery.delivery_status::text IN ('sent', 'edited')" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "delivery_result.event_type = 'notification.delivery.result.v1'" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "render_count > 0" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "sent_or_edited_delivery_count > 0" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
+    assert "delivery_result_event_count > 0" in _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL
 
 
 def test_ready_selector_excludes_validator_control_flow_processed_ready_targets() -> None:
@@ -1081,6 +1145,211 @@ async def test_plan_can_surface_send_worthy_notification_intent_with_negative_ch
 
 
 @pytest.mark.asyncio
+async def test_plan_reports_live_delivered_proof_when_send_worthy_intent_excluded_by_sent_or_edited_delivery() -> None:
+    selected = _live_delivered_target()
+    repository = FakeRepository(
+        counts=_counts(
+            analysis_policy_apply_v1_count=1,
+            analyses_count=1,
+            analyses_by_verdict_count={"inspect_now": 1},
+            analyses_by_delivery_decision_count={"send_now": 1},
+            notification_plan_created_v1_count=1,
+            notification_plans_by_status_count={"sent": 1},
+            notification_renders_count=1,
+            notification_delivery_records_by_delivery_status_count={"sent": 1},
+            send_worthy_notification_intent_count=0,
+            live_delivered_notification_proof_count=1,
+        ),
+        selected_notification=None,
+        selected_live_delivered=selected,
+    )
+
+    report, validator, policy, commit = await _run(
+        PostJudgeNotificationPipelineInventoryRequest(mode="plan", lookback_hours=72, sample_limit=100),
+        repository,
+    )
+
+    payload = json.dumps(asdict(report), sort_keys=True)
+    assert report.status == "pass"
+    assert report.reason_code == "sent_or_edited_notification_proof_already_closed"
+    assert report.counts["live_delivered_notification_proof_count"] == 1
+    assert report.selected_live_delivered_notification_intent_fingerprint == _fingerprint(selected.event_id)
+    assert report.selected_live_delivered_analysis_fingerprint == _fingerprint(selected.analysis_id)
+    assert report.selected_live_delivered_notification_plan_fingerprint == _fingerprint(
+        selected.notification_plan_id
+    )
+    assert report.selected_live_delivered_candidate_group_fingerprint == _fingerprint(
+        selected.candidate_group_id
+    )
+    assert report.selected_live_delivered_judge_output_fingerprint == _fingerprint(selected.judge_output_id)
+    assert report.final_verdict == "inspect_now"
+    assert report.delivery_decision == "send_now"
+    assert report.selected_live_delivered_render_count == 1
+    assert report.selected_live_delivered_sent_or_edited_delivery_count == 1
+    assert report.selected_live_delivered_delivery_result_event_count == 1
+    assert report.nearest_send_worthy_missing_stage is None
+    assert report.runtime_rollout_readiness == "restricted_runtime_rollout_preflight_ready"
+    assert report.validator_attempted is False
+    assert report.policy_attempted is False
+    assert report.notifier_attempted is False
+    assert commit.calls == 0
+    for value in (
+        str(selected.event_id),
+        str(selected.analysis_id),
+        str(selected.notification_plan_id),
+        str(selected.candidate_group_id),
+        str(selected.judge_output_id),
+        SENSITIVE_CHAT_LOCATOR_SENTINEL,
+        SENSITIVE_MESSAGE_LOCATOR_SENTINEL,
+        SENSITIVE_DB_LOCATOR_SENTINEL,
+        SENSITIVE_REDIS_LOCATOR_SENTINEL,
+        SENSITIVE_TEXT_SENTINEL,
+        SENSITIVE_URL_SENTINEL,
+        SENSITIVE_EXCEPTION_SENTINEL,
+        SENSITIVE_STDERR_SENTINEL,
+    ):
+        assert value not in payload
+    assert validator.calls == []
+    assert policy.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_live_delivered_proof_does_not_mark_rollout_ready_or_close() -> None:
+    selected = _live_delivered_target()
+    counts = _counts(
+        analysis_policy_apply_v1_count=1,
+        analyses_count=1,
+        notification_plan_created_v1_count=1,
+        notification_renders_count=2,
+        notification_delivery_records_by_delivery_status_count={"sent": 2},
+        send_worthy_notification_intent_count=0,
+        live_delivered_notification_proof_count=2,
+    )
+    plan_repository = FakeRepository(
+        counts=counts,
+        selected_notification=None,
+        selected_live_delivered=selected,
+    )
+
+    plan_report, validator, policy, commit = await _run(
+        PostJudgeNotificationPipelineInventoryRequest(mode="plan", lookback_hours=72, sample_limit=100),
+        plan_repository,
+    )
+
+    assert plan_report.status == "pass"
+    assert plan_report.reason_code == "inventory_plan_complete"
+    assert plan_report.reason_code != "sent_or_edited_notification_proof_already_closed"
+    assert plan_report.runtime_rollout_readiness is None
+    assert plan_report.nearest_send_worthy_missing_stage == "judge.output.ready.v1"
+    assert validator.calls == []
+    assert policy.calls == []
+    assert commit.calls == 0
+
+    execute_repository = FakeRepository(
+        counts=counts,
+        selected_notification=None,
+        selected_live_delivered=selected,
+    )
+    execute_report, _validator, _policy, notifier, execute_commit = await _run_with_notifier(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-macro",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_send_worthy_notification_intent=True,
+            expected_notification_intent_fingerprint=_fingerprint(selected.event_id),
+        ),
+        execute_repository,
+    )
+
+    assert execute_report.status == "blocked"
+    assert execute_report.reason_code == "sent_or_edited_notification_proof_ambiguous"
+    assert execute_report.reason_code != "sent_or_edited_notification_proof_already_closed"
+    assert execute_report.runtime_rollout_readiness is None
+    assert execute_report.notifier_attempted is False
+    assert execute_report.db_write_attempted is False
+    assert notifier.calls == []
+    assert execute_commit.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_send_worthy_notification_intent_wins_over_live_delivered_proof() -> None:
+    selected_notification = _notification_target()
+    selected_live_delivered = _live_delivered_target()
+    counts = _counts(
+        analysis_policy_apply_v1_count=1,
+        analyses_count=1,
+        notification_plan_created_v1_count=2,
+        notification_renders_count=1,
+        notification_delivery_records_by_delivery_status_count={"sent": 1},
+        send_worthy_notification_intent_count=1,
+        live_delivered_notification_proof_count=1,
+    )
+    plan_repository = FakeRepository(
+        counts=counts,
+        selected_notification=selected_notification,
+        selected_live_delivered=selected_live_delivered,
+    )
+
+    plan_report, validator, policy, commit = await _run(
+        PostJudgeNotificationPipelineInventoryRequest(mode="plan", lookback_hours=72, sample_limit=100),
+        plan_repository,
+    )
+
+    assert plan_report.status == "pass"
+    assert plan_report.reason_code == "inventory_plan_complete"
+    assert plan_report.reason_code != "sent_or_edited_notification_proof_already_closed"
+    assert plan_report.selected_notification_intent_fingerprint == _fingerprint(
+        selected_notification.event_id
+    )
+    assert plan_report.selected_analysis_fingerprint == _fingerprint(selected_notification.analysis_id)
+    assert plan_report.selected_live_delivered_notification_intent_fingerprint == _fingerprint(
+        selected_live_delivered.event_id
+    )
+    assert plan_report.runtime_rollout_readiness is None
+    assert validator.calls == []
+    assert policy.calls == []
+    assert commit.calls == 0
+
+    execute_repository = FakeRepository(
+        counts=counts,
+        selected_notification=selected_notification,
+        selected_live_delivered=selected_live_delivered,
+        notification_readbacks=[
+            NotificationProofReadback(notification_intent_event_count=1),
+            NotificationProofReadback(
+                notification_intent_event_count=1,
+                notification_plan_count=1,
+                notification_render_count=1,
+                send_disabled_delivery_record_count=1,
+                notification_delivery_result_event_count=1,
+            ),
+        ],
+    )
+    execute_report, _validator, _policy, notifier, execute_commit = await _run_with_notifier(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-macro",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_send_worthy_notification_intent=True,
+            expected_notification_intent_fingerprint=_fingerprint(selected_notification.event_id),
+        ),
+        execute_repository,
+    )
+
+    assert execute_report.status == "pass"
+    assert execute_report.reason_code == "notification_send_disabled_suppressed"
+    assert execute_report.reason_code != "sent_or_edited_notification_proof_already_closed"
+    assert execute_report.selected_notification_intent_fingerprint == _fingerprint(
+        selected_notification.event_id
+    )
+    assert execute_report.runtime_rollout_readiness is None
+    assert execute_report.notifier_attempted is True
+    assert execute_report.db_write_attempted is True
+    assert notifier.calls == [selected_notification.event_id]
+    assert execute_commit.calls == 1
+
+
+@pytest.mark.asyncio
 async def test_execute_notifier_calls_existing_service_once_and_proves_send_disabled_readback() -> None:
     selected = _notification_target()
     repository = FakeRepository(
@@ -1232,6 +1501,119 @@ async def test_execute_notifier_transport_attempt_fails_closed() -> None:
     assert report.telegram_transport_attempted is True
     assert notifier.calls == [selected.event_id]
     assert commit.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_macro_send_worthy_selector_closes_already_live_delivered_proof_without_notifier() -> None:
+    selected = _live_delivered_target()
+    repository = FakeRepository(
+        counts=_counts(
+            analysis_policy_apply_v1_count=1,
+            analyses_count=1,
+            notification_plan_created_v1_count=1,
+            notification_plans_by_status_count={"edited": 1},
+            notification_renders_count=1,
+            notification_delivery_records_by_delivery_status_count={"edited": 1},
+            send_worthy_notification_intent_count=0,
+            live_delivered_notification_proof_count=1,
+        ),
+        selected_notification=None,
+        selected_live_delivered=selected,
+    )
+
+    report, validator, policy, notifier, commit = await _run_with_notifier(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-macro",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_send_worthy_notification_intent=True,
+            expected_notification_intent_fingerprint=_fingerprint(selected.event_id),
+        ),
+        repository,
+    )
+
+    payload = json.dumps(asdict(report), sort_keys=True)
+    assert report.status == "pass"
+    assert report.reason_code == "sent_or_edited_notification_proof_already_closed"
+    assert report.selected_live_delivered_notification_intent_fingerprint == _fingerprint(selected.event_id)
+    assert report.selected_live_delivered_render_count == 1
+    assert report.selected_live_delivered_sent_or_edited_delivery_count == 1
+    assert report.selected_live_delivered_delivery_result_event_count == 1
+    assert report.runtime_rollout_readiness == "restricted_runtime_rollout_preflight_ready"
+    assert report.validator_attempted is False
+    assert report.policy_attempted is False
+    assert report.notifier_attempted is False
+    assert report.db_write_attempted is False
+    assert report.telegram_transport_attempted is False
+    assert report.redis_attempted is False
+    assert report.openai_attempted is False
+    assert report.external_network_attempted is False
+    assert validator.calls == []
+    assert policy.calls == []
+    assert notifier.calls == []
+    assert commit.calls == 0
+    for value in (
+        str(selected.event_id),
+        str(selected.analysis_id),
+        str(selected.notification_plan_id),
+        str(selected.candidate_group_id),
+        str(selected.judge_output_id),
+    ):
+        assert value not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("render_count", "sent_or_edited_delivery_count", "delivery_result_event_count"),
+    [(0, 1, 1), (1, 0, 1), (1, 1, 0)],
+)
+async def test_execute_macro_incomplete_live_delivered_proof_stays_blocked_without_notifier(
+    render_count: int,
+    sent_or_edited_delivery_count: int,
+    delivery_result_event_count: int,
+) -> None:
+    incomplete = _live_delivered_target(
+        render_count=render_count,
+        sent_or_edited_delivery_count=sent_or_edited_delivery_count,
+        delivery_result_event_count=delivery_result_event_count,
+    )
+    repository = FakeRepository(
+        counts=_counts(
+            analysis_policy_apply_v1_count=1,
+            analyses_count=1,
+            notification_plan_created_v1_count=1,
+            notification_renders_count=render_count,
+            notification_delivery_records_by_delivery_status_count=(
+                {"sent": sent_or_edited_delivery_count} if sent_or_edited_delivery_count else {}
+            ),
+            send_worthy_notification_intent_count=0,
+            live_delivered_notification_proof_count=0,
+        ),
+        selected_notification=None,
+        selected_live_delivered=None,
+    )
+
+    report, validator, policy, notifier, commit = await _run_with_notifier(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-macro",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_send_worthy_notification_intent=True,
+            expected_notification_intent_fingerprint=_fingerprint(incomplete.event_id),
+        ),
+        repository,
+    )
+
+    assert report.status == "blocked"
+    assert report.reason_code == "send_worthy_target_missing"
+    assert report.reason_code != "sent_or_edited_notification_proof_already_closed"
+    assert report.selected_live_delivered_notification_intent_fingerprint is None
+    assert report.notifier_attempted is False
+    assert report.db_write_attempted is False
+    assert validator.calls == []
+    assert policy.calls == []
+    assert notifier.calls == []
+    assert commit.calls == 0
 
 
 @pytest.mark.asyncio

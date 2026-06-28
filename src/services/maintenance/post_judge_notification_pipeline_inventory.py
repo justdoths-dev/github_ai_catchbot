@@ -130,6 +130,7 @@ class InventoryCounts:
     policy_apply_already_materialized_count: int = 0
     send_worthy_notification_intent_count: int = 0
     send_worthy_notification_intent_already_materialized_count: int = 0
+    live_delivered_notification_proof_count: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -154,6 +155,24 @@ class SelectedNotificationIntentTarget:
     candidate_group_id: UUID
     verdict: str
     delivery_decision: str
+
+    @property
+    def event_fingerprint(self) -> str:
+        return _fingerprint(self.event_id)
+
+
+@dataclass(slots=True, frozen=True)
+class LiveDeliveredNotificationProofTarget:
+    event_id: UUID
+    analysis_id: UUID
+    notification_plan_id: UUID
+    judge_output_id: UUID
+    candidate_group_id: UUID
+    verdict: str
+    delivery_decision: str
+    render_count: int
+    sent_or_edited_delivery_count: int
+    delivery_result_event_count: int
 
     @property
     def event_fingerprint(self) -> str:
@@ -229,9 +248,18 @@ class PostJudgeNotificationPipelineInventoryReport:
     selected_analysis_fingerprint: str | None
     selected_notification_intent_fingerprint: str | None
     selected_notification_plan_fingerprint: str | None
+    selected_live_delivered_notification_intent_fingerprint: str | None
+    selected_live_delivered_analysis_fingerprint: str | None
+    selected_live_delivered_notification_plan_fingerprint: str | None
+    selected_live_delivered_candidate_group_fingerprint: str | None
+    selected_live_delivered_judge_output_fingerprint: str | None
+    selected_live_delivered_render_count: int
+    selected_live_delivered_sent_or_edited_delivery_count: int
+    selected_live_delivered_delivery_result_event_count: int
     nearest_send_worthy_missing_stage: str | None
     final_verdict: str | None
     delivery_decision: str | None
+    runtime_rollout_readiness: str | None
     validator_attempted: bool
     policy_attempted: bool
     notifier_attempted: bool
@@ -288,6 +316,15 @@ class InventoryRepositoryProtocol(Protocol):
         policy_version: str,
         delivery_policy_version: str,
     ) -> SelectedNotificationIntentTarget | None: ...
+
+    async def select_latest_live_delivered_notification_proof(
+        self,
+        *,
+        lookback_hours: int,
+        sample_limit: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> LiveDeliveredNotificationProofTarget | None: ...
 
     async def load_validator_readback(
         self,
@@ -523,6 +560,11 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
             policy_version=policy_version,
             delivery_policy_version=delivery_policy_version,
         )
+        live_delivered_count = await self._live_delivered_notification_proof_count(
+            lookback_hours=lookback_hours,
+            policy_version=policy_version,
+            delivery_policy_version=delivery_policy_version,
+        )
         return InventoryCounts(
             judge_call_requested_v1_count=_int(row["judge_call_requested_count"]),
             judge_run_status_counts={
@@ -556,6 +598,7 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
             policy_apply_already_materialized_count=materialized_policy_count,
             send_worthy_notification_intent_count=send_worthy_intent_count,
             send_worthy_notification_intent_already_materialized_count=materialized_notification_count,
+            live_delivered_notification_proof_count=live_delivered_count,
         )
 
     async def select_latest_eligible_judge_output_ready(
@@ -605,6 +648,22 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
             delivery_policy_version=delivery_policy_version,
         )
         return _selected_notification_intent_from_row(rows[0]) if rows else None
+
+    async def select_latest_live_delivered_notification_proof(
+        self,
+        *,
+        lookback_hours: int,
+        sample_limit: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> LiveDeliveredNotificationProofTarget | None:
+        rows = await self._live_delivered_notification_proof_rows(
+            lookback_hours=lookback_hours,
+            sample_limit=sample_limit,
+            policy_version=policy_version,
+            delivery_policy_version=delivery_policy_version,
+        )
+        return _live_delivered_notification_proof_from_row(rows[0]) if rows else None
 
     async def load_validator_readback(
         self,
@@ -986,6 +1045,27 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
         )
         return _int(row["materialized_count"])
 
+    async def _live_delivered_notification_proof_count(
+        self,
+        *,
+        lookback_hours: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> int:
+        return _int(
+            (
+                await self._one(
+                    f"SELECT count(*) AS proof_count FROM ({_LIVE_DELIVERED_NOTIFICATION_PROOF_SQL}) live_proofs",
+                    {
+                        "lookback_hours": lookback_hours,
+                        "sample_limit": 500,
+                        "policy_version": policy_version,
+                        "delivery_policy_version": delivery_policy_version,
+                    },
+                )
+            )["proof_count"]
+        )
+
     async def _eligible_judge_output_ready_rows(
         self,
         *,
@@ -1032,6 +1112,24 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
     ) -> list[Mapping[str, Any]]:
         return await self._rows(
             _SEND_WORTHY_NOTIFICATION_INTENT_SQL,
+            {
+                "lookback_hours": lookback_hours,
+                "sample_limit": sample_limit,
+                "policy_version": policy_version,
+                "delivery_policy_version": delivery_policy_version,
+            },
+        )
+
+    async def _live_delivered_notification_proof_rows(
+        self,
+        *,
+        lookback_hours: int,
+        sample_limit: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> list[Mapping[str, Any]]:
+        return await self._rows(
+            _LIVE_DELIVERED_NOTIFICATION_PROOF_SQL,
             {
                 "lookback_hours": lookback_hours,
                 "sample_limit": sample_limit,
@@ -1283,6 +1381,106 @@ LIMIT :sample_limit
 """
 
 
+_LIVE_DELIVERED_NOTIFICATION_PROOF_SQL = f"""
+WITH candidate_events AS (
+    SELECT
+        eo.event_id,
+        eo.aggregate_id,
+        eo.created_at,
+        eo.payload_json->>'notification_plan_id' AS notification_plan_id_text,
+        eo.payload_json->>'analysis_id' AS analysis_id_text,
+        eo.payload_json->>'candidate_group_id' AS candidate_group_id_text,
+        eo.payload_json->>'delivery_decision' AS delivery_decision_text,
+        eo.payload_json->>'target_chat_id' AS target_chat_id_text,
+        eo.payload_json->>'material_change_hash' AS material_change_hash
+    FROM event_outbox eo
+    WHERE eo.event_type = 'notification.plan.created.v1'
+      AND eo.aggregate_type = 'analysis'
+      AND eo.created_at >= now() - make_interval(hours => :lookback_hours)
+      AND eo.payload_json->>'notification_plan_id' ~ '{STRICT_UUID_TEXT_SQL_RE}'
+      AND eo.payload_json->>'analysis_id' ~ '{STRICT_UUID_TEXT_SQL_RE}'
+      AND eo.payload_json->>'candidate_group_id' ~ '{STRICT_UUID_TEXT_SQL_RE}'
+      AND COALESCE(eo.payload_json->>'delivery_decision', '') <> 'suppress'
+      AND COALESCE(eo.payload_json->>'target_chat_id', '') ~ '{SIGNED_BIGINT_TEXT_SQL_RE}'
+      AND (
+            length(ltrim(COALESCE(eo.payload_json->>'target_chat_id', ''), '-')) < 19
+            OR ltrim(COALESCE(eo.payload_json->>'target_chat_id', ''), '-') <= CASE
+                WHEN left(COALESCE(eo.payload_json->>'target_chat_id', ''), 1) = '-'
+                THEN '9223372036854775808'
+                ELSE '9223372036854775807'
+            END
+      )
+      AND COALESCE(eo.payload_json->>'material_change_hash', '') <> ''
+),
+proof_rows AS (
+    SELECT
+        ce.event_id,
+        ce.created_at,
+        a.analysis_id,
+        np.notification_plan_id,
+        a.judge_output_id,
+        a.candidate_group_id,
+        a.verdict::text AS verdict,
+        a.delivery_decision::text AS delivery_decision,
+        count(DISTINCT nr.notification_render_id) AS render_count,
+        count(DISTINCT sent_delivery.notification_delivery_record_id) AS sent_or_edited_delivery_count,
+        count(DISTINCT delivery_result.event_id) AS delivery_result_event_count
+    FROM candidate_events ce
+    JOIN analyses a
+      ON a.analysis_id = CAST(ce.analysis_id_text AS uuid)
+    JOIN notification_plans np
+      ON np.notification_plan_id = CAST(ce.notification_plan_id_text AS uuid)
+     AND np.analysis_id = a.analysis_id
+     AND np.candidate_group_id = a.candidate_group_id
+     AND np.delivery_decision = a.delivery_decision
+     AND np.target_chat_id = CAST(ce.target_chat_id_text AS bigint)
+     AND np.material_change_hash = ce.material_change_hash
+    LEFT JOIN notification_renders nr
+      ON nr.notification_plan_id = np.notification_plan_id
+    LEFT JOIN notification_delivery_records sent_delivery
+      ON sent_delivery.notification_plan_id = np.notification_plan_id
+     AND sent_delivery.delivery_status::text IN ('sent', 'edited')
+    LEFT JOIN event_outbox delivery_result
+      ON delivery_result.event_type = 'notification.delivery.result.v1'
+     AND delivery_result.aggregate_type = 'notification_plan'
+     AND delivery_result.aggregate_id = np.notification_plan_id
+    WHERE ce.aggregate_id = a.analysis_id
+      AND ce.analysis_id_text = a.analysis_id::text
+      AND ce.candidate_group_id_text = a.candidate_group_id::text
+      AND ce.delivery_decision_text = a.delivery_decision::text
+      AND a.policy_version = :policy_version
+      AND a.delivery_policy_version = :delivery_policy_version
+      AND a.delivery_decision::text <> 'suppress'
+    GROUP BY
+        ce.event_id,
+        ce.created_at,
+        a.analysis_id,
+        np.notification_plan_id,
+        a.judge_output_id,
+        a.candidate_group_id,
+        a.verdict,
+        a.delivery_decision
+)
+SELECT
+    event_id,
+    analysis_id,
+    notification_plan_id,
+    judge_output_id,
+    candidate_group_id,
+    verdict,
+    delivery_decision,
+    render_count,
+    sent_or_edited_delivery_count,
+    delivery_result_event_count
+FROM proof_rows
+WHERE render_count > 0
+  AND sent_or_edited_delivery_count > 0
+  AND delivery_result_event_count > 0
+ORDER BY created_at DESC, event_id DESC
+LIMIT :sample_limit
+"""
+
+
 async def run_post_judge_notification_pipeline_inventory(
     request: PostJudgeNotificationPipelineInventoryRequest,
     *,
@@ -1323,11 +1521,32 @@ async def run_post_judge_notification_pipeline_inventory(
             policy_version=policy_config.policy_version,
             delivery_policy_version=policy_config.delivery_policy_version,
         )
+        selected_live_delivered = (
+            await components.inventory_repository.select_latest_live_delivered_notification_proof(
+                lookback_hours=request.lookback_hours,
+                sample_limit=request.sample_limit,
+                policy_version=policy_config.policy_version,
+                delivery_policy_version=policy_config.delivery_policy_version,
+            )
+        )
         report = _apply_selected_ready(report, selected_ready)
         report = _apply_selected_policy(report, selected_policy)
         report = _apply_selected_notification(report, selected_notification)
+        report = _apply_selected_live_delivered_notification_proof(report, selected_live_delivered)
 
         if request.mode == "plan":
+            if (
+                selected_notification is None
+                and selected_live_delivered is not None
+                and _closed_live_delivered_notification_proof_count(report.counts) == 1
+            ):
+                return replace(
+                    _apply_closed_live_delivered_notification_proof_readiness(
+                        report, selected_live_delivered
+                    ),
+                    status="pass",
+                    reason_code="sent_or_edited_notification_proof_already_closed",
+                )
             return replace(report, status="pass", reason_code="inventory_plan_complete")
 
         if request.mode == "execute-validator":
@@ -1368,6 +1587,7 @@ async def run_post_judge_notification_pipeline_inventory(
                 selected_ready=selected_ready,
                 selected_policy=selected_policy,
                 selected_notification=selected_notification,
+                selected_live_delivered=selected_live_delivered,
             )
 
         return replace(report, status="blocked", reason_code="invalid_mode")
@@ -1588,8 +1808,17 @@ async def _execute_macro(
     selected_ready: SelectedTarget | None,
     selected_policy: SelectedTarget | None,
     selected_notification: SelectedNotificationIntentTarget | None,
+    selected_live_delivered: LiveDeliveredNotificationProofTarget | None,
 ) -> PostJudgeNotificationPipelineInventoryReport:
     if request.select_latest_send_worthy_notification_intent:
+        if selected_notification is None:
+            closed = _closed_live_delivered_notification_proof_report(
+                report,
+                selected_live_delivered,
+                expected_notification_intent_fingerprint=request.expected_notification_intent_fingerprint,
+            )
+            if closed is not None:
+                return closed
         return await _execute_notifier(
             request=request,
             policy_config=policy_config,
@@ -1614,6 +1843,7 @@ async def _execute_macro(
             components=components,
             report=policy_report,
             selected_policy=selected_policy,
+            selected_live_delivered=selected_live_delivered,
         )
 
     if request.select_latest_eligible_judge_output_ready:
@@ -1663,6 +1893,7 @@ async def _execute_macro(
             components=components,
             report=policy_report,
             selected_policy=selected_policy_after_validator,
+            selected_live_delivered=selected_live_delivered,
         )
 
     return replace(report, status="blocked", reason_code="macro_selector_required")
@@ -1675,6 +1906,7 @@ async def _execute_macro_notifier_after_policy(
     components: PostJudgeNotificationPipelineInventoryComponents,
     report: PostJudgeNotificationPipelineInventoryReport,
     selected_policy: SelectedTarget,
+    selected_live_delivered: LiveDeliveredNotificationProofTarget | None,
 ) -> PostJudgeNotificationPipelineInventoryReport:
     if report.status != "pass":
         return report
@@ -1690,6 +1922,18 @@ async def _execute_macro_notifier_after_policy(
         delivery_policy_version=policy_config.delivery_policy_version,
     )
     if selected_notification is None:
+        if (
+            selected_live_delivered is not None
+            and selected_live_delivered.judge_output_id == selected_policy.judge_output_id
+            and selected_live_delivered.candidate_group_id == selected_policy.candidate_group_id
+        ):
+            closed = _closed_live_delivered_notification_proof_report(
+                report,
+                selected_live_delivered,
+                expected_notification_intent_fingerprint=selected_live_delivered.event_fingerprint,
+            )
+            if closed is not None:
+                return closed
         return replace(report, status="blocked", reason_code="notification_intent_missing_after_policy")
     if (
         selected_notification.judge_output_id != selected_policy.judge_output_id
@@ -2201,6 +2445,73 @@ def _apply_selected_notification(
     )
 
 
+def _apply_selected_live_delivered_notification_proof(
+    report: PostJudgeNotificationPipelineInventoryReport,
+    selected: LiveDeliveredNotificationProofTarget | None,
+) -> PostJudgeNotificationPipelineInventoryReport:
+    if selected is None:
+        return report
+    counts = dict(report.counts)
+    counts.update(
+        {
+            "selected_live_delivered_render_count": _int(selected.render_count),
+            "selected_live_delivered_sent_or_edited_delivery_count": _int(
+                selected.sent_or_edited_delivery_count
+            ),
+            "selected_live_delivered_delivery_result_event_count": _int(
+                selected.delivery_result_event_count
+            ),
+        }
+    )
+    return replace(
+        report,
+        counts=counts,
+        selected_live_delivered_notification_intent_fingerprint=selected.event_fingerprint,
+        selected_live_delivered_analysis_fingerprint=_fingerprint(selected.analysis_id),
+        selected_live_delivered_notification_plan_fingerprint=_fingerprint(selected.notification_plan_id),
+        selected_live_delivered_candidate_group_fingerprint=_fingerprint(selected.candidate_group_id),
+        selected_live_delivered_judge_output_fingerprint=_fingerprint(selected.judge_output_id),
+        selected_live_delivered_render_count=_int(selected.render_count),
+        selected_live_delivered_sent_or_edited_delivery_count=_int(
+            selected.sent_or_edited_delivery_count
+        ),
+        selected_live_delivered_delivery_result_event_count=_int(selected.delivery_result_event_count),
+        selected_analysis_fingerprint=report.selected_analysis_fingerprint or _fingerprint(selected.analysis_id),
+        selected_notification_plan_fingerprint=(
+            report.selected_notification_plan_fingerprint or _fingerprint(selected.notification_plan_id)
+        ),
+        selected_judge_output_fingerprint=report.selected_judge_output_fingerprint
+        or _fingerprint(selected.judge_output_id),
+        selected_candidate_group_fingerprint=report.selected_candidate_group_fingerprint
+        or _fingerprint(selected.candidate_group_id),
+    )
+
+
+def _apply_closed_live_delivered_notification_proof_readiness(
+    report: PostJudgeNotificationPipelineInventoryReport,
+    selected: LiveDeliveredNotificationProofTarget,
+) -> PostJudgeNotificationPipelineInventoryReport:
+    return replace(
+        _apply_selected_live_delivered_notification_proof(report, selected),
+        selected_analysis_fingerprint=report.selected_analysis_fingerprint or _fingerprint(selected.analysis_id),
+        selected_notification_plan_fingerprint=(
+            report.selected_notification_plan_fingerprint or _fingerprint(selected.notification_plan_id)
+        ),
+        selected_judge_output_fingerprint=report.selected_judge_output_fingerprint
+        or _fingerprint(selected.judge_output_id),
+        selected_candidate_group_fingerprint=report.selected_candidate_group_fingerprint
+        or _fingerprint(selected.candidate_group_id),
+        final_verdict=_safe_bucket_value(selected.verdict),
+        delivery_decision=_safe_bucket_value(selected.delivery_decision),
+        runtime_rollout_readiness="restricted_runtime_rollout_preflight_ready",
+        analysis_created_or_present=True,
+        notification_intent_created_or_present=True,
+        notification_plan_created_or_present=True,
+        notification_render_created_or_present=True,
+        notification_delivery_result_event_created_or_present=True,
+    )
+
+
 def _apply_validator_readback(
     report: PostJudgeNotificationPipelineInventoryReport,
     readback: ValidatorReadback,
@@ -2328,6 +2639,9 @@ def _counts_to_report(counts: InventoryCounts) -> dict[str, Any]:
         "send_worthy_notification_intent_already_materialized_count": _int(
             counts.send_worthy_notification_intent_already_materialized_count
         ),
+        "live_delivered_notification_proof_count": _int(
+            counts.live_delivered_notification_proof_count
+        ),
     }
 
 
@@ -2356,9 +2670,18 @@ def _report(
         selected_analysis_fingerprint=None,
         selected_notification_intent_fingerprint=None,
         selected_notification_plan_fingerprint=None,
+        selected_live_delivered_notification_intent_fingerprint=None,
+        selected_live_delivered_analysis_fingerprint=None,
+        selected_live_delivered_notification_plan_fingerprint=None,
+        selected_live_delivered_candidate_group_fingerprint=None,
+        selected_live_delivered_judge_output_fingerprint=None,
+        selected_live_delivered_render_count=0,
+        selected_live_delivered_sent_or_edited_delivery_count=0,
+        selected_live_delivered_delivery_result_event_count=0,
         nearest_send_worthy_missing_stage=None,
         final_verdict=None,
         delivery_decision=None,
+        runtime_rollout_readiness=None,
         validator_attempted=False,
         policy_attempted=False,
         notifier_attempted=False,
@@ -2412,6 +2735,23 @@ def _selected_notification_intent_from_row(row: Mapping[str, Any]) -> SelectedNo
     )
 
 
+def _live_delivered_notification_proof_from_row(
+    row: Mapping[str, Any],
+) -> LiveDeliveredNotificationProofTarget:
+    return LiveDeliveredNotificationProofTarget(
+        event_id=UUID(str(row["event_id"])),
+        analysis_id=UUID(str(row["analysis_id"])),
+        notification_plan_id=UUID(str(row["notification_plan_id"])),
+        judge_output_id=UUID(str(row["judge_output_id"])),
+        candidate_group_id=UUID(str(row["candidate_group_id"])),
+        verdict=_safe_bucket_value(row["verdict"]),
+        delivery_decision=_safe_bucket_value(row["delivery_decision"]),
+        render_count=_int(row["render_count"]),
+        sent_or_edited_delivery_count=_int(row["sent_or_edited_delivery_count"]),
+        delivery_result_event_count=_int(row["delivery_result_event_count"]),
+    )
+
+
 def _no_ready_target_reason(counts: Mapping[str, Any]) -> str:
     if _int(counts.get("judge_output_ready_v1_count")) == 0:
         return "no_judge_output_ready_events_in_lookback"
@@ -2461,6 +2801,8 @@ def _macro_no_send_worthy_target_reason(counts: Mapping[str, Any]) -> str:
 def _nearest_send_worthy_missing_stage(counts: Mapping[str, Any]) -> str | None:
     if _int(counts.get("send_worthy_notification_intent_count")) > 0:
         return None
+    if _closed_live_delivered_notification_proof_count(counts) == 1:
+        return None
     if _int(counts.get("eligible_policy_apply_count")) > 0:
         return "analysis.policy.apply.v1"
     if _int(counts.get("eligible_judge_output_ready_count")) > 0:
@@ -2509,6 +2851,32 @@ def _notification_proof_ambiguous(readback: NotificationProofReadback) -> bool:
         or readback.notification_render_count > 1
         or readback.send_disabled_delivery_record_count > 1
         or readback.notification_delivery_result_event_count > 1
+    )
+
+
+def _closed_live_delivered_notification_proof_count(counts: Mapping[str, Any]) -> int:
+    return _int(counts.get("live_delivered_notification_proof_count"))
+
+
+def _closed_live_delivered_notification_proof_report(
+    report: PostJudgeNotificationPipelineInventoryReport,
+    selected: LiveDeliveredNotificationProofTarget | None,
+    *,
+    expected_notification_intent_fingerprint: str | None,
+) -> PostJudgeNotificationPipelineInventoryReport | None:
+    proof_count = _closed_live_delivered_notification_proof_count(report.counts)
+    if proof_count == 0:
+        return None
+    if proof_count > 1:
+        return replace(report, status="blocked", reason_code="sent_or_edited_notification_proof_ambiguous")
+    if selected is None:
+        return replace(report, status="blocked", reason_code="sent_or_edited_notification_proof_missing")
+    if expected_notification_intent_fingerprint != selected.event_fingerprint:
+        return replace(report, status="blocked", reason_code="notification_intent_fingerprint_mismatch")
+    return replace(
+        _apply_closed_live_delivered_notification_proof_readiness(report, selected),
+        status="pass",
+        reason_code="sent_or_edited_notification_proof_already_closed",
     )
 
 
@@ -2592,6 +2960,7 @@ __all__ = [
     "POLICY_EVENT_TYPE",
     "DELIVERY_RESULT_EVENT_TYPE",
     "FailClosedTelegramTransport",
+    "LiveDeliveredNotificationProofTarget",
     "PostJudgeNotificationPipelineInventoryComponents",
     "PostJudgeNotificationPipelineInventoryConfigError",
     "PostJudgeNotificationPipelineInventoryReport",
@@ -2605,6 +2974,7 @@ __all__ = [
     "ValidatorReadback",
     "NotificationProofReadback",
     "PolicyReadback",
+    "_LIVE_DELIVERED_NOTIFICATION_PROOF_SQL",
     "_SEND_WORTHY_NOTIFICATION_INTENT_SQL",
     "_fingerprint",
     "build_parser",
