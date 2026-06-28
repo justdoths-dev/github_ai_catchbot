@@ -17,6 +17,7 @@ from services.maintenance.post_judge_notification_pipeline_inventory import (
     POLICY_APPLY_SELECTION_CONFIRM_TOKEN,
     POLICY_CONFIRM_TOKEN,
     STRICT_UUID_TEXT_SQL_RE,
+    VALIDATOR_CONTROL_FLOW_REASON_CODES,
     VALIDATOR_CONFIRM_TOKEN,
     InventoryCounts,
     NotificationProofReadback,
@@ -390,6 +391,7 @@ def _counts(**overrides: object) -> InventoryCounts:
         "notification_renders_count": 0,
         "notification_delivery_records_by_delivery_status_count": {},
         "eligible_judge_output_ready_count": 1,
+        "validator_processed_judge_output_ready_count": 0,
         "eligible_policy_apply_count": 0,
         "policy_apply_already_materialized_count": 0,
         "send_worthy_notification_intent_count": 0,
@@ -448,6 +450,25 @@ def test_send_worthy_notification_intent_sql_stays_on_existing_intent_and_non_su
     assert "a.delivery_decision::text <> 'suppress'" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
     assert "notification.delivery.result.v1" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
     assert "telegram_response_json->>'send_disabled' = 'true'" in _SEND_WORTHY_NOTIFICATION_INTENT_SQL
+
+
+def test_ready_selector_excludes_validator_control_flow_processed_ready_targets() -> None:
+    assert "FROM state_transitions validator_state" in _ELIGIBLE_READY_SQL
+    assert "validator_state.object_type = 'judge_run'" in _ELIGIBLE_READY_SQL
+    assert "validator_state.object_id = jr.judge_run_id" in _ELIGIBLE_READY_SQL
+    assert "validator_state.reason_code LIKE 'validator_%'" in _ELIGIBLE_READY_SQL
+    assert "'model_refusal'" in _ELIGIBLE_READY_SQL
+    assert "'analysis_failed_truncation'" in _ELIGIBLE_READY_SQL
+
+
+def test_validator_readback_includes_control_flow_non_forward_reasons() -> None:
+    readback_source = inspect.getsource(
+        SqlPostJudgeNotificationPipelineInventoryRepository.load_validator_readback
+    )
+
+    assert '_validator_control_flow_transition_predicate("st")' in readback_source
+    assert "model_refusal" in VALIDATOR_CONTROL_FLOW_REASON_CODES
+    assert "analysis_failed_truncation" in VALIDATOR_CONTROL_FLOW_REASON_CODES
 
 
 async def _run(
@@ -742,6 +763,50 @@ async def test_execute_validator_calls_service_once_and_readback_proves_policy_e
     assert commit.calls == 1
     assert repository.validator_readback_calls == 1
     assert repository.ready_select_calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason_code",
+    ["model_refusal", "analysis_failed_truncation", "validator_missing_github_comparables"],
+)
+async def test_execute_validator_classifies_non_forward_transition_as_pass(
+    reason_code: str,
+) -> None:
+    selected = _target()
+    repository = FakeRepository(
+        counts=_counts(),
+        selected_ready=selected,
+        validator_readback=ValidatorReadback(
+            policy_event_count=0,
+            validator_terminal_or_retryable_count=1,
+            validator_terminal_or_retryable_reason_code=reason_code,
+            active_analysis_count=0,
+        ),
+    )
+
+    report, validator, policy, commit = await _run(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-validator",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_eligible_judge_output_ready=True,
+            expected_judge_output_ready_fingerprint=_fingerprint(selected.event_id),
+        ),
+        repository,
+    )
+
+    assert report.status == "pass"
+    assert report.reason_code == reason_code
+    assert report.reason_code != "validator_policy_event_missing"
+    assert report.validator_attempted is True
+    assert report.policy_event_created_or_present is False
+    assert report.counts["selected_policy_apply_event_count"] == 0
+    assert report.counts["selected_validator_terminal_or_retryable_count"] == 1
+    assert report.counts["selected_validator_terminal_or_retryable_reason_code"] == reason_code
+    assert validator.calls == [selected.event_id]
+    assert policy.calls == []
+    assert commit.calls == 1
 
 
 @pytest.mark.asyncio
@@ -1164,6 +1229,105 @@ async def test_execute_macro_from_ready_target_reuses_existing_services_to_send_
     assert policy.calls == [selected_policy.event_id]
     assert notifier.calls == [selected_notification.event_id]
     assert commit.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_execute_macro_blocks_after_validator_non_forward_without_policy_or_notifier() -> None:
+    selected_ready = _target()
+    repository = FakeRepository(
+        counts=_counts(
+            judge_output_ready_v1_count=1,
+            eligible_judge_output_ready_count=1,
+            analysis_policy_apply_v1_count=0,
+            eligible_policy_apply_count=0,
+            notification_plan_created_v1_count=0,
+            send_worthy_notification_intent_count=0,
+        ),
+        selected_ready=selected_ready,
+        validator_readback=ValidatorReadback(
+            policy_event_count=0,
+            validator_terminal_or_retryable_count=1,
+            validator_terminal_or_retryable_reason_code="model_refusal",
+            active_analysis_count=0,
+        ),
+    )
+
+    report, validator, policy, notifier, commit = await _run_with_notifier(
+        PostJudgeNotificationPipelineInventoryRequest(
+            mode="execute-macro",
+            lookback_hours=72,
+            sample_limit=100,
+            select_latest_eligible_judge_output_ready=True,
+            expected_judge_output_ready_fingerprint=_fingerprint(selected_ready.event_id),
+        ),
+        repository,
+    )
+
+    payload = json.dumps(asdict(report), sort_keys=True)
+    forbidden = [
+        str(selected_ready.event_id),
+        str(selected_ready.judge_run_id),
+        str(selected_ready.judge_output_id),
+        str(selected_ready.candidate_group_id),
+        str(selected_ready.bundle_id),
+        SENSITIVE_TEXT_SENTINEL,
+        SENSITIVE_URL_SENTINEL,
+        SENSITIVE_CHAT_LOCATOR_SENTINEL,
+        SENSITIVE_MESSAGE_LOCATOR_SENTINEL,
+        SENSITIVE_DB_LOCATOR_SENTINEL,
+        SENSITIVE_REDIS_LOCATOR_SENTINEL,
+        SENSITIVE_EXCEPTION_SENTINEL,
+        SENSITIVE_STDERR_SENTINEL,
+        SENSITIVE_DEDUPE_SENTINEL,
+    ]
+
+    assert report.status == "blocked"
+    assert report.reason_code == "model_refusal"
+    assert report.validator_attempted is True
+    assert report.policy_attempted is False
+    assert report.notifier_attempted is False
+    assert report.policy_event_created_or_present is False
+    assert report.redis_attempted is False
+    assert report.telegram_transport_attempted is False
+    assert report.openai_attempted is False
+    assert validator.calls == [selected_ready.event_id]
+    assert policy.calls == []
+    assert notifier.calls == []
+    assert commit.calls == 1
+    for value in forbidden:
+        assert value not in payload
+
+
+@pytest.mark.asyncio
+async def test_plan_all_ready_targets_validator_processed_points_back_to_judge_openai() -> None:
+    repository = FakeRepository(
+        counts=_counts(
+            judge_call_requested_v1_count=1,
+            judge_outputs_count=1,
+            judge_output_ready_v1_count=1,
+            eligible_judge_output_ready_count=0,
+            validator_processed_judge_output_ready_count=1,
+            analysis_policy_apply_v1_count=0,
+            analyses_count=0,
+            eligible_policy_apply_count=0,
+            notification_plan_created_v1_count=0,
+            send_worthy_notification_intent_count=0,
+        ),
+        selected_ready=None,
+    )
+
+    report, validator, policy, commit = await _run(
+        PostJudgeNotificationPipelineInventoryRequest(mode="plan", lookback_hours=72, sample_limit=100),
+        repository,
+    )
+
+    assert report.status == "pass"
+    assert report.selected_judge_output_ready_fingerprint is None
+    assert report.counts["validator_processed_judge_output_ready_count"] == 1
+    assert report.nearest_send_worthy_missing_stage == "judge_openai"
+    assert validator.calls == []
+    assert policy.calls == []
+    assert commit.calls == 0
 
 
 @pytest.mark.asyncio

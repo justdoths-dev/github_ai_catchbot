@@ -85,6 +85,17 @@ RUNTIME_FILE_KEYS = {"DATABASE_URL_FILE"}
 RUNTIME_ENV_KEYS = RUNTIME_VALUE_KEYS | RUNTIME_FILE_KEYS
 EXPECTED_FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 SAFE_REASON_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
+VALIDATOR_CONTROL_FLOW_REASON_CODES = ("model_refusal", "analysis_failed_truncation")
+VALIDATOR_CONTROL_FLOW_REASON_SQL_LIST = ", ".join(
+    f"'{reason_code}'" for reason_code in VALIDATOR_CONTROL_FLOW_REASON_CODES
+)
+
+
+def _validator_control_flow_transition_predicate(alias: str) -> str:
+    return (
+        f"({alias}.reason_code LIKE 'validator_%' "
+        f"OR {alias}.reason_code IN ({VALIDATOR_CONTROL_FLOW_REASON_SQL_LIST}))"
+    )
 
 
 class PostJudgeNotificationPipelineInventoryConfigError(ValueError):
@@ -113,6 +124,7 @@ class InventoryCounts:
     notification_renders_count: int = 0
     notification_delivery_records_by_delivery_status_count: dict[str, int] = field(default_factory=dict)
     eligible_judge_output_ready_count: int = 0
+    validator_processed_judge_output_ready_count: int = 0
     eligible_policy_apply_count: int = 0
     policy_apply_already_materialized_count: int = 0
     send_worthy_notification_intent_count: int = 0
@@ -485,6 +497,11 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
             policy_version=policy_version,
             delivery_policy_version=delivery_policy_version,
         )
+        validator_processed_ready_count = await self._validator_processed_judge_output_ready_count(
+            lookback_hours=lookback_hours,
+            policy_version=policy_version,
+            delivery_policy_version=delivery_policy_version,
+        )
         eligible_policy_count = await self._eligible_policy_apply_count(
             lookback_hours=lookback_hours,
             policy_version=policy_version,
@@ -533,6 +550,7 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
             notification_renders_count=_int(row["notification_renders_count"]),
             notification_delivery_records_by_delivery_status_count=delivery_by_status,
             eligible_judge_output_ready_count=eligible_ready_count,
+            validator_processed_judge_output_ready_count=validator_processed_ready_count,
             eligible_policy_apply_count=eligible_policy_count,
             policy_apply_already_materialized_count=materialized_policy_count,
             send_worthy_notification_intent_count=send_worthy_intent_count,
@@ -597,14 +615,14 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
     ) -> ValidatorReadback:
         policy_rows = await self._policy_event_rows(judge_run_id=judge_run_id, judge_output_id=judge_output_id)
         transition_rows = await self._rows(
-            """
-            SELECT reason_code, to_state, count(*) AS transition_count
-            FROM state_transitions
-            WHERE object_type = 'judge_run'
-              AND object_id = CAST(:judge_run_id AS uuid)
-              AND reason_code LIKE 'validator_%'
-            GROUP BY reason_code, to_state
-            ORDER BY max(created_at) DESC, reason_code ASC
+            f"""
+            SELECT st.reason_code, st.to_state, count(*) AS transition_count
+            FROM state_transitions st
+            WHERE st.object_type = 'judge_run'
+              AND st.object_id = CAST(:judge_run_id AS uuid)
+              AND {_validator_control_flow_transition_predicate("st")}
+            GROUP BY st.reason_code, st.to_state
+            ORDER BY max(st.created_at) DESC, st.reason_code ASC
             """,
             {"judge_run_id": str(judge_run_id)},
         )
@@ -780,6 +798,76 @@ class SqlPostJudgeNotificationPipelineInventoryRepository:
                 )
             )["target_count"]
         )
+
+    async def _validator_processed_judge_output_ready_count(
+        self,
+        *,
+        lookback_hours: int,
+        policy_version: str,
+        delivery_policy_version: str,
+    ) -> int:
+        row = await self._one(
+            f"""
+            WITH candidate_events AS (
+                SELECT
+                    eo.event_id,
+                    eo.aggregate_id,
+                    eo.created_at,
+                    eo.payload_json->>'judge_run_id' AS judge_run_id_text,
+                    eo.payload_json->>'judge_output_id' AS judge_output_id_text
+                FROM event_outbox eo
+                WHERE eo.event_type = 'judge.output.ready.v1'
+                  AND eo.aggregate_type = 'judge_run'
+                  AND eo.created_at >= now() - make_interval(hours => :lookback_hours)
+                  AND eo.payload_json->>'judge_run_id' ~ '{STRICT_UUID_TEXT_SQL_RE}'
+                  AND eo.payload_json->>'judge_output_id' ~ '{STRICT_UUID_TEXT_SQL_RE}'
+            )
+            SELECT count(DISTINCT ce.event_id) AS processed_count
+            FROM candidate_events ce
+            JOIN judge_runs jr
+              ON jr.judge_run_id = ce.aggregate_id
+            JOIN judge_outputs jo
+              ON jo.judge_output_id = CAST(ce.judge_output_id_text AS uuid)
+             AND jo.judge_run_id = jr.judge_run_id
+            JOIN candidate_evidence_bundles ceb
+              ON ceb.bundle_id = jr.bundle_id
+             AND ceb.candidate_group_id = jo.candidate_group_id
+            JOIN candidate_group_proposals cgp
+              ON cgp.candidate_group_id = jo.candidate_group_id
+             AND cgp.current_bundle_id = jr.bundle_id
+            WHERE ce.judge_run_id_text = jr.judge_run_id::text
+              AND ce.judge_output_id_text = jo.judge_output_id::text
+              AND EXISTS (
+                    SELECT 1
+                    FROM state_transitions validator_state
+                    WHERE validator_state.object_type = 'judge_run'
+                      AND validator_state.object_id = jr.judge_run_id
+                      AND {_validator_control_flow_transition_predicate("validator_state")}
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM event_outbox policy
+                    WHERE policy.event_type = 'analysis.policy.apply.v1'
+                      AND policy.aggregate_type = 'judge_run'
+                      AND policy.aggregate_id = jr.judge_run_id
+                      AND policy.payload_json->>'judge_run_id' = jr.judge_run_id::text
+                      AND policy.payload_json->>'judge_output_id' = jo.judge_output_id::text
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM analyses a
+                    WHERE a.judge_output_id = jo.judge_output_id
+                      AND a.policy_version = :policy_version
+                      AND a.delivery_policy_version = :delivery_policy_version
+              )
+            """,
+            {
+                "lookback_hours": lookback_hours,
+                "policy_version": policy_version,
+                "delivery_policy_version": delivery_policy_version,
+            },
+        )
+        return _int(row["processed_count"])
 
     async def _eligible_policy_apply_count(
         self,
@@ -1041,6 +1129,13 @@ WHERE ce.judge_run_id_text = jr.judge_run_id::text
         WHERE a.judge_output_id = jo.judge_output_id
           AND a.policy_version = :policy_version
           AND a.delivery_policy_version = :delivery_policy_version
+  )
+  AND NOT EXISTS (
+        SELECT 1
+        FROM state_transitions validator_state
+        WHERE validator_state.object_type = 'judge_run'
+          AND validator_state.object_id = jr.judge_run_id
+          AND {_validator_control_flow_transition_predicate("validator_state")}
   )
 ORDER BY ce.created_at DESC, ce.event_id DESC
 LIMIT :sample_limit
@@ -2215,6 +2310,9 @@ def _counts_to_report(counts: InventoryCounts) -> dict[str, Any]:
             counts.notification_delivery_records_by_delivery_status_count
         ),
         "eligible_judge_output_ready_count": _int(counts.eligible_judge_output_ready_count),
+        "validator_processed_judge_output_ready_count": _int(
+            counts.validator_processed_judge_output_ready_count
+        ),
         "eligible_policy_apply_count": _int(counts.eligible_policy_apply_count),
         "policy_apply_already_materialized_count": _int(counts.policy_apply_already_materialized_count),
         "send_worthy_notification_intent_count": _int(counts.send_worthy_notification_intent_count),
@@ -2310,6 +2408,8 @@ def _no_ready_target_reason(counts: Mapping[str, Any]) -> str:
         return "no_judge_output_ready_events_in_lookback"
     if _int(counts.get("analysis_policy_apply_v1_count")) > 0 or _int(counts.get("analyses_count")) > 0:
         return "judge_output_ready_already_forwarded_or_materialized"
+    if _all_ready_targets_validator_processed(counts):
+        return "judge_output_ready_already_validator_processed"
     return "no_eligible_judge_output_ready_target"
 
 
@@ -2339,6 +2439,10 @@ def _macro_no_send_worthy_target_reason(counts: Mapping[str, Any]) -> str:
     if _int(counts.get("analysis_policy_apply_v1_count")) > 0:
         return "send_worthy_target_requires_non_suppress_policy_output"
     if _int(counts.get("judge_output_ready_v1_count")) > 0:
+        if _all_ready_targets_validator_processed(counts):
+            if _int(counts.get("judge_call_requested_v1_count")) > 0:
+                return "send_worthy_target_requires_live_openai_or_judge_recovery"
+            return "send_worthy_target_requires_exact_source_or_live_openai"
         return "send_worthy_target_requires_validator_or_policy_recovery"
     if _int(counts.get("judge_call_requested_v1_count")) > 0:
         return "send_worthy_target_requires_live_openai_or_judge_recovery"
@@ -2355,12 +2459,28 @@ def _nearest_send_worthy_missing_stage(counts: Mapping[str, Any]) -> str | None:
     if _int(counts.get("analysis_policy_apply_v1_count")) > 0:
         return "policy_engine_non_suppress_output"
     if _int(counts.get("judge_output_ready_v1_count")) > 0:
+        if _all_ready_targets_validator_processed(counts):
+            if _int(counts.get("judge_call_requested_v1_count")) > 0:
+                return "judge_openai"
+            return "source_or_live_openai"
         return "analysis_validator_or_policy_recovery"
     if _int(counts.get("judge_outputs_count")) > 0:
         return "judge.output.ready.v1"
     if _int(counts.get("judge_call_requested_v1_count")) > 0:
         return "judge_openai"
     return "source_or_live_openai"
+
+
+def _all_ready_targets_validator_processed(counts: Mapping[str, Any]) -> bool:
+    ready_count = _int(counts.get("judge_output_ready_v1_count"))
+    if ready_count == 0:
+        return False
+    return (
+        _int(counts.get("eligible_judge_output_ready_count")) == 0
+        and _int(counts.get("analysis_policy_apply_v1_count")) == 0
+        and _int(counts.get("analyses_count")) == 0
+        and _int(counts.get("validator_processed_judge_output_ready_count")) >= ready_count
+    )
 
 
 def _notification_proof_exactly_once(readback: NotificationProofReadback) -> bool:
