@@ -528,7 +528,7 @@ async def test_validator_allows_github_no_comparables_skip_to_policy_suppress() 
     ledger = _ValidatorPolicyLedger(
         scores=_runtime_skip_no_comparables_scores(),
         model_proposed_verdict="skip",
-        mutate_payload=_mark_empty_comparables,
+        mutate_payload=_mark_empty_comparables_with_comparison_gap,
     )
     _validator_repo, policy_repo, relay_repo, publisher, processed = await _run_pipeline(ledger)
 
@@ -549,11 +549,66 @@ async def test_validator_allows_github_no_comparables_skip_to_policy_suppress() 
 
 
 @pytest.mark.asyncio
-async def test_validator_rejects_github_no_comparables_later_before_policy_queue() -> None:
+async def test_validator_allows_github_no_comparables_later_to_policy_notification_queue() -> None:
     ledger = _ValidatorPolicyLedger(
         scores=_conservative_no_comparables_later_scores(),
         model_proposed_verdict="later",
         mutate_payload=_mark_conservative_comparison_gap,
+    )
+    validator_repo, policy_repo, relay_repo, publisher, processed = await _run_pipeline(ledger)
+
+    policy_apply_events = ledger.rows_of_type("analysis.policy.apply.v1")
+    assert len(policy_apply_events) == 1
+    assert policy_repo.loaded_trigger_event_ids == [policy_apply_events[0].event_id]
+    assert len(ledger.analyses) == 1
+    analysis = ledger.analyses[0]
+    assert analysis.verdict == "later"
+    assert analysis.delivery_decision == "send_now"
+    assert analysis.model_proposed_verdict == "later"
+    assert "comparison_gap" in analysis.reason_codes_json
+    notification_events = ledger.rows_of_type("notification.plan.created.v1")
+    assert len(notification_events) == 1
+    assert notification_events[0].payload_json["delivery_decision"] == "send_now"
+    assert notification_events[0].payload_json["urgency_profile"] == "normal_silent"
+    assert processed == 1
+    assert relay_repo.marked_published == [notification_events[0].event_id]
+    assert len(publisher.published) == 1
+    assert validator_repo.ledger.judge_run_status_updates == []
+    assert {
+        "object_type": "judge_run",
+        "object_id": ledger.judge_run_id,
+        "from_state": "succeeded",
+        "to_state": "analysis_validated",
+        "reason_code": "validator_passed",
+    } in ledger.state_transitions
+    assert {
+        "object_type": "analysis",
+        "object_id": ledger.analysis_id,
+        "from_state": "analysis_validated",
+        "to_state": "analysis_finalized",
+        "reason_code": "policy_applied:later:send_now",
+    } in ledger.state_transitions
+    assert (
+        len(
+            [
+                transition
+                for transition in ledger.state_transitions
+                if transition["object_type"] == "judge_run"
+                and transition["object_id"] == ledger.judge_run_id
+            ]
+        )
+        == 1
+    )
+    _assert_no_notifier_owned_writes(ledger)
+    _assert_no_external_authority(ledger)
+
+
+@pytest.mark.asyncio
+async def test_validator_rejects_github_no_comparables_without_comparison_gap_before_policy_queue() -> None:
+    ledger = _ValidatorPolicyLedger(
+        scores=_conservative_no_comparables_later_scores(),
+        model_proposed_verdict="later",
+        mutate_payload=_mark_empty_comparables,
     )
     validator_repo, policy_repo, relay_repo, publisher, processed = await _run_pipeline(ledger)
 
@@ -568,7 +623,7 @@ async def test_validator_rejects_github_no_comparables_later_before_policy_queue
         {
             "judge_run_id": ledger.judge_run_id,
             "status": "failed_terminal",
-            "finish_reason": "validator_missing_github_comparables",
+            "finish_reason": "validator_missing_comparison_gap_reason",
         }
     ]
     assert ledger.state_transitions == [
@@ -577,7 +632,7 @@ async def test_validator_rejects_github_no_comparables_later_before_policy_queue
             "object_id": ledger.judge_run_id,
             "from_state": "succeeded",
             "to_state": "analysis_failed_semantic",
-            "reason_code": "validator_missing_github_comparables",
+            "reason_code": "validator_missing_comparison_gap_reason",
         }
     ]
     _assert_no_notifier_owned_writes(ledger)
@@ -820,6 +875,12 @@ def _conservative_no_comparables_later_scores() -> dict[str, int | None]:
 
 def _mark_empty_comparables(payload: dict[str, Any]) -> None:
     payload["comparables"] = []
+
+
+def _mark_empty_comparables_with_comparison_gap(payload: dict[str, Any]) -> None:
+    payload["comparables"] = []
+    payload["reason_codes"] = ["comparison_gap"]
+    payload["evidence_limitations_ko"] = ["comparison_gap"]
 
 
 def _mark_conservative_comparison_gap(payload: dict[str, Any]) -> None:

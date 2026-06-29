@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from numbers import Real
 from typing import Any
 
@@ -8,6 +9,10 @@ from .models import BundleValidationContext, ValidationDecision
 
 _GITHUB_PRIMARY_TYPES = {"github_repo", "github_subpath", "github_repo_page", "github_gist"}
 _TRUNCATION_FINISH_REASONS = {"incomplete", "max_output_tokens", "output_truncated", "truncated"}
+_COMPARISON_GAP_TOKENS = frozenset({"comparison_gap", "insufficient_comparables"})
+_COMPARISON_GAP_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:comparison_gap|insufficient_comparables)(?![A-Za-z0-9_])"
+)
 
 
 class AnalysisValidatorBusinessRules:
@@ -76,9 +81,7 @@ class AnalysisValidatorBusinessRules:
             and len(comparables) == 0
         ):
             comparables_decision = self._validate_github_no_comparables(
-                confidence_band=payload.get("model_confidence_band"),
-                scores=scores,
-                verdict=verdict,
+                payload=payload,
             )
             if comparables_decision is not None:
                 return comparables_decision
@@ -132,16 +135,23 @@ class AnalysisValidatorBusinessRules:
     def _validate_github_no_comparables(
         self,
         *,
-        confidence_band: Any,
-        scores: dict[str, Any],
-        verdict: Any,
+        payload: dict[str, Any],
     ) -> ValidationDecision | None:
-        confidence = self._score(scores, "confidence")
-
-        if verdict == "skip":
+        if self._has_comparison_gap_token(payload):
             return None
-        if verdict == "inspect_now" or confidence_band == "high" or (
-            confidence is not None and confidence >= 60
-        ):
-            return self._semantic("validator_github_comparables_required_for_high_action")
-        return self._semantic("validator_missing_github_comparables")
+        return self._semantic("validator_missing_comparison_gap_reason")
+
+    @staticmethod
+    def _has_comparison_gap_token(payload: dict[str, Any]) -> bool:
+        reason_codes = payload.get("reason_codes")
+        if isinstance(reason_codes, list):
+            for reason_code in reason_codes:
+                if reason_code in _COMPARISON_GAP_TOKENS:
+                    return True
+
+        evidence_limitations = payload.get("evidence_limitations_ko")
+        if isinstance(evidence_limitations, list):
+            for limitation in evidence_limitations:
+                if isinstance(limitation, str) and _COMPARISON_GAP_TOKEN_RE.search(limitation):
+                    return True
+        return False

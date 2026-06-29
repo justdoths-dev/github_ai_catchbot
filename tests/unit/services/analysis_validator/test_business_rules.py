@@ -136,6 +136,7 @@ def test_business_rules_allow_github_no_comparables_skip_to_reach_policy_suppres
     )
     payload["model_proposed_verdict"] = "skip"
     payload["model_confidence_band"] = "high"
+    payload["reason_codes"].append("comparison_gap")
 
     decision = AnalysisValidatorBusinessRules().validate_semantics(
         payload=payload,
@@ -164,6 +165,7 @@ def test_business_rules_allow_github_missing_or_null_comparables_skip_to_reach_p
     )
     payload["model_proposed_verdict"] = "skip"
     payload["model_confidence_band"] = "high"
+    payload["reason_codes"].append("comparison_gap")
     if shape == "missing":
         payload.pop("comparables")
     else:
@@ -178,25 +180,25 @@ def test_business_rules_allow_github_missing_or_null_comparables_skip_to_reach_p
     assert decision.reason_code == "validator_passed"
 
 
-def test_business_rules_reject_github_no_comparables_later_even_with_comparison_gap_marker() -> None:
+def test_business_rules_allow_github_no_comparables_later_with_reason_code_comparison_gap() -> None:
     payload = _live_terminal_no_comparables_payload()
-    payload["reason_codes"].extend(["comparison_gap", "insufficient_comparables"])
-    payload["evidence_limitations_ko"] = ["comparison_gap"]
+    payload["reason_codes"].append("comparison_gap")
 
     decision = AnalysisValidatorBusinessRules().validate_semantics(
         payload=payload,
         bundle=_bundle("github_repo"),
     )
 
-    assert decision.action == "failed_terminal"
-    assert decision.reason_code == "validator_missing_github_comparables"
+    assert decision.action == "forward_policy"
+    assert decision.reason_code == "validator_passed"
 
 
 @pytest.mark.parametrize("shape", ["missing", "null"])
-def test_business_rules_reject_github_missing_or_null_comparables_later(shape: str) -> None:
+def test_business_rules_allow_github_missing_or_null_comparables_later_with_comparison_gap(
+    shape: str,
+) -> None:
     payload = _live_terminal_no_comparables_payload()
-    payload["reason_codes"].extend(["comparison_gap", "insufficient_comparables"])
-    payload["evidence_limitations_ko"] = ["comparison_gap"]
+    payload["reason_codes"].append("comparison_gap")
     if shape == "missing":
         payload.pop("comparables")
     else:
@@ -207,8 +209,8 @@ def test_business_rules_reject_github_missing_or_null_comparables_later(shape: s
         bundle=_bundle("github_repo"),
     )
 
-    assert decision.action == "failed_terminal"
-    assert decision.reason_code == "validator_missing_github_comparables"
+    assert decision.action == "forward_policy"
+    assert decision.reason_code == "validator_passed"
 
 
 def test_business_rules_non_github_no_comparables_later_still_forwards_policy() -> None:
@@ -225,7 +227,7 @@ def test_business_rules_non_github_no_comparables_later_still_forwards_policy() 
     assert decision.reason_code == "validator_passed"
 
 
-def test_business_rules_reject_github_no_comparables_high_confidence_even_with_gap_marker() -> None:
+def test_business_rules_allow_github_no_comparables_high_confidence_with_gap_marker() -> None:
     payload = _live_terminal_no_comparables_payload()
     payload["reason_codes"].append("comparison_gap")
     payload["model_confidence_band"] = "high"
@@ -235,22 +237,43 @@ def test_business_rules_reject_github_no_comparables_high_confidence_even_with_g
         bundle=_bundle("github_repo"),
     )
 
-    assert decision.action == "failed_terminal"
-    assert decision.reason_code == "validator_github_comparables_required_for_high_action"
+    assert decision.action == "forward_policy"
+    assert decision.reason_code == "validator_passed"
 
 
-def test_business_rules_reject_github_no_comparables_inspect_now_even_with_gap_marker() -> None:
-    payload = _live_terminal_no_comparables_payload()
-    payload["reason_codes"].append("comparison_gap")
+def test_business_rules_allow_github_no_comparables_inspect_now_with_reason_code_insufficient_comparables() -> None:
+    payload = valid_payload()
+    payload["comparables"] = []
+    payload["reason_codes"] = ["insufficient_comparables"]
     payload["model_proposed_verdict"] = "inspect_now"
+    payload["scores"].update(
+        {
+            "evidence_strength": 50,
+            "confidence": 60,
+            "hype_penalty": 69,
+        }
+    )
 
     decision = AnalysisValidatorBusinessRules().validate_semantics(
         payload=payload,
         bundle=_bundle("github_repo"),
     )
 
-    assert decision.action == "failed_terminal"
-    assert decision.reason_code == "validator_github_comparables_required_for_high_action"
+    assert decision.action == "forward_policy"
+    assert decision.reason_code == "validator_passed"
+
+
+def test_business_rules_allow_github_no_comparables_with_evidence_limitation_comparison_gap() -> None:
+    payload = _live_terminal_no_comparables_payload()
+    payload["evidence_limitations_ko"] = ["comparison_gap: no reliable comparable tool in bundle"]
+
+    decision = AnalysisValidatorBusinessRules().validate_semantics(
+        payload=payload,
+        bundle=_bundle("github_repo"),
+    )
+
+    assert decision.action == "forward_policy"
+    assert decision.reason_code == "validator_passed"
 
 
 def test_business_rules_reject_github_no_comparables_without_comparison_gap_marker() -> None:
@@ -262,10 +285,22 @@ def test_business_rules_reject_github_no_comparables_without_comparison_gap_mark
     )
 
     assert decision.action == "failed_terminal"
-    assert decision.reason_code == "validator_missing_github_comparables"
+    assert decision.reason_code == "validator_missing_comparison_gap_reason"
 
 
-def test_business_rules_reject_github_no_comparables_high_action_even_with_comparison_gap() -> None:
+@pytest.mark.parametrize(
+    ("score_field", "score_value", "expected_reason"),
+    [
+        ("evidence_strength", 49, "validator_inspect_now_evidence_too_low"),
+        ("confidence", 59, "validator_inspect_now_confidence_too_low"),
+        ("hype_penalty", 70, "validator_inspect_now_hype_too_high"),
+    ],
+)
+def test_business_rules_reject_github_no_comparables_inspect_now_score_safeguards(
+    score_field: str,
+    score_value: int,
+    expected_reason: str,
+) -> None:
     payload = valid_payload()
     payload["comparables"] = []
     payload["reason_codes"] = ["comparison_gap"]
@@ -276,6 +311,7 @@ def test_business_rules_reject_github_no_comparables_high_action_even_with_compa
             "hype_penalty": 10,
         }
     )
+    payload["scores"][score_field] = score_value
     payload["model_proposed_verdict"] = "inspect_now"
     payload["model_confidence_band"] = "high"
 
@@ -285,7 +321,7 @@ def test_business_rules_reject_github_no_comparables_high_action_even_with_compa
     )
 
     assert decision.action == "failed_terminal"
-    assert decision.reason_code == "validator_github_comparables_required_for_high_action"
+    assert decision.reason_code == expected_reason
 
 
 def test_refusal_branch_produces_analysis_refused_and_no_policy_handoff_decision() -> None:

@@ -367,6 +367,7 @@ async def test_github_no_comparables_skip_emits_policy_apply_event() -> None:
     )
     payload["model_proposed_verdict"] = "skip"
     payload["model_confidence_band"] = "high"
+    payload["reason_codes"].append("comparison_gap")
     payload["candidate_group_id"] = str(output.candidate_group_id)
     repository.outputs[output.judge_output_id] = replace(output, payload_json=payload)
 
@@ -405,6 +406,7 @@ async def test_github_missing_or_null_comparables_skip_emits_policy_apply_event(
     )
     payload["model_proposed_verdict"] = "skip"
     payload["model_confidence_band"] = "high"
+    payload["reason_codes"].append("comparison_gap")
     if shape == "missing":
         payload.pop("comparables")
     else:
@@ -427,7 +429,7 @@ async def test_github_missing_or_null_comparables_skip_emits_policy_apply_event(
 
 
 @pytest.mark.asyncio
-async def test_github_no_comparables_later_with_comparison_gap_fails_before_policy_apply() -> None:
+async def test_github_no_comparables_later_with_comparison_gap_emits_policy_apply() -> None:
     repository, job, run, output = _repo_with_valid_case()
     payload = _live_terminal_no_comparables_payload()
     payload["reason_codes"].extend(["comparison_gap", "insufficient_comparables"])
@@ -437,16 +439,24 @@ async def test_github_no_comparables_later_with_comparison_gap_fails_before_poli
 
     await _handle(repository, job)
 
-    assert repository.runs[run.judge_run_id].status == "failed_terminal"
-    assert repository.runs[run.judge_run_id].finish_reason == "validator_missing_github_comparables"
-    assert repository.state_transitions[0]["to_state"] == "analysis_failed_semantic"
-    assert repository.state_transitions[0]["reason_code"] == "validator_missing_github_comparables"
-    assert repository.outbox == []
+    assert repository.runs[run.judge_run_id].status == "succeeded"
+    assert repository.state_transitions[0]["to_state"] == "analysis_validated"
+    assert repository.state_transitions[0]["reason_code"] == "validator_passed"
+    assert len(repository.outbox) == 1
+    assert repository.outbox[0]["event_type"] == "analysis.policy.apply.v1"
+    assert repository.outbox[0]["payload_json"] == {
+        "judge_run_id": run.judge_run_id,
+        "judge_output_id": output.judge_output_id,
+        "candidate_group_id": output.candidate_group_id,
+        "bundle_id": run.bundle_id,
+    }
 
 
 @pytest.mark.parametrize("shape", ["missing", "null"])
 @pytest.mark.asyncio
-async def test_github_missing_or_null_comparables_later_fails_before_policy_apply(shape: str) -> None:
+async def test_github_missing_or_null_comparables_later_with_comparison_gap_emits_policy_apply(
+    shape: str,
+) -> None:
     repository, job, run, output = _repo_with_valid_case()
     payload = _live_terminal_no_comparables_payload()
     payload["reason_codes"].extend(["comparison_gap", "insufficient_comparables"])
@@ -460,11 +470,11 @@ async def test_github_missing_or_null_comparables_later_fails_before_policy_appl
 
     await _handle(repository, job)
 
-    assert repository.runs[run.judge_run_id].status == "failed_terminal"
-    assert repository.runs[run.judge_run_id].finish_reason == "validator_missing_github_comparables"
-    assert repository.state_transitions[0]["to_state"] == "analysis_failed_semantic"
-    assert repository.state_transitions[0]["reason_code"] == "validator_missing_github_comparables"
-    assert repository.outbox == []
+    assert repository.runs[run.judge_run_id].status == "succeeded"
+    assert repository.state_transitions[0]["to_state"] == "analysis_validated"
+    assert repository.state_transitions[0]["reason_code"] == "validator_passed"
+    assert len(repository.outbox) == 1
+    assert repository.outbox[0]["event_type"] == "analysis.policy.apply.v1"
     stored_payload = repository.outputs[output.judge_output_id].payload_json
     if shape == "missing":
         assert "comparables" not in stored_payload
@@ -482,14 +492,14 @@ async def test_live_terminal_shape_without_comparison_gap_fails_before_policy_ap
     await _handle(repository, job)
 
     assert repository.runs[run.judge_run_id].status == "failed_terminal"
-    assert repository.runs[run.judge_run_id].finish_reason == "validator_missing_github_comparables"
+    assert repository.runs[run.judge_run_id].finish_reason == "validator_missing_comparison_gap_reason"
     assert repository.state_transitions[0]["to_state"] == "analysis_failed_semantic"
-    assert repository.state_transitions[0]["reason_code"] == "validator_missing_github_comparables"
+    assert repository.state_transitions[0]["reason_code"] == "validator_missing_comparison_gap_reason"
     assert repository.outbox == []
 
 
 @pytest.mark.asyncio
-async def test_high_action_github_no_comparables_does_not_pass_to_policy_apply() -> None:
+async def test_high_action_github_no_comparables_with_gap_passes_policy_apply_when_score_floors_pass() -> None:
     repository, job, run, output = _repo_with_valid_case()
     payload = _live_terminal_no_comparables_payload()
     payload["candidate_group_id"] = str(output.candidate_group_id)
@@ -511,11 +521,11 @@ async def test_high_action_github_no_comparables_does_not_pass_to_policy_apply()
 
     await _handle(repository, job)
 
-    assert repository.runs[run.judge_run_id].status == "failed_terminal"
-    assert repository.runs[run.judge_run_id].finish_reason == "validator_github_comparables_required_for_high_action"
-    assert repository.state_transitions[0]["to_state"] == "analysis_failed_semantic"
-    assert repository.state_transitions[0]["reason_code"] == "validator_github_comparables_required_for_high_action"
-    assert repository.outbox == []
+    assert repository.runs[run.judge_run_id].status == "succeeded"
+    assert repository.state_transitions[0]["to_state"] == "analysis_validated"
+    assert repository.state_transitions[0]["reason_code"] == "validator_passed"
+    assert len(repository.outbox) == 1
+    assert repository.outbox[0]["event_type"] == "analysis.policy.apply.v1"
 
 
 @pytest.mark.asyncio
