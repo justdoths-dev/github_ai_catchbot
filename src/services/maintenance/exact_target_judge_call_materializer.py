@@ -1414,6 +1414,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     return asyncio.run(run_cli(argv))
 
 
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
 __all__ = [
     "ANALYSIS_REQUEST_SELECTION_CONFIRM_TOKEN",
     "AnalysisRequestSelectionAuthority",
