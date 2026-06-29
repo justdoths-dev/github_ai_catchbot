@@ -264,6 +264,7 @@ class FinalReadback:
     analysis_requested_events: int = 0
     judge_runs: int = 0
     judge_call_requested_events: int = 0
+    provider_snapshot_updated_event_id: UUID | None = None
     bundle_id: UUID | None = None
     analysis_request_event_id: UUID | None = None
 
@@ -570,6 +571,32 @@ class SqlExactTargetSourceToAnalysisRepository:
                     "bundle_id": str(bundle_id),
                 },
             )
+        provider_snapshot_updated_event_id = await self._uuid_or_none(
+            """
+            SELECT eo.event_id
+            FROM event_outbox eo
+            JOIN candidate_group_members cgm
+              ON cgm.artifact_id = eo.aggregate_id
+            JOIN artifact_registry ar
+              ON ar.artifact_id = cgm.artifact_id
+            JOIN artifact_snapshots aps
+              ON aps.snapshot_id = ar.current_snapshot_id
+            WHERE cgm.candidate_group_id = CAST(:candidate_group_id AS uuid)
+              AND eo.event_type = 'artifact.snapshot.updated.v1'
+              AND eo.aggregate_type = 'artifact'
+              AND aps.provider IN ('github', 'x', 'web')
+              AND aps.status IN ('ready', 'partial_ready')
+              AND eo.dedupe_key = concat(
+                    'artifact:snapshot_updated:',
+                    ar.artifact_id::text,
+                    ':',
+                    aps.snapshot_id::text
+                  )
+            ORDER BY eo.created_at ASC, eo.event_id ASC
+            LIMIT 2
+            """,
+            {"candidate_group_id": str(candidate_group_id)},
+        )
         return FinalReadback(
             source_messages=await self._count(
                 "SELECT count(*) FROM source_messages WHERE source_message_id = CAST(:source_message_id AS uuid)",
@@ -744,6 +771,7 @@ class SqlExactTargetSourceToAnalysisRepository:
                     {"bundle_id": str(bundle_id)},
                 )
             ),
+            provider_snapshot_updated_event_id=provider_snapshot_updated_event_id,
             bundle_id=bundle_id,
             analysis_request_event_id=(
                 None if not analysis_rows else UUID(str(analysis_rows[0]["event_id"]))
@@ -1642,6 +1670,18 @@ async def _load_existing_provider_resume(
     if resume_readback_error is not None:
         return replace(report, status="blocked", reason_code=resume_readback_error, preflight_passed=True)
 
+    if _provider_resume_snapshot_ready_for_assembly(final):
+        return await _run_existing_provider_snapshot_to_analysis(
+            request=request,
+            stage_factory=stage_factory,
+            report=report,
+            preflight=preflight,
+            source_message_id=source_message_id,
+            source_version_no=source_version_no,
+            normalization=normalization,
+            snapshot_updated_event_id=final.provider_snapshot_updated_event_id,
+        )
+
     return await _run_provider_enrichment_to_analysis(
         request=request,
         stage_factory=stage_factory,
@@ -1650,6 +1690,60 @@ async def _load_existing_provider_resume(
         source_message_id=source_message_id,
         source_version_no=source_version_no,
         normalization=normalization,
+    )
+
+
+async def _run_existing_provider_snapshot_to_analysis(
+    *,
+    request: ExactTargetSourceToAnalysisRequest,
+    stage_factory: StageFactoryProtocol,
+    report: ExactTargetSourceToAnalysisReport,
+    preflight: PreflightSnapshot,
+    source_message_id: UUID,
+    source_version_no: int,
+    normalization: NormalizationReadback,
+    snapshot_updated_event_id: UUID | None,
+) -> ExactTargetSourceToAnalysisReport:
+    if snapshot_updated_event_id is None:
+        return replace(
+            report,
+            status="blocked",
+            reason_code="provider_resume_snapshot_event_ambiguous",
+            preflight_passed=True,
+        )
+    assert preflight.registry_target is not None
+    assert preflight.source_content_hash is not None
+    assert normalization.candidate_group_id is not None
+
+    report = replace(
+        report,
+        assembler_attempted=True,
+        provider_snapshot_update_fingerprint=_fingerprint(snapshot_updated_event_id),
+    )
+    async with stage_factory.stage("assembler") as components:
+        await components.assembler_service.handle_trigger_event(snapshot_updated_event_id)
+        await components.commit()
+
+    async with stage_factory.stage("final_readback") as components:
+        final = await components.materializer_repository.load_final_readback(
+            source_message_id=source_message_id,
+            source_version_no=source_version_no,
+            source_content_hash=preflight.source_content_hash,
+            chat_id=preflight.registry_target.chat_id,
+            message_id=request.packet.parsed_ref.message_id,
+            candidate_group_id=normalization.candidate_group_id,
+        )
+    report = _apply_final_readback(report, final)
+    provider_final_error = _provider_final_readback_error(final)
+    if provider_final_error is not None:
+        return replace(report, status="failed", reason_code=provider_final_error)
+    return replace(
+        report,
+        status="pass",
+        reason_code="source_url_provider_evidence_analysis_requested",
+        preflight_passed=True,
+        bundle_created=True,
+        analysis_request_created=True,
     )
 
 
@@ -2143,6 +2237,10 @@ def _apply_final_readback(
         _with_counts(report, readback.to_counts()),
         bundle_fingerprint=_fingerprint(readback.bundle_id),
         analysis_request_fingerprint=_fingerprint(readback.analysis_request_event_id),
+        provider_snapshot_update_fingerprint=(
+            report.provider_snapshot_update_fingerprint
+            or _fingerprint(readback.provider_snapshot_updated_event_id)
+        ),
         text_idea_snapshot_created=readback.text_idea_snapshots == 1,
         bundle_created=readback.ready_current_bundles == 1,
         analysis_request_created=readback.analysis_requested_events == 1,
@@ -2241,13 +2339,30 @@ def _provider_resume_pre_provider_readback_error(readback: FinalReadback) -> str
         return "provider_resume_text_idea_snapshots_unexpected"
     if readback.analysis_requested_events != 0:
         return "provider_resume_analysis_already_present"
-    if readback.provider_snapshots != 0 or readback.artifact_snapshot_updated_events != 0:
-        return "provider_resume_snapshot_already_present"
-    if readback.ready_current_bundles != 0 or readback.candidate_evidence_members != 0:
-        return "provider_resume_bundle_already_present"
     if readback.judge_runs != 0 or readback.judge_call_requested_events != 0:
         return "provider_resume_judge_state_unexpected"
+    if readback.ready_current_bundles != 0 or readback.candidate_evidence_members != 0:
+        return "provider_resume_bundle_already_present"
+    if readback.provider_snapshots == 1 and readback.artifact_snapshot_updated_events == 1:
+        if readback.provider_snapshot_updated_event_id is None:
+            return "provider_resume_snapshot_event_ambiguous"
+        return None
+    if readback.provider_snapshots != 0 or readback.artifact_snapshot_updated_events != 0:
+        return "provider_resume_snapshot_state_ambiguous"
     return None
+
+
+def _provider_resume_snapshot_ready_for_assembly(readback: FinalReadback) -> bool:
+    return (
+        readback.provider_snapshots == 1
+        and readback.artifact_snapshot_updated_events == 1
+        and readback.provider_snapshot_updated_event_id is not None
+        and readback.ready_current_bundles == 0
+        and readback.candidate_evidence_members == 0
+        and readback.analysis_requested_events == 0
+        and readback.judge_runs == 0
+        and readback.judge_call_requested_events == 0
+    )
 
 
 def _provider_not_ready_readback_error(readback: FinalReadback) -> str | None:
