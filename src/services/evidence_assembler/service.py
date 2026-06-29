@@ -698,6 +698,7 @@ def _github_projection_summary(*, snapshot: SnapshotRecord, projection: dict[str
         _put_list(context, "languages", values=languages, cap=_GITHUB_CONTEXT_LIST_CAP)
     _put_text(context, "license", projection, ("license_spdx", "license_name", ("license", "spdx_id"), ("license", "key"), "license"))
     _put_text(context, "default_branch", projection, ("default_branch", "observed_default_branch"))
+    _put_text(context, "auth_mode", projection, ("auth_mode",))
 
     for output_key, keys in {
         "stars": ("stars", "stargazers_count", "star_count"),
@@ -739,6 +740,12 @@ def _github_projection_summary(*, snapshot: SnapshotRecord, projection: dict[str
         sample_count = len(projection["file_samples"])
     if sample_count is not None:
         context["file_sample_count"] = sample_count
+    _put_list(
+        context,
+        "file_sample_roles",
+        values=_projection_list(projection, ("file_sample_roles", "sampled_file_roles")),
+        cap=_GITHUB_CONTEXT_LIST_CAP,
+    )
 
     tooling = _projection_list(
         projection,

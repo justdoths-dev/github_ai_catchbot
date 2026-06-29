@@ -152,6 +152,95 @@ async def test_non_github_primary_summary_does_not_include_github_context() -> N
 
 
 @pytest.mark.asyncio
+async def test_github_primary_summary_surfaces_child_derived_context_without_raw_excerpts() -> None:
+    repository = FakeRepository()
+    repository.source_text = SOURCE_TEXT
+    trigger_event_id = uuid4()
+    artifact_id = uuid4()
+    candidate_group_id = uuid4()
+    add_candidate(
+        repository,
+        candidate_group_id=candidate_group_id,
+        primary_artifact_id=artifact_id,
+        artifact_type="github_repo",
+    )
+    repository.snapshots[artifact_id] = SnapshotRecord(
+        snapshot_id=uuid4(),
+        artifact_id=artifact_id,
+        provider="github",
+        snapshot_type="github_repo",
+        status="ready",
+        fetched_at=None,
+        content_anchor="commit:abc123",
+        normalized_projection={
+            "artifact_type": "github_repo",
+            "description": "thin parent projection",
+            "repo_full_name": "owner_fixture/repo_fixture",
+            "default_branch": "main",
+            "readme_present": True,
+            "detected_build_systems_json": ["python"],
+            "detected_languages_json": ["Python"],
+            "key_paths_json": ["README.md", "pyproject.toml"],
+            "config_paths_json": ["pyproject.toml"],
+            "file_sample_count": 2,
+            "file_sample_roles": ["README", "manifest"],
+            "file_samples": [
+                {"path": "README.md", "role": "README"},
+                {"path": "pyproject.toml", "role": "manifest"},
+            ],
+            "release_summary_json": {
+                "release_count_recent": 1,
+                "latest_release_published_at": "2026-06-01T00:00:00Z",
+                "has_release_assets": True,
+            },
+            "auth_mode": "anonymous_degraded",
+            "evidence_limitations": ["github_app_auth_unavailable; using anonymous public API mode"],
+        },
+        evidence_limitations=["github_app_auth_unavailable; using anonymous public API mode"],
+        auth_mode="anonymous_degraded",
+    )
+    repository.targets = [BundleRefreshTarget(candidate_group_id, trigger_event_id, "candidate.bundle.refresh.v1")]
+
+    await EvidenceAssemblerService(config(), repository=repository).handle_trigger_event(trigger_event_id)  # type: ignore[arg-type]
+
+    primary_summary = repository.bundles[0][1].primary_summary
+    github_context = primary_summary["github_context"]
+    assert github_context["repository"] == "owner_fixture/repo_fixture"
+    assert github_context["default_branch"] == "main"
+    assert github_context["readme_present"] is True
+    assert github_context["config_present"] is True
+    assert github_context["language"] == "Python"
+    assert github_context["languages"] == ["Python"]
+    assert github_context["package_tooling"] == ["python"]
+    assert github_context["notable_files"] == ["README.md", "pyproject.toml"]
+    assert github_context["file_sample_count"] == 2
+    assert github_context["file_sample_roles"] == ["README", "manifest"]
+    assert github_context["release_count_recent"] == 1
+    assert github_context["latest_release_published_at"] == "2026-06-01"
+    assert github_context["has_release_assets"] is True
+    assert github_context["auth_mode"] == "anonymous_degraded"
+    assert github_context["evidence_limitations"] == [
+        "github_app_auth_unavailable; using anonymous public API mode"
+    ]
+    assert primary_summary["source_context_signals"] == {
+        "source_text_present": True,
+        "source_text_chars_bucket": "1-120",
+        "regex_url_count": 1,
+        "regex_url_count_capped": False,
+        "contains_mcp_token": True,
+        "contains_setup_signal": True,
+        "contains_connect_signal": True,
+        "contains_use_signal": True,
+        "signal_count": 4,
+    }
+    serialized_summary = json.dumps(primary_summary, sort_keys=True)
+    assert "http://" not in serialized_summary
+    assert "https://" not in serialized_summary
+    assert "README excerpt" not in serialized_summary
+    assert "file excerpt" not in serialized_summary
+
+
+@pytest.mark.asyncio
 async def test_github_context_participates_in_bundle_hash_when_snapshot_id_is_unchanged() -> None:
     repository = FakeRepository()
     repository.source_text = SOURCE_TEXT
@@ -197,3 +286,68 @@ async def test_github_context_participates_in_bundle_hash_when_snapshot_id_is_un
     assert len(repository.bundles) == 2
     assert repository.bundles[1][1].bundle_input_hash != first_hash
     assert repository.bundles[1][1].primary_summary["github_context"]["stars"] == 2
+
+
+@pytest.mark.asyncio
+async def test_child_derived_github_context_participates_in_bundle_hash_when_snapshot_id_is_unchanged() -> None:
+    repository = FakeRepository()
+    repository.source_text = SOURCE_TEXT
+    trigger_event_id = uuid4()
+    artifact_id = uuid4()
+    snapshot_id = uuid4()
+    candidate_group_id = uuid4()
+    add_candidate(
+        repository,
+        candidate_group_id=candidate_group_id,
+        primary_artifact_id=artifact_id,
+        artifact_type="github_repo",
+    )
+    repository.snapshots[artifact_id] = SnapshotRecord(
+        snapshot_id=snapshot_id,
+        artifact_id=artifact_id,
+        provider="github",
+        snapshot_type="github_repo",
+        status="ready",
+        fetched_at=None,
+        content_anchor="commit:abc123",
+        normalized_projection={
+            "repo_full_name": "example/example-tool",
+            "file_sample_count": 1,
+            "file_sample_roles": ["README"],
+            "file_samples": [{"path": "README.md", "role": "README"}],
+        },
+    )
+    repository.targets = [BundleRefreshTarget(candidate_group_id, trigger_event_id, "candidate.bundle.refresh.v1")]
+    service = EvidenceAssemblerService(config(), repository=repository)  # type: ignore[arg-type]
+
+    first = await service.handle_trigger_event(trigger_event_id)
+    first_hash = repository.bundles[0][1].bundle_input_hash
+    repository.snapshots[artifact_id] = SnapshotRecord(
+        snapshot_id=snapshot_id,
+        artifact_id=artifact_id,
+        provider="github",
+        snapshot_type="github_repo",
+        status="ready",
+        fetched_at=None,
+        content_anchor="commit:abc123",
+        normalized_projection={
+            "repo_full_name": "example/example-tool",
+            "file_sample_count": 2,
+            "file_sample_roles": ["README", "manifest"],
+            "file_samples": [
+                {"path": "README.md", "role": "README"},
+                {"path": "pyproject.toml", "role": "manifest"},
+            ],
+        },
+    )
+    second = await service.handle_trigger_event(trigger_event_id)
+
+    assert first[0].reused_existing_bundle is False
+    assert second[0].reused_existing_bundle is False
+    assert len(repository.bundles) == 2
+    assert repository.bundles[1][1].bundle_input_hash != first_hash
+    assert repository.bundles[1][1].primary_summary["github_context"]["file_sample_count"] == 2
+    assert repository.bundles[1][1].primary_summary["github_context"]["file_sample_roles"] == [
+        "README",
+        "manifest",
+    ]

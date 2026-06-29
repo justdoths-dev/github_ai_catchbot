@@ -82,6 +82,7 @@ class SnapshotRecord:
     normalized_projection: dict[str, Any] | None = None
     evidence_limitations: list[str] = field(default_factory=list)
     fetch_anomalies: list[str] = field(default_factory=list)
+    auth_mode: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

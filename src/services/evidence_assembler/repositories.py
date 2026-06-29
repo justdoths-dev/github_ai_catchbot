@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Iterable, Protocol
+from typing import Any, AsyncIterator, Iterable, Mapping, Protocol
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -178,10 +178,56 @@ class EvidenceAssemblerRepository:
             sa.text(
                 """
                 SELECT ar.artifact_id, s.snapshot_id, s.provider, s.snapshot_type, s.status,
-                       s.fetched_at, s.content_anchor, s.normalized_projection,
-                       s.evidence_limitations, s.fetch_anomalies
+                       s.fetched_at, s.content_anchor, s.auth_mode, s.normalized_projection,
+                       s.evidence_limitations, s.fetch_anomalies,
+                       gr.snapshot_id AS github_repo_snapshot_id,
+                       gr.repo_full_name AS github_repo_full_name,
+                       gr.default_branch AS github_default_branch,
+                       gr.resolved_ref AS github_resolved_ref,
+                       gr.content_anchor_commit_sha AS github_content_anchor_commit_sha,
+                       gr.repo_flags_json AS github_repo_flags_json,
+                       gr.license_spdx AS github_license_spdx,
+                       gr.topics_json AS github_topics_json,
+                       (gr.readme_excerpt IS NOT NULL AND btrim(gr.readme_excerpt) <> '') AS github_readme_present,
+                       gr.detected_build_systems_json AS github_detected_build_systems_json,
+                       gr.detected_languages_json AS github_detected_languages_json,
+                       gr.key_paths_json AS github_key_paths_json,
+                       gr.test_paths_json AS github_test_paths_json,
+                       gr.ci_paths_json AS github_ci_paths_json,
+                       gr.examples_paths_json AS github_examples_paths_json,
+                       gr.docs_paths_json AS github_docs_paths_json,
+                       gr.release_summary_json AS github_release_summary_json,
+                       (
+                           SELECT COUNT(*)::int
+                           FROM artifact_snapshot_github_file_samples fs_count
+                           WHERE fs_count.snapshot_id = s.snapshot_id
+                       ) AS github_file_sample_count,
+                       (
+                           SELECT jsonb_agg(
+                               jsonb_build_object('path', fs_sample.path, 'role', fs_sample.role)
+                               ORDER BY fs_sample.role, fs_sample.path
+                           )
+                           FROM (
+                               SELECT path, role
+                               FROM artifact_snapshot_github_file_samples
+                               WHERE snapshot_id = s.snapshot_id
+                                 AND (path IS NOT NULL OR role IS NOT NULL)
+                               ORDER BY role, path
+                               LIMIT 16
+                           ) fs_sample
+                       ) AS github_file_samples_json,
+                       (
+                           SELECT jsonb_agg(fs_role.role ORDER BY fs_role.role)
+                           FROM (
+                               SELECT DISTINCT role
+                               FROM artifact_snapshot_github_file_samples
+                               WHERE snapshot_id = s.snapshot_id
+                                 AND role IS NOT NULL
+                           ) fs_role
+                       ) AS github_file_sample_roles_json
                 FROM artifact_registry ar
                 JOIN artifact_snapshots s ON s.snapshot_id = ar.current_snapshot_id
+                LEFT JOIN artifact_snapshot_github_repo gr ON gr.snapshot_id = s.snapshot_id
                 WHERE ar.artifact_id = ANY(CAST(:artifact_ids AS uuid[]))
                 """
             ),
@@ -190,6 +236,15 @@ class EvidenceAssemblerRepository:
         snapshots: dict[UUID, SnapshotRecord] = {}
         for row in result.mappings().all():
             artifact_id = UUID(str(row["artifact_id"]))
+            evidence_limitations = _json_loads(row["evidence_limitations"]) or []
+            fetch_anomalies = _json_loads(row["fetch_anomalies"]) or []
+            auth_mode = str(row["auth_mode"]) if row["auth_mode"] else None
+            normalized_projection = _merge_github_child_projection(
+                _json_loads(row["normalized_projection"]) or {},
+                row,
+                auth_mode=auth_mode,
+                evidence_limitations=evidence_limitations,
+            )
             snapshots[artifact_id] = SnapshotRecord(
                 snapshot_id=UUID(str(row["snapshot_id"])),
                 artifact_id=artifact_id,
@@ -198,9 +253,10 @@ class EvidenceAssemblerRepository:
                 status=str(row["status"]),
                 fetched_at=row["fetched_at"],
                 content_anchor=str(row["content_anchor"]),
-                normalized_projection=_json_loads(row["normalized_projection"]),
-                evidence_limitations=_json_loads(row["evidence_limitations"]) or [],
-                fetch_anomalies=_json_loads(row["fetch_anomalies"]) or [],
+                normalized_projection=normalized_projection,
+                evidence_limitations=evidence_limitations,
+                fetch_anomalies=fetch_anomalies,
+                auth_mode=auth_mode,
             )
         return snapshots
 
@@ -831,6 +887,142 @@ def _text_idea_projection(draft: TextIdeaSnapshotDraft) -> dict[str, Any]:
         "display_surface": draft.display_surface,
         "dev_context_signals_json": draft.dev_context_signals_json,
     }
+
+
+def _merge_github_child_projection(
+    parent_projection: dict[str, Any],
+    row: Mapping[str, Any],
+    *,
+    auth_mode: str | None,
+    evidence_limitations: list[str],
+) -> dict[str, Any] | None:
+    projection = dict(parent_projection)
+    if not _row_is_github_snapshot(row=row, projection=projection):
+        return projection or None
+
+    if auth_mode:
+        _put_if_absent(projection, "auth_mode", auth_mode)
+    if evidence_limitations:
+        projection["evidence_limitations"] = _merge_projection_lists(
+            projection.get("evidence_limitations"),
+            evidence_limitations,
+        )
+
+    repo_child_present = row.get("github_repo_snapshot_id") is not None
+    file_sample_count = _safe_nonnegative_int(row.get("github_file_sample_count"))
+    file_samples = _github_file_samples(row.get("github_file_samples_json"))
+    file_sample_roles = _json_list(row.get("github_file_sample_roles_json"))
+
+    for projection_key, row_key in {
+        "repo_full_name": "github_repo_full_name",
+        "default_branch": "github_default_branch",
+        "resolved_ref": "github_resolved_ref",
+        "content_anchor_commit_sha": "github_content_anchor_commit_sha",
+        "license_spdx": "github_license_spdx",
+    }.items():
+        _put_if_absent(projection, projection_key, row.get(row_key))
+
+    for projection_key, row_key in {
+        "repo_flags_json": "github_repo_flags_json",
+        "topics_json": "github_topics_json",
+        "detected_build_systems_json": "github_detected_build_systems_json",
+        "detected_languages_json": "github_detected_languages_json",
+        "key_paths_json": "github_key_paths_json",
+        "test_paths_json": "github_test_paths_json",
+        "ci_paths_json": "github_ci_paths_json",
+        "examples_paths_json": "github_examples_paths_json",
+        "docs_paths_json": "github_docs_paths_json",
+        "release_summary_json": "github_release_summary_json",
+    }.items():
+        _put_if_absent(projection, projection_key, _json_loads(row.get(row_key)))
+
+    if _safe_bool(row.get("github_readme_present")) or "README" in file_sample_roles:
+        _put_if_absent(projection, "readme_present", True)
+    if repo_child_present or file_sample_count is not None and file_sample_count > 0:
+        _put_if_absent(projection, "file_sample_count", file_sample_count or 0)
+    if file_samples:
+        _put_if_absent(projection, "file_samples", file_samples)
+    if file_sample_roles:
+        _put_if_absent(projection, "file_sample_roles", file_sample_roles)
+
+    config_paths = _paths_for_roles(file_samples, {"config", "manifest"})
+    if config_paths:
+        _put_if_absent(projection, "config_paths_json", config_paths)
+
+    return projection or None
+
+
+def _row_is_github_snapshot(*, row: Mapping[str, Any], projection: dict[str, Any]) -> bool:
+    provider = str(row.get("provider") or "").lower()
+    snapshot_type = str(row.get("snapshot_type") or "").lower()
+    artifact_type = str(projection.get("artifact_type") or "").lower()
+    return (
+        provider == "github"
+        or snapshot_type.startswith("github_")
+        or artifact_type in {"github_repo", "github_subpath", "github_repo_page", "github_gist"}
+        or row.get("github_repo_snapshot_id") is not None
+    )
+
+
+def _put_if_absent(projection: dict[str, Any], key: str, value: Any) -> None:
+    if _has_value(projection.get(key)) or not _has_value(value):
+        return
+    projection[key] = value
+
+
+def _has_value(value: Any) -> bool:
+    return value is not None and value != "" and value != [] and value != {}
+
+
+def _merge_projection_lists(existing: Any, additions: Iterable[Any]) -> list[Any]:
+    merged: list[Any] = []
+    for value in [*_json_list(existing), *additions]:
+        if not _has_value(value) or value in merged:
+            continue
+        merged.append(value)
+    return merged
+
+
+def _json_list(value: Any) -> list[Any]:
+    loaded = _json_loads(value)
+    return loaded if isinstance(loaded, list) else []
+
+
+def _safe_nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
+def _safe_bool(value: Any) -> bool:
+    return bool(value) if isinstance(value, bool) else False
+
+
+def _github_file_samples(value: Any) -> list[dict[str, str]]:
+    samples: list[dict[str, str]] = []
+    for item in _json_list(value):
+        if not isinstance(item, dict):
+            continue
+        sample: dict[str, str] = {}
+        for key in ("path", "role"):
+            item_value = item.get(key)
+            if isinstance(item_value, str) and item_value.strip():
+                sample[key] = item_value.strip()
+        if sample and sample not in samples:
+            samples.append(sample)
+    return samples
+
+
+def _paths_for_roles(samples: list[dict[str, str]], roles: set[str]) -> list[str]:
+    paths: list[str] = []
+    for sample in samples:
+        role = sample.get("role", "").lower()
+        path = sample.get("path")
+        if role in roles and path and path not in paths:
+            paths.append(path)
+    return paths
 
 
 def _uuid_or_none(value: Any) -> UUID | None:
