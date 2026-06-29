@@ -43,7 +43,16 @@ _USE_SIGNAL_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:use|using|usage|run|try)(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
+_WHITESPACE_RE = re.compile(r"\s+")
+_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _SOURCE_URL_COUNT_CAP = 20
+_GITHUB_REPO_LIKE_SNAPSHOT_TYPES = frozenset(
+    {"github_repo", "github_subpath", "github_repo_page", "github_gist"}
+)
+_GITHUB_CONTEXT_TEXT_CAP = 240
+_GITHUB_CONTEXT_IDENTIFIER_CAP = 120
+_GITHUB_CONTEXT_LIST_CAP = 8
+_GITHUB_CONTEXT_FILE_LIST_CAP = 8
 
 
 class EvidenceAssemblerService:
@@ -127,6 +136,11 @@ class EvidenceAssemblerService:
             candidate=candidate,
             artifact_type=artifact_types.get(current_primary_artifact_id),
         )
+        primary_summary = self._snapshot_summary(
+            primary_snapshot,
+            artifact_id=current_primary_artifact_id,
+            source_context_signals=source_context_signals,
+        )
         bundle_input_hash = self._bundle_input_hash(
             candidate_group_id=candidate.candidate_group_id,
             current_primary_artifact_id=current_primary_artifact_id,
@@ -135,6 +149,7 @@ class EvidenceAssemblerService:
             discovered_links=discovered_links,
             bundle_profile_version=self._config.bundle_profile_version,
             source_context_signals=source_context_signals,
+            github_context=primary_summary.get("github_context"),
         )
         existing_bundle = await self._repository.load_existing_bundle(
             candidate_group_id=candidate.candidate_group_id,
@@ -253,6 +268,11 @@ class EvidenceAssemblerService:
             candidate=candidate,
             artifact_type=artifact_types.get(current_primary_artifact_id),
         )
+        primary_summary = self._snapshot_summary(
+            primary_snapshot,
+            artifact_id=current_primary_artifact_id,
+            source_context_signals=source_context_signals,
+        )
         bundle_input_hash = self._bundle_input_hash(
             candidate_group_id=candidate.candidate_group_id,
             current_primary_artifact_id=current_primary_artifact_id,
@@ -261,6 +281,7 @@ class EvidenceAssemblerService:
             discovered_links=discovered_links,
             bundle_profile_version=self._config.bundle_profile_version,
             source_context_signals=source_context_signals,
+            github_context=primary_summary.get("github_context"),
         )
 
         existing_bundle = await self._repository.load_existing_bundle(
@@ -310,11 +331,7 @@ class EvidenceAssemblerService:
             bundle_profile_version=self._config.bundle_profile_version,
             bundle_input_hash=bundle_input_hash,
             reroot_count=reroot_count,
-            primary_summary=self._snapshot_summary(
-                primary_snapshot,
-                artifact_id=current_primary_artifact_id,
-                source_context_signals=source_context_signals,
-            ),
+            primary_summary=primary_summary,
             supporting_summaries_json=[
                 self._snapshot_summary(snapshot, artifact_id=snapshot.artifact_id) for snapshot in supporting_snapshots
             ],
@@ -583,6 +600,9 @@ class EvidenceAssemblerService:
             "content_anchor": snapshot.content_anchor,
             "headline": projection.get("title") or projection.get("description") or projection.get("display_surface"),
         }
+        github_context = _github_projection_summary(snapshot=snapshot, projection=projection)
+        if github_context:
+            summary["github_context"] = github_context
         if source_context_signals is not None:
             summary["source_context_signals"] = source_context_signals
         return summary
@@ -607,6 +627,7 @@ class EvidenceAssemblerService:
         discovered_links: list[DiscoveredLinkSummary],
         bundle_profile_version: str,
         source_context_signals: dict[str, Any] | None = None,
+        github_context: Any | None = None,
     ) -> str:
         payload = {
             "candidate_group_id": str(candidate_group_id),
@@ -633,6 +654,8 @@ class EvidenceAssemblerService:
         }
         if source_context_signals is not None:
             payload["source_context_signals"] = source_context_signals
+        if isinstance(github_context, dict) and github_context:
+            payload["primary_summary_github_context"] = github_context
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -644,6 +667,346 @@ class EvidenceAssemblerService:
         if artifact_type in {"web_article", "text_idea"}:
             return "text_idea_primary"
         return None
+
+
+def _github_projection_summary(*, snapshot: SnapshotRecord, projection: dict[str, Any]) -> dict[str, Any] | None:
+    if not _is_github_projection(snapshot=snapshot, projection=projection):
+        return None
+
+    context: dict[str, Any] = {}
+    _put_text(
+        context,
+        "repository",
+        projection,
+        ("repo_full_name", "repository_full_name", "full_name", ("repository", "full_name"), ("repo", "repo_full_name")),
+    )
+    _put_text(context, "name", projection, ("repo_name", "name", ("repository", "name")))
+    _put_text(context, "display_name", projection, ("display_name", "title"))
+    _put_text(
+        context,
+        "description",
+        projection,
+        ("description", "display_surface"),
+        cap=_GITHUB_CONTEXT_TEXT_CAP,
+        redact_urls=True,
+    )
+    _put_text(context, "language", projection, ("language", "primary_language"))
+    languages = _projection_list(projection, ("detected_languages_json", "languages"))
+    if languages:
+        if "language" not in context:
+            context["language"] = languages[0]
+        _put_list(context, "languages", values=languages, cap=_GITHUB_CONTEXT_LIST_CAP)
+    _put_text(context, "license", projection, ("license_spdx", "license_name", ("license", "spdx_id"), ("license", "key"), "license"))
+    _put_text(context, "default_branch", projection, ("default_branch", "observed_default_branch"))
+
+    for output_key, keys in {
+        "stars": ("stars", "stargazers_count", "star_count"),
+        "forks": ("forks", "forks_count", "fork_count"),
+        "watchers": ("watchers", "watchers_count", "subscribers_count"),
+        "open_issues": ("open_issues", "open_issues_count"),
+    }.items():
+        _put_count(context, output_key, projection, keys)
+
+    for output_key in ("pushed_at", "updated_at", "created_at"):
+        _put_date(context, output_key, projection, (output_key,))
+    _put_date(context, "latest_release_published_at", projection, (("release_summary_json", "latest_release_published_at"),))
+    _put_count(context, "release_count_recent", projection, (("release_summary_json", "release_count_recent"),))
+
+    _put_list(
+        context,
+        "topics",
+        values=_projection_list(projection, ("topics", "topics_json")),
+        cap=_GITHUB_CONTEXT_LIST_CAP,
+        include_count=True,
+    )
+
+    notable_files = _projection_list(
+        projection,
+        (
+            "notable_files",
+            "file_names",
+            "file_samples",
+            "key_paths_json",
+            "test_paths_json",
+            "ci_paths_json",
+            "examples_paths_json",
+            "docs_paths_json",
+        ),
+    )
+    _put_list(context, "notable_files", values=notable_files, cap=_GITHUB_CONTEXT_FILE_LIST_CAP, include_count=True)
+    sample_count = _first_count(projection, ("file_sample_count", "sampled_file_count"))
+    if sample_count is None and isinstance(projection.get("file_samples"), list):
+        sample_count = len(projection["file_samples"])
+    if sample_count is not None:
+        context["file_sample_count"] = sample_count
+
+    tooling = _projection_list(
+        projection,
+        (
+            "package_tooling",
+            "tooling_indicators",
+            "package_managers",
+            "detected_build_systems_json",
+            "build_systems",
+        ),
+    )
+    _put_list(context, "package_tooling", values=tooling, cap=_GITHUB_CONTEXT_LIST_CAP)
+
+    setup_indicators = _projection_list(projection, ("setup_indicators", "setup_paths", "setup_files"))
+    install_indicators = _projection_list(projection, ("install_indicators", "install_paths", "install_files"))
+    _put_list(context, "setup_indicators", values=setup_indicators, cap=_GITHUB_CONTEXT_LIST_CAP)
+    _put_list(context, "install_indicators", values=install_indicators, cap=_GITHUB_CONTEXT_LIST_CAP)
+    _put_readiness_indicators(context, projection=projection, notable_files=notable_files)
+
+    _put_text(context, "focus_kind", projection, ("focus_kind",))
+    _put_text(context, "focus_path", projection, ("focus_path",))
+    _put_text(context, "page_path", projection, ("page_path",))
+    for output_key, keys in {
+        "tree_truncated": ("tree_truncated",),
+        "truncated": ("truncated",),
+        "archived": ("archived", ("repo_flags_json", "archived")),
+        "fork": ("fork", ("repo_flags_json", "fork")),
+        "template": ("template", "is_template", ("repo_flags_json", "template")),
+        "has_release_assets": ("has_release_assets", ("release_summary_json", "has_release_assets")),
+    }.items():
+        _put_bool(context, output_key, projection, keys)
+
+    limitations = _projection_list(projection, ("evidence_limitations", "limitations", "fetch_anomalies"))
+    _put_list(context, "evidence_limitations", values=limitations, cap=_GITHUB_CONTEXT_LIST_CAP)
+    return context or None
+
+
+def _is_github_projection(*, snapshot: SnapshotRecord, projection: dict[str, Any]) -> bool:
+    snapshot_type = str(snapshot.snapshot_type or "").lower()
+    provider = str(snapshot.provider or "").lower()
+    artifact_type = str(projection.get("artifact_type") or "").lower()
+    return (
+        provider == "github"
+        or snapshot_type in _GITHUB_REPO_LIKE_SNAPSHOT_TYPES
+        or snapshot_type.startswith("github_")
+        or artifact_type in _GITHUB_REPO_LIKE_SNAPSHOT_TYPES
+    )
+
+
+def _put_text(
+    context: dict[str, Any],
+    output_key: str,
+    projection: dict[str, Any],
+    keys: tuple[Any, ...],
+    *,
+    cap: int = _GITHUB_CONTEXT_IDENTIFIER_CAP,
+    redact_urls: bool = False,
+) -> None:
+    value = _first_text(projection, keys, cap=cap, redact_urls=redact_urls)
+    if value is not None:
+        context[output_key] = value
+
+
+def _first_text(
+    projection: dict[str, Any],
+    keys: tuple[Any, ...],
+    *,
+    cap: int,
+    redact_urls: bool = False,
+) -> str | None:
+    for key in keys:
+        text = _safe_text(_projection_lookup(projection, key), cap=cap, redact_urls=redact_urls)
+        if text is not None:
+            return text
+    return None
+
+
+def _safe_text(value: Any, *, cap: int, redact_urls: bool = False) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if redact_urls:
+        text = _SOURCE_URL_RE.sub("[redacted_url]", text)
+    elif _contains_url(text):
+        return None
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    if not text:
+        return None
+    if len(text) > cap:
+        text = f"{text[: max(0, cap - 3)].rstrip()}..."
+    return text
+
+
+def _put_count(context: dict[str, Any], output_key: str, projection: dict[str, Any], keys: tuple[Any, ...]) -> None:
+    value = _first_count(projection, keys)
+    if value is not None:
+        context[output_key] = value
+
+
+def _first_count(projection: dict[str, Any], keys: tuple[Any, ...]) -> int | None:
+    for key in keys:
+        value = _safe_count(_projection_lookup(projection, key))
+        if value is not None:
+            return value
+    return None
+
+
+def _safe_count(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def _put_bool(context: dict[str, Any], output_key: str, projection: dict[str, Any], keys: tuple[Any, ...]) -> None:
+    value = _first_bool(projection, keys)
+    if value is not None:
+        context[output_key] = value
+
+
+def _first_bool(projection: dict[str, Any], keys: tuple[Any, ...]) -> bool | None:
+    for key in keys:
+        value = _safe_bool(_projection_lookup(projection, key))
+        if value is not None:
+            return value
+    return None
+
+
+def _safe_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    return None
+
+
+def _put_date(context: dict[str, Any], output_key: str, projection: dict[str, Any], keys: tuple[Any, ...]) -> None:
+    for key in keys:
+        value = _date_prefix(_projection_lookup(projection, key))
+        if value is not None:
+            context[output_key] = value
+            return
+
+
+def _date_prefix(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if _contains_url(text):
+        return None
+    match = _DATE_PREFIX_RE.match(text)
+    return match.group(0) if match else None
+
+
+def _put_list(
+    context: dict[str, Any],
+    output_key: str,
+    *,
+    values: list[str],
+    cap: int,
+    include_count: bool = False,
+) -> None:
+    if not values:
+        return
+    context[output_key] = values[:cap]
+    if include_count:
+        context[f"{output_key}_count"] = len(values)
+    if len(values) > cap:
+        context[f"{output_key}_capped"] = True
+
+
+def _projection_list(projection: dict[str, Any], keys: tuple[Any, ...]) -> list[str]:
+    values: list[str] = []
+    for key in keys:
+        values.extend(_coerce_list_values(_projection_lookup(projection, key)))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _coerce_list_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        values: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                values.extend(_coerce_dict_list_item(item))
+                continue
+            text = _safe_text(item, cap=_GITHUB_CONTEXT_IDENTIFIER_CAP)
+            if text is not None:
+                values.append(text)
+        return values
+    text = _safe_text(value, cap=_GITHUB_CONTEXT_IDENTIFIER_CAP)
+    return [text] if text is not None else []
+
+
+def _coerce_dict_list_item(item: dict[str, Any]) -> list[str]:
+    for key in ("path", "name", "role"):
+        text = _safe_text(item.get(key), cap=_GITHUB_CONTEXT_IDENTIFIER_CAP)
+        if text is not None:
+            return [text]
+    return []
+
+
+def _put_readiness_indicators(
+    context: dict[str, Any],
+    *,
+    projection: dict[str, Any],
+    notable_files: list[str],
+) -> None:
+    for output_key, bool_keys, list_keys, contains_tokens in (
+        ("readme_present", ("readme_present", "has_readme"), ("readme_excerpt",), ("readme",)),
+        ("docs_present", ("docs_present", "has_docs"), ("docs_paths_json", "docs_indicators"), ("docs/", "documentation")),
+        ("config_present", ("config_present", "has_config"), ("config_paths_json", "config_indicators"), ("config", ".env")),
+    ):
+        value = _first_bool(projection, bool_keys)
+        if value is None and _projection_list(projection, list_keys):
+            value = True
+        if value is None and contains_tokens:
+            value = any(_contains_any(item, contains_tokens) for item in notable_files)
+        if value is not None:
+            context[output_key] = value
+
+    if "setup_indicators" in context:
+        context["setup_present"] = True
+    else:
+        _put_bool(context, "setup_present", projection, ("setup_present", "has_setup"))
+    if "install_indicators" in context:
+        context["install_present"] = True
+    else:
+        _put_bool(context, "install_present", projection, ("install_present", "has_install"))
+
+
+def _contains_any(value: str, tokens: tuple[str, ...]) -> bool:
+    lowered = value.lower()
+    return any(token in lowered for token in tokens)
+
+
+def _projection_lookup(projection: dict[str, Any], key: Any) -> Any:
+    if isinstance(key, tuple):
+        current: Any = projection
+        for part in key:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(part)
+        return current
+    return projection.get(key)
+
+
+def _contains_url(value: str) -> bool:
+    lowered = value.lower()
+    return "http://" in lowered or "https://" in lowered
 
 
 def _source_text_chars_bucket(length: int) -> str:

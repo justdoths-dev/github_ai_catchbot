@@ -17,6 +17,12 @@ def test_context_builder_uses_only_bundle_fields() -> None:
         primary_summary={
             "title": "repo",
             "body": "useful",
+            "github_context": {
+                "repository": "example/example-tool",
+                "description": "Developer workflow helper",
+                "stars": 123,
+                "topics": ["ai", "developer-tools"],
+            },
             "source_context_signals": {
                 "source_text_present": True,
                 "source_text_chars_bucket": "121-500",
@@ -48,6 +54,12 @@ def test_context_builder_uses_only_bundle_fields() -> None:
         "current_primary_artifact_id": str(bundle.current_primary_artifact_id),
         "primary_summary": {
             "body": "useful",
+            "github_context": {
+                "description": "Developer workflow helper",
+                "repository": "example/example-tool",
+                "stars": 123,
+                "topics": ["ai", "developer-tools"],
+            },
             "source_context_signals": {
                 "contains_connect_signal": True,
                 "contains_mcp_token": True,
