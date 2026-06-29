@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from typing import Any
 from uuid import UUID
 
@@ -26,6 +27,23 @@ from .repositories import EvidenceAssemblerRepository
 from .reroot_rules import RerootRules
 from .text_idea_builder import TextIdeaBuilder
 from .token_budget import TokenBudgetProfiler
+
+
+_SOURCE_URL_RE = re.compile(r"https?://[^\s<>'\")]+", re.IGNORECASE)
+_MCP_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])mcp(?![A-Za-z0-9_])", re.IGNORECASE)
+_SETUP_SIGNAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:setup|set\s+up|install|configure|configuration|quickstart)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_CONNECT_SIGNAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:connect|connected|connection|integrate|integration)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_USE_SIGNAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:use|using|usage|run|try)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_SOURCE_URL_COUNT_CAP = 20
 
 
 class EvidenceAssemblerService:
@@ -105,6 +123,10 @@ class EvidenceAssemblerService:
             token_budget_profile=token_budget_profile,
         )
         reroot_count = await self._repository.count_reroot_events(candidate.candidate_group_id)
+        source_context_signals = await self._source_context_signals_for_primary(
+            candidate=candidate,
+            artifact_type=artifact_types.get(current_primary_artifact_id),
+        )
         bundle_input_hash = self._bundle_input_hash(
             candidate_group_id=candidate.candidate_group_id,
             current_primary_artifact_id=current_primary_artifact_id,
@@ -112,6 +134,7 @@ class EvidenceAssemblerService:
             reroot_count=reroot_count,
             discovered_links=discovered_links,
             bundle_profile_version=self._config.bundle_profile_version,
+            source_context_signals=source_context_signals,
         )
         existing_bundle = await self._repository.load_existing_bundle(
             candidate_group_id=candidate.candidate_group_id,
@@ -226,6 +249,10 @@ class EvidenceAssemblerService:
         )
         evidence_limitations = self._collect_limitations(primary_snapshot, supporting_snapshots)
         reroot_count = await self._repository.count_reroot_events(candidate.candidate_group_id)
+        source_context_signals = await self._source_context_signals_for_primary(
+            candidate=candidate,
+            artifact_type=artifact_types.get(current_primary_artifact_id),
+        )
         bundle_input_hash = self._bundle_input_hash(
             candidate_group_id=candidate.candidate_group_id,
             current_primary_artifact_id=current_primary_artifact_id,
@@ -233,6 +260,7 @@ class EvidenceAssemblerService:
             reroot_count=reroot_count,
             discovered_links=discovered_links,
             bundle_profile_version=self._config.bundle_profile_version,
+            source_context_signals=source_context_signals,
         )
 
         existing_bundle = await self._repository.load_existing_bundle(
@@ -282,7 +310,11 @@ class EvidenceAssemblerService:
             bundle_profile_version=self._config.bundle_profile_version,
             bundle_input_hash=bundle_input_hash,
             reroot_count=reroot_count,
-            primary_summary=self._snapshot_summary(primary_snapshot, artifact_id=current_primary_artifact_id),
+            primary_summary=self._snapshot_summary(
+                primary_snapshot,
+                artifact_id=current_primary_artifact_id,
+                source_context_signals=source_context_signals,
+            ),
             supporting_summaries_json=[
                 self._snapshot_summary(snapshot, artifact_id=snapshot.artifact_id) for snapshot in supporting_snapshots
             ],
@@ -429,6 +461,60 @@ class EvidenceAssemblerService:
             async with self._repository.transaction():
                 snapshots[member.artifact_id] = await self._repository.ensure_text_idea_snapshot(draft)
 
+    async def _source_context_signals_for_primary(
+        self,
+        *,
+        candidate: CandidateGroupRecord,
+        artifact_type: str | None,
+    ) -> dict[str, Any] | None:
+        if artifact_type not in {"github_repo", "github_subpath", "github_repo_page", "github_gist"}:
+            return None
+        text_surface = await self._repository.load_source_message_text_surface(
+            source_message_id=candidate.source_message_id,
+            source_version_no=candidate.source_version_no,
+        )
+        return self._source_context_signals(text_surface)
+
+    @staticmethod
+    def _source_context_signals(text_surface: str | None) -> dict[str, Any]:
+        if not text_surface:
+            return {
+                "source_text_present": False,
+                "source_text_chars_bucket": "0",
+                "regex_url_count": 0,
+                "regex_url_count_capped": False,
+                "contains_mcp_token": False,
+                "contains_setup_signal": False,
+                "contains_connect_signal": False,
+                "contains_use_signal": False,
+                "signal_count": 0,
+            }
+
+        url_count = len(_SOURCE_URL_RE.findall(text_surface))
+        contains_mcp_token = bool(_MCP_TOKEN_RE.search(text_surface))
+        contains_setup_signal = bool(_SETUP_SIGNAL_RE.search(text_surface))
+        contains_connect_signal = bool(_CONNECT_SIGNAL_RE.search(text_surface))
+        contains_use_signal = bool(_USE_SIGNAL_RE.search(text_surface))
+        signal_count = sum(
+            [
+                contains_mcp_token,
+                contains_setup_signal,
+                contains_connect_signal,
+                contains_use_signal,
+            ]
+        )
+        return {
+            "source_text_present": True,
+            "source_text_chars_bucket": _source_text_chars_bucket(len(text_surface)),
+            "regex_url_count": min(url_count, _SOURCE_URL_COUNT_CAP),
+            "regex_url_count_capped": url_count > _SOURCE_URL_COUNT_CAP,
+            "contains_mcp_token": contains_mcp_token,
+            "contains_setup_signal": contains_setup_signal,
+            "contains_connect_signal": contains_connect_signal,
+            "contains_use_signal": contains_use_signal,
+            "signal_count": signal_count,
+        }
+
     def _bundle_members(
         self,
         *,
@@ -475,11 +561,20 @@ class EvidenceAssemblerService:
                     values.append(limitation)
         return values
 
-    def _snapshot_summary(self, snapshot: SnapshotRecord | None, *, artifact_id: UUID) -> dict[str, Any]:
+    def _snapshot_summary(
+        self,
+        snapshot: SnapshotRecord | None,
+        *,
+        artifact_id: UUID,
+        source_context_signals: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if snapshot is None:
-            return {"artifact_id": str(artifact_id), "status": "missing"}
+            summary = {"artifact_id": str(artifact_id), "status": "missing"}
+            if source_context_signals is not None:
+                summary["source_context_signals"] = source_context_signals
+            return summary
         projection = snapshot.normalized_projection or {}
-        return {
+        summary: dict[str, Any] = {
             "artifact_id": str(snapshot.artifact_id),
             "snapshot_id": str(snapshot.snapshot_id),
             "provider": snapshot.provider,
@@ -488,6 +583,9 @@ class EvidenceAssemblerService:
             "content_anchor": snapshot.content_anchor,
             "headline": projection.get("title") or projection.get("description") or projection.get("display_surface"),
         }
+        if source_context_signals is not None:
+            summary["source_context_signals"] = source_context_signals
+        return summary
 
     @staticmethod
     def _discovered_link_summary(link: DiscoveredLinkSummary) -> dict[str, Any]:
@@ -508,6 +606,7 @@ class EvidenceAssemblerService:
         reroot_count: int,
         discovered_links: list[DiscoveredLinkSummary],
         bundle_profile_version: str,
+        source_context_signals: dict[str, Any] | None = None,
     ) -> str:
         payload = {
             "candidate_group_id": str(candidate_group_id),
@@ -532,6 +631,8 @@ class EvidenceAssemblerService:
             ],
             "bundle_profile_version": bundle_profile_version,
         }
+        if source_context_signals is not None:
+            payload["source_context_signals"] = source_context_signals
         encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -543,3 +644,15 @@ class EvidenceAssemblerService:
         if artifact_type in {"web_article", "text_idea"}:
             return "text_idea_primary"
         return None
+
+
+def _source_text_chars_bucket(length: int) -> str:
+    if length <= 0:
+        return "0"
+    if length <= 120:
+        return "1-120"
+    if length <= 500:
+        return "121-500"
+    if length <= 2000:
+        return "501-2000"
+    return "2001-plus"

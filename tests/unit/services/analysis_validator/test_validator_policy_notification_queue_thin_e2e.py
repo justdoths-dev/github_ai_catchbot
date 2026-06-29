@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -83,6 +84,7 @@ class _ValidatorPolicyLedger:
         *,
         scores: dict[str, int | None],
         model_proposed_verdict: str,
+        source_context_signals: dict[str, Any] | None = None,
         mutate_payload: Any | None = None,
     ) -> None:
         self.trigger_event_id = uuid4()
@@ -93,6 +95,7 @@ class _ValidatorPolicyLedger:
         self.judge_output_id = uuid4()
         self.analysis_id = uuid4()
         self.judge_run_status = "succeeded"
+        self.source_context_signals = source_context_signals or {}
         self.payload = _judge_output_payload(
             candidate_group_id=self.candidate_group_id,
             scores=scores,
@@ -504,9 +507,18 @@ async def test_validator_policy_notification_queue_send_worthy_thin_e2e() -> Non
 
 @pytest.mark.asyncio
 async def test_validator_policy_notification_queue_early_github_tool_later_thin_e2e() -> None:
-    ledger = _ValidatorPolicyLedger(scores=_early_concrete_github_tool_scores(), model_proposed_verdict="later")
+    ledger = _ValidatorPolicyLedger(
+        scores=_early_concrete_github_tool_scores(),
+        model_proposed_verdict="later",
+        source_context_signals=_source_context_signals_fixture(),
+        mutate_payload=lambda payload: payload["reason_codes"].append("source_context_signals_present"),
+    )
     validator_repo, policy_repo, relay_repo, publisher, processed = await _run_pipeline(ledger)
 
+    assert ledger.source_context_signals == _source_context_signals_fixture()
+    serialized_source_context_signals = json.dumps(ledger.source_context_signals, sort_keys=True)
+    assert ("http" + "s://") not in serialized_source_context_signals
+    assert "MCP server setup guide" not in serialized_source_context_signals
     policy_apply_events = ledger.rows_of_type("analysis.policy.apply.v1")
     assert len(policy_apply_events) == 1
     assert policy_repo.loaded_trigger_event_ids == [policy_apply_events[0].event_id]
@@ -514,6 +526,7 @@ async def test_validator_policy_notification_queue_early_github_tool_later_thin_
     analysis = ledger.analyses[0]
     assert analysis.verdict == "later"
     assert analysis.delivery_decision == "send_now"
+    assert "source_context_signals_present" in analysis.reason_codes_json
     assert "policy_threshold_early_github_tool_later" in analysis.reason_codes_json
     assert "policy_threshold_later" not in analysis.reason_codes_json
 
@@ -885,6 +898,20 @@ def _early_concrete_github_tool_scores() -> dict[str, int | None]:
         "maintenance_signal": 10,
         "specificity": 45,
         "reproducibility_signal": 10,
+    }
+
+
+def _source_context_signals_fixture() -> dict[str, Any]:
+    return {
+        "source_text_present": True,
+        "source_text_chars_bucket": "121-500",
+        "regex_url_count": 1,
+        "regex_url_count_capped": False,
+        "contains_mcp_token": True,
+        "contains_setup_signal": True,
+        "contains_connect_signal": True,
+        "contains_use_signal": True,
+        "signal_count": 4,
     }
 
 

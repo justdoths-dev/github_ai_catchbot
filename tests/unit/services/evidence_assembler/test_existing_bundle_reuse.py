@@ -31,6 +31,7 @@ class FakeRepository:
         self.snapshot_id = uuid4()
         self.existing_bundle_id = uuid4()
         self.existing_analysis_event_id = uuid4()
+        self.source_text = "MCP setup instructions for a GitHub automation tool."
         self.current_bundle_updates = []
         self.appended_bundles = []
         self.outbox = []
@@ -70,6 +71,9 @@ class FakeRepository:
 
     async def load_discovered_links(self, **kwargs):
         return []
+
+    async def load_source_message_text_surface(self, **kwargs):
+        return self.source_text
 
     async def count_reroot_events(self, candidate_group_id):
         return 0
