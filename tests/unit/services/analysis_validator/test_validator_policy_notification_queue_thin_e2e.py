@@ -503,6 +503,49 @@ async def test_validator_policy_notification_queue_send_worthy_thin_e2e() -> Non
 
 
 @pytest.mark.asyncio
+async def test_validator_policy_notification_queue_early_github_tool_later_thin_e2e() -> None:
+    ledger = _ValidatorPolicyLedger(scores=_early_concrete_github_tool_scores(), model_proposed_verdict="later")
+    validator_repo, policy_repo, relay_repo, publisher, processed = await _run_pipeline(ledger)
+
+    policy_apply_events = ledger.rows_of_type("analysis.policy.apply.v1")
+    assert len(policy_apply_events) == 1
+    assert policy_repo.loaded_trigger_event_ids == [policy_apply_events[0].event_id]
+    assert len(ledger.analyses) == 1
+    analysis = ledger.analyses[0]
+    assert analysis.verdict == "later"
+    assert analysis.delivery_decision == "send_now"
+    assert "policy_threshold_early_github_tool_later" in analysis.reason_codes_json
+    assert "policy_threshold_later" not in analysis.reason_codes_json
+
+    notification_events = ledger.rows_of_type("notification.plan.created.v1")
+    assert len(notification_events) == 1
+    notification_row = notification_events[0]
+    assert notification_row.payload_json["delivery_decision"] == "send_now"
+    assert notification_row.payload_json["urgency_profile"] == "normal_silent"
+    assert notification_row.payload_json["render_profile"] == "telegram_single_alert_normal_v1"
+    assert set(notification_row.payload_json) == REQUIRED_NOTIFICATION_PLAN_PAYLOAD_KEYS
+
+    assert processed == 1
+    assert relay_repo.marked_published == [notification_row.event_id]
+    assert relay_repo.marked_failed == []
+    assert len(publisher.published) == 1
+    route, message = publisher.published[0]
+    assert route.queue_name == "q.notification.send"
+    assert route.stage_name == "notify"
+    assert set(message.as_stream_fields()) == THIN_REDIS_FIELDS
+    assert publisher.notifier_transport_calls == 0
+    assert {
+        "object_type": "analysis",
+        "object_id": ledger.analysis_id,
+        "from_state": "analysis_validated",
+        "to_state": "analysis_finalized",
+        "reason_code": "policy_applied:later:send_now",
+    } in ledger.state_transitions
+    _assert_no_notifier_owned_writes(ledger)
+    _assert_no_external_authority(ledger)
+
+
+@pytest.mark.asyncio
 async def test_validator_policy_suppress_path_stops_before_notification_queue() -> None:
     ledger = _ValidatorPolicyLedger(scores=_suppress_scores(), model_proposed_verdict="skip")
     _validator_repo, policy_repo, relay_repo, publisher, processed = await _run_pipeline(ledger)
@@ -828,6 +871,20 @@ def _send_worthy_scores() -> dict[str, int | None]:
         "maintenance_signal": 75,
         "specificity": 80,
         "reproducibility_signal": 70,
+    }
+
+
+def _early_concrete_github_tool_scores() -> dict[str, int | None]:
+    return {
+        "novelty": 45,
+        "practical_usefulness": 35,
+        "evidence_strength": 15,
+        "hype_penalty": 20,
+        "confidence": 20,
+        "code_quality": 35,
+        "maintenance_signal": 10,
+        "specificity": 45,
+        "reproducibility_signal": 10,
     }
 
 

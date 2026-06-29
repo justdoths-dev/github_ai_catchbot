@@ -32,6 +32,8 @@ class VerdictPolicy:
         hype = _score(scores, "hype_penalty")
         code_quality = _score(scores, "code_quality")
         specificity = _score(scores, "specificity")
+        reproducibility = _score(scores, "reproducibility_signal")
+        maintenance = _score(scores, "maintenance_signal")
 
         if (
             practical >= 70
@@ -49,6 +51,19 @@ class VerdictPolicy:
         if practical >= 45 and evidence >= 30 and confidence >= 35:
             return VerdictDecision(verdict="later", reason_codes=["policy_threshold_later"])
 
+        if self._early_github_tool_gate(
+            artifact_type=current_primary_artifact_type,
+            practical=practical,
+            evidence=evidence,
+            confidence=confidence,
+            hype=hype,
+            code_quality=code_quality,
+            specificity=specificity,
+            reproducibility=reproducibility,
+            maintenance=maintenance,
+        ):
+            return VerdictDecision(verdict="later", reason_codes=["policy_threshold_early_github_tool_later"])
+
         return VerdictDecision(verdict="skip", reason_codes=["policy_threshold_skip"])
 
     @staticmethod
@@ -63,6 +78,33 @@ class VerdictPolicy:
         if artifact_type in TEXT_LIKE_PRIMARY_TYPES:
             return specificity >= 60
         return False
+
+    @staticmethod
+    def _early_github_tool_gate(
+        *,
+        artifact_type: str | None,
+        practical: int,
+        evidence: int,
+        confidence: int,
+        hype: int,
+        code_quality: int,
+        specificity: int,
+        reproducibility: int,
+        maintenance: int,
+    ) -> bool:
+        if artifact_type not in GITHUB_PRIMARY_TYPES:
+            return False
+        if hype >= 70 or practical < 35 or evidence < 15 or confidence < 20:
+            return False
+        concrete_signal_count = sum(
+            [
+                code_quality >= 35,
+                specificity >= 45,
+                reproducibility >= 35,
+                maintenance >= 20,
+            ]
+        )
+        return concrete_signal_count >= 2
 
 
 def _score(scores: dict[str, Any], key: str) -> int:
