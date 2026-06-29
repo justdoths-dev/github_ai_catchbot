@@ -76,8 +76,10 @@ class PromptLibrary:
                 "Do not invent comparables, repo activity, social proof, dates, or evidence.",
                 "Only include comparables when supported by the provided CandidateEvidenceBundle.",
                 "Do not use latent/general knowledge to fill comparables.",
-                "For GitHub-primary outputs, model_proposed_verdict=later or model_proposed_verdict=inspect_now requires 1-3 meaningful bundle-supported comparables.",
-                "For GitHub-primary outputs with no reliable comparables, choose model_proposed_verdict=skip, set comparables=[], and include comparison_gap or insufficient_comparables in reason_codes or evidence_limitations_ko.",
+                "For GitHub-primary outputs, comparables strengthen evidence but are not mandatory when primary bundle evidence is strong and specific.",
+                "Strong primary GitHub evidence may include bundle-supported repo metadata, code activity, implementation specificity, README/API/CLI details, maintenance signals, or reproducible developer workflow evidence.",
+                "When no reliable comparables are available, leave comparables=[] and include comparison_gap or insufficient_comparables in reason_codes or evidence_limitations_ko, but do not force skip solely for that reason.",
+                "Compensate for missing comparables by lowering evidence_strength and/or confidence unless primary GitHub evidence is strong and specific.",
                 "If evidence is weak, reflect that in scores, red flags, limitations, and confidence.",
                 "Do not decide final verdict or delivery_decision; downstream deterministic services do that later.",
             ]

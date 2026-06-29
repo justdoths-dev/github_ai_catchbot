@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from services.judge_openai.request_shape import build_judge_output_schema
 from services.judge_openai.service import JudgeOpenAIService
 
 
@@ -56,25 +57,51 @@ def test_judge_output_schema_documents_no_fabricated_comparables_contract() -> N
 
     assert "supported by the provided CandidateEvidenceBundle" in properties["comparables"]["description"]
     assert "do not use latent/general knowledge" in properties["comparables"]["description"]
-    assert "use [] only with conservative skip" in properties["comparables"]["description"]
+    assert "unsupported comparables" in properties["model_proposed_verdict"]["description"]
     assert "comparison_gap or insufficient_comparables" in properties["reason_codes"]["description"]
 
 
-def test_judge_output_schema_guides_github_primary_non_skip_to_include_comparables() -> None:
+def test_judge_output_schema_no_longer_encodes_comparables_as_automatic_skip() -> None:
     properties = JudgeOpenAIService.judge_output_schema()["properties"]
+    comparables_description = properties["comparables"]["description"]
+    verdict_description = properties["model_proposed_verdict"]["description"]
 
-    assert "GitHub-primary later or inspect_now outputs" in properties["comparables"]["description"]
-    assert "require 1-3 meaningful bundle-supported comparables" in properties["comparables"]["description"]
-    assert "later or inspect_now requires meaningful bundle-supported comparables" in properties[
-        "model_proposed_verdict"
-    ]["description"]
+    assert "use [] only with conservative skip" not in comparables_description
+    assert "later or inspect_now requires" not in verdict_description
+    assert "no reliable comparables are available, emit skip" not in verdict_description
+    assert "may be proposed without comparables" in verdict_description
 
 
-def test_judge_output_schema_guides_no_reliable_comparables_to_skip() -> None:
+def test_judge_output_schema_guides_no_reliable_comparables_to_limitation_and_penalty() -> None:
     properties = JudgeOpenAIService.judge_output_schema()["properties"]
+    reason_description = properties["reason_codes"]["description"]
+    verdict_description = properties["model_proposed_verdict"]["description"]
 
-    assert "if no reliable comparables are available, emit skip" in properties["model_proposed_verdict"][
-        "description"
-    ]
-    assert "align that with model_proposed_verdict=skip" in properties["reason_codes"]["description"]
-    assert "comparison_gap or insufficient_comparables" in properties["reason_codes"]["description"]
+    assert "comparison_gap or insufficient_comparables" in reason_description
+    assert "not an automatic veto" in reason_description
+    assert "reduce evidence_strength" in verdict_description
+    assert "and/or confidence" in verdict_description
+
+
+def test_judge_output_schema_shape_remains_strict_and_compatible() -> None:
+    schema = build_judge_output_schema()
+    properties = schema["properties"]
+    scores = properties["scores"]
+
+    assert schema["additionalProperties"] is False
+    assert scores["additionalProperties"] is False
+    assert set(schema["required"]) >= {
+        "comparables",
+        "scores",
+        "reason_codes",
+        "model_proposed_verdict",
+    }
+    assert set(scores["required"]) >= {
+        "practical_usefulness",
+        "evidence_strength",
+        "confidence",
+        "hype_penalty",
+        "code_quality",
+        "specificity",
+    }
+    assert properties["model_proposed_verdict"]["enum"] == ["inspect_now", "later", "skip", None]

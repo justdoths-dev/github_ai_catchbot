@@ -230,9 +230,10 @@ def build_judge_output_schema() -> dict[str, Any]:
                 "items": {"type": "string"},
                 "description": (
                     "Comparable tools only when supported by the provided CandidateEvidenceBundle; "
-                    "do not use latent/general knowledge; GitHub-primary later or inspect_now outputs "
-                    "require 1-3 meaningful bundle-supported comparables; use [] only with conservative "
-                    "skip when no reliable comparables are available."
+                    "do not use latent/general knowledge; GitHub-primary comparables strengthen evidence "
+                    "but are not mandatory when primary bundle evidence is strong; use [] when no reliable "
+                    "comparables are available and explain the limitation with comparison_gap or "
+                    "insufficient_comparables instead of inventing one."
                 ),
             },
             "scores": {
@@ -266,8 +267,8 @@ def build_judge_output_schema() -> dict[str, Any]:
                 "items": {"type": "string"},
                 "description": (
                     "Include comparison_gap or insufficient_comparables when comparables is [] "
-                    "because no reliable comparable tools are available; for GitHub-primary no-comparable "
-                    "outputs, align that with model_proposed_verdict=skip."
+                    "because no reliable comparable tools are available; treat that gap as an evidence "
+                    "limitation and confidence penalty, not an automatic veto."
                 ),
             },
             "red_flags_ko": {"type": "array", "items": {"type": "string"}},
@@ -278,10 +279,11 @@ def build_judge_output_schema() -> dict[str, Any]:
                 "type": ["string", "null"],
                 "enum": ["inspect_now", "later", "skip", None],
                 "description": (
-                    "Model's provisional action hint only; policy remains final. For GitHub-primary "
-                    "outputs, later or inspect_now requires meaningful bundle-supported comparables; "
-                    "if no reliable comparables are available, emit skip with comparison_gap or "
-                    "insufficient_comparables evidence limitation."
+                    "Model's provisional action hint only; policy remains final. GitHub-primary "
+                    "later or inspect_now may be proposed without comparables only when primary bundle "
+                    "evidence is strong and specific; missing comparables should reduce evidence_strength "
+                    "and/or confidence unless that primary evidence compensates, and must use comparison_gap "
+                    "or insufficient_comparables instead of unsupported comparables."
                 ),
             },
             "model_confidence_band": {
