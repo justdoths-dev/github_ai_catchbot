@@ -388,12 +388,53 @@ async def test_malformed_payload_provider_and_artifact_mismatch_block_before_pub
 
     assert malformed.error_code == "malformed_event_payload"
     assert malformed.payload_has_content_anchor is False
+    assert malformed.payload_has_snapshot_type is True
     assert provider.error_code == "provider_missing"
     assert artifact.error_code == "artifact_id_mismatch"
     assert malformed.state.redis_publish_attempted is False
     assert provider.state.redis_publish_attempted is False
     assert artifact.state.redis_publish_attempted is False
+    assert malformed.state.database_write_attempted is False
+    assert provider.state.database_write_attempted is False
+    assert artifact.state.database_write_attempted is False
     assert raw_anchor not in rendered
+
+
+@pytest.mark.asyncio
+async def test_snapshot_updated_publish_accepts_missing_snapshot_type_when_required_thin_fields_present() -> None:
+    artifact_id = uuid4()
+    snapshot_id = uuid4()
+    payload = _payload(
+        artifact_id,
+        snapshot_id=snapshot_id,
+        provider="github",
+        provider_route=None,
+    )
+    payload.pop("snapshot_type")
+    row = _row(artifact_id=artifact_id, snapshot_id=snapshot_id, payload_json=payload)
+    repository = FakeRepository([row])
+    publisher = FakeRedisPublisher()
+
+    result = await run_bounded_snapshot_updated_outbox_publish(
+        _approved_config(event_id=row.event_id),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(repository),
+        redis_publisher_builder=FakeRedisPublisherBuilder(publisher),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["ok"] is True
+    assert report["status"] == "published"
+    assert report["queue_name"] == "q.candidate.bundle"
+    assert report["stage_name"] == "bundle"
+    assert report["payload_has_snapshot_type"] is False
+    assert report["events_published_count"] == 1
+    assert report["event_outbox_marked_published"] is True
+    assert report["redis_publish_attempted"] is True
+    assert report["database_write_attempted"] is True
+    assert repository.mark_published_calls == [row.event_id]
+    assert len(repository.job_attempt_calls) == 1
+    assert len(publisher.publish_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -420,6 +461,7 @@ async def test_snapshot_updated_publish_uses_existing_route_and_thin_id_only_pay
     assert report["stage_name"] == "bundle"
     assert report["selected_payload_provider"] == "web"
     assert report["selected_payload_provider_route"] == "web"
+    assert report["payload_has_snapshot_type"] is True
     assert report["target_event_id_suffix"] == str(row.event_id)[-8:]
     assert report["target_artifact_id_suffix"] == str(artifact_id)[-8:]
     assert report["target_snapshot_id_suffix"] == str(snapshot_id)[-8:]

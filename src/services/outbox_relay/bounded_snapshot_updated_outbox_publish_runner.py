@@ -33,10 +33,10 @@ HARD_MAX_EVENTS = 1
 REQUIRED_PAYLOAD_FIELDS = (
     "artifact_id",
     "snapshot_id",
-    "snapshot_type",
     "status",
     "content_anchor",
 )
+PAYLOAD_REPORT_FIELDS = (*REQUIRED_PAYLOAD_FIELDS, "snapshot_type")
 
 
 @dataclass(frozen=True, slots=True)
@@ -494,7 +494,7 @@ async def run_bounded_snapshot_updated_outbox_publish(
                 snapshot_id=snapshot_id,
             )
             raise _PublishResultReady
-        if not all(payload_flags.values()):
+        if not all(payload_flags.get(field_name, False) for field_name in REQUIRED_PAYLOAD_FIELDS):
             result = _result(
                 "blocked",
                 "malformed_event_payload",
@@ -806,7 +806,7 @@ def _build_stream_message(row: OutboxEventRow, route: QueueRoute) -> RedisQueued
 
 
 def _payload_presence_flags(payload: Mapping[str, Any]) -> dict[str, bool]:
-    return {field_name: _payload_field_present(payload.get(field_name)) for field_name in REQUIRED_PAYLOAD_FIELDS}
+    return {field_name: _payload_field_present(payload.get(field_name)) for field_name in PAYLOAD_REPORT_FIELDS}
 
 
 def _payload_field_present(value: Any) -> bool:
@@ -933,6 +933,7 @@ __all__ = [
     "EVENT_TYPE",
     "HARD_MAX_EVENTS",
     "MODE",
+    "PAYLOAD_REPORT_FIELDS",
     "QUEUE_NAME",
     "REQUIRED_PAYLOAD_FIELDS",
     "ROOT_OBJECT_TYPE",
