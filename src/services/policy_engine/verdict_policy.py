@@ -107,6 +107,32 @@ class VerdictPolicy:
         return concrete_signal_count >= 2
 
 
+def normalize_scores_for_policy(
+    scores: dict[str, Any],
+    *,
+    model_proposed_verdict: str | None,
+) -> tuple[dict[str, Any], bool]:
+    normalized = dict(scores)
+    if model_proposed_verdict not in {"later", "inspect_now"}:
+        return normalized, False
+
+    numeric_keys: list[str] = []
+    for key, value in scores.items():
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            numeric_keys.append(key)
+
+    if not numeric_keys:
+        return normalized, False
+    if any(not 0 <= scores[key] <= 10 for key in numeric_keys):
+        return normalized, False
+
+    for key in numeric_keys:
+        normalized[key] = scores[key] * 10
+    return normalized, True
+
+
 def _score(scores: dict[str, Any], key: str) -> int:
     value = scores.get(key)
     if isinstance(value, bool):

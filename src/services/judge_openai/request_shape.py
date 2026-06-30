@@ -196,8 +196,26 @@ def build_responses_request(
 
 
 def build_judge_output_schema() -> dict[str, Any]:
-    score_0_to_100 = {"type": "integer", "minimum": 0, "maximum": 100}
-    nullable_score_0_to_100 = {"type": ["integer", "null"], "minimum": 0, "maximum": 100}
+    score_scale_description = (
+        "Integer score on a 0-100 scale, not a 0-10 scale; use 70 for strong, not 7, "
+        "and use 45 for moderate, not 4.5/5."
+    )
+    nullable_score_scale_description = (
+        "Integer score on a 0-100 scale, or null when not applicable; not a 0-10 scale; "
+        "use 70 for strong, not 7, and use 45 for moderate, not 4.5/5."
+    )
+    score_0_to_100 = {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100,
+        "description": score_scale_description,
+    }
+    nullable_score_0_to_100 = {
+        "type": ["integer", "null"],
+        "minimum": 0,
+        "maximum": 100,
+        "description": nullable_score_scale_description,
+    }
     return {
         "type": "object",
         "additionalProperties": False,
@@ -239,6 +257,10 @@ def build_judge_output_schema() -> dict[str, Any]:
             "scores": {
                 "type": "object",
                 "additionalProperties": False,
+                "description": (
+                    "All score fields use integer 0-100 scoring, not 0-10 scoring; "
+                    "strong signals should be around 70, not 7, and moderate signals around 45, not 4.5/5."
+                ),
                 "required": [
                     "novelty",
                     "practical_usefulness",

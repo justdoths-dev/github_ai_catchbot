@@ -34,7 +34,7 @@ from .models import (
 )
 from .notification_intent import NotificationIntentBuilder
 from .repositories import PolicyEngineRepository
-from .verdict_policy import VerdictPolicy, reconcile_model_verdict
+from .verdict_policy import VerdictPolicy, normalize_scores_for_policy, reconcile_model_verdict
 
 
 SCHEMA_VERSION = "bounded_policy_engine_analysis_v1"
@@ -1656,6 +1656,10 @@ def _build_analysis(
 ) -> tuple[AnalysisDraft, PolicyEvaluation]:
     payload = judge_output.payload_json if isinstance(judge_output.payload_json, dict) else {}
     scores = payload.get("scores") if isinstance(payload.get("scores"), dict) else {}
+    scores, score_scale_normalized = normalize_scores_for_policy(
+        scores,
+        model_proposed_verdict=judge_output.model_proposed_verdict,
+    )
     verdict_decision = VerdictPolicy().evaluate(
         scores=scores,
         current_primary_artifact_type=bundle.current_primary_artifact_type,
@@ -1665,8 +1669,10 @@ def _build_analysis(
     )
     reason_codes = [
         *_string_list(payload.get("reason_codes")),
-        *verdict_decision.reason_codes,
     ]
+    if score_scale_normalized:
+        reason_codes.append("policy_score_scale_normalized_0_10_to_0_100")
+    reason_codes.extend(verdict_decision.reason_codes)
     if delivery_decision.suppress_reason_code:
         reason_codes.append(delivery_decision.suppress_reason_code)
     policy_reconciled_flag, reason_codes = reconcile_model_verdict(

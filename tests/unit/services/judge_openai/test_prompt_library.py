@@ -14,6 +14,8 @@ def test_prompt_library_renders_supported_profiles(profile: str) -> None:
     assert "Do not browse, search, fetch, call tools" in prompt
     assert "Evaluate negative-first" in prompt
     assert "Do not invent comparables" in prompt
+    assert "Scores must be integers on a 0-100 scale, not a 0-10 scale" in prompt
+    assert "use 70 for strong, not 7; use 45 for moderate, not 4.5/5" in prompt
     assert "Do not decide final verdict or delivery_decision" in prompt
 
 

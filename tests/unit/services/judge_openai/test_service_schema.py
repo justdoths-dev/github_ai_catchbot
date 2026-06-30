@@ -30,7 +30,11 @@ def test_judge_output_schema_uses_locked_score_names_and_0_to_100_range() -> Non
         "confidence",
     ]
     for name in common_scores:
-        assert scores["properties"][name] == {"type": "integer", "minimum": 0, "maximum": 100}
+        assert scores["properties"][name]["type"] == "integer"
+        assert scores["properties"][name]["minimum"] == 0
+        assert scores["properties"][name]["maximum"] == 100
+        assert "0-100 scale" in scores["properties"][name]["description"]
+        assert "not a 0-10 scale" in scores["properties"][name]["description"]
 
     nullable_scores = [
         "code_quality",
@@ -39,7 +43,14 @@ def test_judge_output_schema_uses_locked_score_names_and_0_to_100_range() -> Non
         "reproducibility_signal",
     ]
     for name in nullable_scores:
-        assert scores["properties"][name] == {"type": ["integer", "null"], "minimum": 0, "maximum": 100}
+        assert scores["properties"][name]["type"] == ["integer", "null"]
+        assert scores["properties"][name]["minimum"] == 0
+        assert scores["properties"][name]["maximum"] == 100
+        assert "0-100 scale" in scores["properties"][name]["description"]
+        assert "not a 0-10 scale" in scores["properties"][name]["description"]
+
+    assert "0-100 scoring" in scores["description"]
+    assert "not 0-10 scoring" in scores["description"]
 
 
 def test_judge_output_schema_rejects_old_score_contract_names() -> None:

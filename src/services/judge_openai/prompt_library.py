@@ -81,6 +81,7 @@ class PromptLibrary:
                 "When no reliable comparables are available, leave comparables=[] and include comparison_gap or insufficient_comparables in reason_codes or evidence_limitations_ko, but do not force skip solely for that reason.",
                 "Compensate for missing comparables by lowering evidence_strength and/or confidence unless primary GitHub evidence is strong and specific.",
                 "If evidence is weak, reflect that in scores, red flags, limitations, and confidence.",
+                "Scores must be integers on a 0-100 scale, not a 0-10 scale; use 70 for strong, not 7; use 45 for moderate, not 4.5/5.",
                 "Do not decide final verdict or delivery_decision; downstream deterministic services do that later.",
             ]
         )

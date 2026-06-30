@@ -542,6 +542,22 @@ def _skip_scores(**overrides: int) -> dict[str, int]:
     return scores
 
 
+def _live_like_0_to_10_scores(**overrides: int) -> dict[str, int]:
+    scores = {
+        "novelty": 5,
+        "practical_usefulness": 7,
+        "evidence_strength": 7,
+        "hype_penalty": 2,
+        "confidence": 7,
+        "code_quality": 7,
+        "maintenance_signal": 7,
+        "specificity": 8,
+        "reproducibility_signal": 6,
+    }
+    scores.update(overrides)
+    return scores
+
+
 def _run(
     repository: FakeRepository,
     *,
@@ -652,6 +668,26 @@ def test_later_with_delivery_enabled_creates_normal_silent_plan_intent() -> None
     assert report["urgency_profile"] == "normal_silent"
     assert report["notification_plan_intent_outbox_written"] is True
     assert repository.notification_rows[0].payload_json["urgency_profile"] == "normal_silent"
+
+
+def test_0_to_10_model_scores_are_normalized_before_bounded_apply_persistence() -> None:
+    repository = FakeRepository(judge_output=_judge_output(_live_like_0_to_10_scores(), model_proposed_verdict="later"))
+
+    result, _, _ = _run(repository)
+    report = result.to_sanitized_dict()
+
+    assert report["ok"] is True
+    assert report["verdict"] in {"later", "inspect_now"}
+    assert len(repository.inserted_analyses) == 1
+    analysis = repository.inserted_analyses[0]
+    assert analysis.scores_json["practical_usefulness"] == 70
+    assert analysis.scores_json["specificity"] == 80
+    assert analysis.reason_codes_json[:3] == [
+        "judge_output_validated",
+        "policy_score_scale_normalized_0_10_to_0_100",
+        "policy_threshold_inspect_now",
+    ]
+    assert analysis.reason_codes_json[-1] == "policy_overrode_model_verdict"
 
 
 def test_later_with_delivery_disabled_creates_analysis_without_notification_intent() -> None:

@@ -19,7 +19,7 @@ from .models import (
 )
 from .notification_intent import NotificationIntentBuilder
 from .repositories import PolicyEngineRepository
-from .verdict_policy import VerdictPolicy, reconcile_model_verdict
+from .verdict_policy import VerdictPolicy, normalize_scores_for_policy, reconcile_model_verdict
 
 
 class PolicyEngineRepositoryProtocol(Protocol):
@@ -192,6 +192,10 @@ class PolicyEngineService:
     ) -> tuple[AnalysisDraft, PolicyEvaluation]:
         payload = judge_output.payload_json if isinstance(judge_output.payload_json, dict) else {}
         scores = payload.get("scores") if isinstance(payload.get("scores"), dict) else {}
+        scores, score_scale_normalized = normalize_scores_for_policy(
+            scores,
+            model_proposed_verdict=judge_output.model_proposed_verdict,
+        )
 
         verdict_decision = self._verdict_policy.evaluate(
             scores=scores,
@@ -200,8 +204,10 @@ class PolicyEngineService:
         delivery_decision = self._delivery_policy.evaluate(verdict=verdict_decision.verdict)
         reason_codes = [
             *_string_list(payload.get("reason_codes")),
-            *verdict_decision.reason_codes,
         ]
+        if score_scale_normalized:
+            reason_codes.append("policy_score_scale_normalized_0_10_to_0_100")
+        reason_codes.extend(verdict_decision.reason_codes)
         if delivery_decision.suppress_reason_code:
             reason_codes.append(delivery_decision.suppress_reason_code)
 
