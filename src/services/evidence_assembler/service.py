@@ -43,6 +43,17 @@ _USE_SIGNAL_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:use|using|usage|run|try)(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
+_SENSITIVE_HEADER_RE = re.compile(
+    r"(?i)\b(authorization|proxy-authorization|cookie|set-cookie|x-api-key)(\s*:\s*)([^,\n\r;]+)"
+)
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|password|passwd|credential|private[_-]?key|database_url|"
+    r"redis_url|openai_api_key|github_token|telegram[_-]?[a-z0-9_]*)(\s*[:=]\s*)([^\s,;]+)"
+)
+_ENV_SECRET_ASSIGNMENT_RE = re.compile(
+    r"\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASS|CREDENTIAL|DATABASE_URL|REDIS_URL|API_KEY))"
+    r"(\s*=\s*)([^\s,;]+)"
+)
 _WHITESPACE_RE = re.compile(r"\s+")
 _DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _SOURCE_URL_COUNT_CAP = 20
@@ -53,6 +64,8 @@ _GITHUB_CONTEXT_TEXT_CAP = 240
 _GITHUB_CONTEXT_IDENTIFIER_CAP = 120
 _GITHUB_CONTEXT_LIST_CAP = 8
 _GITHUB_CONTEXT_FILE_LIST_CAP = 8
+_GITHUB_CONTEXT_README_EXCERPT_CAP = 1200
+_GITHUB_CONTEXT_FILE_EXCERPT_CAP = 800
 
 
 class EvidenceAssemblerService:
@@ -699,6 +712,13 @@ def _github_projection_summary(*, snapshot: SnapshotRecord, projection: dict[str
     _put_text(context, "license", projection, ("license_spdx", "license_name", ("license", "spdx_id"), ("license", "key"), "license"))
     _put_text(context, "default_branch", projection, ("default_branch", "observed_default_branch"))
     _put_text(context, "auth_mode", projection, ("auth_mode",))
+    _put_evidence_text(
+        context,
+        "readme_excerpt",
+        projection,
+        ("readme_excerpt", ("readme", "excerpt")),
+        cap=_GITHUB_CONTEXT_README_EXCERPT_CAP,
+    )
 
     for output_key, keys in {
         "stars": ("stars", "stargazers_count", "star_count"),
@@ -721,20 +741,53 @@ def _github_projection_summary(*, snapshot: SnapshotRecord, projection: dict[str
         include_count=True,
     )
 
-    notable_files = _projection_list(
-        projection,
-        (
+    file_sample_entries = _projection_file_sample_entries(projection)
+    has_textual_file_evidence = any(item.get("has_excerpt") for item in file_sample_entries)
+    if has_textual_file_evidence:
+        notable_files = _merge_notable_file_entries(
+            file_sample_entries=file_sample_entries,
+            path_values=_projection_list(
+                projection,
+                (
+                    "notable_files",
+                    "file_names",
+                    "key_paths_json",
+                    "test_paths_json",
+                    "ci_paths_json",
+                    "examples_paths_json",
+                    "docs_paths_json",
+                ),
+            ),
+        )
+        _put_notable_file_entries(
+            context,
             "notable_files",
-            "file_names",
-            "file_samples",
-            "key_paths_json",
-            "test_paths_json",
-            "ci_paths_json",
-            "examples_paths_json",
-            "docs_paths_json",
-        ),
-    )
-    _put_list(context, "notable_files", values=notable_files, cap=_GITHUB_CONTEXT_FILE_LIST_CAP, include_count=True)
+            entries=notable_files,
+            cap=_GITHUB_CONTEXT_FILE_LIST_CAP,
+            include_count=True,
+        )
+        notable_file_names = _notable_file_names(notable_files)
+    else:
+        notable_file_names = _projection_list(
+            projection,
+            (
+                "notable_files",
+                "file_names",
+                "file_samples",
+                "key_paths_json",
+                "test_paths_json",
+                "ci_paths_json",
+                "examples_paths_json",
+                "docs_paths_json",
+            ),
+        )
+        _put_list(
+            context,
+            "notable_files",
+            values=notable_file_names,
+            cap=_GITHUB_CONTEXT_FILE_LIST_CAP,
+            include_count=True,
+        )
     sample_count = _first_count(projection, ("file_sample_count", "sampled_file_count"))
     if sample_count is None and isinstance(projection.get("file_samples"), list):
         sample_count = len(projection["file_samples"])
@@ -763,7 +816,7 @@ def _github_projection_summary(*, snapshot: SnapshotRecord, projection: dict[str
     install_indicators = _projection_list(projection, ("install_indicators", "install_paths", "install_files"))
     _put_list(context, "setup_indicators", values=setup_indicators, cap=_GITHUB_CONTEXT_LIST_CAP)
     _put_list(context, "install_indicators", values=install_indicators, cap=_GITHUB_CONTEXT_LIST_CAP)
-    _put_readiness_indicators(context, projection=projection, notable_files=notable_files)
+    _put_readiness_indicators(context, projection=projection, notable_files=notable_file_names)
 
     _put_text(context, "focus_kind", projection, ("focus_kind",))
     _put_text(context, "focus_path", projection, ("focus_path",))
@@ -809,6 +862,19 @@ def _put_text(
         context[output_key] = value
 
 
+def _put_evidence_text(
+    context: dict[str, Any],
+    output_key: str,
+    projection: dict[str, Any],
+    keys: tuple[Any, ...],
+    *,
+    cap: int,
+) -> None:
+    value = _first_evidence_text(projection, keys, cap=cap)
+    if value is not None:
+        context[output_key] = value
+
+
 def _first_text(
     projection: dict[str, Any],
     keys: tuple[Any, ...],
@@ -818,6 +884,14 @@ def _first_text(
 ) -> str | None:
     for key in keys:
         text = _safe_text(_projection_lookup(projection, key), cap=cap, redact_urls=redact_urls)
+        if text is not None:
+            return text
+    return None
+
+
+def _first_evidence_text(projection: dict[str, Any], keys: tuple[Any, ...], *, cap: int) -> str | None:
+    for key in keys:
+        text = _safe_evidence_text(_projection_lookup(projection, key), cap=cap)
         if text is not None:
             return text
     return None
@@ -833,6 +907,33 @@ def _safe_text(value: Any, *, cap: int, redact_urls: bool = False) -> str | None
         text = _SOURCE_URL_RE.sub("[redacted_url]", text)
     elif _contains_url(text):
         return None
+    text = _WHITESPACE_RE.sub(" ", text).strip()
+    if not text:
+        return None
+    if len(text) > cap:
+        text = f"{text[: max(0, cap - 3)].rstrip()}..."
+    return text
+
+
+def _safe_evidence_text(value: Any, *, cap: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    text = _SOURCE_URL_RE.sub("[redacted_url]", text)
+    text = _SENSITIVE_HEADER_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+        text,
+    )
+    text = _SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+        text,
+    )
+    text = _ENV_SECRET_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+        text,
+    )
     text = _WHITESPACE_RE.sub(" ", text).strip()
     if not text:
         return None
@@ -926,6 +1027,23 @@ def _put_list(
         context[f"{output_key}_capped"] = True
 
 
+def _put_notable_file_entries(
+    context: dict[str, Any],
+    output_key: str,
+    *,
+    entries: list[dict[str, Any]],
+    cap: int,
+    include_count: bool = False,
+) -> None:
+    if not entries:
+        return
+    context[output_key] = entries[:cap]
+    if include_count:
+        context[f"{output_key}_count"] = len(entries)
+    if len(entries) > cap:
+        context[f"{output_key}_capped"] = True
+
+
 def _projection_list(projection: dict[str, Any], keys: tuple[Any, ...]) -> list[str]:
     values: list[str] = []
     for key in keys:
@@ -939,6 +1057,64 @@ def _projection_list(projection: dict[str, Any], keys: tuple[Any, ...]) -> list[
         seen.add(value)
         deduped.append(value)
     return deduped
+
+
+def _projection_file_sample_entries(projection: dict[str, Any]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    raw_samples = projection.get("file_samples")
+    if not isinstance(raw_samples, list):
+        return entries
+    for item in raw_samples:
+        if not isinstance(item, dict):
+            continue
+        path = _safe_text(item.get("path"), cap=_GITHUB_CONTEXT_IDENTIFIER_CAP)
+        role = _safe_text(item.get("role"), cap=_GITHUB_CONTEXT_IDENTIFIER_CAP)
+        excerpt = _safe_evidence_text(item.get("excerpt"), cap=_GITHUB_CONTEXT_FILE_EXCERPT_CAP)
+        if path is None and role is None and excerpt is None:
+            continue
+        entry: dict[str, Any] = {}
+        if role is not None:
+            entry["role"] = role
+        if path is not None:
+            entry["path"] = path
+        if excerpt is not None:
+            entry["excerpt"] = excerpt
+            entry["has_excerpt"] = True
+        else:
+            entry["has_excerpt"] = False
+        identity = (entry.get("role", ""), entry.get("path", ""), entry.get("excerpt", ""))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        entries.append(entry)
+    return entries
+
+
+def _merge_notable_file_entries(
+    *,
+    file_sample_entries: list[dict[str, Any]],
+    path_values: list[str],
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = [dict(item) for item in file_sample_entries]
+    seen_paths = {str(item.get("path")) for item in entries if item.get("path")}
+    for path in path_values:
+        if path in seen_paths:
+            continue
+        entries.append({"path": path, "has_excerpt": False})
+        seen_paths.add(path)
+    return entries
+
+
+def _notable_file_names(entries: list[dict[str, Any]]) -> list[str]:
+    names: list[str] = []
+    for entry in entries:
+        for key in ("path", "role"):
+            value = entry.get(key)
+            if isinstance(value, str) and value not in names:
+                names.append(value)
+                break
+    return names
 
 
 def _coerce_list_values(value: Any) -> list[str]:

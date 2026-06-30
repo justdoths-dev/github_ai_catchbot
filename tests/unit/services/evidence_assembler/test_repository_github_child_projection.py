@@ -62,6 +62,7 @@ def _row(**overrides: Any) -> dict[str, Any]:
         "github_license_spdx": "MIT",
         "github_topics_json": ["ai", "developer-tools"],
         "github_readme_present": True,
+        "github_readme_excerpt": "README child excerpt with setup and usage details.",
         "github_detected_build_systems_json": ["python"],
         "github_detected_languages_json": ["Python"],
         "github_key_paths_json": ["README.md", "pyproject.toml"],
@@ -76,8 +77,8 @@ def _row(**overrides: Any) -> dict[str, Any]:
         },
         "github_file_sample_count": 2,
         "github_file_samples_json": [
-            {"path": "README.md", "role": "README"},
-            {"path": "pyproject.toml", "role": "manifest"},
+            {"path": "README.md", "role": "README", "excerpt": "README file excerpt"},
+            {"path": "pyproject.toml", "role": "manifest", "excerpt": "Manifest file excerpt"},
         ],
         "github_file_sample_roles_json": ["README", "manifest"],
     }
@@ -102,6 +103,7 @@ async def test_load_current_snapshots_merges_sanitized_github_child_projection()
     assert projection["repo_full_name"] == "owner_fixture/repo_fixture"
     assert projection["default_branch"] == "main"
     assert projection["readme_present"] is True
+    assert projection["readme_excerpt"] == "README child excerpt with setup and usage details."
     assert projection["detected_build_systems_json"] == ["python"]
     assert projection["detected_languages_json"] == ["Python"]
     assert projection["key_paths_json"] == ["README.md", "pyproject.toml"]
@@ -109,8 +111,8 @@ async def test_load_current_snapshots_merges_sanitized_github_child_projection()
     assert projection["file_sample_count"] == 2
     assert projection["file_sample_roles"] == ["README", "manifest"]
     assert projection["file_samples"] == [
-        {"path": "README.md", "role": "README"},
-        {"path": "pyproject.toml", "role": "manifest"},
+        {"path": "README.md", "role": "README", "excerpt": "README file excerpt"},
+        {"path": "pyproject.toml", "role": "manifest", "excerpt": "Manifest file excerpt"},
     ]
     assert projection["release_summary_json"]["release_count_recent"] == 1
     assert projection["auth_mode"] == "anonymous_degraded"
@@ -122,13 +124,14 @@ async def test_load_current_snapshots_merges_sanitized_github_child_projection()
     ]
 
     serialized_projection = json.dumps(projection, sort_keys=True)
-    assert "readme_excerpt" not in serialized_projection
     assert "raw_blob_ref" not in serialized_projection
     assert "content_hash" not in serialized_projection
 
     statement = str(session.execute_calls[0][0])
     assert "artifact_snapshot_github_repo" in statement
     assert "artifact_snapshot_github_file_samples" in statement
+    assert "readme_excerpt" in statement
+    assert "excerpt" in statement
     assert "raw_blob_ref" not in statement
     assert "content_hash" not in statement
     assert "size_bytes" not in statement
@@ -146,6 +149,7 @@ async def test_load_current_snapshots_keeps_non_github_projection_unmerged() -> 
         github_repo_snapshot_id=None,
         github_repo_full_name=None,
         github_default_branch=None,
+        github_readme_excerpt=None,
         github_readme_present=None,
         github_file_sample_count=0,
         github_file_samples_json=None,

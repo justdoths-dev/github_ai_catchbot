@@ -20,6 +20,15 @@ def test_context_builder_uses_only_bundle_fields() -> None:
             "github_context": {
                 "repository": "example/example-tool",
                 "description": "Developer workflow helper",
+                "readme_excerpt": "README setup and usage excerpt.",
+                "notable_files": [
+                    {
+                        "role": "README",
+                        "path": "README.md",
+                        "excerpt": "README file excerpt.",
+                        "has_excerpt": True,
+                    }
+                ],
                 "stars": 123,
                 "topics": ["ai", "developer-tools"],
             },
@@ -56,6 +65,15 @@ def test_context_builder_uses_only_bundle_fields() -> None:
             "body": "useful",
             "github_context": {
                 "description": "Developer workflow helper",
+                "notable_files": [
+                    {
+                        "excerpt": "README file excerpt.",
+                        "has_excerpt": True,
+                        "path": "README.md",
+                        "role": "README",
+                    }
+                ],
+                "readme_excerpt": "README setup and usage excerpt.",
                 "repository": "example/example-tool",
                 "stars": 123,
                 "topics": ["ai", "developer-tools"],

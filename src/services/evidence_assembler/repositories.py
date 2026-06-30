@@ -189,6 +189,7 @@ class EvidenceAssemblerRepository:
                        gr.license_spdx AS github_license_spdx,
                        gr.topics_json AS github_topics_json,
                        (gr.readme_excerpt IS NOT NULL AND btrim(gr.readme_excerpt) <> '') AS github_readme_present,
+                       gr.readme_excerpt AS github_readme_excerpt,
                        gr.detected_build_systems_json AS github_detected_build_systems_json,
                        gr.detected_languages_json AS github_detected_languages_json,
                        gr.key_paths_json AS github_key_paths_json,
@@ -204,14 +205,18 @@ class EvidenceAssemblerRepository:
                        ) AS github_file_sample_count,
                        (
                            SELECT jsonb_agg(
-                               jsonb_build_object('path', fs_sample.path, 'role', fs_sample.role)
+                               jsonb_build_object(
+                                   'path', fs_sample.path,
+                                   'role', fs_sample.role,
+                                   'excerpt', fs_sample.excerpt
+                               )
                                ORDER BY fs_sample.role, fs_sample.path
                            )
                            FROM (
-                               SELECT path, role
+                               SELECT path, role, excerpt
                                FROM artifact_snapshot_github_file_samples
                                WHERE snapshot_id = s.snapshot_id
-                                 AND (path IS NOT NULL OR role IS NOT NULL)
+                                 AND (path IS NOT NULL OR role IS NOT NULL OR excerpt IS NOT NULL)
                                ORDER BY role, path
                                LIMIT 16
                            ) fs_sample
@@ -938,6 +943,7 @@ def _merge_github_child_projection(
 
     if _safe_bool(row.get("github_readme_present")) or "README" in file_sample_roles:
         _put_if_absent(projection, "readme_present", True)
+    _put_if_absent(projection, "readme_excerpt", row.get("github_readme_excerpt"))
     if repo_child_present or file_sample_count is not None and file_sample_count > 0:
         _put_if_absent(projection, "file_sample_count", file_sample_count or 0)
     if file_samples:
@@ -1006,7 +1012,7 @@ def _github_file_samples(value: Any) -> list[dict[str, str]]:
         if not isinstance(item, dict):
             continue
         sample: dict[str, str] = {}
-        for key in ("path", "role"):
+        for key in ("path", "role", "excerpt"):
             item_value = item.get(key)
             if isinstance(item_value, str) and item_value.strip():
                 sample[key] = item_value.strip()

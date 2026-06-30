@@ -152,12 +152,23 @@ async def test_non_github_primary_summary_does_not_include_github_context() -> N
 
 
 @pytest.mark.asyncio
-async def test_github_primary_summary_surfaces_child_derived_context_without_raw_excerpts() -> None:
+async def test_github_primary_summary_surfaces_child_textual_evidence_with_bounds() -> None:
     repository = FakeRepository()
     repository.source_text = SOURCE_TEXT
     trigger_event_id = uuid4()
     artifact_id = uuid4()
     candidate_group_id = uuid4()
+    long_readme_excerpt = (
+        "README excerpt shows setup, usage, configuration, and integration details. "
+        "OPENAI_API_KEY=private-value "
+        + ("Install with the package manager and run the server. " * 40)
+        + f"See {RAW_SOURCE_URL}."
+    )
+    long_file_excerpt = (
+        "Manifest file excerpt declares project metadata and scripts. TOKEN=private-token "
+        + ("python dependency " * 80)
+        + RAW_SOURCE_URL
+    )
     add_candidate(
         repository,
         candidate_group_id=candidate_group_id,
@@ -178,6 +189,7 @@ async def test_github_primary_summary_surfaces_child_derived_context_without_raw
             "repo_full_name": "owner_fixture/repo_fixture",
             "default_branch": "main",
             "readme_present": True,
+            "readme_excerpt": long_readme_excerpt,
             "detected_build_systems_json": ["python"],
             "detected_languages_json": ["Python"],
             "key_paths_json": ["README.md", "pyproject.toml"],
@@ -185,8 +197,8 @@ async def test_github_primary_summary_surfaces_child_derived_context_without_raw
             "file_sample_count": 2,
             "file_sample_roles": ["README", "manifest"],
             "file_samples": [
-                {"path": "README.md", "role": "README"},
-                {"path": "pyproject.toml", "role": "manifest"},
+                {"path": "README.md", "role": "README", "excerpt": "README excerpt explains setup and usage."},
+                {"path": "pyproject.toml", "role": "manifest", "excerpt": long_file_excerpt},
             ],
             "release_summary_json": {
                 "release_count_recent": 1,
@@ -212,7 +224,20 @@ async def test_github_primary_summary_surfaces_child_derived_context_without_raw
     assert github_context["language"] == "Python"
     assert github_context["languages"] == ["Python"]
     assert github_context["package_tooling"] == ["python"]
-    assert github_context["notable_files"] == ["README.md", "pyproject.toml"]
+    assert github_context["readme_excerpt"].startswith("README excerpt shows setup")
+    assert len(github_context["readme_excerpt"]) <= 1200
+    assert github_context["readme_excerpt"].endswith("...")
+    assert github_context["notable_files"][0] == {
+        "role": "README",
+        "path": "README.md",
+        "excerpt": "README excerpt explains setup and usage.",
+        "has_excerpt": True,
+    }
+    assert github_context["notable_files"][1]["role"] == "manifest"
+    assert github_context["notable_files"][1]["path"] == "pyproject.toml"
+    assert github_context["notable_files"][1]["has_excerpt"] is True
+    assert len(github_context["notable_files"][1]["excerpt"]) <= 800
+    assert github_context["notable_files"][1]["excerpt"].endswith("...")
     assert github_context["file_sample_count"] == 2
     assert github_context["file_sample_roles"] == ["README", "manifest"]
     assert github_context["release_count_recent"] == 1
@@ -236,8 +261,54 @@ async def test_github_primary_summary_surfaces_child_derived_context_without_raw
     serialized_summary = json.dumps(primary_summary, sort_keys=True)
     assert "http://" not in serialized_summary
     assert "https://" not in serialized_summary
-    assert "README excerpt" not in serialized_summary
-    assert "file excerpt" not in serialized_summary
+    assert RAW_SOURCE_URL not in serialized_summary
+    assert "private-value" not in serialized_summary
+    assert "private-token" not in serialized_summary
+    assert "[redacted]" in serialized_summary
+
+
+@pytest.mark.asyncio
+async def test_github_primary_summary_does_not_fake_absent_child_excerpts() -> None:
+    repository = FakeRepository()
+    trigger_event_id = uuid4()
+    artifact_id = uuid4()
+    candidate_group_id = uuid4()
+    add_candidate(
+        repository,
+        candidate_group_id=candidate_group_id,
+        primary_artifact_id=artifact_id,
+        artifact_type="github_repo",
+    )
+    repository.snapshots[artifact_id] = SnapshotRecord(
+        snapshot_id=uuid4(),
+        artifact_id=artifact_id,
+        provider="github",
+        snapshot_type="github_repo",
+        status="ready",
+        fetched_at=None,
+        content_anchor="commit:abc123",
+        normalized_projection={
+            "artifact_type": "github_repo",
+            "repo_full_name": "owner_fixture/repo_fixture",
+            "default_branch": "main",
+            "file_sample_count": 2,
+            "file_sample_roles": ["README", "manifest"],
+            "file_samples": [
+                {"path": "README.md", "role": "README"},
+                {"path": "pyproject.toml", "role": "manifest"},
+            ],
+        },
+    )
+    repository.targets = [BundleRefreshTarget(candidate_group_id, trigger_event_id, "candidate.bundle.refresh.v1")]
+
+    await EvidenceAssemblerService(config(), repository=repository).handle_trigger_event(trigger_event_id)  # type: ignore[arg-type]
+
+    github_context = repository.bundles[0][1].primary_summary["github_context"]
+    assert "readme_excerpt" not in github_context
+    assert github_context["notable_files"] == ["README.md", "pyproject.toml"]
+    serialized_context = json.dumps(github_context, sort_keys=True)
+    assert "has_excerpt" not in serialized_context
+    assert "excerpt" not in serialized_context
 
 
 @pytest.mark.asyncio
