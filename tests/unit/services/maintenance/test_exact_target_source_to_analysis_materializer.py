@@ -27,6 +27,7 @@ from src.services.maintenance.exact_target_source_to_analysis_materializer impor
     ExistingSourceProviderResumeAuthority,
     ExactTargetSourceToAnalysisRequest,
     FinalReadback,
+    M1NotificationUxReadbackAcceptance,
     NormalizationReadback,
     ProviderEnrichmentRequest,
     ProviderEnrichmentResult,
@@ -693,6 +694,47 @@ def packet_json(text: str = KOREAN_LLM_WORKFLOW_TEXT) -> str:
     )
 
 
+def m1_notification_ux_readback_payload(
+    *,
+    status: str = "pass",
+    authority_overrides: dict[str, bool] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    authority = {
+        "live_telegram_transport_attempted": False,
+        "live_openai_called": False,
+        "live_github_called": False,
+        "live_x_called": False,
+        "live_web_called": False,
+        "docker_or_systemd_called": False,
+        "alembic_or_ddl_ran": False,
+        "runtime_values_printed": False,
+        "raw_payload_printed": False,
+        "raw_ids_printed": False,
+    }
+    if authority_overrides:
+        authority.update(authority_overrides)
+    payload: dict[str, Any] = {
+        "schema_version": "notification_operator_acceptance_readback_consolidation_v1",
+        "status": status,
+        "surfaces": {
+            "fake_backed_notification_operator_acceptance": {
+                "status": "pass",
+                "reason_code": "fake_backed_acceptance_closed",
+            }
+        },
+        "authority": authority,
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def write_json(path: Path, payload: Any) -> Path:
+    path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    return path
+
+
 def runtime_bundle() -> RuntimeConfigBundle:
     return RuntimeConfigBundle(
         database_url="db_locator_not_used",
@@ -736,6 +778,7 @@ async def run(
     text: str | None = None,
     provider_authority: ProviderLiveAuthority | None = None,
     provider_resume_authority: ExistingSourceProviderResumeAuthority | None = None,
+    m1_notification_ux_readback: M1NotificationUxReadbackAcceptance | None = None,
 ):
     return await run_exact_target_source_to_analysis_materializer(
         ExactTargetSourceToAnalysisRequest(
@@ -745,6 +788,7 @@ async def run(
             provider_resume_authority=(
                 provider_resume_authority or ExistingSourceProviderResumeAuthority()
             ),
+            m1_notification_ux_readback=m1_notification_ux_readback,
         ),
         stage_factory=FakeStageFactory(ledger),
     )
@@ -1269,6 +1313,88 @@ async def test_execute_stage_order_materializes_exactly_one_analysis_request() -
 
 
 @pytest.mark.asyncio
+async def test_execute_report_includes_restricted_source_channel_proof_without_raw_leaks() -> None:
+    ledger = Ledger()
+
+    report = await run(ledger, mode="execute")
+    proof = report.restricted_source_channel_proof
+    closure = report.mvp_closure_packet
+    rendered = json.dumps(asdict(report), ensure_ascii=False, sort_keys=True)
+
+    assert proof["schema_version"] == "github_ai_catchbot_restricted_source_channel_proof_v1"
+    assert proof["status"] == "pass"
+    assert proof["reason_code"] == "restricted_source_channel_proof_closed"
+    assert proof["exact_source_channel_bounded"] is True
+    assert proof["registry_lookup"] == {
+        "public_username_scoped": True,
+        "exact_single_target_required": True,
+        "missing_target_fails_closed": True,
+        "ambiguous_target_fails_closed": True,
+    }
+    assert proof["provenance"] == {
+        "operator_supplied": True,
+        "live_telegram_read": False,
+        "operator_path_distinct_from_live_collector": True,
+    }
+    assert proof["source_to_analysis_boundary"] == {
+        "source_packet_fingerprint_present": True,
+        "source_ref_fingerprint_present": True,
+        "source_message_fingerprint_present": True,
+        "source_outbox_event_fingerprint_present": True,
+        "normalization_run_visible": True,
+        "candidate_group_fingerprint_present": True,
+        "candidate_group_visible": True,
+        "artifact_fingerprint_present": True,
+        "evidence_bundle_fingerprint_present": True,
+        "ready_evidence_bundle_visible": True,
+        "analysis_request_fingerprint_present": True,
+        "analysis_requested_visible": True,
+        "judge_call_not_requested": True,
+    }
+    assert proof["bounded_counts"]["telegram_raw_updates"] == 0
+    assert proof["authority"] == {
+        "full_live_collector_opened": False,
+        "tdlib_live_history_read_opened": False,
+        "broad_registry_ingest_opened": False,
+        "telegram_raw_updates_write_required": False,
+        "telegram_send_opened": False,
+        "openai_called": False,
+        "github_called": False,
+        "x_called": False,
+        "web_called": False,
+        "redis_consume_or_ack": False,
+        "docker_or_systemd_called": False,
+        "alembic_or_ddl_ran": False,
+        "production_db_mutation": False,
+    }
+    assert all(proof["raw_values_printed"][name] is False for name in proof["raw_values_printed"])
+    assert closure["schema_version"] == "github_ai_catchbot_mvp_closure_packet_v1"
+    assert closure["status"] == "blocked"
+    assert closure["reason_code"] == "mvp_closure_inputs_incomplete"
+    assert closure["m1_notification_ux_acceptance_closed"] is False
+    assert closure["m1_notification_ux_readback_schema_version"] is None
+    assert closure["m2_restricted_source_channel_proof_closed"] is True
+    assert closure["mvp_closure_packet_ready"] is False
+    assert "AUTHORITY_OPEN" in closure["open_gates"]
+    assert "ROLLOUT_OPEN" in closure["open_gates"]
+    assert closure["completion_claims"]["mvp_code_proof_ux_packet_ready"] is False
+    assert closure["completion_claims"]["final_function_complete"] is False
+    assert closure["completion_claims"]["production_complete"] is False
+    assert closure["completion_claims"]["bot_complete"] is False
+    assert closure["completion_claims"]["one_hundred_percent_complete"] is False
+    for raw_value in (
+        "https://t.me/SynthChannel/12345",
+        "SynthChannel/12345",
+        KOREAN_LLM_WORKFLOW_TEXT,
+        "db_locator_not_used",
+        "redis_locator_not_used",
+        RAW_SECRET,
+        "Traceback",
+    ):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
 async def test_execute_url_path_materializes_provider_snapshot_and_analysis_request() -> None:
     ledger = Ledger()
 
@@ -1709,6 +1835,91 @@ async def test_cli_provider_live_flags_are_blocked_in_plan_mode(tmp_path: Path) 
     payload = json.loads(emitted[0])
     assert payload["status"] == "blocked"
     assert payload["reason_code"] == "provider_live_authority_not_allowed_for_plan"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("readback_payload", "reason_code"),
+    [
+        (
+            m1_notification_ux_readback_payload(status="blocked"),
+            "m1_notification_ux_readback_not_pass",
+        ),
+        (
+            m1_notification_ux_readback_payload(
+                authority_overrides={"live_openai_called": True}
+            ),
+            "m1_notification_ux_readback_authority_open",
+        ),
+        (
+            m1_notification_ux_readback_payload(
+                extra={"unsafe_marker": "DATABASE_URL=postgresql+psycopg://private"}
+            ),
+            "m1_notification_ux_readback_not_sanitized",
+        ),
+    ],
+)
+async def test_cli_blocks_invalid_m1_readback_before_runtime_or_stage(
+    tmp_path: Path,
+    readback_payload: dict[str, Any],
+    reason_code: str,
+) -> None:
+    emitted: list[str] = []
+    packet_path = tmp_path / "source-packet.json"
+    packet_path.write_text(packet_json(), encoding="utf-8")
+    readback_path = write_json(tmp_path / "m1-readback.json", readback_payload)
+    runtime_loads: list[str] = []
+
+    def runtime_loader(env_file: str) -> RuntimeConfigBundle:
+        runtime_loads.append(env_file)
+        raise AssertionError("runtime config must not be loaded for invalid M1 readback")
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "execute",
+            "--source-packet-json",
+            str(packet_path),
+            "--env-file",
+            "/tmp/not-read-by-test.env",
+            "--confirm",
+            "materialize-source-analysis",
+            "--m1-notification-ux-readback-json",
+            str(readback_path),
+        ],
+        emit_json=emitted.append,
+        runtime_config_loader=runtime_loader,
+        stage_factory_builder=lambda runtime_config: FakeStageFactoryContext(Ledger()),
+    )
+
+    payload = json.loads(emitted[0])
+    assert exit_code == 2
+    assert payload["status"] == "blocked"
+    assert payload["reason_code"] == reason_code
+    assert payload["mvp_closure_packet"]["status"] == "blocked"
+    assert payload["mvp_closure_packet"]["m1_notification_ux_acceptance_closed"] is False
+    assert runtime_loads == []
+    for forbidden in (
+        str(packet_path),
+        str(readback_path),
+        "/tmp/not-read-by-test.env",
+        "DATABASE_URL",
+        "postgresql+psycopg" + "://",
+        "redis" + "://",
+        "TELEGRAM_BOT_TOKEN",
+        "OPENAI_API_KEY",
+        "payload_json",
+        "telegram_response_json",
+        "runtime.env",
+        "Traceback",
+        RAW_SECRET,
+        KOREAN_LLM_WORKFLOW_TEXT,
+        "llm",
+        "https://t.me/SynthChannel/12345",
+        "SynthChannel/12345",
+        "TARGET_EVENT_ID",
+    ):
+        assert forbidden not in emitted[0]
 
 
 @pytest.mark.asyncio

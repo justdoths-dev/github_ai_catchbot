@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -18,7 +19,19 @@ from services.notifier_telegram.main import (
     _run_restricted_live_queued_worker_once,
     _run_send_disabled_worker_once_proof,
 )
+from src.services.maintenance.exact_target_source_to_analysis_materializer import (
+    build_mvp_closure_packet,
+    run_cli,
+)
 from tests.component.services.notifier_telegram._fakes import RaisingTelegramClient
+from tests.unit.services.maintenance.test_exact_target_source_to_analysis_materializer import (
+    FakeStageFactoryContext,
+    Ledger,
+    ROOT,
+    packet_json,
+    run as run_source_materializer,
+    runtime_bundle,
+)
 from tests.unit.services.maintenance.test_restricted_delivery_result_maintenance_drain_proof_runner import (
     FakeMaintenanceRunner,
     FakePublisherRunner as DeliveryDrainPublisherRunner,
@@ -54,35 +67,12 @@ from tests.unit.services.notifier_telegram.test_send_disabled_worker_once_proof_
 
 @pytest.mark.asyncio
 async def test_notification_operator_acceptance_consolidates_closed_readbacks_without_live_authority() -> None:
-    send_disabled = await _send_disabled_acceptance()
-    queued_worker = await _queued_worker_acceptance()
-    queue_chain = await _queue_chain_acceptance()
-    delivery_drain = await _delivery_drain_acceptance()
-    zero_readback = _zero_readback_acceptance()
-
-    consolidated = {
-        "schema_version": "notification_operator_acceptance_readback_consolidation_v1",
-        "status": "pass",
-        "surfaces": {
-            "restricted_send_disabled": send_disabled,
-            "restricted_queued_worker": queued_worker,
-            "restricted_queue_chain": queue_chain,
-            "delivery_result_drain": delivery_drain,
-            "zero_preserving_readback": zero_readback,
-        },
-        "authority": {
-            "live_telegram_transport_attempted": False,
-            "live_openai_called": False,
-            "live_github_called": False,
-            "live_x_called": False,
-            "live_web_called": False,
-            "docker_or_systemd_called": False,
-            "alembic_or_ddl_ran": False,
-            "runtime_values_printed": False,
-            "raw_payload_printed": False,
-            "raw_ids_printed": False,
-        },
-    }
+    consolidated = await _notification_acceptance_consolidation()
+    send_disabled = consolidated["surfaces"]["restricted_send_disabled"]
+    queued_worker = consolidated["surfaces"]["restricted_queued_worker"]
+    queue_chain = consolidated["surfaces"]["restricted_queue_chain"]
+    delivery_drain = consolidated["surfaces"]["delivery_result_drain"]
+    zero_readback = consolidated["surfaces"]["zero_preserving_readback"]
 
     assert send_disabled == {
         "status": "pass",
@@ -149,6 +139,199 @@ async def test_notification_operator_acceptance_consolidates_closed_readbacks_wi
         str(TARGET_EVENT_ID),
     ):
         assert forbidden not in rendered
+
+
+@pytest.mark.asyncio
+async def test_mvp_closure_packet_consumes_m1_and_source_channel_proofs_without_final_claims() -> None:
+    m1_readback = await _notification_acceptance_consolidation()
+    source_report = await run_source_materializer(Ledger(), mode="execute")
+
+    packet = build_mvp_closure_packet(
+        source_report,
+        m1_notification_ux_acceptance_closed=m1_readback["status"] == "pass",
+        m1_notification_ux_readback_schema_version=str(m1_readback["schema_version"]),
+        restricted_source_channel_proof=source_report.restricted_source_channel_proof,
+    )
+
+    assert source_report.restricted_source_channel_proof["status"] == "pass"
+    assert packet["schema_version"] == "github_ai_catchbot_mvp_closure_packet_v1"
+    assert packet["status"] == "pass"
+    assert packet["reason_code"] == "mvp_code_proof_ux_packet_ready"
+    assert packet["m1_notification_ux_acceptance_closed"] is True
+    assert packet["m2_restricted_source_channel_proof_closed"] is True
+    assert packet["mvp_closure_packet_ready"] is True
+    assert packet["closed_capabilities"] == [
+        "M1 notification UX acceptance packet closed",
+        "M2 restricted source/channel proof closed",
+        "MVP code/proof/UX packet ready",
+    ]
+    assert packet["open_gates"] == [
+        "AUTHORITY_OPEN",
+        "ROLLOUT_OPEN",
+        "PRODUCTION_ROLLOUT_OPEN",
+        "FUNCTION_COMPLETE_OPEN",
+        "full live collector rollout open",
+        "provider live authority open",
+        "always-on worker/systemd rollout open",
+        "final function-complete/production-complete claims open",
+    ]
+    assert packet["authority"] == {
+        "live_telegram_read_opened": False,
+        "live_telegram_send_opened": False,
+        "openai_called": False,
+        "github_called": False,
+        "x_called": False,
+        "web_called": False,
+        "redis_consume_or_ack": False,
+        "docker_or_systemd_called": False,
+        "alembic_or_ddl_ran": False,
+        "production_db_mutation": False,
+    }
+    assert packet["completion_claims"] == {
+        "mvp_code_proof_ux_packet_ready": True,
+        "final_function_complete": False,
+        "production_complete": False,
+        "bot_complete": False,
+        "one_hundred_percent_complete": False,
+    }
+    rendered = json.dumps(packet, ensure_ascii=False, sort_keys=True)
+    for forbidden in (
+        "postgresql+psycopg" + "://",
+        "redis" + "://",
+        "TELEGRAM_BOT_TOKEN",
+        "DATABASE_URL",
+        "REDIS_URL",
+        "Traceback",
+        RAW_SECRET,
+        str(TARGET_EVENT_ID),
+    ):
+        assert forbidden not in rendered
+
+
+@pytest.mark.asyncio
+async def test_materializer_cli_consumes_m1_readback_and_emits_operator_pass_packet(
+    tmp_path: Path,
+) -> None:
+    m1_readback = await _notification_acceptance_consolidation()
+    packet_path = tmp_path / "source-packet.json"
+    readback_path = tmp_path / "m1-notification-ux-readback.json"
+    packet_path.write_text(packet_json(), encoding="utf-8")
+    readback_path.write_text(
+        json.dumps(m1_readback, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    emitted: list[str] = []
+    ledger = Ledger()
+    runtime_loads: list[str] = []
+
+    def runtime_loader(env_file: str):
+        runtime_loads.append(env_file)
+        return runtime_bundle()
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "execute",
+            "--source-packet-json",
+            str(packet_path),
+            "--env-file",
+            "/tmp/not-read-by-test.env",
+            "--confirm",
+            "materialize-source-analysis",
+            "--m1-notification-ux-readback-json",
+            str(readback_path),
+        ],
+        emit_json=emitted.append,
+        runtime_config_loader=runtime_loader,
+        stage_factory_builder=lambda runtime_config: FakeStageFactoryContext(ledger),
+        repo_root=ROOT,
+    )
+
+    payload = json.loads(emitted[0])
+    closure = payload["mvp_closure_packet"]
+    claims = closure["completion_claims"]
+    assert exit_code == 0
+    assert runtime_loads == ["/tmp/not-read-by-test.env"]
+    assert payload["status"] == "pass"
+    assert payload["reason_code"] == "analysis_request_materialized"
+    assert payload["restricted_source_channel_proof"]["status"] == "pass"
+    assert payload["restricted_source_channel_proof"]["reason_code"] == (
+        "restricted_source_channel_proof_closed"
+    )
+    assert closure["status"] == "pass"
+    assert closure["reason_code"] == "mvp_code_proof_ux_packet_ready"
+    assert closure["m1_notification_ux_acceptance_closed"] is True
+    assert closure["m1_notification_ux_readback_schema_version"] == (
+        "notification_operator_acceptance_readback_consolidation_v1"
+    )
+    assert closure["m2_restricted_source_channel_proof_closed"] is True
+    assert closure["mvp_closure_packet_ready"] is True
+    assert "AUTHORITY_OPEN" in closure["open_gates"]
+    assert "ROLLOUT_OPEN" in closure["open_gates"]
+    assert "FUNCTION_COMPLETE_OPEN" in closure["open_gates"]
+    assert "PRODUCTION_ROLLOUT_OPEN" in closure["open_gates"]
+    assert claims["mvp_code_proof_ux_packet_ready"] is True
+    assert claims["final_function_complete"] is False
+    assert claims["production_complete"] is False
+    assert claims["bot_complete"] is False
+    assert claims["one_hundred_percent_complete"] is False
+
+    rendered = emitted[0]
+    for forbidden in (
+        str(packet_path),
+        str(readback_path),
+        "https://t.me/SynthChannel/12345",
+        "SynthChannel/12345",
+        "회사에서 llm 사용 권한",
+        "llm",
+        "postgresql+psycopg" + "://",
+        "postgresql" + "://",
+        "redis" + "://",
+        "TELEGRAM_BOT_TOKEN",
+        "DATABASE_URL",
+        "REDIS_URL",
+        "OPENAI_API_KEY",
+        "Traceback",
+        "payload_json",
+        "telegram_response_json",
+        "runtime.env",
+        RAW_SECRET,
+        str(TARGET_EVENT_ID),
+        "TARGET_EVENT_ID",
+    ):
+        assert forbidden not in rendered
+
+
+async def _notification_acceptance_consolidation() -> dict[str, object]:
+    send_disabled = await _send_disabled_acceptance()
+    queued_worker = await _queued_worker_acceptance()
+    queue_chain = await _queue_chain_acceptance()
+    delivery_drain = await _delivery_drain_acceptance()
+    zero_readback = _zero_readback_acceptance()
+
+    return {
+        "schema_version": "notification_operator_acceptance_readback_consolidation_v1",
+        "status": "pass",
+        "surfaces": {
+            "restricted_send_disabled": send_disabled,
+            "restricted_queued_worker": queued_worker,
+            "restricted_queue_chain": queue_chain,
+            "delivery_result_drain": delivery_drain,
+            "zero_preserving_readback": zero_readback,
+        },
+        "authority": {
+            "live_telegram_transport_attempted": False,
+            "live_openai_called": False,
+            "live_github_called": False,
+            "live_x_called": False,
+            "live_web_called": False,
+            "docker_or_systemd_called": False,
+            "alembic_or_ddl_ran": False,
+            "runtime_values_printed": False,
+            "raw_payload_printed": False,
+            "raw_ids_printed": False,
+        },
+    }
 
 
 async def _send_disabled_acceptance() -> dict[str, object]:

@@ -270,6 +270,14 @@ async def test_registry_identity_requires_exact_non_null_match() -> None:
 
     assert ambiguous.value.reason_code == "telegram_channel_registry_target_ambiguous"
 
+    repository.registry_rows = [
+        {"registry_id": "reg-1", "chat_id": None},
+    ]
+    with pytest.raises(OperatorSuppliedSourceError) as null_chat_id:
+        await adapter.resolve_registry_target(repository, packet())
+
+    assert null_chat_id.value.reason_code == "telegram_channel_registry_target_missing"
+
 
 def test_projection_uses_operator_provenance_and_no_raw_source_ref_storage() -> None:
     item = packet()

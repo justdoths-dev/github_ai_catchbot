@@ -35,11 +35,84 @@ from ..router_normalizer.url_extraction import extract_urls
 
 
 SCHEMA_VERSION = "exact_target_source_to_analysis_materializer_report_v2"
+RESTRICTED_SOURCE_CHANNEL_PROOF_SCHEMA_VERSION = (
+    "github_ai_catchbot_restricted_source_channel_proof_v1"
+)
+MVP_CLOSURE_PACKET_SCHEMA_VERSION = "github_ai_catchbot_mvp_closure_packet_v1"
+M1_NOTIFICATION_UX_READBACK_SCHEMA_VERSION = (
+    "notification_operator_acceptance_readback_consolidation_v1"
+)
 CONFIRM_TOKEN = "materialize-source-analysis"
 PROVIDER_LIVE_CONFIRM_TOKEN = "live-github-provider-evidence"
 PROVIDER_RESUME_CONFIRM_TOKEN = "resume-live-github-provider-evidence"
 PLACEHOLDER_REDIS_URL = "redis_locator_not_attempted"
 REPO_ROOT = Path(__file__).resolve().parents[3]
+MVP_OPEN_GATES = (
+    "AUTHORITY_OPEN",
+    "ROLLOUT_OPEN",
+    "PRODUCTION_ROLLOUT_OPEN",
+    "FUNCTION_COMPLETE_OPEN",
+    "full live collector rollout open",
+    "provider live authority open",
+    "always-on worker/systemd rollout open",
+    "final function-complete/production-complete claims open",
+)
+MVP_REDACTIONS_APPLIED = (
+    "raw_source_text_omitted",
+    "raw_source_ref_omitted",
+    "raw_source_url_omitted",
+    "raw_ids_replaced_by_fingerprints",
+    "db_url_omitted",
+    "redis_url_omitted",
+    "tokens_omitted",
+    "runtime_env_values_omitted",
+    "stderr_omitted",
+    "exception_body_omitted",
+)
+MVP_AUTHORITY_CLOSED = {
+    "live_telegram_read_opened": False,
+    "live_telegram_send_opened": False,
+    "openai_called": False,
+    "github_called": False,
+    "x_called": False,
+    "web_called": False,
+    "redis_consume_or_ack": False,
+    "docker_or_systemd_called": False,
+    "alembic_or_ddl_ran": False,
+    "production_db_mutation": False,
+}
+M1_READBACK_AUTHORITY_FIELDS = (
+    "live_telegram_transport_attempted",
+    "live_openai_called",
+    "live_github_called",
+    "live_x_called",
+    "live_web_called",
+    "docker_or_systemd_called",
+    "alembic_or_ddl_ran",
+    "runtime_values_printed",
+    "raw_payload_printed",
+    "raw_ids_printed",
+)
+M1_READBACK_UNSAFE_LITERAL_MARKERS = (
+    "postgresql://",
+    "redis://",
+    "TELEGRAM_BOT_TOKEN",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "OPENAI_API_KEY",
+    "Traceback",
+    "payload_json",
+    "telegram_response_json",
+    "runtime.env",
+)
+M1_READBACK_UNSAFE_CASEFOLD_MARKERS = (
+    "postgresql+",
+    "secret",
+    "token",
+    "password",
+    "credential",
+    "api_key",
+)
 
 RUNTIME_VALUE_KEYS = {
     "APP_ENV",
@@ -125,6 +198,11 @@ class ExistingSourceProviderResumeAuthority:
 
 
 @dataclass(slots=True, frozen=True)
+class M1NotificationUxReadbackAcceptance:
+    schema_version: str
+
+
+@dataclass(slots=True, frozen=True)
 class ExactTargetSourceToAnalysisReport:
     schema_version: str
     mode: str
@@ -162,6 +240,8 @@ class ExactTargetSourceToAnalysisReport:
     external_network_attempted: bool
     redactions_applied: bool
     bounded_counts: dict[str, int] = field(default_factory=dict)
+    restricted_source_channel_proof: dict[str, Any] = field(default_factory=dict)
+    mvp_closure_packet: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
@@ -172,6 +252,7 @@ class ExactTargetSourceToAnalysisRequest:
     provider_resume_authority: ExistingSourceProviderResumeAuthority = field(
         default_factory=ExistingSourceProviderResumeAuthority
     )
+    m1_notification_ux_readback: M1NotificationUxReadbackAcceptance | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -1328,6 +1409,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider-live-confirm", default=None)
     parser.add_argument("--allow-existing-source-provider-resume", action="store_true")
     parser.add_argument("--provider-resume-confirm", default=None)
+    parser.add_argument("--m1-notification-ux-readback-json", default=None)
     return parser
 
 
@@ -1420,6 +1502,29 @@ async def run_cli(
         )
         return 2
 
+    m1_notification_ux_readback: M1NotificationUxReadbackAcceptance | None = None
+    if args.m1_notification_ux_readback_json is not None:
+        try:
+            m1_notification_ux_readback = load_m1_notification_ux_readback_acceptance(
+                args.m1_notification_ux_readback_json
+            )
+        except ExactTargetSourceToAnalysisConfigError as exc:
+            emit_json(
+                _compact_json(
+                    asdict(
+                        _finalize_report(
+                            _report(
+                                mode=args.mode,
+                                status="blocked",
+                                reason_code=_safe_reason_code(exc),
+                                packet=packet,
+                            )
+                        )
+                    )
+                )
+            )
+            return 2
+
     try:
         runtime = (runtime_config_loader or load_runtime_config)(str(args.env_file))
     except ExactTargetSourceToAnalysisConfigError as exc:
@@ -1445,6 +1550,7 @@ async def run_cli(
                 packet=packet,
                 provider_authority=_provider_authority_from_args(args),
                 provider_resume_authority=_provider_resume_authority_from_args(args),
+                m1_notification_ux_readback=m1_notification_ux_readback,
             ),
             stage_factory=stage_factory,
         )
@@ -1463,6 +1569,13 @@ async def run_exact_target_source_to_analysis_materializer(
         reason_code="unhandled_error",
         packet=request.packet,
     )
+
+    def finalize(candidate: ExactTargetSourceToAnalysisReport) -> ExactTargetSourceToAnalysisReport:
+        return _finalize_report(
+            candidate,
+            m1_notification_ux_readback=request.m1_notification_ux_readback,
+        )
+
     try:
         async with stage_factory.stage("preflight") as components:
             preflight = await _load_preflight(
@@ -1472,13 +1585,17 @@ async def run_exact_target_source_to_analysis_materializer(
             )
         report = _apply_preflight(report, preflight)
         if not preflight.passed:
-            return replace(
-                report,
-                status="blocked",
-                reason_code=preflight.reason_code or "preflight_blocked",
+            return finalize(
+                replace(
+                    report,
+                    status="blocked",
+                    reason_code=preflight.reason_code or "preflight_blocked",
+                )
             )
         if request.mode == "plan":
-            return replace(report, status="pass", reason_code="plan_ready", preflight_passed=True)
+            return finalize(
+                replace(report, status="pass", reason_code="plan_ready", preflight_passed=True)
+            )
 
         assert preflight.registry_target is not None
         assert preflight.source_content_hash is not None
@@ -1491,7 +1608,7 @@ async def run_exact_target_source_to_analysis_materializer(
                 preflight=preflight,
             )
             if resume is not None:
-                return resume
+                return finalize(resume)
 
         report = replace(report, source_ingest_attempted=True)
         async with stage_factory.stage("source_ingest") as components:
@@ -1501,10 +1618,12 @@ async def run_exact_target_source_to_analysis_materializer(
                 registry_target=preflight.registry_target,
             )
             if ingest.duplicate:
-                return replace(
-                    _apply_ingest(report, ingest),
-                    status="blocked",
-                    reason_code="source_packet_already_materialized",
+                return finalize(
+                    replace(
+                        _apply_ingest(report, ingest),
+                        status="blocked",
+                        reason_code="source_packet_already_materialized",
+                    )
                 )
             await components.commit()
         report = _apply_ingest(report, ingest)
@@ -1513,7 +1632,9 @@ async def run_exact_target_source_to_analysis_materializer(
             or ingest.source_version_no is None
             or ingest.source_event_id is None
         ):
-            return replace(report, status="failed", reason_code="source_ingest_readback_invalid")
+            return finalize(
+                replace(report, status="failed", reason_code="source_ingest_readback_invalid")
+            )
 
         source_message_id = UUID(ingest.source_message_id)
         source_version_no = int(ingest.source_version_no)
@@ -1541,18 +1662,22 @@ async def run_exact_target_source_to_analysis_materializer(
         report = _apply_normalization_readback(report, normalization)
         normalization_error = _normalization_error(normalization)
         if normalization_error is not None:
-            return replace(report, status="failed", reason_code=normalization_error)
+            return finalize(
+                replace(report, status="failed", reason_code=normalization_error)
+            )
         assert normalization.candidate_group_id is not None
 
         if normalization.enrichment_requests >= 1:
-            return await _run_provider_enrichment_to_analysis(
-                request=request,
-                stage_factory=stage_factory,
-                report=report,
-                preflight=preflight,
-                source_message_id=source_message_id,
-                source_version_no=source_version_no,
-                normalization=normalization,
+            return finalize(
+                await _run_provider_enrichment_to_analysis(
+                    request=request,
+                    stage_factory=stage_factory,
+                    report=report,
+                    preflight=preflight,
+                    source_message_id=source_message_id,
+                    source_version_no=source_version_no,
+                    normalization=normalization,
+                )
             )
 
         report = replace(report, bundle_refresh_attempted=True)
@@ -1564,7 +1689,9 @@ async def run_exact_target_source_to_analysis_materializer(
                 packet_fingerprint=request.packet.packet_fingerprint,
             )
             if not refresh.created:
-                return replace(report, status="blocked", reason_code="refresh_event_already_exists")
+                return finalize(
+                    replace(report, status="blocked", reason_code="refresh_event_already_exists")
+                )
             await components.commit()
         report = replace(report, refresh_event_fingerprint=_fingerprint(refresh.event_id))
 
@@ -1585,26 +1712,28 @@ async def run_exact_target_source_to_analysis_materializer(
         report = _apply_final_readback(report, final)
         final_error = _final_readback_error(final)
         if final_error is not None:
-            return replace(report, status="failed", reason_code=final_error)
+            return finalize(replace(report, status="failed", reason_code=final_error))
 
-        return replace(
-            report,
-            status="pass",
-            reason_code="analysis_request_materialized",
-            preflight_passed=True,
-            source_message_created=True,
-            source_version_created=True,
-            candidate_created=True,
-            text_idea_snapshot_created=True,
-            bundle_created=True,
-            analysis_request_created=True,
+        return finalize(
+            replace(
+                report,
+                status="pass",
+                reason_code="analysis_request_materialized",
+                preflight_passed=True,
+                source_message_created=True,
+                source_version_created=True,
+                candidate_created=True,
+                text_idea_snapshot_created=True,
+                bundle_created=True,
+                analysis_request_created=True,
+            )
         )
     except OperatorSuppliedSourceError as exc:
-        return replace(report, status="blocked", reason_code=exc.reason_code)
+        return finalize(replace(report, status="blocked", reason_code=exc.reason_code))
     except ExactTargetSourceToAnalysisConfigError as exc:
-        return replace(report, status="blocked", reason_code=_safe_reason_code(exc))
+        return finalize(replace(report, status="blocked", reason_code=_safe_reason_code(exc)))
     except Exception:
-        return replace(report, status="failed", reason_code="unhandled_error")
+        return finalize(replace(report, status="failed", reason_code="unhandled_error"))
 
 
 async def _load_existing_provider_resume(
@@ -2549,6 +2678,278 @@ def _report(
         redactions_applied=True,
         bounded_counts={},
     )
+
+
+def load_m1_notification_ux_readback_acceptance(
+    path_value: str,
+) -> M1NotificationUxReadbackAcceptance:
+    path = Path(path_value)
+    if not path.is_file():
+        raise ExactTargetSourceToAnalysisConfigError("m1_notification_ux_readback_missing")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_readback_invalid_json"
+        ) from None
+    except OSError:
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_readback_missing"
+        ) from None
+
+    if not isinstance(payload, Mapping):
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_readback_schema_invalid"
+        )
+    if not _m1_notification_ux_readback_is_sanitized(payload):
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_readback_not_sanitized"
+        )
+
+    schema_version = payload.get("schema_version")
+    if schema_version != M1_NOTIFICATION_UX_READBACK_SCHEMA_VERSION:
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_readback_schema_invalid"
+        )
+    if payload.get("status") != "pass":
+        raise ExactTargetSourceToAnalysisConfigError("m1_notification_ux_readback_not_pass")
+
+    authority = payload.get("authority")
+    if not isinstance(authority, Mapping) or any(
+        authority.get(field) is not False for field in M1_READBACK_AUTHORITY_FIELDS
+    ):
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_readback_authority_open"
+        )
+
+    return M1NotificationUxReadbackAcceptance(schema_version=str(schema_version))
+
+
+def _m1_notification_ux_readback_is_sanitized(payload: Mapping[str, Any]) -> bool:
+    rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    rendered_casefold = rendered.casefold()
+    if any(marker.casefold() in rendered_casefold for marker in M1_READBACK_UNSAFE_LITERAL_MARKERS):
+        return False
+    if any(marker in rendered_casefold for marker in M1_READBACK_UNSAFE_CASEFOLD_MARKERS):
+        return False
+    return re.search(r"postgresql\+[^\"'\s:]+://", rendered, flags=re.IGNORECASE) is None
+
+
+def build_restricted_source_channel_proof(
+    report: ExactTargetSourceToAnalysisReport,
+) -> dict[str, Any]:
+    source_to_analysis_visible = _source_to_analysis_boundary_visible(report)
+    authority_closed = (
+        not report.openai_attempted
+        and not report.redis_attempted
+        and not report.telegram_live_read_attempted
+        and not report.telegram_send_attempted
+        and not report.external_network_attempted
+    )
+    source_channel_closed = (
+        report.status == "pass"
+        and report.preflight_passed
+        and source_to_analysis_visible
+        and authority_closed
+        and _count(report, "telegram_raw_updates") == 0
+        and _count(report, "judge_runs") == 0
+        and _count(report, "judge_call_requested_events") == 0
+    )
+    source_to_analysis = {
+        "source_packet_fingerprint_present": report.source_packet_fingerprint is not None,
+        "source_ref_fingerprint_present": report.source_ref_fingerprint is not None,
+        "source_message_fingerprint_present": report.source_message_fingerprint is not None,
+        "source_outbox_event_fingerprint_present": report.source_event_fingerprint is not None,
+        "normalization_run_visible": _count(report, "normalization_runs") == 1,
+        "candidate_group_fingerprint_present": report.candidate_group_fingerprint is not None,
+        "candidate_group_visible": _count(report, "candidate_groups") == 1,
+        "artifact_fingerprint_present": report.artifact_fingerprint is not None,
+        "evidence_bundle_fingerprint_present": report.bundle_fingerprint is not None,
+        "ready_evidence_bundle_visible": _count(report, "ready_current_bundles") == 1,
+        "analysis_request_fingerprint_present": report.analysis_request_fingerprint is not None,
+        "analysis_requested_visible": _count(report, "analysis_requested_events") == 1,
+        "judge_call_not_requested": _count(report, "judge_call_requested_events") == 0,
+    }
+    return {
+        "schema_version": RESTRICTED_SOURCE_CHANNEL_PROOF_SCHEMA_VERSION,
+        "status": "pass" if source_channel_closed else "blocked",
+        "reason_code": (
+            "restricted_source_channel_proof_closed"
+            if source_channel_closed
+            else "source_analysis_boundary_not_closed"
+        ),
+        "exact_source_channel_bounded": report.preflight_passed,
+        "registry_lookup": {
+            "public_username_scoped": report.source_ref_fingerprint is not None,
+            "exact_single_target_required": True,
+            "missing_target_fails_closed": True,
+            "ambiguous_target_fails_closed": True,
+        },
+        "provenance": {
+            "operator_supplied": report.source_packet_fingerprint is not None,
+            "live_telegram_read": False,
+            "operator_path_distinct_from_live_collector": True,
+        },
+        "safe_fingerprints": {
+            "source_packet": report.source_packet_fingerprint,
+            "source_ref": report.source_ref_fingerprint,
+            "source_message": report.source_message_fingerprint,
+            "source_outbox_event": report.source_event_fingerprint,
+            "artifact": report.artifact_fingerprint,
+            "candidate_group": report.candidate_group_fingerprint,
+            "bundle": report.bundle_fingerprint,
+            "analysis_request": report.analysis_request_fingerprint,
+        },
+        "source_to_analysis_boundary": source_to_analysis,
+        "bounded_counts": {
+            key: _count(report, key)
+            for key in (
+                "source_messages",
+                "source_message_versions",
+                "source_created_events",
+                "telegram_raw_updates",
+                "normalization_runs",
+                "candidate_groups",
+                "external_enrichment_requests",
+                "provider_snapshots",
+                "artifact_snapshot_updated_events",
+                "text_idea_snapshots",
+                "ready_current_bundles",
+                "candidate_evidence_members",
+                "analysis_requested_events",
+                "judge_runs",
+                "judge_call_requested_events",
+            )
+        },
+        "authority": {
+            "full_live_collector_opened": False,
+            "tdlib_live_history_read_opened": report.telegram_live_read_attempted,
+            "broad_registry_ingest_opened": False,
+            "telegram_raw_updates_write_required": False,
+            "telegram_send_opened": report.telegram_send_attempted,
+            "openai_called": report.openai_attempted,
+            "github_called": report.external_network_attempted,
+            "x_called": False,
+            "web_called": False,
+            "redis_consume_or_ack": report.redis_attempted,
+            "docker_or_systemd_called": False,
+            "alembic_or_ddl_ran": False,
+            "production_db_mutation": False,
+        },
+        "redactions_applied": list(MVP_REDACTIONS_APPLIED),
+        "raw_values_printed": {
+            "source_text": False,
+            "source_ref": False,
+            "source_url": False,
+            "raw_ids": False,
+            "db_url": False,
+            "redis_url": False,
+            "token": False,
+            "runtime_env_value": False,
+            "stderr": False,
+            "exception_body": False,
+        },
+    }
+
+
+def build_mvp_closure_packet(
+    report: ExactTargetSourceToAnalysisReport,
+    *,
+    m1_notification_ux_acceptance_closed: bool = False,
+    m1_notification_ux_readback_schema_version: str | None = None,
+    restricted_source_channel_proof: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    source_proof = dict(
+        restricted_source_channel_proof
+        if restricted_source_channel_proof is not None
+        else build_restricted_source_channel_proof(report)
+    )
+    m2_closed = source_proof.get("status") == "pass"
+    ready = bool(m1_notification_ux_acceptance_closed and m2_closed)
+    closed_capabilities: list[str] = []
+    if m1_notification_ux_acceptance_closed:
+        closed_capabilities.append("M1 notification UX acceptance packet closed")
+    if m2_closed:
+        closed_capabilities.append("M2 restricted source/channel proof closed")
+    if ready:
+        closed_capabilities.append("MVP code/proof/UX packet ready")
+    return {
+        "schema_version": MVP_CLOSURE_PACKET_SCHEMA_VERSION,
+        "status": "pass" if ready else "blocked",
+        "reason_code": (
+            "mvp_code_proof_ux_packet_ready"
+            if ready
+            else "mvp_closure_inputs_incomplete"
+        ),
+        "m1_notification_ux_acceptance_closed": bool(m1_notification_ux_acceptance_closed),
+        "m1_notification_ux_readback_schema_version": m1_notification_ux_readback_schema_version,
+        "m2_restricted_source_channel_proof_closed": bool(m2_closed),
+        "mvp_closure_packet_ready": ready,
+        "closed_capabilities": closed_capabilities,
+        "open_gates": list(MVP_OPEN_GATES),
+        "authority": dict(MVP_AUTHORITY_CLOSED),
+        "redactions_applied": list(MVP_REDACTIONS_APPLIED),
+        "completion_claims": {
+            "mvp_code_proof_ux_packet_ready": ready,
+            "final_function_complete": False,
+            "production_complete": False,
+            "bot_complete": False,
+            "one_hundred_percent_complete": False,
+        },
+        "source_channel_proof_schema_version": source_proof.get("schema_version"),
+        "source_channel_proof_status": source_proof.get("status"),
+        "source_analysis_boundary_visible": source_proof.get(
+            "source_to_analysis_boundary", {}
+        ).get("analysis_requested_visible")
+        is True,
+    }
+
+
+def _finalize_report(
+    report: ExactTargetSourceToAnalysisReport,
+    *,
+    m1_notification_ux_readback: M1NotificationUxReadbackAcceptance | None = None,
+) -> ExactTargetSourceToAnalysisReport:
+    source_proof = build_restricted_source_channel_proof(report)
+    return replace(
+        report,
+        restricted_source_channel_proof=source_proof,
+        mvp_closure_packet=build_mvp_closure_packet(
+            report,
+            m1_notification_ux_acceptance_closed=m1_notification_ux_readback is not None,
+            m1_notification_ux_readback_schema_version=(
+                None
+                if m1_notification_ux_readback is None
+                else m1_notification_ux_readback.schema_version
+            ),
+            restricted_source_channel_proof=source_proof,
+        ),
+    )
+
+
+def _source_to_analysis_boundary_visible(report: ExactTargetSourceToAnalysisReport) -> bool:
+    return (
+        report.source_packet_fingerprint is not None
+        and report.source_ref_fingerprint is not None
+        and report.source_message_fingerprint is not None
+        and report.source_event_fingerprint is not None
+        and report.candidate_group_fingerprint is not None
+        and report.artifact_fingerprint is not None
+        and report.bundle_fingerprint is not None
+        and report.analysis_request_fingerprint is not None
+        and _count(report, "source_messages") == 1
+        and _count(report, "source_message_versions") == 1
+        and _count(report, "source_created_events") == 1
+        and _count(report, "normalization_runs") == 1
+        and _count(report, "candidate_groups") == 1
+        and _count(report, "ready_current_bundles") == 1
+        and _count(report, "candidate_evidence_members") >= 1
+        and _count(report, "analysis_requested_events") == 1
+    )
+
+
+def _count(report: ExactTargetSourceToAnalysisReport, key: str) -> int:
+    return int(report.bounded_counts.get(key, 0))
 
 
 def _cli_request_error(args: argparse.Namespace) -> str | None:
