@@ -79,6 +79,7 @@ ONE_SHOT_RUNTIME_CONFIG_REASON_CODES = {
     "env_file_redis_url_file_empty",
     "env_file_telegram_bot_token_file_missing",
     "env_file_telegram_bot_token_file_empty",
+    "runtime_database_config_not_found",
     "notifier_runtime_config_error",
 }
 
@@ -104,10 +105,50 @@ ONE_SHOT_RUNTIME_ENV_VALUE_KEYS = {
 }
 ONE_SHOT_RUNTIME_ENV_FILE_KEYS = {"DATABASE_URL_FILE", "REDIS_URL_FILE", "TELEGRAM_BOT_TOKEN_FILE"}
 ONE_SHOT_RUNTIME_ENV_KEYS = ONE_SHOT_RUNTIME_ENV_VALUE_KEYS | ONE_SHOT_RUNTIME_ENV_FILE_KEYS
+NOTIFICATION_UX_DB_RUNTIME_ENV_KEYS = {
+    "DATABASE_URL",
+    "DATABASE_URL_FILE",
+    "NOTIFIER_TELEGRAM_MAX_MESSAGE_CHARS",
+}
+NOTIFICATION_UX_DB_RUNTIME_CANDIDATE_FILE_NAMES = {
+    "runtime.env",
+    ".env",
+    ".env.prod",
+    "prod.env",
+    "production.env",
+    "catchbot.env",
+    "github_ai_catchbot.env",
+    "github_ai_catchbot.runtime.env",
+}
+NOTIFICATION_UX_DB_RUNTIME_DISCOVERY_SKIP_DIRS = {
+    ".git",
+    "venv",
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+    "node_modules",
+    "logs",
+    "log",
+}
+NOTIFICATION_UX_DB_RUNTIME_DISCOVERY_MAX_DEPTH = 7
+NOTIFICATION_UX_DB_RUNTIME_DISCOVERY_MAX_FILES = 80
+NOTIFICATION_UX_PREVIEW_DEFAULT_MAX_MESSAGE_CHARS = 3800
 
 
 class _NotifierOneShotRuntimeConfigError(ValueError):
     pass
+
+
+@dataclass(slots=True, frozen=True)
+class _NotificationUxPreviewRuntimeConfig:
+    database_url: str
+    max_message_chars: int
+
+
+@dataclass(slots=True, frozen=True)
+class _NotificationUxPreviewRuntimeConfigResult:
+    config: _NotificationUxPreviewRuntimeConfig
+    locator: dict[str, Any]
 
 
 def _build_logger(level: str) -> logging.Logger:
@@ -140,8 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
     create_canary_plan.add_argument("--format", choices=["json"], default="json")
 
     notification_ux_preview = subcommands.add_parser("notification-ux-render-preview")
-    notification_ux_preview.add_argument("--notification-plan-id", required=True)
+    notification_ux_selector = notification_ux_preview.add_mutually_exclusive_group(required=True)
+    notification_ux_selector.add_argument("--notification-plan-id")
+    notification_ux_selector.add_argument("--select-latest-eligible", action="store_true")
     notification_ux_preview.add_argument("--env-file")
+    notification_ux_preview.add_argument("--discover-db-config", action="store_true")
     notification_ux_preview.add_argument("--format", choices=["json"], default="json")
 
     send_disabled_proof = subcommands.add_parser("send-disabled-worker-once-proof")
@@ -390,34 +434,68 @@ async def _run_restricted_transport_canary_command(args: argparse.Namespace, *, 
     )
 
 
-async def _run_notification_ux_render_preview_command(args: argparse.Namespace, *, emit_json=print) -> int:
-    try:
-        notification_plan_id = UUID(str(args.notification_plan_id))
-    except (TypeError, ValueError, AttributeError):
-        emit_json(_to_json(_notification_ux_preview_payload("invalid_notification_plan_id", db_read_attempted=False)))
-        return 2
-
-    try:
-        config = _load_notification_ux_preview_config(args)
-    except _NotifierOneShotRuntimeConfigError as exc:
-        reason_code = _one_shot_runtime_config_reason_code(exc)
-        emit_json(_to_json(_notification_ux_preview_payload(reason_code, db_read_attempted=False)))
-        return 1
-
-    return await _run_notification_ux_render_preview(
-        config,
-        notification_plan_id,
-        emit_json=emit_json,
-    )
-
-
-async def _run_notification_ux_render_preview(
-    config: NotifierTelegramConfig,
-    notification_plan_id: UUID,
+async def _run_notification_ux_render_preview_command(
+    args: argparse.Namespace,
     *,
     emit_json=print,
     session_factory_builder=None,
     repository_builder=NotifierTelegramRepository,
+) -> int:
+    select_latest_eligible = bool(getattr(args, "select_latest_eligible", False))
+    notification_plan_id: UUID | None = None
+    if not select_latest_eligible:
+        try:
+            notification_plan_id = UUID(str(args.notification_plan_id))
+        except (TypeError, ValueError, AttributeError):
+            emit_json(
+                _to_json(
+                    _notification_ux_preview_payload(
+                        "invalid_notification_plan_id",
+                        db_read_attempted=False,
+                    )
+                )
+            )
+            return 2
+
+    try:
+        config_result = _load_notification_ux_preview_config(args)
+    except _NotifierOneShotRuntimeConfigError as exc:
+        reason_code = _one_shot_runtime_config_reason_code(exc)
+        emit_json(
+            _to_json(
+                _notification_ux_preview_payload(
+                    reason_code,
+                    db_read_attempted=False,
+                    selection=_notification_ux_preview_selection_payload(
+                        latest=select_latest_eligible,
+                        selected=False,
+                    ),
+                    runtime_config_locator=_notification_ux_preview_runtime_config_locator_from_args(args),
+                )
+            )
+        )
+        return 1
+
+    return await _run_notification_ux_render_preview(
+        config_result.config,
+        notification_plan_id,
+        emit_json=emit_json,
+        session_factory_builder=session_factory_builder,
+        repository_builder=repository_builder,
+        select_latest_eligible=select_latest_eligible,
+        runtime_config_locator=config_result.locator,
+    )
+
+
+async def _run_notification_ux_render_preview(
+    config: Any,
+    notification_plan_id: UUID | None,
+    *,
+    emit_json=print,
+    session_factory_builder=None,
+    repository_builder=NotifierTelegramRepository,
+    select_latest_eligible: bool = False,
+    runtime_config_locator: Mapping[str, Any] | None = None,
 ) -> int:
     if session_factory_builder is None:
         session_factory_builder = _build_send_canary_session_factory
@@ -427,16 +505,46 @@ async def _run_notification_ux_render_preview(
         try:
             async with session_factory.begin() as session:
                 repository = repository_builder(session)
+                if select_latest_eligible:
+                    return await run_latest_eligible_notification_ux_render_preview_with_repository(
+                        repository,
+                        renderer=NotificationRenderer(max_message_chars=config.max_message_chars),
+                        emit_json=emit_json,
+                        runtime_config_locator=runtime_config_locator,
+                    )
+                if notification_plan_id is None:
+                    emit_json(
+                        _to_json(
+                            _notification_ux_preview_payload(
+                                "invalid_notification_plan_id",
+                                db_read_attempted=False,
+                                runtime_config_locator=runtime_config_locator,
+                            )
+                        )
+                    )
+                    return 2
                 return await run_notification_ux_render_preview_with_repository(
                     notification_plan_id,
                     repository,
                     renderer=NotificationRenderer(max_message_chars=config.max_message_chars),
                     emit_json=emit_json,
+                    runtime_config_locator=runtime_config_locator,
                 )
         finally:
             await dispose()
     except Exception:
-        emit_json(_to_json(_notification_ux_preview_payload("db_read_failed")))
+        emit_json(
+            _to_json(
+                _notification_ux_preview_payload(
+                    "db_read_failed",
+                    selection=_notification_ux_preview_selection_payload(
+                        latest=select_latest_eligible,
+                        selected=False,
+                    ),
+                    runtime_config_locator=runtime_config_locator,
+                )
+            )
+        )
         return 1
 
 
@@ -446,11 +554,50 @@ async def run_notification_ux_render_preview_with_repository(
     *,
     renderer: NotificationRenderer | None = None,
     emit_json=print,
+    runtime_config_locator: Mapping[str, Any] | None = None,
 ) -> int:
     payload = await build_notification_ux_render_preview_payload(
         notification_plan_id,
         repository,
         renderer=renderer,
+        runtime_config_locator=runtime_config_locator,
+    )
+    emit_json(_to_json(payload))
+    return 0 if payload["status"] == "pass" else 1
+
+
+async def run_latest_eligible_notification_ux_render_preview_with_repository(
+    repository,
+    *,
+    renderer: NotificationRenderer | None = None,
+    emit_json=print,
+    runtime_config_locator: Mapping[str, Any] | None = None,
+) -> int:
+    plan = await _load_latest_eligible_notification_plan(repository)
+    if plan is None:
+        payload = _notification_ux_preview_payload(
+            "no_eligible_notification_plan_found",
+            selection=_notification_ux_preview_selection_payload(latest=True, selected=False),
+            runtime_config_locator=runtime_config_locator,
+        )
+        emit_json(_to_json(payload))
+        return 1
+    notification_plan_id = _uuid_from_row(plan.get("notification_plan_id"))
+    if notification_plan_id is None:
+        payload = _notification_ux_preview_payload(
+            "no_eligible_notification_plan_found",
+            selection=_notification_ux_preview_selection_payload(latest=True, selected=False),
+            runtime_config_locator=runtime_config_locator,
+        )
+        emit_json(_to_json(payload))
+        return 1
+    payload = await build_notification_ux_render_preview_payload(
+        notification_plan_id,
+        repository,
+        renderer=renderer,
+        preloaded_plan=plan,
+        selection=_notification_ux_preview_selection_payload(latest=True, selected=True),
+        runtime_config_locator=runtime_config_locator,
     )
     emit_json(_to_json(payload))
     return 0 if payload["status"] == "pass" else 1
@@ -461,37 +608,58 @@ async def build_notification_ux_render_preview_payload(
     repository,
     *,
     renderer: NotificationRenderer | None = None,
+    preloaded_plan: Mapping[str, Any] | None = None,
+    selection: Mapping[str, Any] | None = None,
+    runtime_config_locator: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     renderer = renderer or NotificationRenderer()
-    plan = await repository.load_notification_plan(notification_plan_id)
+    plan = dict(preloaded_plan) if preloaded_plan is not None else await repository.load_notification_plan(notification_plan_id)
     if plan is None:
         return _notification_ux_preview_payload(
             "notification_plan_missing",
             checks=_notification_ux_preview_base_checks(plan_found=False),
+            selection=selection,
+            runtime_config_locator=runtime_config_locator,
         )
 
     analysis_id = _uuid_from_row(plan.get("analysis_id"))
     candidate_group_id = _uuid_from_row(plan.get("candidate_group_id"))
     urgency_profile = str(plan.get("urgency_profile") or "")
     if analysis_id is None:
-        return _notification_ux_preview_payload("analysis_id_missing")
+        return _notification_ux_preview_payload(
+            "analysis_id_missing",
+            selection=selection,
+            runtime_config_locator=runtime_config_locator,
+        )
     if candidate_group_id is None:
-        return _notification_ux_preview_payload("candidate_group_id_missing")
+        return _notification_ux_preview_payload(
+            "candidate_group_id_missing",
+            selection=selection,
+            runtime_config_locator=runtime_config_locator,
+        )
 
     analysis = await repository.load_analysis(analysis_id)
     if analysis is None:
         return _notification_ux_preview_payload(
             "analysis_missing",
             checks=_notification_ux_preview_base_checks(analysis_found=False),
+            selection=selection,
+            runtime_config_locator=runtime_config_locator,
         )
     if analysis.candidate_group_id != candidate_group_id:
-        return _notification_ux_preview_payload("analysis_candidate_group_mismatch")
+        return _notification_ux_preview_payload(
+            "analysis_candidate_group_mismatch",
+            selection=selection,
+            runtime_config_locator=runtime_config_locator,
+        )
 
     judge_output = await repository.load_judge_output_render_fields(analysis.judge_output_id)
     if judge_output is None:
         return _notification_ux_preview_payload(
             "judge_output_missing",
             checks=_notification_ux_preview_base_checks(judge_output_found=False),
+            selection=selection,
+            runtime_config_locator=runtime_config_locator,
         )
 
     candidate = await repository.load_candidate_render_context(candidate_group_id)
@@ -499,6 +667,8 @@ async def build_notification_ux_render_preview_payload(
         return _notification_ux_preview_payload(
             "candidate_missing",
             checks=_notification_ux_preview_base_checks(candidate_found=False),
+            selection=selection,
+            runtime_config_locator=runtime_config_locator,
         )
 
     render = renderer.render(
@@ -518,7 +688,7 @@ async def build_notification_ux_render_preview_payload(
         candidate=candidate,
     )
     failed = [name for name, passed in checks.items() if not passed]
-    return {
+    payload = {
         "schema_version": NOTIFICATION_UX_RENDER_PREVIEW_SCHEMA_VERSION,
         "status": "pass" if not failed else "fail",
         "reason_code": "ok" if not failed else "render_preview_checks_failed",
@@ -527,6 +697,11 @@ async def build_notification_ux_render_preview_payload(
         "render_summary": _notification_ux_render_summary(render),
         "authority": _notification_ux_preview_authority(),
     }
+    if selection is not None:
+        payload["selection"] = dict(selection)
+    if runtime_config_locator is not None:
+        payload["runtime_config_locator"] = dict(runtime_config_locator)
+    return payload
 
 
 async def _run_worker_once_command(args: argparse.Namespace, *, emit_json=print) -> int:
@@ -2233,9 +2408,11 @@ def _notification_ux_preview_payload(
     *,
     checks: dict[str, bool] | None = None,
     db_read_attempted: bool = True,
+    selection: Mapping[str, Any] | None = None,
+    runtime_config_locator: Mapping[str, Any] | None = None,
 ) -> dict:
     checks = checks or _notification_ux_preview_base_checks()
-    return {
+    payload = {
         "schema_version": NOTIFICATION_UX_RENDER_PREVIEW_SCHEMA_VERSION,
         "status": "fail",
         "reason_code": reason_code,
@@ -2243,6 +2420,11 @@ def _notification_ux_preview_payload(
         "checks": checks,
         "authority": _notification_ux_preview_authority(db_read_attempted=db_read_attempted),
     }
+    if selection is not None:
+        payload["selection"] = dict(selection)
+    if runtime_config_locator is not None:
+        payload["runtime_config_locator"] = dict(runtime_config_locator)
+    return payload
 
 
 def _notification_ux_preview_base_checks(
@@ -2273,7 +2455,7 @@ def _notification_ux_preview_base_checks(
         "source_url_not_in_message_text_when_button_exists": False,
         "no_url_in_message_text": False,
         "no_uuid_in_message_text": False,
-        "no_secret_words_in_message_text": False,
+        "no_sensitive_markers_in_message_text": False,
     }
 
 
@@ -2293,7 +2475,7 @@ def _notification_ux_render_checks(
     primary_button_exists = bool(primary_url and primary_url in button_urls)
     source_button_exists = bool(source_url and source_url in button_urls)
     github_primary = bool(primary_url and _is_github_url(primary_url)) or candidate.primary_artifact_type == "github_repo"
-    secret_text = message_text.lower()
+    sensitive_text = message_text.lower()
     return {
         "plan_found": True,
         "analysis_found": True,
@@ -2327,7 +2509,9 @@ def _notification_ux_render_checks(
         ),
         "no_url_in_message_text": NOTIFICATION_UX_URL_RE.search(message_text) is None,
         "no_uuid_in_message_text": NOTIFICATION_UX_UUID_RE.search(message_text) is None,
-        "no_secret_words_in_message_text": not any(word.lower() in secret_text for word in NOTIFICATION_UX_SECRET_WORDS),
+        "no_sensitive_markers_in_message_text": not any(
+            word.lower() in sensitive_text for word in NOTIFICATION_UX_SECRET_WORDS
+        ),
     }
 
 
@@ -2398,6 +2582,62 @@ def _notification_ux_preview_authority(*, db_read_attempted: bool = True) -> dic
     }
 
 
+def _notification_ux_preview_selection_payload(*, latest: bool, selected: bool) -> dict[str, Any] | None:
+    if not latest:
+        return None
+    return {
+        "mode": "latest_eligible",
+        "selected": selected,
+        "raw_id_printed": False,
+    }
+
+
+async def _load_latest_eligible_notification_plan(repository) -> dict[str, Any] | None:
+    loader = getattr(repository, "load_latest_eligible_notification_plan", None)
+    if callable(loader):
+        row = await loader()
+        return dict(row) if row is not None else None
+
+    session = getattr(repository, "_session", None)
+    if session is None:
+        return None
+    import sqlalchemy as sa
+
+    result = await session.execute(
+        sa.text(
+            """
+            SELECT p.notification_plan_id, p.analysis_id, p.candidate_group_id, p.delivery_decision,
+                   p.urgency_profile, p.target_chat_id, p.target_thread_id, p.render_profile,
+                   p.dedupe_subject_key, p.material_change_hash, p.send_after,
+                   p.suppress_reason_code, p.status
+            FROM notification_plans p
+            JOIN analyses a
+              ON a.analysis_id = p.analysis_id
+             AND a.candidate_group_id = p.candidate_group_id
+            JOIN judge_outputs jo
+              ON jo.judge_output_id = a.judge_output_id
+            JOIN candidate_group_proposals cgp
+              ON cgp.candidate_group_id = p.candidate_group_id
+            WHERE p.delivery_decision::text = 'send_now'
+              AND p.urgency_profile::text IN ('normal_silent', 'high')
+              AND a.verdict::text IN ('later', 'inspect_now')
+            ORDER BY
+              CASE
+                WHEN p.status::text IN ('sent', 'edited') THEN 0
+                WHEN p.status::text IN ('rendered', 'queued') THEN 1
+                WHEN p.status::text = 'planned' THEN 2
+                ELSE 3
+              END ASC,
+              p.created_at DESC,
+              p.notification_plan_id DESC
+            LIMIT 1
+            """
+        )
+    )
+    row = result.mappings().first()
+    return dict(row) if row else None
+
+
 def _create_canary_failure_payload(reason_code: str) -> dict:
     return {
         "schema_version": CANARY_PLAN_SCHEMA_VERSION,
@@ -2424,13 +2664,248 @@ def _load_notifier_one_shot_runtime_config(
         raise _NotifierOneShotRuntimeConfigError("notifier_runtime_config_error") from None
 
 
-def _load_notification_ux_preview_config(args: argparse.Namespace) -> NotifierTelegramConfig:
-    if getattr(args, "env_file", None):
-        return _load_notifier_one_shot_runtime_config(args)
+def _load_notification_ux_preview_config(args: argparse.Namespace) -> _NotificationUxPreviewRuntimeConfigResult:
+    process_env = getattr(args, "_notification_ux_preview_process_env", None)
+    if process_env is None:
+        process_env = os.environ
+    discovery_roots = getattr(args, "_notification_ux_preview_discovery_roots", None)
+
+    process_config = _notification_ux_preview_config_from_values(process_env)
+    if process_config is not None:
+        return _NotificationUxPreviewRuntimeConfigResult(
+            config=process_config,
+            locator=_notification_ux_preview_runtime_config_locator(
+                process_env_used=True,
+                bounded_candidate_file_count=0,
+                bounded_candidate_files_with_database_key_count=0,
+            ),
+        )
+
+    env_file = getattr(args, "env_file", None)
+    if env_file:
+        try:
+            env_values = _read_minimal_env_file(
+                str(env_file),
+                allowed_keys=NOTIFICATION_UX_DB_RUNTIME_ENV_KEYS,
+            )
+        except ValueError:
+            env_values = {}
+        env_config = _notification_ux_preview_config_from_values(
+            env_values,
+            fallback_values=process_env,
+        )
+        if env_config is not None:
+            return _NotificationUxPreviewRuntimeConfigResult(
+                config=env_config,
+                locator=_notification_ux_preview_runtime_config_locator(
+                    process_env_used=False,
+                    bounded_candidate_file_count=0,
+                    bounded_candidate_files_with_database_key_count=0,
+                ),
+            )
+
+    if getattr(args, "discover_db_config", False):
+        discovered = _discover_notification_ux_preview_db_runtime_config(
+            process_env=process_env,
+            roots=discovery_roots,
+        )
+        if discovered is not None:
+            return discovered
+
+    raise _NotifierOneShotRuntimeConfigError("runtime_database_config_not_found")
+
+
+def _notification_ux_preview_runtime_config_locator_from_args(args: argparse.Namespace) -> dict[str, Any]:
+    candidate_count = 0
+    database_key_count = 0
+    if getattr(args, "discover_db_config", False):
+        roots = getattr(args, "_notification_ux_preview_discovery_roots", None)
+        candidate_count, database_key_count = _count_notification_ux_preview_db_runtime_candidate_files(roots=roots)
+    return _notification_ux_preview_runtime_config_locator(
+        process_env_used=False,
+        bounded_candidate_file_count=candidate_count,
+        bounded_candidate_files_with_database_key_count=database_key_count,
+    )
+
+
+def _notification_ux_preview_runtime_config_locator(
+    *,
+    process_env_used: bool,
+    bounded_candidate_file_count: int,
+    bounded_candidate_files_with_database_key_count: int,
+) -> dict[str, Any]:
+    return {
+        "process_env_checked": True,
+        "process_env_used": process_env_used,
+        "bounded_candidate_file_count": bounded_candidate_file_count,
+        "bounded_candidate_files_with_database_key_count": bounded_candidate_files_with_database_key_count,
+        "paths_printed": False,
+        "values_printed": False,
+    }
+
+
+def _notification_ux_preview_config_from_values(
+    values: Mapping[str, str],
+    *,
+    fallback_values: Mapping[str, str] | None = None,
+) -> _NotificationUxPreviewRuntimeConfig | None:
+    database_url = str(values.get("DATABASE_URL", "") or "").strip()
+    if not database_url:
+        database_url_file = str(values.get("DATABASE_URL_FILE", "") or "").strip()
+        if database_url_file:
+            try:
+                database_url = _read_runtime_secret_file(
+                    database_url_file,
+                    missing_reason_code="runtime_database_config_not_found",
+                    empty_reason_code="runtime_database_config_not_found",
+                )
+            except ValueError:
+                database_url = ""
+    if not database_url:
+        return None
+
+    max_chars_value = str(values.get("NOTIFIER_TELEGRAM_MAX_MESSAGE_CHARS", "") or "").strip()
+    if not max_chars_value and fallback_values is not None:
+        max_chars_value = str(fallback_values.get("NOTIFIER_TELEGRAM_MAX_MESSAGE_CHARS", "") or "").strip()
+    max_message_chars = _notification_ux_preview_max_message_chars(max_chars_value)
+    return _NotificationUxPreviewRuntimeConfig(
+        database_url=database_url,
+        max_message_chars=max_message_chars,
+    )
+
+
+def _notification_ux_preview_max_message_chars(value: str) -> int:
+    if not value:
+        return NOTIFICATION_UX_PREVIEW_DEFAULT_MAX_MESSAGE_CHARS
     try:
-        return NotifierTelegramConfig.from_env(require_transport_token=False)
-    except (NotifierTelegramConfigurationError, ValueError, TypeError):
+        parsed = int(value)
+    except ValueError:
         raise _NotifierOneShotRuntimeConfigError("notifier_runtime_config_error") from None
+    if parsed < 500 or parsed > 4096:
+        raise _NotifierOneShotRuntimeConfigError("notifier_runtime_config_error")
+    return parsed
+
+
+def _discover_notification_ux_preview_db_runtime_config(
+    *,
+    process_env: Mapping[str, str],
+    roots: list[Path] | None = None,
+) -> _NotificationUxPreviewRuntimeConfigResult | None:
+    candidate_count = 0
+    database_key_count = 0
+    for candidate in _iter_notification_ux_preview_db_runtime_candidate_files(roots=roots):
+        candidate_count += 1
+        try:
+            values = _read_minimal_env_file(str(candidate), allowed_keys=NOTIFICATION_UX_DB_RUNTIME_ENV_KEYS)
+        except ValueError:
+            values = {}
+        if "DATABASE_URL" in values or "DATABASE_URL_FILE" in values:
+            database_key_count += 1
+        config = _notification_ux_preview_config_from_values(values, fallback_values=process_env)
+        if config is not None:
+            return _NotificationUxPreviewRuntimeConfigResult(
+                config=config,
+                locator=_notification_ux_preview_runtime_config_locator(
+                    process_env_used=False,
+                    bounded_candidate_file_count=candidate_count,
+                    bounded_candidate_files_with_database_key_count=database_key_count,
+                ),
+            )
+    return None
+
+
+def _count_notification_ux_preview_db_runtime_candidate_files(*, roots: list[Path] | None = None) -> tuple[int, int]:
+    candidate_count = 0
+    database_key_count = 0
+    for candidate in _iter_notification_ux_preview_db_runtime_candidate_files(roots=roots):
+        candidate_count += 1
+        try:
+            values = _read_minimal_env_file(str(candidate), allowed_keys=NOTIFICATION_UX_DB_RUNTIME_ENV_KEYS)
+        except ValueError:
+            values = {}
+        if "DATABASE_URL" in values or "DATABASE_URL_FILE" in values:
+            database_key_count += 1
+    return candidate_count, database_key_count
+
+
+def _iter_notification_ux_preview_db_runtime_candidate_files(
+    *,
+    roots: list[Path] | None = None,
+):
+    candidate_roots = roots if roots is not None else _notification_ux_preview_db_runtime_candidate_roots()
+    seen: set[Path] = set()
+    yielded = 0
+    for root in candidate_roots:
+        if yielded >= NOTIFICATION_UX_DB_RUNTIME_DISCOVERY_MAX_FILES:
+            return
+        root_path = Path(root)
+        if not root_path.exists():
+            continue
+        try:
+            resolved_root = root_path.resolve()
+        except OSError:
+            continue
+        if resolved_root in seen:
+            continue
+        seen.add(resolved_root)
+        for candidate in _walk_notification_ux_preview_db_runtime_candidate_files(resolved_root):
+            if yielded >= NOTIFICATION_UX_DB_RUNTIME_DISCOVERY_MAX_FILES:
+                return
+            yielded += 1
+            yield candidate
+
+
+def _notification_ux_preview_db_runtime_candidate_roots() -> list[Path]:
+    repo_root = Path(__file__).resolve().parents[3]
+    roots = [
+        repo_root,
+        repo_root.parent,
+        Path("/home/deploy"),
+        Path("/srv/catchbot"),
+        Path("/srv/github_ai_catchbot"),
+        Path("/opt/catchbot"),
+        Path("/opt/github_ai_catchbot"),
+        Path("/etc/catchbot"),
+        Path("/etc/github_ai_catchbot"),
+    ]
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            resolved = root
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(root)
+    return deduped
+
+
+def _walk_notification_ux_preview_db_runtime_candidate_files(root: Path):
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            entries = sorted(os.scandir(current), key=lambda entry: entry.name)
+        except OSError:
+            continue
+        child_dirs: list[Path] = []
+        for entry in entries:
+            name = entry.name
+            try:
+                if entry.is_file(follow_symlinks=False) and name in NOTIFICATION_UX_DB_RUNTIME_CANDIDATE_FILE_NAMES:
+                    yield Path(entry.path)
+                elif (
+                    depth < NOTIFICATION_UX_DB_RUNTIME_DISCOVERY_MAX_DEPTH
+                    and entry.is_dir(follow_symlinks=False)
+                    and name not in NOTIFICATION_UX_DB_RUNTIME_DISCOVERY_SKIP_DIRS
+                ):
+                    child_dirs.append(Path(entry.path))
+            except OSError:
+                continue
+        for child in reversed(child_dirs):
+            stack.append((child, depth + 1))
 
 
 def _resolve_one_shot_runtime_env_file_overlay(
