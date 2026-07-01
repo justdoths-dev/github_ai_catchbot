@@ -39,26 +39,31 @@ limits, forbidden areas, and requested validation.
 Record whether each required source file was read and any task-relevant notes:
 
 - `AGENTS.md`
-- `docs/project-source/README_replacement_consolidated_v0_20.md`
+- `.codex/config.toml`, if present
+- `.codex/review-bundle-template.md`, if present
+- current repo HEAD: code, tests, migrations, repo-local instructions, and commits
+- PASS Review Bundles and VPS/runtime readbacks, if available to the task
+- `github_ai_catchbot_chatgpt_master_roadmap_progress_authority_completion_v3.md`, if present as active project source/local doc
 - `docs/project-source/00_foundations_stage0_stage1_bundle_v0_1.md`
 - `docs/project-source/01_runtime_collector_design_stage2_stage3_bundle_v0_1.md`
 - `docs/project-source/02_normalization_enrichment_design_stage4_stage5_bundle_v0_1.md`
 - `docs/project-source/03_judge_delivery_operations_stage6_stage10_bundle_v0_1.md`
 - `docs/project-source/04_execution_contracts_migrations_stage11_stage12_bundle_v0_1.md`
-- `docs/project-source/05_migration_code_drafts_stage13_stage16_bundle_v0_1.md`
-- `docs/project-source/06_collector_implementation_stage17_stage25_bundle_v0_1.md`
-- `docs/project-source/07_outbox_normalizer_stage26_stage28_bundle_v0_1.md`
-- `docs/project-source/08_enrichers_assembler_stage29_stage32_bundle_v0_1.md`
-- `docs/project-source/09_analysis_pipeline_stage33_stage38_bundle_v0_1.md`
-- `docs/project-source/10_delivery_hardening_stage39_plus_v0_1.md`
-- `docs/project-source/03_GitHub_AI_application_plan.md` as advisory only
+- `docs/project-source/README_replacement_consolidated_v0_20.md`, only if explicitly requested for archaeology
+- implementation bundles `05` through `10`, only if explicitly requested for archaeology
+- `docs/project-source/03_GitHub_AI_application_plan.md`, advisory only if explicitly relevant
+- stale sources avoided as active next-step authority: yes/no, with notes
 
 State the applied source priority:
 
-1. `README_replacement_consolidated_v0_20.md`
-2. `00` through `04` design and locked bundles
-3. `05` through `10` implementation bundles
-4. `03_GitHub_AI_application_plan.md` as advisory only
+1. Current repo HEAD: code, tests, migrations, `AGENTS.md`, `.codex/*`, and commits
+2. PASS Review Bundles and VPS/runtime readbacks
+3. `github_ai_catchbot_chatgpt_master_roadmap_progress_authority_completion_v3.md`, if present as active project source/local doc
+4. Locked bundles `00` through `04`
+5. Historical/archaeology docs only when explicitly requested
+
+Do not require README v20 or implementation bundles `05` through `10` as active
+next-step authority unless the task explicitly asks for archaeology.
 
 ## 4. Project Boundary Check
 
@@ -205,4 +210,3 @@ Include exact suggested staging commands only if approval is recommended.
 Call out anything the reviewer should know, including known environment limits,
 untracked files, skipped broad tests, shell quoting issues, or intentionally
 excluded files.
-

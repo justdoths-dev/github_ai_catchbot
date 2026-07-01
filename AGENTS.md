@@ -19,14 +19,15 @@ not a trading bot.
 
 ## Repo Map
 
-Known project-source authority:
+Known project-source and historical references:
 
-- `docs/project-source/README_replacement_consolidated_v0_20.md`
 - `docs/project-source/00_foundations_stage0_stage1_bundle_v0_1.md`
 - `docs/project-source/01_runtime_collector_design_stage2_stage3_bundle_v0_1.md`
 - `docs/project-source/02_normalization_enrichment_design_stage4_stage5_bundle_v0_1.md`
 - `docs/project-source/03_judge_delivery_operations_stage6_stage10_bundle_v0_1.md`
 - `docs/project-source/04_execution_contracts_migrations_stage11_stage12_bundle_v0_1.md`
+- `github_ai_catchbot_chatgpt_master_roadmap_progress_authority_completion_v3.md`, if present as an active local/project-source doc
+- `docs/project-source/README_replacement_consolidated_v0_20.md` as a historical index only
 - `docs/project-source/05_migration_code_drafts_stage13_stage16_bundle_v0_1.md`
 - `docs/project-source/06_collector_implementation_stage17_stage25_bundle_v0_1.md`
 - `docs/project-source/07_outbox_normalizer_stage26_stage28_bundle_v0_1.md`
@@ -34,6 +35,10 @@ Known project-source authority:
 - `docs/project-source/09_analysis_pipeline_stage33_stage38_bundle_v0_1.md`
 - `docs/project-source/10_delivery_hardening_stage39_plus_v0_1.md`
 - `docs/project-source/03_GitHub_AI_application_plan.md`
+
+Implementation bundles `05` through `10`, older README snapshots, and advisory
+application plans are historical/archaeology sources only unless the current
+task explicitly asks to inspect them. They are not active next-step authority.
 
 Known implementation areas, if present:
 
@@ -63,25 +68,30 @@ Read before substantive implementation or review:
 1. `AGENTS.md`
 2. `.codex/config.toml`, if present
 3. `.codex/review-bundle-template.md`, if present
-4. `docs/project-source/README_replacement_consolidated_v0_20.md`
-5. project-source bundles `00` through `10`
-6. `docs/project-source/03_GitHub_AI_application_plan.md`
+4. current repo HEAD: code, tests, migrations, `AGENTS.md`, `.codex/*`, and commits
+5. PASS Review Bundles and VPS/runtime readbacks when available to the task
+6. `github_ai_catchbot_chatgpt_master_roadmap_progress_authority_completion_v3.md`, if present as active project source/local doc
+7. locked project-source bundles `00` through `04` for architecture and ownership references
 
 Apply this priority order:
 
-1. Latest README v20: `README_replacement_consolidated_v0_20.md`
-2. Locked design bundles: `00` through `04`
-3. Implementation bundles: `05` through `10`
-4. `03_GitHub_AI_application_plan.md` as advisory only
+1. Current repo HEAD: code, tests, migrations, `AGENTS.md`, `.codex/*`, and commits
+2. PASS Review Bundles and VPS/runtime readbacks
+3. `github_ai_catchbot_chatgpt_master_roadmap_progress_authority_completion_v3.md`, if present as active project source/local doc
+4. Locked design bundles `00` through `04`
+5. Historical/archaeology docs only when explicitly requested
 
-`03_GitHub_AI_application_plan.md` is advisory only. It does not override
-architecture, phase ordering, service ownership, or contracts. Older README
-versions and standalone superseded stage docs are historical unless a task
-explicitly asks for archaeology.
+`README_replacement_consolidated_v0_20.md` is a historical index only.
+Implementation bundles `05` through `10` are not active next-step authority.
+`03_GitHub_AI_application_plan.md` is advisory only. These documents do not
+override current code/tests, reviewed PASS bundles/readbacks, active v3
+authority, locked bundles `00` through `04`, service ownership, or contracts
+unless the current task explicitly asks for archaeology.
 
-If source docs conflict, the latest README and locked design bundles win over
-implementation drafts and advisory notes. If the conflict blocks the bounded
-task, stop and report it.
+`OPEN`, `UX_OPEN`, `AUTHORITY_OPEN`, or `ROLLOUT_OPEN` never means code is
+absent. Re-check current HEAD and reviewed readbacks before adding a new
+surface. If sources conflict and the conflict blocks the bounded task, stop and
+report it.
 
 ## Architecture Invariants
 
@@ -113,9 +123,13 @@ Layer rules:
 ## Coding Rules
 
 - Prefer minimal bounded implementation slices.
+- Use the largest safe bounded macro-slice when adjacent work shares the same
+  opened authority and validation boundary; do not fragment safe adjacent work.
 - Do not redesign architecture unless source documents explicitly require it.
 - Do not add comfort docs, extra diagrams, diagnostics, reports, or runbooks as substitutes for implementation.
 - If a safety issue is found, connect it to a contract, test, fix, stop condition, or implementation slice.
+- Implement safety through guards, readback, idempotency, redaction, focused
+  tests, and explicit bounds, not wrapper/readiness theater.
 - Keep service ownership narrow.
 - Do not duplicate business logic in ops scripts when an existing service boundary is available.
 - Ops smoke scripts must be bounded, sanitized, and explicit about approvals.

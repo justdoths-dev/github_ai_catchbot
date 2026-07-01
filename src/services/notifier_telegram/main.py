@@ -21,6 +21,7 @@ from .models import NotificationPlanDraft
 from .redis_streams import RedisStreamConsumer
 from .repositories import NotifierTelegramRepository
 from .restricted_transport_canary import run_restricted_transport_canary
+from .renderer import NotificationRenderer, RenderInput
 from .service import NotifierTelegramService
 from .telegram_client import TelegramBotClient
 from .worker import NotifierTelegramWorker
@@ -28,6 +29,7 @@ from .worker_once import EXPECTED_QUEUE_NAME, EXPECTED_STAGE_NAME, run_worker_on
 
 CANARY_SCHEMA_VERSION = "notifier_one_shot_canary_v1"
 CANARY_PLAN_SCHEMA_VERSION = "notifier_canary_plan_created_v1"
+NOTIFICATION_UX_RENDER_PREVIEW_SCHEMA_VERSION = "notification_ux_render_preview_v1"
 CANARY_PLAN_SEED_VERSION = "operator-canary-plan-v1"
 CANARY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._-]{6,80}$")
 SEND_DISABLED_PROOF_SCHEMA_VERSION = "notifier_send_disabled_worker_once_proof_v1"
@@ -39,6 +41,19 @@ RESTRICTED_LIVE_PROOF_SEED_VERSION = "notifier-restricted-live-worker-once-proof
 RESTRICTED_LIVE_PROOF_KEY_PATTERN = CANARY_KEY_PATTERN
 RESTRICTED_LIVE_QUEUED_WORKER_ONCE_SCHEMA_VERSION = "notifier_restricted_live_queued_worker_once_v1"
 RESTRICTED_LIVE_QUEUED_WORKER_ONCE_DEFAULT_MAX_LAG = 1
+NOTIFICATION_UX_SECRET_WORDS = (
+    "secret",
+    "runtime.env",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "OPENAI_API_KEY",
+    "TELEGRAM_BOT_TOKEN",
+)
+NOTIFICATION_UX_URL_RE = re.compile(r"https?://[^\s<>)\"']+")
+NOTIFICATION_UX_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
 SEND_DISABLED_PROOF_SETUP_REJECTION_REASONS = {
     "source_notification_plan_missing",
     "source_plan_not_send_now",
@@ -123,6 +138,11 @@ def build_parser() -> argparse.ArgumentParser:
     create_canary_plan.add_argument("--operator-confirmed", action="store_true")
     create_canary_plan.add_argument("--env-file")
     create_canary_plan.add_argument("--format", choices=["json"], default="json")
+
+    notification_ux_preview = subcommands.add_parser("notification-ux-render-preview")
+    notification_ux_preview.add_argument("--notification-plan-id", required=True)
+    notification_ux_preview.add_argument("--env-file")
+    notification_ux_preview.add_argument("--format", choices=["json"], default="json")
 
     send_disabled_proof = subcommands.add_parser("send-disabled-worker-once-proof")
     send_disabled_proof.add_argument("--source-notification-plan-id", required=True)
@@ -368,6 +388,145 @@ async def _run_restricted_transport_canary_command(args: argparse.Namespace, *, 
         confirm_send=args.confirm_send,
         emit_json=emit_json,
     )
+
+
+async def _run_notification_ux_render_preview_command(args: argparse.Namespace, *, emit_json=print) -> int:
+    try:
+        notification_plan_id = UUID(str(args.notification_plan_id))
+    except (TypeError, ValueError, AttributeError):
+        emit_json(_to_json(_notification_ux_preview_payload("invalid_notification_plan_id", db_read_attempted=False)))
+        return 2
+
+    try:
+        config = _load_notification_ux_preview_config(args)
+    except _NotifierOneShotRuntimeConfigError as exc:
+        reason_code = _one_shot_runtime_config_reason_code(exc)
+        emit_json(_to_json(_notification_ux_preview_payload(reason_code, db_read_attempted=False)))
+        return 1
+
+    return await _run_notification_ux_render_preview(
+        config,
+        notification_plan_id,
+        emit_json=emit_json,
+    )
+
+
+async def _run_notification_ux_render_preview(
+    config: NotifierTelegramConfig,
+    notification_plan_id: UUID,
+    *,
+    emit_json=print,
+    session_factory_builder=None,
+    repository_builder=NotifierTelegramRepository,
+) -> int:
+    if session_factory_builder is None:
+        session_factory_builder = _build_send_canary_session_factory
+
+    try:
+        session_factory, dispose = session_factory_builder(config.database_url)
+        try:
+            async with session_factory.begin() as session:
+                repository = repository_builder(session)
+                return await run_notification_ux_render_preview_with_repository(
+                    notification_plan_id,
+                    repository,
+                    renderer=NotificationRenderer(max_message_chars=config.max_message_chars),
+                    emit_json=emit_json,
+                )
+        finally:
+            await dispose()
+    except Exception:
+        emit_json(_to_json(_notification_ux_preview_payload("db_read_failed")))
+        return 1
+
+
+async def run_notification_ux_render_preview_with_repository(
+    notification_plan_id: UUID,
+    repository,
+    *,
+    renderer: NotificationRenderer | None = None,
+    emit_json=print,
+) -> int:
+    payload = await build_notification_ux_render_preview_payload(
+        notification_plan_id,
+        repository,
+        renderer=renderer,
+    )
+    emit_json(_to_json(payload))
+    return 0 if payload["status"] == "pass" else 1
+
+
+async def build_notification_ux_render_preview_payload(
+    notification_plan_id: UUID,
+    repository,
+    *,
+    renderer: NotificationRenderer | None = None,
+) -> dict[str, Any]:
+    renderer = renderer or NotificationRenderer()
+    plan = await repository.load_notification_plan(notification_plan_id)
+    if plan is None:
+        return _notification_ux_preview_payload(
+            "notification_plan_missing",
+            checks=_notification_ux_preview_base_checks(plan_found=False),
+        )
+
+    analysis_id = _uuid_from_row(plan.get("analysis_id"))
+    candidate_group_id = _uuid_from_row(plan.get("candidate_group_id"))
+    urgency_profile = str(plan.get("urgency_profile") or "")
+    if analysis_id is None:
+        return _notification_ux_preview_payload("analysis_id_missing")
+    if candidate_group_id is None:
+        return _notification_ux_preview_payload("candidate_group_id_missing")
+
+    analysis = await repository.load_analysis(analysis_id)
+    if analysis is None:
+        return _notification_ux_preview_payload(
+            "analysis_missing",
+            checks=_notification_ux_preview_base_checks(analysis_found=False),
+        )
+    if analysis.candidate_group_id != candidate_group_id:
+        return _notification_ux_preview_payload("analysis_candidate_group_mismatch")
+
+    judge_output = await repository.load_judge_output_render_fields(analysis.judge_output_id)
+    if judge_output is None:
+        return _notification_ux_preview_payload(
+            "judge_output_missing",
+            checks=_notification_ux_preview_base_checks(judge_output_found=False),
+        )
+
+    candidate = await repository.load_candidate_render_context(candidate_group_id)
+    if candidate is None:
+        return _notification_ux_preview_payload(
+            "candidate_missing",
+            checks=_notification_ux_preview_base_checks(candidate_found=False),
+        )
+
+    render = renderer.render(
+        notification_plan_id=notification_plan_id,
+        payload=RenderInput(
+            analysis=analysis,
+            judge_output=judge_output,
+            candidate=candidate,
+            urgency_profile=urgency_profile,
+        ),
+    )
+    checks = _notification_ux_render_checks(
+        message_text=render.message_text,
+        render=render,
+        verdict=analysis.verdict,
+        urgency_profile=urgency_profile,
+        candidate=candidate,
+    )
+    failed = [name for name, passed in checks.items() if not passed]
+    return {
+        "schema_version": NOTIFICATION_UX_RENDER_PREVIEW_SCHEMA_VERSION,
+        "status": "pass" if not failed else "fail",
+        "reason_code": "ok" if not failed else "render_preview_checks_failed",
+        "checks_failed": failed,
+        "checks": checks,
+        "render_summary": _notification_ux_render_summary(render),
+        "authority": _notification_ux_preview_authority(),
+    }
 
 
 async def _run_worker_once_command(args: argparse.Namespace, *, emit_json=print) -> int:
@@ -2069,6 +2228,176 @@ def _create_canary_rejected_payload(reason_code: str) -> dict:
     }
 
 
+def _notification_ux_preview_payload(
+    reason_code: str,
+    *,
+    checks: dict[str, bool] | None = None,
+    db_read_attempted: bool = True,
+) -> dict:
+    checks = checks or _notification_ux_preview_base_checks()
+    return {
+        "schema_version": NOTIFICATION_UX_RENDER_PREVIEW_SCHEMA_VERSION,
+        "status": "fail",
+        "reason_code": reason_code,
+        "checks_failed": [name for name, passed in checks.items() if not passed],
+        "checks": checks,
+        "authority": _notification_ux_preview_authority(db_read_attempted=db_read_attempted),
+    }
+
+
+def _notification_ux_preview_base_checks(
+    *,
+    plan_found: bool = True,
+    analysis_found: bool = True,
+    judge_output_found: bool = True,
+    candidate_found: bool = True,
+) -> dict[str, bool]:
+    return {
+        "plan_found": plan_found,
+        "analysis_found": analysis_found,
+        "judge_output_found": judge_output_found,
+        "candidate_found": candidate_found,
+        "message_nonempty": False,
+        "message_under_telegram_limit": False,
+        "verdict_visible_in_first_three_lines": False,
+        "korean_summary_marker_present": False,
+        "skeptical_or_risk_marker_present": False,
+        "recommended_action_marker_present": False,
+        "link_preview_disabled": False,
+        "protect_content_false": False,
+        "silent_later_or_normal_profile": False,
+        "high_profile_not_silent": False,
+        "url_button_present": False,
+        "github_primary_button_label": False,
+        "primary_url_not_in_message_text_when_button_exists": False,
+        "source_url_not_in_message_text_when_button_exists": False,
+        "no_url_in_message_text": False,
+        "no_uuid_in_message_text": False,
+        "no_secret_words_in_message_text": False,
+    }
+
+
+def _notification_ux_render_checks(
+    *,
+    message_text: str,
+    render,
+    verdict: str,
+    urgency_profile: str,
+    candidate,
+) -> dict[str, bool]:
+    first_lines = _first_nonempty_lines(message_text)
+    buttons = _notification_ux_url_buttons(render.reply_markup_json)
+    button_urls = {button["url"] for button in buttons}
+    primary_url = candidate.primary_canonical_url
+    source_url = candidate.source_message_link
+    primary_button_exists = bool(primary_url and primary_url in button_urls)
+    source_button_exists = bool(source_url and source_url in button_urls)
+    github_primary = bool(primary_url and _is_github_url(primary_url)) or candidate.primary_artifact_type == "github_repo"
+    secret_text = message_text.lower()
+    return {
+        "plan_found": True,
+        "analysis_found": True,
+        "judge_output_found": True,
+        "candidate_found": True,
+        "message_nonempty": bool(message_text.strip()),
+        "message_under_telegram_limit": len(message_text) <= 4096,
+        "verdict_visible_in_first_three_lines": any(verdict and verdict in line for line in first_lines[:3]),
+        "korean_summary_marker_present": "한줄 요약:" in message_text or "요약:" in message_text,
+        "skeptical_or_risk_marker_present": "냉정 평가:" in message_text or "리스크:" in message_text,
+        "recommended_action_marker_present": "추천 행동:" in message_text,
+        "link_preview_disabled": render.link_preview_options_json == {"is_disabled": True},
+        "protect_content_false": render.protect_content is False,
+        "silent_later_or_normal_profile": (
+            render.disable_notification is True
+            if urgency_profile == "normal_silent" or verdict == "later"
+            else True
+        ),
+        "high_profile_not_silent": render.disable_notification is False if urgency_profile == "high" else True,
+        "url_button_present": bool(buttons) if primary_url or source_url else True,
+        "github_primary_button_label": (
+            any(button["text"] == "GitHub 열기" and button["url"] == primary_url for button in buttons)
+            if github_primary and primary_url
+            else True
+        ),
+        "primary_url_not_in_message_text_when_button_exists": (
+            primary_url not in message_text if primary_button_exists and primary_url else True
+        ),
+        "source_url_not_in_message_text_when_button_exists": (
+            source_url not in message_text if source_button_exists and source_url else True
+        ),
+        "no_url_in_message_text": NOTIFICATION_UX_URL_RE.search(message_text) is None,
+        "no_uuid_in_message_text": NOTIFICATION_UX_UUID_RE.search(message_text) is None,
+        "no_secret_words_in_message_text": not any(word.lower() in secret_text for word in NOTIFICATION_UX_SECRET_WORDS),
+    }
+
+
+def _notification_ux_render_summary(render) -> dict[str, Any]:
+    buttons = _notification_ux_url_buttons(render.reply_markup_json)
+    return {
+        "render_hash_suffix": render.render_hash[-8:],
+        "message_char_count": len(render.message_text),
+        "first_nonempty_lines": [_sanitize_notification_ux_line(line) for line in _first_nonempty_lines(render.message_text)[:5]],
+        "button_count": len(buttons),
+        "button_labels": [button["text"] for button in buttons],
+        "disable_notification": render.disable_notification,
+        "protect_content": render.protect_content,
+        "link_preview_disabled": render.link_preview_options_json == {"is_disabled": True},
+    }
+
+
+def _notification_ux_url_buttons(reply_markup_json: Any) -> list[dict[str, str]]:
+    if not isinstance(reply_markup_json, dict):
+        return []
+    rows = reply_markup_json.get("inline_keyboard")
+    if not isinstance(rows, list):
+        return []
+    buttons: list[dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        for button in row:
+            if not isinstance(button, dict):
+                continue
+            text = _string_from_row(button.get("text"))
+            url = _string_from_row(button.get("url"))
+            if text and url:
+                buttons.append({"text": text, "url": url})
+    return buttons
+
+
+def _first_nonempty_lines(message_text: str) -> list[str]:
+    return [line.strip() for line in message_text.splitlines() if line.strip()]
+
+
+def _sanitize_notification_ux_line(line: str) -> str:
+    sanitized = NOTIFICATION_UX_UUID_RE.sub("[redacted-id]", line)
+    sanitized = NOTIFICATION_UX_URL_RE.sub("[redacted-url]", sanitized)
+    for word in NOTIFICATION_UX_SECRET_WORDS:
+        sanitized = re.sub(re.escape(word), "[redacted-sensitive-marker]", sanitized, flags=re.IGNORECASE)
+    return sanitized[:180]
+
+
+def _is_github_url(value: str) -> bool:
+    host = urlparse(value).netloc.lower()
+    return host == "github.com" or host.endswith(".github.com")
+
+
+def _notification_ux_preview_authority(*, db_read_attempted: bool = True) -> dict[str, bool]:
+    return {
+        "db_read_attempted": db_read_attempted,
+        "db_write_attempted": False,
+        "redis_attempted": False,
+        "telegram_transport_attempted": False,
+        "openai_called": False,
+        "github_called": False,
+        "x_called": False,
+        "web_called": False,
+        "docker_or_systemd_called": False,
+        "alembic_or_ddl_ran": False,
+        "runtime_env_values_printed": False,
+    }
+
+
 def _create_canary_failure_payload(reason_code: str) -> dict:
     return {
         "schema_version": CANARY_PLAN_SCHEMA_VERSION,
@@ -2091,6 +2420,15 @@ def _load_notifier_one_shot_runtime_config(
     try:
         with _temporary_environment_defaults(overlay):
             return NotifierTelegramConfig.from_env(require_transport_token=False)
+    except (NotifierTelegramConfigurationError, ValueError, TypeError):
+        raise _NotifierOneShotRuntimeConfigError("notifier_runtime_config_error") from None
+
+
+def _load_notification_ux_preview_config(args: argparse.Namespace) -> NotifierTelegramConfig:
+    if getattr(args, "env_file", None):
+        return _load_notifier_one_shot_runtime_config(args)
+    try:
+        return NotifierTelegramConfig.from_env(require_transport_token=False)
     except (NotifierTelegramConfigurationError, ValueError, TypeError):
         raise _NotifierOneShotRuntimeConfigError("notifier_runtime_config_error") from None
 
@@ -2294,6 +2632,8 @@ async def _run(argv: list[str] | None = None) -> int:
         return await _run_restricted_live_queued_worker_once_command(args)
     if command == "send-canary":
         return await _run_send_canary_command(args)
+    if command == "notification-ux-render-preview":
+        return await _run_notification_ux_render_preview_command(args)
     if command == "worker":
         config = NotifierTelegramConfig.from_env()
         return await _run_worker(config)
