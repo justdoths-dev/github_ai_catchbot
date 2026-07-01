@@ -15,7 +15,9 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
+from ..analysis_validator.business_rules import AnalysisValidatorBusinessRules
 from ..analysis_validator.config import AnalysisValidatorConfig
+from ..analysis_validator.models import BundleValidationContext
 from ..analysis_validator.repositories import AnalysisValidatorRepository
 from ..analysis_validator.service import AnalysisValidatorService
 from ..judge_openai.config import JudgeOpenAIConfig, JudgeOpenAIConfigurationError
@@ -32,8 +34,10 @@ from ..notifier_telegram.repositories import NotifierTelegramRepository
 from ..notifier_telegram.service import NotifierTelegramService
 from ..notifier_telegram.transport import TelegramTransportTerminalError
 from ..policy_engine.config import PolicyEngineConfig
+from ..policy_engine.delivery_policy import DeliveryPolicy
 from ..policy_engine.repositories import PolicyEngineRepository
 from ..policy_engine.service import PolicyEngineService
+from ..policy_engine.verdict_policy import GITHUB_PRIMARY_TYPES, VerdictPolicy, normalize_scores_for_policy
 
 
 SCHEMA_VERSION = "exact_target_live_openai_canary_report_v1"
@@ -369,6 +373,66 @@ class FailClosedTelegramTransport:
             "telegram_transport_forbidden",
             error_code="telegram_transport_forbidden",
         )
+
+
+class ResumeSuppressedSkipCompatibilityRules(AnalysisValidatorBusinessRules):
+    def __init__(self, *, policy_config: PolicyEngineConfig) -> None:
+        super().__init__()
+        self._verdict_policy = VerdictPolicy()
+        self._delivery_policy = DeliveryPolicy(
+            enable_later_delivery=policy_config.enable_later_delivery,
+            enable_silent_later=policy_config.enable_silent_later,
+        )
+
+    def normalize_payload_for_validation(
+        self,
+        *,
+        payload: dict[str, Any],
+        bundle: BundleValidationContext,
+    ) -> dict[str, Any]:
+        normalized = super().normalize_payload_for_validation(payload=payload, bundle=bundle)
+        if not self._is_policy_suppressed_skip_no_comparables(payload=normalized, bundle=bundle):
+            return normalized
+
+        reason_codes = normalized.get("reason_codes")
+        if not isinstance(reason_codes, list) or not all(isinstance(item, str) for item in reason_codes):
+            return normalized
+
+        compatible = dict(normalized)
+        compatible["reason_codes"] = [*reason_codes, "comparison_gap"]
+        return compatible
+
+    def _is_policy_suppressed_skip_no_comparables(
+        self,
+        *,
+        payload: dict[str, Any],
+        bundle: BundleValidationContext,
+    ) -> bool:
+        if bundle.current_primary_artifact_type not in GITHUB_PRIMARY_TYPES:
+            return False
+        if payload.get("model_proposed_verdict") != "skip":
+            return False
+        comparables = payload.get("comparables")
+        if not isinstance(comparables, list) or comparables:
+            return False
+        if self._has_comparison_gap_token(payload):
+            return False
+        scores = payload.get("scores")
+        if not isinstance(scores, dict):
+            return False
+
+        policy_scores, _ = normalize_scores_for_policy(
+            scores,
+            model_proposed_verdict=payload.get("model_proposed_verdict"),
+        )
+        verdict = self._verdict_policy.evaluate(
+            scores=policy_scores,
+            current_primary_artifact_type=bundle.current_primary_artifact_type,
+        ).verdict
+        if verdict != "skip":
+            return False
+        delivery = self._delivery_policy.evaluate(verdict=verdict)
+        return delivery.delivery_decision == "suppress"
 
 
 class SqlExactTargetCanaryRepository:
@@ -1404,6 +1468,11 @@ async def _continue_from_judge_output_ready(
     validator = AnalysisValidatorService(
         service_configs.validator,
         repository=components.validator_repository,
+        business_rules=(
+            ResumeSuppressedSkipCompatibilityRules(policy_config=service_configs.policy)
+            if resume_mode
+            else None
+        ),
     )
     await validator.handle_trigger_event(judge_readback.ready_event_id)
     commit_failed_reason = await _commit_active_transaction(

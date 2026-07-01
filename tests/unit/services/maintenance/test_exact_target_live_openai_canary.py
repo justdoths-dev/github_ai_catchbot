@@ -3073,6 +3073,35 @@ async def test_resume_existing_skip_judge_output_with_missing_or_null_github_com
 
 
 @pytest.mark.asyncio
+async def test_resume_existing_skip_judge_output_with_send_worthy_scores_keeps_comparables_firewall(
+    tmp_path: Path,
+) -> None:
+    ledger = _Ledger(verdict="skip")
+    ledger.payload["comparables"] = []
+    ledger.payload["model_confidence_band"] = "high"
+    _materialize_existing_judge_output(ledger)
+
+    report = await _run_resume_execute(ledger, tmp_path)
+
+    assert report.status == "failed"
+    assert report.reason_code == "validator_rejected"
+    assert report.post_judge_output_resume_attempted is True
+    assert report.openai_call_attempted is False
+    assert report.openai_request_count == 0
+    assert report.validator_attempted is True
+    assert report.validator_forwarded_policy is False
+    assert report.policy_attempted is False
+    assert report.analysis_created is False
+    assert report.notification_intent_created is False
+    assert report.notifier_attempted is False
+    assert report.telegram_transport_attempted is False
+    assert report.redis_attempted is False
+    assert len(ledger.plans) == 0
+    assert len(ledger.renders) == 0
+    assert len(ledger.delivery_records) == 0
+
+
+@pytest.mark.asyncio
 async def test_resume_multiple_policy_events_fail_closed(tmp_path: Path) -> None:
     ledger = _Ledger()
     ledger.force_duplicate_policy_events = True
