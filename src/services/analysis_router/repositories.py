@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Protocol
 from uuid import UUID
@@ -9,6 +10,13 @@ from uuid import UUID
 import sqlalchemy as sa
 
 from .models import AnalysisRequestedJob, BundleRouteRecord, BundleShapeStats, CandidateRouteState
+
+
+@dataclass(frozen=True, slots=True)
+class BundleRefreshOutboxRecord:
+    event_id: UUID
+    created: bool
+    status: str
 
 
 class AsyncSessionLike(Protocol):
@@ -271,17 +279,19 @@ class AnalysisRouterRepository:
         candidate_group_id: UUID,
         bundle_id: UUID,
         refresh_reason: str,
-    ) -> None:
+    ) -> BundleRefreshOutboxRecord:
         payload = {
             "candidate_group_id": str(candidate_group_id),
             "trigger_kind": "analysis_router_recheck",
             "trigger_object_type": "bundle",
             "trigger_object_id": str(bundle_id),
             "refresh_reason": refresh_reason,
+            "bundle_id": str(bundle_id),
         }
-        await self._session.execute(
+        result = await self._session.execute(
             sa.text(
                 """
+                WITH inserted AS (
                 INSERT INTO event_outbox (
                     event_type, aggregate_type, aggregate_id, dedupe_key,
                     payload_json, status, created_at
@@ -295,14 +305,47 @@ class AnalysisRouterRepository:
                     now()
                 )
                 ON CONFLICT (dedupe_key) DO NOTHING
+                RETURNING event_id, status, TRUE AS created
+                )
+                SELECT event_id, status, created
+                FROM (
+                    SELECT event_id, status, created FROM inserted
+                    UNION ALL
+                    SELECT event_id, status, FALSE AS created
+                    FROM event_outbox
+                    WHERE dedupe_key = :dedupe_key
+                ) AS materialized
+                ORDER BY created DESC
+                LIMIT 1
                 """
             ),
             {
                 "candidate_group_id": str(candidate_group_id),
-                "dedupe_key": f"bundle-refresh:{candidate_group_id}:{bundle_id}:{refresh_reason}",
+                "dedupe_key": bundle_refresh_outbox_dedupe_key(
+                    candidate_group_id=candidate_group_id,
+                    bundle_id=bundle_id,
+                    refresh_reason=refresh_reason,
+                ),
                 "payload_json": _jsonb_dumps(payload),
             },
         )
+        row = result.mappings().first()
+        if row is None:
+            raise RuntimeError("bundle_refresh_outbox_not_materialized")
+        return BundleRefreshOutboxRecord(
+            event_id=UUID(str(row["event_id"])),
+            created=bool(row["created"]),
+            status=str(row["status"]),
+        )
+
+
+def bundle_refresh_outbox_dedupe_key(
+    *,
+    candidate_group_id: UUID,
+    bundle_id: UUID,
+    refresh_reason: str,
+) -> str:
+    return f"bundle-refresh:{candidate_group_id}:{bundle_id}:{refresh_reason}"
 
 
 def _uuid_or_none(value: Any) -> UUID | None:
