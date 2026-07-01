@@ -22,8 +22,12 @@ PREVIEW_MODE = "preview"
 EXECUTE_MODE = "execute"
 QUEUE_NAME = "q.candidate.bundle"
 STAGE_NAME = "bundle"
-ROOT_OBJECT_TYPE = "artifact"
-EVENT_TYPE = "artifact.snapshot.updated.v1"
+ARTIFACT_ROOT_OBJECT_TYPE = "artifact"
+CANDIDATE_GROUP_ROOT_OBJECT_TYPE = "candidate_group"
+ARTIFACT_SNAPSHOT_UPDATED_EVENT_TYPE = "artifact.snapshot.updated.v1"
+CANDIDATE_BUNDLE_REFRESH_EVENT_TYPE = "candidate.bundle.refresh.v1"
+ROOT_OBJECT_TYPE = ARTIFACT_ROOT_OBJECT_TYPE
+EVENT_TYPE = ARTIFACT_SNAPSHOT_UPDATED_EVENT_TYPE
 DEFAULT_MAX_MESSAGES = 1
 HARD_MAX_MESSAGES = 1
 DEFAULT_SCAN_LIMIT = 25
@@ -63,6 +67,44 @@ REQUIRED_EVENT_PAYLOAD_FIELDS = frozenset(
         "status",
         "content_anchor",
     }
+)
+REQUIRED_ARTIFACT_SNAPSHOT_EVENT_PAYLOAD_FIELDS = REQUIRED_EVENT_PAYLOAD_FIELDS
+REQUIRED_CANDIDATE_BUNDLE_REFRESH_EVENT_PAYLOAD_FIELDS = frozenset(
+    {
+        "candidate_group_id",
+        "trigger_kind",
+        "trigger_object_type",
+        "trigger_object_id",
+        "refresh_reason",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerFamilyContract:
+    event_type: str
+    root_object_type: str
+    aggregate_type: str
+    required_payload_fields: frozenset[str]
+
+
+TRIGGER_FAMILY_CONTRACTS = {
+    ARTIFACT_SNAPSHOT_UPDATED_EVENT_TYPE: TriggerFamilyContract(
+        event_type=ARTIFACT_SNAPSHOT_UPDATED_EVENT_TYPE,
+        root_object_type=ARTIFACT_ROOT_OBJECT_TYPE,
+        aggregate_type=ARTIFACT_ROOT_OBJECT_TYPE,
+        required_payload_fields=REQUIRED_ARTIFACT_SNAPSHOT_EVENT_PAYLOAD_FIELDS,
+    ),
+    CANDIDATE_BUNDLE_REFRESH_EVENT_TYPE: TriggerFamilyContract(
+        event_type=CANDIDATE_BUNDLE_REFRESH_EVENT_TYPE,
+        root_object_type=CANDIDATE_GROUP_ROOT_OBJECT_TYPE,
+        aggregate_type=CANDIDATE_GROUP_ROOT_OBJECT_TYPE,
+        required_payload_fields=REQUIRED_CANDIDATE_BUNDLE_REFRESH_EVENT_PAYLOAD_FIELDS,
+    ),
+}
+ALLOWED_EVENT_TYPES = frozenset(TRIGGER_FAMILY_CONTRACTS)
+ALLOWED_ROOT_OBJECT_TYPES = frozenset(
+    contract.root_object_type for contract in TRIGGER_FAMILY_CONTRACTS.values()
 )
 
 
@@ -679,13 +721,16 @@ class SqlAlchemyBoundedBundleAssemblerDatabase:
                 """
                 SELECT event_id
                 FROM event_outbox
-                WHERE event_type = :event_type
+                WHERE event_type IN :event_types
                   AND lower(CAST(event_id AS text)) LIKE :event_suffix_pattern
                 ORDER BY created_at ASC, event_id ASC
                 LIMIT 2
                 """
-            ),
-            {"event_type": EVENT_TYPE, "event_suffix_pattern": f"%{trigger_event_suffix.lower()}"},
+            ).bindparams(sa.bindparam("event_types", expanding=True)),
+            {
+                "event_types": tuple(sorted(ALLOWED_EVENT_TYPES)),
+                "event_suffix_pattern": f"%{trigger_event_suffix.lower()}",
+            },
         )
         rows = result.mappings().all()
         if not rows:
@@ -740,6 +785,18 @@ class SqlAlchemyBoundedBundleAssemblerDatabase:
             impacted_candidate_group_count=0,
         )
         _validate_trigger_contract(event=event, selected=selected, config=config)
+
+        if event.event_type == CANDIDATE_BUNDLE_REFRESH_EVENT_TYPE:
+            selected_candidate_group_id = _select_candidate_group(
+                [event.aggregate_id],
+                candidate_group_suffix=config.candidate_group_suffix,
+            )
+            return replace(
+                event,
+                impacted_candidate_group_count=1,
+                selected_candidate_group_id=selected_candidate_group_id,
+            )
+
         impacted_candidate_group_ids = await self._impacted_candidate_group_ids(event.aggregate_id)
         if not impacted_candidate_group_ids:
             raise BoundedBundleAssemblerError("candidate_group_not_found")
@@ -1276,14 +1333,21 @@ def _result(
     if selected is not None:
         redis_message_id = selected.redis_message_id
         trigger_event_id = _uuid_or_none(selected.message.trigger_event_id)
-        artifact_id = _uuid_or_none(selected.message.root_object_id)
+        selected_root_object_id = _uuid_or_none(selected.message.root_object_id)
+        if selected.message.root_object_type == ARTIFACT_ROOT_OBJECT_TYPE:
+            artifact_id = selected_root_object_id
+        elif selected.message.root_object_type == CANDIDATE_GROUP_ROOT_OBJECT_TYPE:
+            candidate_group_id = selected_root_object_id
     if trigger_event is not None:
         trigger_event_id = trigger_event.event_id
-        artifact_id = trigger_event.aggregate_id
-        candidate_group_id = trigger_event.selected_candidate_group_id
-        snapshot_id = trigger_event.snapshot_id
-        snapshot_type = trigger_event.snapshot_type or None
-        snapshot_status = trigger_event.snapshot_status or None
+        if trigger_event.event_type == ARTIFACT_SNAPSHOT_UPDATED_EVENT_TYPE:
+            artifact_id = trigger_event.aggregate_id
+            candidate_group_id = trigger_event.selected_candidate_group_id
+            snapshot_id = trigger_event.snapshot_id
+            snapshot_type = trigger_event.snapshot_type or None
+            snapshot_status = trigger_event.snapshot_status or None
+        elif trigger_event.event_type == CANDIDATE_BUNDLE_REFRESH_EVENT_TYPE:
+            candidate_group_id = trigger_event.selected_candidate_group_id or trigger_event.aggregate_id
     return BoundedBundleAssemblerResult(
         status=status,
         ok=status in {"previewed", "assembled"} and error_code is None,
@@ -1459,13 +1523,13 @@ def _selected_message_contract_error(
         return "redis_message_contract_invalid"
     if selected.message.stage_name != STAGE_NAME:
         return "stage_not_allowed"
-    if selected.message.root_object_type != ROOT_OBJECT_TYPE:
+    if selected.message.root_object_type not in ALLOWED_ROOT_OBJECT_TYPES:
         return "root_object_type_not_allowed"
     selected_trigger_event_id = _uuid_or_none(selected.message.trigger_event_id)
     if selected_trigger_event_id is None:
         return "trigger_event_id_invalid"
-    selected_artifact_id = _uuid_or_none(selected.message.root_object_id)
-    if selected_artifact_id is None:
+    selected_root_object_id = _uuid_or_none(selected.message.root_object_id)
+    if selected_root_object_id is None:
         return "redis_message_contract_invalid"
     if not selected.redis_message_id.endswith(config.redis_message_id_suffix or ""):
         return "target_redis_message_mismatch"
@@ -1482,25 +1546,77 @@ def _validate_trigger_contract(
     selected: TargetedRedisBundleMessage,
     config: BoundedBundleAssemblerConfig,
 ) -> None:
+    contract = TRIGGER_FAMILY_CONTRACTS.get(event.event_type)
+    if contract is None:
+        raise BoundedBundleAssemblerError("event_type_not_allowed")
+    if event.event_type == ARTIFACT_SNAPSHOT_UPDATED_EVENT_TYPE:
+        _validate_artifact_snapshot_trigger_contract(event=event, selected=selected, contract=contract)
+        return
+    if event.event_type == CANDIDATE_BUNDLE_REFRESH_EVENT_TYPE:
+        _validate_candidate_bundle_refresh_trigger_contract(
+            event=event,
+            selected=selected,
+            config=config,
+            contract=contract,
+        )
+        return
+    raise BoundedBundleAssemblerError("event_type_not_allowed")
+
+
+def _validate_common_trigger_contract(
+    *,
+    event: TriggerEventContract,
+    selected: TargetedRedisBundleMessage,
+    contract: TriggerFamilyContract,
+) -> UUID:
     selected_trigger_event_id = _uuid_or_none(selected.message.trigger_event_id)
-    selected_artifact_id = _uuid_or_none(selected.message.root_object_id)
+    selected_root_object_id = _uuid_or_none(selected.message.root_object_id)
     if event.event_id != selected_trigger_event_id:
         raise BoundedBundleAssemblerError("trigger_event_id_mismatch")
-    if event.event_type != EVENT_TYPE:
-        raise BoundedBundleAssemblerError("event_type_not_allowed")
     if event.status != "published":
         raise BoundedBundleAssemblerError("event_not_published")
-    if event.aggregate_type != ROOT_OBJECT_TYPE:
+    if selected.message.root_object_type != contract.root_object_type:
+        raise BoundedBundleAssemblerError("root_object_type_not_allowed")
+    if event.aggregate_type != contract.aggregate_type:
         raise BoundedBundleAssemblerError("aggregate_type_not_allowed")
-    if event.aggregate_id != selected_artifact_id:
+    if event.aggregate_id != selected_root_object_id:
         raise BoundedBundleAssemblerError("aggregate_root_mismatch")
-    if not all(_payload_field_present(event.payload_json.get(field)) for field in REQUIRED_EVENT_PAYLOAD_FIELDS):
+    if not all(_payload_field_present(event.payload_json.get(field)) for field in contract.required_payload_fields):
         raise BoundedBundleAssemblerError("malformed_event_payload")
+    return event.aggregate_id
+
+
+def _validate_artifact_snapshot_trigger_contract(
+    *,
+    event: TriggerEventContract,
+    selected: TargetedRedisBundleMessage,
+    contract: TriggerFamilyContract,
+) -> None:
+    _validate_common_trigger_contract(event=event, selected=selected, contract=contract)
     payload_artifact_id = _payload_uuid(event.payload_json, "artifact_id")
     if payload_artifact_id is not None and payload_artifact_id != event.aggregate_id:
         raise BoundedBundleAssemblerError("payload_artifact_id_mismatch")
     if _payload_uuid(event.payload_json, "snapshot_id") is None:
         raise BoundedBundleAssemblerError("malformed_event_payload")
+
+
+def _validate_candidate_bundle_refresh_trigger_contract(
+    *,
+    event: TriggerEventContract,
+    selected: TargetedRedisBundleMessage,
+    config: BoundedBundleAssemblerConfig,
+    contract: TriggerFamilyContract,
+) -> None:
+    _validate_common_trigger_contract(event=event, selected=selected, contract=contract)
+    payload_candidate_group_id = _payload_uuid(event.payload_json, "candidate_group_id")
+    if payload_candidate_group_id is None:
+        raise BoundedBundleAssemblerError("malformed_event_payload")
+    if payload_candidate_group_id != event.aggregate_id:
+        raise BoundedBundleAssemblerError("payload_candidate_group_id_mismatch")
+    if config.candidate_group_suffix is not None and not str(event.aggregate_id).lower().endswith(
+        config.candidate_group_suffix.lower()
+    ):
+        raise BoundedBundleAssemblerError("candidate_group_suffix_not_found")
 
 
 def _select_candidate_group(

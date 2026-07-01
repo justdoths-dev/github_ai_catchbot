@@ -63,6 +63,19 @@ def _message_fields(event_id: UUID, artifact_id: UUID, **extra) -> dict[str, str
     return fields
 
 
+def _candidate_refresh_message_fields(event_id: UUID, candidate_group_id: UUID, **extra) -> dict[str, str]:
+    fields = {
+        "job_id": str(event_id),
+        "stage_name": "bundle",
+        "root_object_type": "candidate_group",
+        "root_object_id": str(candidate_group_id),
+        "idempotency_key": RAW_IDEMPOTENCY_KEY,
+        "trigger_event_id": str(event_id),
+    }
+    fields.update(extra)
+    return fields
+
+
 class FakeConsumer:
     def __init__(
         self,
@@ -146,14 +159,14 @@ class FakeDatabase:
         return self.event
 
     async def preview(self, trigger_event_id, selected_candidate_group_id, state):
-        del selected_candidate_group_id
         assert trigger_event_id == self.event.event_id
+        assert selected_candidate_group_id == self.event.selected_candidate_group_id
         state.database_read_attempted = True
         return self.preview_results or []
 
     async def assemble(self, trigger_event_id, selected_candidate_group_id, state):
-        del selected_candidate_group_id
         assert trigger_event_id == self.event.event_id
+        assert selected_candidate_group_id == self.event.selected_candidate_group_id
         state.database_write_attempted = True
         if self.assemble_error is not None:
             raise self.assemble_error
@@ -310,6 +323,19 @@ def _selected(event_id: UUID, artifact_id: UUID, fields: dict[str, str] | None =
     )
 
 
+def _selected_candidate_refresh(
+    event_id: UUID,
+    candidate_group_id: UUID,
+    fields: dict[str, str] | None = None,
+) -> TargetedRedisBundleMessage:
+    message_fields = fields or _candidate_refresh_message_fields(event_id, candidate_group_id)
+    return TargetedRedisBundleMessage(
+        redis_message_id=STREAM_ID,
+        fields=message_fields,
+        message=RedisBundleMessage.from_stream_fields(message_fields),
+    )
+
+
 def _event(
     event_id: UUID,
     artifact_id: UUID,
@@ -343,6 +369,39 @@ def _event(
         content_anchor_present=True,
         impacted_candidate_group_count=impacted_count,
         selected_candidate_group_id=uuid4(),
+    )
+
+
+def _candidate_refresh_event(
+    event_id: UUID,
+    candidate_group_id: UUID,
+    *,
+    aggregate_type: str = "candidate_group",
+    payload_candidate_group_id: UUID | None = None,
+    missing_payload_fields: set[str] | None = None,
+) -> TriggerEventContract:
+    payload = {
+        "candidate_group_id": str(payload_candidate_group_id or candidate_group_id),
+        "trigger_kind": "bounded_refresh",
+        "trigger_object_type": "artifact",
+        "trigger_object_id": str(uuid4()),
+        "refresh_reason": "bounded_candidate_bundle_refresh",
+    }
+    for field_name in missing_payload_fields or set():
+        payload.pop(field_name, None)
+    return TriggerEventContract(
+        event_id=event_id,
+        event_type="candidate.bundle.refresh.v1",
+        status="published",
+        aggregate_type=aggregate_type,
+        aggregate_id=candidate_group_id,
+        payload_json=payload,
+        snapshot_id=UUID(int=0),
+        snapshot_type="",
+        snapshot_status="",
+        content_anchor_present=False,
+        impacted_candidate_group_count=1,
+        selected_candidate_group_id=candidate_group_id,
     )
 
 
@@ -503,6 +562,211 @@ async def test_event_payload_with_provider_and_snapshot_type_reports_sanitized_t
     assert report["status"] == "assembled"
     assert report["target_snapshot_type"] == "web_article"
     assert report["target_snapshot_id_suffix"] is not None
+
+
+@pytest.mark.asyncio
+async def test_candidate_bundle_refresh_validates_and_assembles_without_artifact_snapshot_payload() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    order: list[str] = []
+    event = _candidate_refresh_event(event_id, candidate_group_id)
+    selected = _selected_candidate_refresh(event_id, candidate_group_id)
+    forbidden_artifact_fields = {"artifact_id", "snapshot_id", "provider", "status", "content_anchor"}
+    assert forbidden_artifact_fields.isdisjoint(event.payload_json)
+    database = FakeDatabase(
+        event=event,
+        counters=BoundedBundleAssemblerCounters(),
+        run_contract_validation=True,
+    )
+    consumer = FakeConsumer(selected, order=order)
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(consumer),
+        database_builder=FakeDatabaseBuilder(database, order=order),
+    )
+
+    report = result.to_sanitized_dict()
+    assert result.ok is True
+    assert report["status"] == "assembled"
+    assert report["target_artifact_id_suffix"] is None
+    assert report["target_candidate_group_suffix"] == str(candidate_group_id)[-8:]
+    assert report["target_snapshot_id_suffix"] is None
+    assert report["target_snapshot_type"] is None
+    assert report["candidate_groups_seen"] == 1
+    assert report["candidate_groups_processed"] == 1
+    assert report["bundles_written_count"] == 1
+    assert report["redis_acked_count"] == 1
+    assert order == ["commit", "ack"]
+    assert consumer.acked == [STREAM_ID]
+    assert database.assembled is True
+
+
+@pytest.mark.asyncio
+async def test_candidate_bundle_refresh_preview_reaches_selected_candidate_group_filter() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    event = _candidate_refresh_event(event_id, candidate_group_id)
+    selected = _selected_candidate_refresh(event_id, candidate_group_id)
+    database = FakeDatabase(
+        event=event,
+        counters=BoundedBundleAssemblerCounters(),
+        preview_results=[
+            EvidenceBundlePreview(
+                candidate_group_id=candidate_group_id,
+                current_bundle_present_before=False,
+                bundle_input_existing=False,
+                ready_for_analysis=True,
+                analysis_requested_existing=False,
+                analysis_requested_would_emit=True,
+            )
+        ],
+        run_contract_validation=True,
+    )
+    consumer = FakeConsumer(selected)
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(
+            event_id=event_id,
+            run_mode="preview",
+            allow_database_write_for_evidence_bundle_only=False,
+            allow_redis_consume=False,
+            allow_redis_ack=False,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(consumer),
+        database_builder=FakeDatabaseBuilder(database),
+    )
+
+    report = result.to_sanitized_dict()
+    assert result.ok is True
+    assert report["status"] == "previewed"
+    assert report["target_candidate_group_suffix"] == str(candidate_group_id)[-8:]
+    assert report["bundle_input_new_count"] == 1
+    assert report["database_write_attempted"] is False
+    assert report["redis_ack_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_candidate_bundle_refresh_wrong_aggregate_type_blocks_before_assembly_or_ack() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    selected = _selected_candidate_refresh(event_id, candidate_group_id)
+    database = FakeDatabase(
+        event=_candidate_refresh_event(event_id, candidate_group_id, aggregate_type="artifact"),
+        counters=BoundedBundleAssemblerCounters(),
+        run_contract_validation=True,
+    )
+    consumer = FakeConsumer(selected)
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(consumer),
+        database_builder=FakeDatabaseBuilder(database),
+    )
+
+    report = result.to_sanitized_dict()
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "aggregate_type_not_allowed"
+    assert database.assembled is False
+    assert report["database_write_attempted"] is False
+    assert report["redis_ack_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_candidate_bundle_refresh_payload_candidate_group_mismatch_blocks() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    selected = _selected_candidate_refresh(event_id, candidate_group_id)
+    database = FakeDatabase(
+        event=_candidate_refresh_event(
+            event_id,
+            candidate_group_id,
+            payload_candidate_group_id=uuid4(),
+        ),
+        counters=BoundedBundleAssemblerCounters(),
+        run_contract_validation=True,
+    )
+    consumer = FakeConsumer(selected)
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(consumer),
+        database_builder=FakeDatabaseBuilder(database),
+    )
+
+    report = result.to_sanitized_dict()
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "payload_candidate_group_id_mismatch"
+    assert database.assembled is False
+    assert report["database_write_attempted"] is False
+    assert report["redis_ack_attempted"] is False
+
+
+@pytest.mark.asyncio
+async def test_candidate_bundle_refresh_candidate_group_suffix_mismatch_blocks() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    selected = _selected_candidate_refresh(event_id, candidate_group_id)
+    database = FakeDatabase(
+        event=_candidate_refresh_event(event_id, candidate_group_id),
+        counters=BoundedBundleAssemblerCounters(),
+        run_contract_validation=True,
+    )
+    consumer = FakeConsumer(selected)
+    bad_suffix = "00000000"
+    if str(candidate_group_id).endswith(bad_suffix):
+        bad_suffix = "11111111"
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(event_id=event_id, candidate_group_suffix=bad_suffix),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(consumer),
+        database_builder=FakeDatabaseBuilder(database),
+    )
+
+    report = result.to_sanitized_dict()
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "candidate_group_suffix_not_found"
+    assert database.assembled is False
+    assert report["database_write_attempted"] is False
+    assert report["redis_ack_attempted"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing_field",
+    ["candidate_group_id", "trigger_kind", "trigger_object_type", "trigger_object_id", "refresh_reason"],
+)
+async def test_candidate_bundle_refresh_missing_required_payload_field_blocks_with_malformed_payload(
+    missing_field: str,
+) -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    selected = _selected_candidate_refresh(event_id, candidate_group_id)
+    database = FakeDatabase(
+        event=_candidate_refresh_event(event_id, candidate_group_id, missing_payload_fields={missing_field}),
+        counters=BoundedBundleAssemblerCounters(),
+        run_contract_validation=True,
+    )
+    consumer = FakeConsumer(selected)
+
+    result = await run_bounded_bundle_assembler(
+        _approved_config(event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(consumer),
+        database_builder=FakeDatabaseBuilder(database),
+    )
+
+    report = result.to_sanitized_dict()
+    assert report["status"] == "blocked"
+    assert report["error_code"] == "malformed_event_payload"
+    assert database.assembled is False
+    assert report["database_write_attempted"] is False
+    assert report["redis_ack_attempted"] is False
 
 
 @pytest.mark.asyncio

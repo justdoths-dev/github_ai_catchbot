@@ -667,12 +667,15 @@ def test_source_guard_keeps_live_authority_and_runtime_surfaces_out() -> None:
     source = SOURCE_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
     imported_modules: set[str] = set()
+    imported_roots: set[str] = set()
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imported_modules.update(alias.name for alias in node.names)
+            imported_roots.update(alias.name.split(".", 1)[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported_modules.add(node.module)
+            imported_roots.add(node.module.split(".", 1)[0])
 
     forbidden_fragments = {
         "send_message(",
@@ -682,6 +685,7 @@ def test_source_guard_keeps_live_authority_and_runtime_surfaces_out() -> None:
     lowered = source.lower()
     assert all(fragment not in lowered for fragment in forbidden_fragments)
     assert "xadd" not in lowered
+    assert {"openai", "telegram", "subprocess", "requests", "httpx", "aiohttp"}.isdisjoint(imported_roots)
     assert not any(".notifier_telegram" in module for module in imported_modules)
     assert not any(".policy_engine" in module for module in imported_modules)
     assert not any(".analysis_router" in module for module in imported_modules)
