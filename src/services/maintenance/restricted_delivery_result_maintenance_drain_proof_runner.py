@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
@@ -288,11 +288,7 @@ async def load_delivery_result_maintenance_drain_readback(
     pending = None
     try:
         groups = await redis_client.xinfo_groups(cfg.maintenance_queue_name)
-        for group in groups or []:
-            if isinstance(group, dict) and _decode(group.get("name") or group.get(b"name")) == cfg.maintenance_consumer_group:
-                lag = _safe_int(group.get("lag") or group.get(b"lag"))
-                pending = _safe_int(group.get("pending") or group.get(b"pending"))
-                break
+        lag, pending = _redis_group_lag_pending(groups, cfg.maintenance_consumer_group)
     finally:
         close = getattr(redis_client, "aclose", None) or getattr(redis_client, "close", None)
         if close is not None:
@@ -607,6 +603,30 @@ def _safe_int(value: object) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _group_value(group: Mapping[object, object], key: str) -> object | None:
+    if key in group:
+        return group[key]
+    encoded = key.encode()
+    if encoded in group:
+        return group[encoded]
+    return None
+
+
+def _redis_group_lag_pending(
+    groups: Iterable[object] | None,
+    consumer_group: str,
+) -> tuple[int | None, int | None]:
+    for group in groups or ():
+        if not isinstance(group, Mapping):
+            continue
+        if _decode(_group_value(group, "name")) == consumer_group:
+            return (
+                _safe_int(_group_value(group, "lag")),
+                _safe_int(_group_value(group, "pending")),
+            )
+    return None, None
 
 
 def _decode(value: object) -> str:

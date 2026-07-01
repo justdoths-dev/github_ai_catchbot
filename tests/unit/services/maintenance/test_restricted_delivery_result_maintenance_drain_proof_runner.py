@@ -15,6 +15,7 @@ from services.maintenance.models import DeliveryResultWorkerResult
 from services.maintenance.restricted_delivery_result_maintenance_drain_proof_runner import (
     DeliveryResultMaintenanceDrainReadback,
     RestrictedDeliveryResultMaintenanceDrainProofConfig,
+    _redis_group_lag_pending,
     build_parser,
     run_restricted_delivery_result_maintenance_drain_proof,
 )
@@ -213,6 +214,26 @@ def _readback(**overrides) -> DeliveryResultMaintenanceDrainReadback:
     }
     values.update(overrides)
     return DeliveryResultMaintenanceDrainReadback(**values)
+
+
+def test_redis_group_readback_preserves_zero_lag_and_pending_with_string_keys() -> None:
+    redis_lag, redis_pending = _redis_group_lag_pending(
+        [{"name": "maintenance", "lag": 0, "pending": 0}],
+        "maintenance",
+    )
+
+    assert redis_lag == 0
+    assert redis_pending == 0
+
+
+def test_redis_group_readback_preserves_zero_lag_and_pending_with_bytes_keys() -> None:
+    redis_lag, redis_pending = _redis_group_lag_pending(
+        [{b"name": b"maintenance", b"lag": 0, b"pending": 0}],
+        "maintenance",
+    )
+
+    assert redis_lag == 0
+    assert redis_pending == 0
 
 
 @pytest.mark.asyncio
