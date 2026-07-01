@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -158,6 +160,137 @@ async def test_command_rejects_send_disabled_config(tmp_path, monkeypatch: pytes
     assert payload["status"] == "rejected"
     assert payload["reason_code"] == "notification_send_disabled"
     assert "runtime_config_locator" not in payload
+
+
+@pytest.mark.asyncio
+async def test_command_without_projection_rejects_allow_edits_before_redis_or_worker(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setattr(notifier_main, "_build_send_disabled_proof_redis_client", _unused_redis_builder)
+    emitted: list[str] = []
+    args = build_parser().parse_args(
+        [
+            "restricted-live-queued-worker-once",
+            "--operator-confirmed",
+            "--env-file",
+            _write_env_file(tmp_path, NOTIFIER_TELEGRAM_ALLOW_EDITS="true"),
+            "--format",
+            "json",
+        ]
+    )
+
+    code = await _run_restricted_live_queued_worker_once_command(args, emit_json=emitted.append)
+    payload = json.loads(emitted[0])
+
+    assert code == 2
+    assert payload["status"] == "rejected"
+    assert payload["reason_code"] == "notifier_edits_enabled"
+    assert payload["redis_precheck"] == {"pending": None, "lag": None, "reason_code": None}
+    assert payload["authority"]["database_session_opened"] is False
+    assert "runtime_projection" not in payload
+
+
+@pytest.mark.asyncio
+async def test_send_only_projection_reduces_allow_edits_and_reaches_lag_zero_noop(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    redis_url = "redis" + "://unit/0"
+    env_file = Path(_write_env_file(tmp_path, REDIS_URL=redis_url, NOTIFIER_TELEGRAM_ALLOW_EDITS="true"))
+    before_env_contents = env_file.read_text(encoding="utf-8")
+    emitted: list[str] = []
+    redis = FakeRedis(pending=0, lag=0)
+    seen_redis_urls: list[str] = []
+
+    def fake_redis_builder(value: str):
+        seen_redis_urls.append(value)
+        return redis
+
+    monkeypatch.setattr(notifier_main, "_build_send_disabled_proof_redis_client", fake_redis_builder)
+    args = build_parser().parse_args(
+        [
+            "restricted-live-queued-worker-once",
+            "--operator-confirmed",
+            "--env-file",
+            str(env_file),
+            "--send-only-runtime-projection",
+            "--max-lag",
+            "1",
+            "--format",
+            "json",
+        ]
+    )
+
+    code = await _run_restricted_live_queued_worker_once_command(args, emit_json=emitted.append)
+    payload = json.loads(emitted[0])
+
+    assert code == 0
+    assert payload["status"] == "noop"
+    assert payload["reason_code"] == "no_queued_message"
+    assert payload["redis_precheck"] == {"pending": 0, "lag": 0, "reason_code": None}
+    assert payload["runtime_projection"] == {
+        "mode": "send_only",
+        "requested": True,
+        "applied": True,
+        "source_allow_edits_enabled": True,
+        "effective_allow_edits": False,
+        "env_mutated": False,
+        "values_printed": False,
+        "paths_printed": False,
+    }
+    assert seen_redis_urls == [redis_url]
+    assert env_file.read_text(encoding="utf-8") == before_env_contents
+    for key in RUNTIME_ENV_KEYS:
+        assert key not in os.environ
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "expected_reason"),
+    [
+        ({"NOTIFIER_TELEGRAM_DRY_RUN": "true"}, "notifier_dry_run_enabled"),
+        ({"ENABLE_NOTIFICATION_SEND": "false"}, "notification_send_disabled"),
+        ({"TELEGRAM_API_BASE_URL": "https://example.com"}, "telegram_api_base_url_unofficial"),
+        ({"TELEGRAM_API_BASE_URL": "http://127.0.0.1:8081"}, "telegram_api_base_url_blackhole"),
+        ({"TELEGRAM_BOT_TOKEN": ""}, "telegram_bot_token_missing"),
+        ({"APP_ENV": "dev"}, "app_env_not_prod"),
+    ],
+)
+async def test_send_only_projection_does_not_bypass_other_config_guards(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, str],
+    expected_reason: str,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    monkeypatch.setattr(notifier_main, "_build_send_disabled_proof_redis_client", _unused_redis_builder)
+    emitted: list[str] = []
+    args = build_parser().parse_args(
+        [
+            "restricted-live-queued-worker-once",
+            "--operator-confirmed",
+            "--env-file",
+            _write_env_file(tmp_path, NOTIFIER_TELEGRAM_ALLOW_EDITS="true", **overrides),
+            "--send-only-runtime-projection",
+            "--format",
+            "json",
+        ]
+    )
+
+    code = await _run_restricted_live_queued_worker_once_command(args, emit_json=emitted.append)
+    payload = json.loads(emitted[0])
+
+    assert code == 2
+    assert payload["status"] == "rejected"
+    assert payload["reason_code"] == expected_reason
+    assert payload["redis_precheck"] == {"pending": None, "lag": None, "reason_code": None}
+    assert payload["runtime_projection"]["mode"] == "send_only"
+    assert payload["runtime_projection"]["source_allow_edits_enabled"] is True
+    assert payload["runtime_projection"]["effective_allow_edits"] is False
+    assert payload["authority"]["database_session_opened"] is False
 
 
 @pytest.mark.asyncio
@@ -510,6 +643,82 @@ async def test_processes_exactly_one_fake_queued_message_when_lag_is_one(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_send_only_projection_processes_one_fake_queued_message_when_lag_is_one(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail_if_proof_setup_called(*args, **kwargs):
+        raise AssertionError("real queued worker-once must not create proof plans or events")
+
+    monkeypatch.setattr(
+        notifier_main,
+        "create_restricted_live_worker_once_proof_with_repository",
+        fail_if_proof_setup_called,
+    )
+    _clear_runtime_env(monkeypatch)
+    env_file = _write_env_file(tmp_path, NOTIFIER_TELEGRAM_ALLOW_EDITS="true")
+    emitted: list[str] = []
+    redis = FakeRedis(pending=0, lag=1)
+    consumer = OneMessageConsumer(_valid_message())
+    service = RecordingService()
+    seen_worker_configs = []
+
+    async def worker_once_runner(config, emit_json):
+        seen_worker_configs.append(config)
+        return await _run_fake_worker_once(config, emit_json, consumer=consumer, service=service)
+
+    monkeypatch.setattr(notifier_main, "_build_send_disabled_proof_redis_client", lambda redis_url: redis)
+    monkeypatch.setattr(notifier_main, "_run_default_restricted_live_queued_worker_once", worker_once_runner)
+    args = build_parser().parse_args(
+        [
+            "restricted-live-queued-worker-once",
+            "--operator-confirmed",
+            "--env-file",
+            env_file,
+            "--send-only-runtime-projection",
+            "--max-lag",
+            "1",
+            "--format",
+            "json",
+        ]
+    )
+
+    code = await _run_restricted_live_queued_worker_once_command(args, emit_json=emitted.append)
+    payload = json.loads(emitted[0])
+
+    assert code == 0
+    assert payload["status"] == "pass"
+    assert payload["reason_code"] == "restricted_live_queued_worker_once_processed"
+    assert payload["runtime_projection"]["source_allow_edits_enabled"] is True
+    assert payload["runtime_projection"]["effective_allow_edits"] is False
+    assert payload["worker_once"] == {
+        "exit_code": 0,
+        "status": "processed",
+        "reason_code": "processed",
+        "acked": True,
+        "handler_called": True,
+    }
+    assert len(seen_worker_configs) == 1
+    assert seen_worker_configs[0].allow_edits is False
+    assert seen_worker_configs[0].database_url == _live_config().database_url
+    assert seen_worker_configs[0].redis_url == _live_config().redis_url
+    assert seen_worker_configs[0].telegram_bot_token == _live_config().telegram_bot_token
+    assert consumer.read_calls == 1
+    assert consumer.acked == ["1-0"]
+    assert service.calls == [consumer.message.fields["trigger_event_id"]]
+    assert payload["authority"]["workers_started"] is False
+    assert payload["authority"]["run_forever_started"] is False
+    assert payload["authority"]["openai_called"] is False
+    assert payload["authority"]["github_called"] is False
+    assert payload["authority"]["docker_or_systemd_called"] is False
+    assert payload["authority"]["alembic_or_ddl_ran"] is False
+    assert "payload_json" not in emitted[0]
+    assert consumer.message.fields["trigger_event_id"] not in emitted[0]
+    assert consumer.message.fields["root_object_id"] not in emitted[0]
+    assert consumer.message.fields["idempotency_key"] not in emitted[0]
+
+
+@pytest.mark.asyncio
 async def test_payload_json_field_is_rejected_by_worker_once_and_not_echoed() -> None:
     emitted: list[str] = []
     consumer = OneMessageConsumer(_valid_message(field_overrides={"payload_json": "{}"}))
@@ -599,6 +808,86 @@ async def test_output_is_sanitized_on_success_and_worker_exception() -> None:
         assert forbidden not in failure_emitted[0]
 
 
+@pytest.mark.asyncio
+async def test_send_only_projection_output_redacts_runtime_and_worker_values(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    db_url = "postgresql+psycopg" + "://unit:password@db.internal/catchbot"
+    redis_url = "redis" + "://:password@redis.internal/0"
+    telegram_token = "123456:unit-live-token-value"
+    db_secret = tmp_path / "database-secret-file.txt"
+    redis_secret = tmp_path / "redis-secret-file.txt"
+    telegram_secret = tmp_path / "telegram-secret-file.txt"
+    db_secret.write_text(db_url, encoding="utf-8")
+    redis_secret.write_text(redis_url, encoding="utf-8")
+    telegram_secret.write_text(telegram_token, encoding="utf-8")
+    env_file = tmp_path / "runtime-secret-file.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "APP_ENV=prod",
+                f"DATABASE_URL_FILE={db_secret}",
+                f"REDIS_URL_FILE={redis_secret}",
+                f"TELEGRAM_BOT_TOKEN_FILE={telegram_secret}",
+                "TELEGRAM_API_BASE_URL=https://api.telegram.org",
+                "ENABLE_NOTIFICATION_SEND=true",
+                "NOTIFIER_TELEGRAM_DRY_RUN=false",
+                "NOTIFIER_TELEGRAM_ALLOW_EDITS=true",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    emitted: list[str] = []
+    redis = FakeRedis(pending=0, lag=1)
+    consumer = OneMessageConsumer(_valid_message())
+    service = RecordingService()
+
+    async def worker_once_runner(config, emit_json):
+        return await _run_fake_worker_once(config, emit_json, consumer=consumer, service=service)
+
+    monkeypatch.setattr(notifier_main, "_build_send_disabled_proof_redis_client", lambda redis_url: redis)
+    monkeypatch.setattr(notifier_main, "_run_default_restricted_live_queued_worker_once", worker_once_runner)
+    args = build_parser().parse_args(
+        [
+            "restricted-live-queued-worker-once",
+            "--operator-confirmed",
+            "--env-file",
+            str(env_file),
+            "--send-only-runtime-projection",
+            "--max-lag",
+            "1",
+            "--format",
+            "json",
+        ]
+    )
+
+    code = await _run_restricted_live_queued_worker_once_command(args, emit_json=emitted.append)
+
+    assert code == 0
+    serialized = emitted[0]
+    for forbidden in [
+        db_url,
+        redis_url,
+        telegram_token,
+        str(env_file),
+        str(db_secret),
+        str(redis_secret),
+        str(telegram_secret),
+        "DATABASE_URL",
+        "REDIS_URL",
+        "TELEGRAM_BOT_TOKEN",
+        "password",
+        "token",
+        "secret",
+        "Traceback",
+        "RAW_TELEGRAM_RESPONSE_BODY",
+        "payload_json",
+    ]:
+        assert forbidden not in serialized
+
+
 def test_parser_accepts_restricted_live_queued_worker_once_command() -> None:
     args = build_parser().parse_args(
         [
@@ -637,6 +926,29 @@ def test_parser_accepts_restricted_live_queued_worker_once_discovery_command() -
     assert args.operator_confirmed is True
     assert args.env_file is None
     assert args.discover_runtime_config is True
+    assert args.max_lag == 1
+    assert args.format == "json"
+
+
+def test_parser_accepts_restricted_live_queued_worker_once_send_only_projection_discovery_command() -> None:
+    args = build_parser().parse_args(
+        [
+            "restricted-live-queued-worker-once",
+            "--operator-confirmed",
+            "--discover-runtime-config",
+            "--send-only-runtime-projection",
+            "--max-lag",
+            "1",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert args.command == "restricted-live-queued-worker-once"
+    assert args.operator_confirmed is True
+    assert args.env_file is None
+    assert args.discover_runtime_config is True
+    assert args.send_only_runtime_projection is True
     assert args.max_lag == 1
     assert args.format == "json"
 

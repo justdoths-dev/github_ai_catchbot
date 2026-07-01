@@ -9,7 +9,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -219,6 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
     restricted_live_queued.add_argument("--operator-confirmed", action="store_true")
     restricted_live_queued.add_argument("--env-file")
     restricted_live_queued.add_argument("--discover-runtime-config", action="store_true")
+    restricted_live_queued.add_argument("--send-only-runtime-projection", action="store_true")
     restricted_live_queued.add_argument(
         "--max-lag",
         type=int,
@@ -450,11 +451,16 @@ async def _run_restricted_live_queued_worker_once_command(args: argparse.Namespa
         emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload(reason_code)))
         return 2
 
+    runtime_projection: dict[str, Any] | None = None
+    if getattr(args, "send_only_runtime_projection", False):
+        config, runtime_projection = _restricted_live_queued_send_only_projection(config)
+
     return await _run_restricted_live_queued_worker_once(
         config,
         max_lag=max_lag,
         emit_json=emit_json,
         runtime_config_locator=runtime_config_locator,
+        runtime_projection=runtime_projection,
     )
 
 
@@ -1144,6 +1150,7 @@ async def _run_restricted_live_queued_worker_once(
     max_lag: int = RESTRICTED_LIVE_QUEUED_WORKER_ONCE_DEFAULT_MAX_LAG,
     emit_json=print,
     runtime_config_locator: Mapping[str, Any] | None = None,
+    runtime_projection: Mapping[str, Any] | None = None,
     redis_client_builder=None,
     worker_once_runner: Callable[[NotifierTelegramConfig, Callable[[str], None]], Awaitable[int]] | None = None,
 ) -> int:
@@ -1155,6 +1162,7 @@ async def _run_restricted_live_queued_worker_once(
                     guard_reason,
                     config=config,
                     runtime_config_locator=runtime_config_locator,
+                    runtime_projection=runtime_projection,
                 )
             )
         )
@@ -1166,6 +1174,7 @@ async def _run_restricted_live_queued_worker_once(
                     "invalid_max_lag",
                     config=config,
                     runtime_config_locator=runtime_config_locator,
+                    runtime_projection=runtime_projection,
                 )
             )
         )
@@ -1190,6 +1199,7 @@ async def _run_restricted_live_queued_worker_once(
                         config=config,
                         redis_metrics=redis_metrics,
                         runtime_config_locator=runtime_config_locator,
+                        runtime_projection=runtime_projection,
                     )
                 )
             )
@@ -1208,6 +1218,7 @@ async def _run_restricted_live_queued_worker_once(
                         config=config,
                         redis_metrics=redis_metrics,
                         runtime_config_locator=runtime_config_locator,
+                        runtime_projection=runtime_projection,
                     )
                 )
             )
@@ -1220,6 +1231,7 @@ async def _run_restricted_live_queued_worker_once(
                         config=config,
                         redis_metrics=redis_metrics,
                         runtime_config_locator=runtime_config_locator,
+                        runtime_projection=runtime_projection,
                     )
                 )
             )
@@ -1232,6 +1244,7 @@ async def _run_restricted_live_queued_worker_once(
                         config=config,
                         redis_metrics=redis_metrics,
                         runtime_config_locator=runtime_config_locator,
+                        runtime_projection=runtime_projection,
                     )
                 )
             )
@@ -1244,6 +1257,7 @@ async def _run_restricted_live_queued_worker_once(
                         config=config,
                         redis_metrics=redis_metrics,
                         runtime_config_locator=runtime_config_locator,
+                        runtime_projection=runtime_projection,
                     )
                 )
             )
@@ -1260,6 +1274,7 @@ async def _run_restricted_live_queued_worker_once(
                         config=config,
                         redis_metrics=redis_metrics,
                         runtime_config_locator=runtime_config_locator,
+                        runtime_projection=runtime_projection,
                     )
                 )
             )
@@ -1272,6 +1287,7 @@ async def _run_restricted_live_queued_worker_once(
             worker_code=worker_code,
             worker_payload=worker_payload,
             runtime_config_locator=runtime_config_locator,
+            runtime_projection=runtime_projection,
         )
         emit_json(_to_json(payload))
         if payload["status"] in {"pass", "noop"}:
@@ -1285,6 +1301,7 @@ async def _run_restricted_live_queued_worker_once(
                     config=config,
                     redis_metrics=redis_metrics,
                     runtime_config_locator=runtime_config_locator,
+                    runtime_projection=runtime_projection,
                 )
             )
         )
@@ -2120,6 +2137,7 @@ def _restricted_live_queued_worker_once_rejected_payload(
     config: NotifierTelegramConfig | None = None,
     redis_metrics: _RedisGroupMetrics | None = None,
     runtime_config_locator: Mapping[str, Any] | None = None,
+    runtime_projection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _restricted_live_queued_worker_once_base_payload(
         status="rejected",
@@ -2127,6 +2145,7 @@ def _restricted_live_queued_worker_once_rejected_payload(
         config=config,
         redis_metrics=redis_metrics,
         runtime_config_locator=runtime_config_locator,
+        runtime_projection=runtime_projection,
     )
 
 
@@ -2136,6 +2155,7 @@ def _restricted_live_queued_worker_once_noop_payload(
     config: NotifierTelegramConfig,
     redis_metrics: _RedisGroupMetrics,
     runtime_config_locator: Mapping[str, Any] | None = None,
+    runtime_projection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _restricted_live_queued_worker_once_base_payload(
         status="noop",
@@ -2143,6 +2163,7 @@ def _restricted_live_queued_worker_once_noop_payload(
         config=config,
         redis_metrics=redis_metrics,
         runtime_config_locator=runtime_config_locator,
+        runtime_projection=runtime_projection,
     )
 
 
@@ -2152,6 +2173,7 @@ def _restricted_live_queued_worker_once_failure_payload(
     config: NotifierTelegramConfig | None,
     redis_metrics: _RedisGroupMetrics | None = None,
     runtime_config_locator: Mapping[str, Any] | None = None,
+    runtime_projection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _restricted_live_queued_worker_once_base_payload(
         status="fail",
@@ -2159,6 +2181,7 @@ def _restricted_live_queued_worker_once_failure_payload(
         config=config,
         redis_metrics=redis_metrics,
         runtime_config_locator=runtime_config_locator,
+        runtime_projection=runtime_projection,
     )
 
 
@@ -2169,6 +2192,7 @@ def _restricted_live_queued_worker_once_result_payload(
     worker_code: int,
     worker_payload: dict[str, Any],
     runtime_config_locator: Mapping[str, Any] | None = None,
+    runtime_projection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     worker_status = _safe_output_token(worker_payload.get("status"), "unknown")
     worker_reason = _safe_output_token(worker_payload.get("reason_code"), "unknown")
@@ -2199,6 +2223,7 @@ def _restricted_live_queued_worker_once_result_payload(
         redis_metrics=redis_metrics,
         worker_payload=worker_payload,
         runtime_config_locator=runtime_config_locator,
+        runtime_projection=runtime_projection,
     )
     payload["worker_once"] = worker_once
     if status == "pass":
@@ -2218,6 +2243,7 @@ def _restricted_live_queued_worker_once_base_payload(
     redis_metrics: _RedisGroupMetrics | None = None,
     worker_payload: dict[str, Any] | None = None,
     runtime_config_locator: Mapping[str, Any] | None = None,
+    runtime_projection: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "schema_version": RESTRICTED_LIVE_QUEUED_WORKER_ONCE_SCHEMA_VERSION,
@@ -2232,7 +2258,25 @@ def _restricted_live_queued_worker_once_base_payload(
     }
     if runtime_config_locator is not None:
         payload["runtime_config_locator"] = dict(runtime_config_locator)
+    if runtime_projection is not None:
+        payload["runtime_projection"] = dict(runtime_projection)
     return payload
+
+
+def _restricted_live_queued_send_only_projection(
+    config: NotifierTelegramConfig,
+) -> tuple[NotifierTelegramConfig, dict[str, Any]]:
+    projected = replace(config, allow_edits=False)
+    return projected, {
+        "mode": "send_only",
+        "requested": True,
+        "applied": True,
+        "source_allow_edits_enabled": bool(config.allow_edits),
+        "effective_allow_edits": bool(projected.allow_edits),
+        "env_mutated": False,
+        "values_printed": False,
+        "paths_printed": False,
+    }
 
 
 def _restricted_live_queued_worker_once_authority(
