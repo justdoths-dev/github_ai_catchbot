@@ -71,6 +71,7 @@ async def test_explicit_delivery_replay_preserves_upstream_and_notifier_owned_ro
     )
     event = outbox_event(
         "replay.requested.v1",
+        aggregate_type="replay_request",
         aggregate_id=replay_request_id,
         payload_json={
             "replay_request_id": str(replay_request_id),

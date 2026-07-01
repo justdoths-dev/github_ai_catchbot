@@ -16,6 +16,24 @@ _UUID_TEXT_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
+_DB_REDIS_URL_TEXT_RE = re.compile(
+    r"\b(?:postgres(?:ql)?(?:\+[A-Za-z0-9_]+)?|redis(?:\+[A-Za-z0-9_]+)?)://[^\s<>)\"']+",
+    flags=re.IGNORECASE,
+)
+_HTTP_URL_TEXT_RE = re.compile(r"https?://[^\s<>)\"']+", flags=re.IGNORECASE)
+_SENSITIVE_TEXT_RE = re.compile(
+    r"\b(?:DATABASE_URL|REDIS_URL|OPENAI_API_KEY|TELEGRAM_BOT_TOKEN|"
+    r"runtime\.env|secret|token|password|credential|api[_-]?key)\b",
+    flags=re.IGNORECASE,
+)
+_EXCEPTION_TEXT_RE = re.compile(
+    r"\b(?:Traceback|OperationalError|RuntimeError|ValueError|Exception)\b[^\n]*",
+    flags=re.IGNORECASE,
+)
+_RAW_PAYLOAD_TEXT_RE = re.compile(
+    r"(?:\"?payload_json\"?\s*:|\"?source_text_surface\"?\s*:|raw source text)",
+    flags=re.IGNORECASE,
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -37,6 +55,10 @@ class NotificationRenderer:
         self._entity_builder = entity_builder or TelegramEntityBuilder()
         self._keyboard_builder = keyboard_builder or InlineKeyboardBuilder()
         self._max_message_chars = max_message_chars
+
+    @property
+    def max_message_chars(self) -> int:
+        return self._max_message_chars
 
     def render(self, *, notification_plan_id: UUID, payload: RenderInput) -> NotificationRenderDraft:
         analysis = payload.analysis
@@ -132,4 +154,9 @@ def _safe_candidate_label(candidate: CandidateRenderContext | None) -> str | Non
 
 
 def _redact_message_text(text: str) -> str:
-    return _UUID_TEXT_RE.sub("[redacted-id]", text)
+    redacted = _EXCEPTION_TEXT_RE.sub("[redacted-error]", text)
+    redacted = _DB_REDIS_URL_TEXT_RE.sub("[redacted-runtime-url]", redacted)
+    redacted = _HTTP_URL_TEXT_RE.sub("[redacted-url]", redacted)
+    redacted = _UUID_TEXT_RE.sub("[redacted-id]", redacted)
+    redacted = _RAW_PAYLOAD_TEXT_RE.sub("[redacted-payload]", redacted)
+    return _SENSITIVE_TEXT_RE.sub("[redacted-sensitive]", redacted)

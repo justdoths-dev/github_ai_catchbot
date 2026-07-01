@@ -129,7 +129,13 @@ async def test_suppress_path_does_not_call_telegram() -> None:
 async def test_same_material_idempotency_prevents_duplicate_plan_row() -> None:
     repository, intent = repo_with_valid_case()
 
-    await service(repository).handle_intent(intent)
-    await service(repository).handle_intent(replace(intent, notification_plan_id=uuid4()))
+    first = await service(repository).handle_intent(intent)
+    second = await service(repository).handle_intent(replace(intent, notification_plan_id=uuid4()))
 
+    assert first is not None
+    assert second is not None
+    assert second.transport_error_code == "notification_existing_suppressed_noop"
     assert len(repository.plans) == 1
+    assert len(repository.renders) == 1
+    assert len(repository.delivery_records) == 1
+    assert len(repository.delivery_outbox) == 1

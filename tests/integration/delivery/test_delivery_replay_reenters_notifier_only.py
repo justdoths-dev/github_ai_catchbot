@@ -28,6 +28,7 @@ async def test_replay_requested_routes_to_replay_and_delivery_replay_reenters_no
     )
     replay_event = outbox_event(
         "replay.requested.v1",
+        aggregate_type="replay_request",
         aggregate_id=replay_request_id,
         payload_json={
             "replay_request_id": str(replay_request_id),

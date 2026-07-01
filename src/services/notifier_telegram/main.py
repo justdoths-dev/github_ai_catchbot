@@ -50,9 +50,21 @@ NOTIFICATION_UX_SECRET_WORDS = (
     "TELEGRAM_BOT_TOKEN",
 )
 NOTIFICATION_UX_URL_RE = re.compile(r"https?://[^\s<>)\"']+")
+NOTIFICATION_UX_DB_REDIS_URL_RE = re.compile(
+    r"\b(?:postgres(?:ql)?(?:\+[A-Za-z0-9_]+)?|redis(?:\+[A-Za-z0-9_]+)?)://[^\s<>)\"']+",
+    flags=re.IGNORECASE,
+)
 NOTIFICATION_UX_UUID_RE = re.compile(
     r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+NOTIFICATION_UX_EXCEPTION_RE = re.compile(
+    r"\b(?:Traceback|OperationalError|RuntimeError|ValueError|Exception)\b",
+    flags=re.IGNORECASE,
+)
+NOTIFICATION_UX_TOKENLIKE_RE = re.compile(
+    r"\b(?:secret|token|password|credential|api[_-]?key)\b",
+    flags=re.IGNORECASE,
 )
 SEND_DISABLED_PROOF_SETUP_REJECTION_REASONS = {
     "source_notification_plan_missing",
@@ -725,6 +737,7 @@ async def build_notification_ux_render_preview_payload(
         verdict=analysis.verdict,
         urgency_profile=urgency_profile,
         candidate=candidate,
+        message_char_limit=renderer.max_message_chars,
     )
     failed = [name for name, passed in checks.items() if not passed]
     payload = {
@@ -733,7 +746,7 @@ async def build_notification_ux_render_preview_payload(
         "reason_code": "ok" if not failed else "render_preview_checks_failed",
         "checks_failed": failed,
         "checks": checks,
-        "render_summary": _notification_ux_render_summary(render),
+        "render_summary": _notification_ux_render_summary(render, message_char_limit=renderer.max_message_chars),
         "authority": _notification_ux_preview_authority(),
     }
     if selection is not None:
@@ -2780,9 +2793,13 @@ def _notification_ux_preview_base_checks(
         "candidate_found": candidate_found,
         "message_nonempty": False,
         "message_under_telegram_limit": False,
+        "message_under_configured_limit": False,
         "verdict_visible_in_first_three_lines": False,
+        "urgency_visible_in_first_three_lines": False,
         "korean_summary_marker_present": False,
         "skeptical_or_risk_marker_present": False,
+        "why_it_matters_marker_present": False,
+        "evidence_limitations_marker_present": False,
         "recommended_action_marker_present": False,
         "link_preview_disabled": False,
         "protect_content_false": False,
@@ -2793,8 +2810,11 @@ def _notification_ux_preview_base_checks(
         "primary_url_not_in_message_text_when_button_exists": False,
         "source_url_not_in_message_text_when_button_exists": False,
         "no_url_in_message_text": False,
+        "no_db_or_redis_url_in_message_text": False,
         "no_uuid_in_message_text": False,
         "no_sensitive_markers_in_message_text": False,
+        "no_sensitive_marker_or_error_body_in_message_text": False,
+        "no_source_or_raw_json_in_message_text": False,
     }
 
 
@@ -2805,6 +2825,7 @@ def _notification_ux_render_checks(
     verdict: str,
     urgency_profile: str,
     candidate,
+    message_char_limit: int,
 ) -> dict[str, bool]:
     first_lines = _first_nonempty_lines(message_text)
     buttons = _notification_ux_url_buttons(render.reply_markup_json)
@@ -2815,6 +2836,7 @@ def _notification_ux_render_checks(
     source_button_exists = bool(source_url and source_url in button_urls)
     github_primary = bool(primary_url and _is_github_url(primary_url)) or candidate.primary_artifact_type == "github_repo"
     sensitive_text = message_text.lower()
+    source_text = _string_from_row(getattr(candidate, "source_text_surface", None))
     return {
         "plan_found": True,
         "analysis_found": True,
@@ -2822,9 +2844,13 @@ def _notification_ux_render_checks(
         "candidate_found": True,
         "message_nonempty": bool(message_text.strip()),
         "message_under_telegram_limit": len(message_text) <= 4096,
+        "message_under_configured_limit": len(message_text) <= message_char_limit,
         "verdict_visible_in_first_three_lines": any(verdict and verdict in line for line in first_lines[:3]),
+        "urgency_visible_in_first_three_lines": any(urgency_profile and urgency_profile in line for line in first_lines[:3]),
         "korean_summary_marker_present": "한줄 요약:" in message_text or "요약:" in message_text,
         "skeptical_or_risk_marker_present": "냉정 평가:" in message_text or "리스크:" in message_text,
+        "why_it_matters_marker_present": "왜 볼만한가:" in message_text or "근거:" in message_text,
+        "evidence_limitations_marker_present": "증거 한계:" in message_text,
         "recommended_action_marker_present": "추천 행동:" in message_text,
         "link_preview_disabled": render.link_preview_options_json == {"is_disabled": True},
         "protect_content_false": render.protect_content is False,
@@ -2847,18 +2873,29 @@ def _notification_ux_render_checks(
             source_url not in message_text if source_button_exists and source_url else True
         ),
         "no_url_in_message_text": NOTIFICATION_UX_URL_RE.search(message_text) is None,
+        "no_db_or_redis_url_in_message_text": NOTIFICATION_UX_DB_REDIS_URL_RE.search(message_text) is None,
         "no_uuid_in_message_text": NOTIFICATION_UX_UUID_RE.search(message_text) is None,
         "no_sensitive_markers_in_message_text": not any(
             word.lower() in sensitive_text for word in NOTIFICATION_UX_SECRET_WORDS
         ),
+        "no_sensitive_marker_or_error_body_in_message_text": (
+            NOTIFICATION_UX_TOKENLIKE_RE.search(message_text) is None
+            and NOTIFICATION_UX_EXCEPTION_RE.search(message_text) is None
+        ),
+        "no_source_or_raw_json_in_message_text": (
+            "payload_json" not in sensitive_text
+            and "source_text_surface" not in sensitive_text
+            and (source_text is None or source_text not in message_text)
+        ),
     }
 
 
-def _notification_ux_render_summary(render) -> dict[str, Any]:
+def _notification_ux_render_summary(render, *, message_char_limit: int) -> dict[str, Any]:
     buttons = _notification_ux_url_buttons(render.reply_markup_json)
     return {
         "render_hash_suffix": render.render_hash[-8:],
         "message_char_count": len(render.message_text),
+        "configured_message_char_limit": message_char_limit,
         "first_nonempty_lines": [_sanitize_notification_ux_line(line) for line in _first_nonempty_lines(render.message_text)[:5]],
         "button_count": len(buttons),
         "button_labels": [button["text"] for button in buttons],
@@ -2893,8 +2930,11 @@ def _first_nonempty_lines(message_text: str) -> list[str]:
 
 
 def _sanitize_notification_ux_line(line: str) -> str:
-    sanitized = NOTIFICATION_UX_UUID_RE.sub("[redacted-id]", line)
+    sanitized = NOTIFICATION_UX_EXCEPTION_RE.sub("[redacted-error]", line)
+    sanitized = NOTIFICATION_UX_DB_REDIS_URL_RE.sub("[redacted-runtime-url]", sanitized)
+    sanitized = NOTIFICATION_UX_UUID_RE.sub("[redacted-id]", sanitized)
     sanitized = NOTIFICATION_UX_URL_RE.sub("[redacted-url]", sanitized)
+    sanitized = NOTIFICATION_UX_TOKENLIKE_RE.sub("[redacted-sensitive]", sanitized)
     for word in NOTIFICATION_UX_SECRET_WORDS:
         sanitized = re.sub(re.escape(word), "[redacted-sensitive-marker]", sanitized, flags=re.IGNORECASE)
     return sanitized[:180]

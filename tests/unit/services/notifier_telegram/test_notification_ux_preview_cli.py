@@ -118,12 +118,20 @@ async def test_preview_passes_for_later_normal_silent_github_button_without_raw_
     assert payload["status"] == "pass"
     assert payload["checks_failed"] == []
     assert payload["checks"]["verdict_visible_in_first_three_lines"] is True
+    assert payload["checks"]["urgency_visible_in_first_three_lines"] is True
     assert payload["checks"]["korean_summary_marker_present"] is True
     assert payload["checks"]["skeptical_or_risk_marker_present"] is True
+    assert payload["checks"]["why_it_matters_marker_present"] is True
+    assert payload["checks"]["evidence_limitations_marker_present"] is True
     assert payload["checks"]["recommended_action_marker_present"] is True
+    assert payload["checks"]["message_under_configured_limit"] is True
     assert payload["checks"]["link_preview_disabled"] is True
     assert payload["checks"]["protect_content_false"] is True
     assert payload["checks"]["primary_url_not_in_message_text_when_button_exists"] is True
+    assert payload["checks"]["no_db_or_redis_url_in_message_text"] is True
+    assert payload["checks"]["no_sensitive_marker_or_error_body_in_message_text"] is True
+    assert payload["checks"]["no_source_or_raw_json_in_message_text"] is True
+    assert payload["render_summary"]["message_char_count"] <= payload["render_summary"]["configured_message_char_limit"]
     assert payload["render_summary"]["disable_notification"] is True
     assert payload["render_summary"]["protect_content"] is False
     assert payload["render_summary"]["link_preview_disabled"] is True
@@ -361,8 +369,57 @@ async def test_preview_command_sanitizes_ids_urls_db_paths_source_text_and_secre
     assert db_url not in output
     assert str(env_file) not in output
     assert raw_source_text not in output
-    for forbidden in ("DATABASE_URL", "TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY", "secret", "token", "pass" + "word"):
+    for forbidden in (
+        "DATABASE_URL",
+        "TELEGRAM_BOT_TOKEN",
+        "OPENAI_API_KEY",
+        "secret",
+        "token",
+        "payload_json",
+        "Traceback",
+        "pass" + "word",
+    ):
         assert forbidden not in output
+
+
+@pytest.mark.asyncio
+async def test_preview_accepts_redacted_runtime_payload_and_exception_markers_without_raw_output() -> None:
+    raw_uuid = str(uuid4())
+    raw_db_url = "postgresql+psycopg" + "://user:pass" + "word@db.internal/catchbot"
+    raw_redis_url = "redis" + "://:pass" + "word@redis.internal/0"
+    raw_source_text = "raw source text must not be emitted"
+    repository, plan_id = _preview_repository(
+        source_text_surface=raw_source_text,
+        summary=f"개발자 도구 후보입니다. {raw_uuid}",
+        skeptical=f"Traceback OperationalError {raw_db_url}",
+        why=f"반복 검토 시간을 줄일 수 있습니다. {raw_redis_url}",
+    )
+    emitted: list[str] = []
+
+    code = await run_notification_ux_render_preview_with_repository(plan_id, repository, emit_json=emitted.append)
+    payload = json.loads(emitted[0])
+
+    assert code == 0
+    assert payload["status"] == "pass"
+    assert payload["checks"]["no_uuid_in_message_text"] is True
+    assert payload["checks"]["no_db_or_redis_url_in_message_text"] is True
+    assert payload["checks"]["no_sensitive_marker_or_error_body_in_message_text"] is True
+    assert payload["checks"]["no_source_or_raw_json_in_message_text"] is True
+    assert payload["checks_failed"] == []
+    for raw in (
+        raw_uuid,
+        raw_db_url,
+        raw_redis_url,
+        raw_source_text,
+        "payload_json",
+        "DATABASE_URL",
+        "REDIS_URL",
+        "Traceback",
+        "OperationalError",
+        "pass" + "word",
+        "tok" + "en",
+    ):
+        assert raw not in emitted[0]
 
 
 @pytest.mark.asyncio
@@ -393,10 +450,10 @@ async def test_preview_sanitizes_uuid_and_raw_urls_from_readback_lines() -> None
     payload = json.loads(emitted[0])
     serialized = json.dumps(payload, ensure_ascii=False)
 
-    assert code == 1
-    assert payload["status"] == "fail"
-    assert payload["checks"]["no_url_in_message_text"] is False
-    assert "no_url_in_message_text" in payload["checks_failed"]
+    assert code == 0
+    assert payload["status"] == "pass"
+    assert payload["checks"]["no_url_in_message_text"] is True
+    assert payload["checks_failed"] == []
     assert raw_url not in serialized
     assert raw_uuid not in serialized
     assert "[redacted-url]" in serialized
@@ -436,6 +493,7 @@ def _preview_repository(
     source_text_surface: str = "raw source text should not be emitted",
     summary: str = "로컬 개발 워크플로우를 줄이는 GitHub 도구입니다.",
     skeptical: str = "유지보수와 실제 사용 흔적은 추가 확인이 필요합니다.",
+    why: str = "반복적인 개발 도구 검토 시간을 줄일 수 있습니다.",
 ) -> tuple[FakeRepository, UUID]:
     repository = repository or FakeRepository()
     plan_id = uuid4()
@@ -474,7 +532,7 @@ def _preview_repository(
             "headline": "Useful repo",
             "summary_one_line_ko": summary,
             "skeptical_take_ko": skeptical,
-            "why_it_might_matter_ko": "반복적인 개발 도구 검토 시간을 줄일 수 있습니다.",
+            "why_it_might_matter_ko": why,
         },
         model_confidence_band="medium",
     )

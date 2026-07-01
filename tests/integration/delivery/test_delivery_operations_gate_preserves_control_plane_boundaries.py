@@ -57,4 +57,4 @@ async def test_delivery_operations_gate_report_generation_is_read_only() -> None
     assert repository.notification_plan_mutations == 0
     assert repository.notification_delivery_record_mutations == 0
     assert "delivery_gate_open_dlq_present" in report.blocking_reason_codes
-    assert "delivery_gate_prod_replay_guard_rejects_present" in report.blocking_reason_codes
+    assert "delivery_gate_replay_guard_rejects_present" in report.blocking_reason_codes
