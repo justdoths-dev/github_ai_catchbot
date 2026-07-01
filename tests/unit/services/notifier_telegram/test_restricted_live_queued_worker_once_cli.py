@@ -28,12 +28,20 @@ from tests.unit.services.notifier_telegram._service_fakes import config as base_
 RUNTIME_ENV_KEYS = (
     "APP_ENV",
     "DATABASE_URL",
+    "DATABASE_URL_FILE",
     "REDIS_URL",
+    "REDIS_URL_FILE",
     "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN_FILE",
     "TELEGRAM_API_BASE_URL",
     "ENABLE_NOTIFICATION_SEND",
     "NOTIFIER_TELEGRAM_DRY_RUN",
     "NOTIFIER_TELEGRAM_ALLOW_EDITS",
+    "NOTIFIER_TELEGRAM_MAX_MESSAGE_CHARS",
+    "NOTIFIER_TELEGRAM_EDIT_WINDOW_MINUTES",
+    "NOTIFIER_TELEGRAM_REQUEST_TIMEOUT_SEC",
+    "ENABLE_DIGEST_RUNTIME",
+    "LOG_LEVEL",
     "NOTIFIER_TELEGRAM_QUEUE_NAME",
     "NOTIFIER_TELEGRAM_CONSUMER_GROUP",
     "NOTIFIER_TELEGRAM_CONSUMER_NAME",
@@ -76,13 +84,17 @@ def _write_env_file(tmp_path, **overrides: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_command_rejects_without_operator_confirmation() -> None:
+async def test_command_rejects_without_operator_confirmation(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_if_discovery_runs(args):
+        del args
+        raise AssertionError("runtime config discovery must not run before operator confirmation")
+
+    monkeypatch.setattr(notifier_main, "_load_restricted_live_queued_runtime_config", fail_if_discovery_runs)
     emitted: list[str] = []
     args = build_parser().parse_args(
         [
             "restricted-live-queued-worker-once",
-            "--env-file",
-            "/tmp/notifier-runtime.env",
+            "--discover-runtime-config",
             "--format",
             "json",
         ]
@@ -99,7 +111,12 @@ async def test_command_rejects_without_operator_confirmation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_command_rejects_without_env_file() -> None:
+async def test_command_rejects_without_env_file_or_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_if_config_loads(args):
+        del args
+        raise AssertionError("runtime config must not load without env-file or discovery")
+
+    monkeypatch.setattr(notifier_main, "_load_notifier_one_shot_runtime_config", fail_if_config_loads)
     emitted: list[str] = []
     args = build_parser().parse_args(
         [
@@ -116,6 +133,7 @@ async def test_command_rejects_without_env_file() -> None:
     assert code == 2
     assert payload["status"] == "rejected"
     assert payload["reason_code"] == "env_file_required"
+    assert "runtime_config_locator" not in payload
 
 
 @pytest.mark.asyncio
@@ -139,6 +157,189 @@ async def test_command_rejects_send_disabled_config(tmp_path, monkeypatch: pytes
     assert code == 2
     assert payload["status"] == "rejected"
     assert payload["reason_code"] == "notification_send_disabled"
+    assert "runtime_config_locator" not in payload
+
+
+@pytest.mark.asyncio
+async def test_discover_runtime_config_from_bounded_candidate_file_emits_sanitized_locator(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    db_url = "postgresql+psycopg" + "://unit:dbpass@db.internal/catchbot"
+    redis_url = "redis" + "://:redispass@redis.internal/0"
+    telegram_token = "123456:unit-live-token-value"
+    db_secret = tmp_path / "db-secret-value.txt"
+    redis_secret = tmp_path / "redis-secret-value.txt"
+    telegram_secret = tmp_path / "telegram-secret-value.txt"
+    db_secret.write_text(db_url, encoding="utf-8")
+    redis_secret.write_text(redis_url, encoding="utf-8")
+    telegram_secret.write_text(telegram_token, encoding="utf-8")
+    env_file = tmp_path / "nested" / "github_ai_catchbot.runtime.env"
+    env_file.parent.mkdir()
+    env_file.write_text(
+        "\n".join(
+            [
+                "IGNORED_SECRET_MARKER=do-not-read",
+                "APP_ENV=prod",
+                f"DATABASE_URL_FILE={db_secret}",
+                f"REDIS_URL_FILE={redis_secret}",
+                f"TELEGRAM_BOT_TOKEN_FILE={telegram_secret}",
+                "TELEGRAM_API_BASE_URL=https://api.telegram.org",
+                "ENABLE_NOTIFICATION_SEND=true",
+                "NOTIFIER_TELEGRAM_DRY_RUN=false",
+                "NOTIFIER_TELEGRAM_ALLOW_EDITS=false",
+                "NOTIFIER_TELEGRAM_QUEUE_NAME=q.notification.send",
+                "NOTIFIER_TELEGRAM_CONSUMER_GROUP=notifier-telegram",
+                "NOTIFIER_TELEGRAM_CONSUMER_NAME=notifier-telegram-operator",
+                "NOTIFIER_TELEGRAM_BATCH_SIZE=1",
+                "NOTIFIER_TELEGRAM_BLOCK_MS=500",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    redis = FakeRedis(pending=0, lag=0)
+    seen_redis_urls: list[str] = []
+
+    def fake_redis_builder(value: str):
+        seen_redis_urls.append(value)
+        return redis
+
+    monkeypatch.setattr(notifier_main, "_build_send_disabled_proof_redis_client", fake_redis_builder)
+    emitted: list[str] = []
+    args = build_parser().parse_args(
+        [
+            "restricted-live-queued-worker-once",
+            "--operator-confirmed",
+            "--discover-runtime-config",
+            "--max-lag",
+            "1",
+            "--format",
+            "json",
+        ]
+    )
+    args._restricted_live_queued_worker_once_process_env = {}
+    args._restricted_live_queued_worker_once_discovery_roots = [tmp_path]
+
+    code = await _run_restricted_live_queued_worker_once_command(args, emit_json=emitted.append)
+    payload = json.loads(emitted[0])
+
+    assert code == 0
+    assert payload["status"] == "noop"
+    assert payload["reason_code"] == "no_queued_message"
+    assert payload["runtime_config_locator"] == {
+        "process_env_checked": True,
+        "process_env_used": False,
+        "bounded_candidate_file_count": 1,
+        "bounded_candidate_files_with_runtime_config_key_count": 1,
+        "database_config_present": True,
+        "redis_config_present": True,
+        "telegram_bot_token_present": True,
+        "paths_printed": False,
+        "values_printed": False,
+    }
+    assert payload["redis_precheck"] == {"pending": 0, "lag": 0, "reason_code": None}
+    assert seen_redis_urls == [redis_url]
+
+    serialized = emitted[0]
+    for forbidden in [
+        str(env_file),
+        str(db_secret),
+        str(redis_secret),
+        str(telegram_secret),
+        db_url,
+        redis_url,
+        telegram_token,
+        "https://api.telegram.org",
+        "IGNORED_SECRET_MARKER",
+        "do-not-read",
+        "Traceback",
+        "RAW_PRIVATE_STDERR",
+        "Exception(",
+        "TELEGRAM_BOT_TOKEN_FILE",
+        "DATABASE_URL_FILE",
+        "REDIS_URL_FILE",
+    ]:
+        assert forbidden not in serialized
+
+
+@pytest.mark.asyncio
+async def test_discover_runtime_config_failure_is_sanitized_before_redis_or_worker(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_runtime_env(monkeypatch)
+    db_url = "postgresql+psycopg" + "://unit:password@db.internal/catchbot"
+    env_file = tmp_path / "github_ai_catchbot.runtime.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "APP_ENV=prod",
+                "DATABASE_URL=" + db_url,
+                "REDIS_URL_FILE=" + str(tmp_path / "missing-redis-secret-RAW_PRIVATE_STDERR"),
+                "TELEGRAM_BOT_TOKEN_FILE=" + str(tmp_path / "missing-telegram-token-secret"),
+                "TELEGRAM_API_BASE_URL=https://api.telegram.org",
+                "ENABLE_NOTIFICATION_SEND=true",
+                "NOTIFIER_TELEGRAM_DRY_RUN=false",
+                "NOTIFIER_TELEGRAM_ALLOW_EDITS=false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(notifier_main, "_build_send_disabled_proof_redis_client", _unused_redis_builder)
+    emitted: list[str] = []
+    args = build_parser().parse_args(
+        [
+            "restricted-live-queued-worker-once",
+            "--operator-confirmed",
+            "--discover-runtime-config",
+            "--max-lag",
+            "1",
+            "--format",
+            "json",
+        ]
+    )
+    args._restricted_live_queued_worker_once_process_env = {}
+    args._restricted_live_queued_worker_once_discovery_roots = [tmp_path]
+
+    code = await _run_restricted_live_queued_worker_once_command(args, emit_json=emitted.append)
+    payload = json.loads(emitted[0])
+
+    assert code == 2
+    assert payload["status"] == "rejected"
+    assert payload["reason_code"] == "runtime_config_not_found"
+    assert payload["redis_precheck"] == {"pending": None, "lag": None, "reason_code": None}
+    assert payload["authority"]["database_session_opened"] is False
+    assert payload["runtime_config_locator"] == {
+        "process_env_checked": True,
+        "process_env_used": False,
+        "bounded_candidate_file_count": 1,
+        "bounded_candidate_files_with_runtime_config_key_count": 1,
+        "database_config_present": True,
+        "redis_config_present": True,
+        "telegram_bot_token_present": True,
+        "paths_printed": False,
+        "values_printed": False,
+    }
+
+    serialized = emitted[0]
+    for forbidden in [
+        str(env_file),
+        str(tmp_path),
+        db_url,
+        "redis://",
+        "123456:",
+        "password",
+        "RAW_PRIVATE_STDERR",
+        "missing-redis-secret",
+        "missing-telegram-token-secret",
+        "https://api.telegram.org",
+        "Traceback",
+        "env_file_redis_url_file_missing",
+        "env_file_telegram_bot_token_file_missing",
+    ]:
+        assert forbidden not in serialized
 
 
 @pytest.mark.asyncio
@@ -415,6 +616,27 @@ def test_parser_accepts_restricted_live_queued_worker_once_command() -> None:
     assert args.command == "restricted-live-queued-worker-once"
     assert args.operator_confirmed is True
     assert args.env_file == "/tmp/notifier-runtime.env"
+    assert args.max_lag == 1
+    assert args.format == "json"
+
+
+def test_parser_accepts_restricted_live_queued_worker_once_discovery_command() -> None:
+    args = build_parser().parse_args(
+        [
+            "restricted-live-queued-worker-once",
+            "--operator-confirmed",
+            "--discover-runtime-config",
+            "--max-lag",
+            "1",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert args.command == "restricted-live-queued-worker-once"
+    assert args.operator_confirmed is True
+    assert args.env_file is None
+    assert args.discover_runtime_config is True
     assert args.max_lag == 1
     assert args.format == "json"
 

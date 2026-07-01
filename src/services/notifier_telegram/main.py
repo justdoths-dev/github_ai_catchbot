@@ -79,6 +79,7 @@ ONE_SHOT_RUNTIME_CONFIG_REASON_CODES = {
     "env_file_redis_url_file_empty",
     "env_file_telegram_bot_token_file_missing",
     "env_file_telegram_bot_token_file_empty",
+    "runtime_config_not_found",
     "runtime_database_config_not_found",
     "notifier_runtime_config_error",
 }
@@ -151,6 +152,18 @@ class _NotificationUxPreviewRuntimeConfigResult:
     locator: dict[str, Any]
 
 
+@dataclass(slots=True, frozen=True)
+class _RestrictedLiveQueuedRuntimeConfigResult:
+    config: NotifierTelegramConfig
+    locator: dict[str, Any]
+
+
+class _RestrictedLiveQueuedRuntimeConfigDiscoveryError(_NotifierOneShotRuntimeConfigError):
+    def __init__(self, reason_code: str, locator: Mapping[str, Any]) -> None:
+        super().__init__(reason_code)
+        self.locator = dict(locator)
+
+
 def _build_logger(level: str) -> logging.Logger:
     logging.basicConfig(level=getattr(logging, level, logging.INFO))
     return logging.getLogger("notifier-telegram")
@@ -205,6 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
     restricted_live_queued = subcommands.add_parser("restricted-live-queued-worker-once")
     restricted_live_queued.add_argument("--operator-confirmed", action="store_true")
     restricted_live_queued.add_argument("--env-file")
+    restricted_live_queued.add_argument("--discover-runtime-config", action="store_true")
     restricted_live_queued.add_argument(
         "--max-lag",
         type=int,
@@ -402,7 +416,8 @@ async def _run_restricted_live_queued_worker_once_command(args: argparse.Namespa
         emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload("operator_confirmation_required")))
         return 2
 
-    if not getattr(args, "env_file", None):
+    discover_runtime_config = bool(getattr(args, "discover_runtime_config", False))
+    if not getattr(args, "env_file", None) and not discover_runtime_config:
         emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload("env_file_required")))
         return 2
 
@@ -411,8 +426,25 @@ async def _run_restricted_live_queued_worker_once_command(args: argparse.Namespa
         emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload("invalid_max_lag")))
         return 2
 
+    runtime_config_locator: dict[str, Any] | None = None
     try:
-        config = _load_notifier_one_shot_runtime_config(args)
+        if discover_runtime_config:
+            config_result = _load_restricted_live_queued_runtime_config(args)
+            config = config_result.config
+            runtime_config_locator = config_result.locator
+        else:
+            config = _load_notifier_one_shot_runtime_config(args)
+    except _RestrictedLiveQueuedRuntimeConfigDiscoveryError as exc:
+        reason_code = _one_shot_runtime_config_reason_code(exc)
+        emit_json(
+            _to_json(
+                _restricted_live_queued_worker_once_rejected_payload(
+                    reason_code,
+                    runtime_config_locator=exc.locator,
+                )
+            )
+        )
+        return 2
     except _NotifierOneShotRuntimeConfigError as exc:
         reason_code = _one_shot_runtime_config_reason_code(exc)
         emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload(reason_code)))
@@ -422,6 +454,7 @@ async def _run_restricted_live_queued_worker_once_command(args: argparse.Namespa
         config,
         max_lag=max_lag,
         emit_json=emit_json,
+        runtime_config_locator=runtime_config_locator,
     )
 
 
@@ -1110,15 +1143,32 @@ async def _run_restricted_live_queued_worker_once(
     *,
     max_lag: int = RESTRICTED_LIVE_QUEUED_WORKER_ONCE_DEFAULT_MAX_LAG,
     emit_json=print,
+    runtime_config_locator: Mapping[str, Any] | None = None,
     redis_client_builder=None,
     worker_once_runner: Callable[[NotifierTelegramConfig, Callable[[str], None]], Awaitable[int]] | None = None,
 ) -> int:
     guard_reason = _restricted_live_queued_worker_once_config_guard_reason(config)
     if guard_reason is not None:
-        emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload(guard_reason, config=config)))
+        emit_json(
+            _to_json(
+                _restricted_live_queued_worker_once_rejected_payload(
+                    guard_reason,
+                    config=config,
+                    runtime_config_locator=runtime_config_locator,
+                )
+            )
+        )
         return 2
     if max_lag < 1:
-        emit_json(_to_json(_restricted_live_queued_worker_once_rejected_payload("invalid_max_lag", config=config)))
+        emit_json(
+            _to_json(
+                _restricted_live_queued_worker_once_rejected_payload(
+                    "invalid_max_lag",
+                    config=config,
+                    runtime_config_locator=runtime_config_locator,
+                )
+            )
+        )
         return 2
 
     if redis_client_builder is None:
@@ -1139,6 +1189,7 @@ async def _run_restricted_live_queued_worker_once(
                         redis_metrics.reason_code,
                         config=config,
                         redis_metrics=redis_metrics,
+                        runtime_config_locator=runtime_config_locator,
                     )
                 )
             )
@@ -1156,6 +1207,7 @@ async def _run_restricted_live_queued_worker_once(
                         redis_metrics.reason_code,
                         config=config,
                         redis_metrics=redis_metrics,
+                        runtime_config_locator=runtime_config_locator,
                     )
                 )
             )
@@ -1167,6 +1219,7 @@ async def _run_restricted_live_queued_worker_once(
                         "redis_pending_messages_present",
                         config=config,
                         redis_metrics=redis_metrics,
+                        runtime_config_locator=runtime_config_locator,
                     )
                 )
             )
@@ -1178,6 +1231,7 @@ async def _run_restricted_live_queued_worker_once(
                         "no_queued_message",
                         config=config,
                         redis_metrics=redis_metrics,
+                        runtime_config_locator=runtime_config_locator,
                     )
                 )
             )
@@ -1189,6 +1243,7 @@ async def _run_restricted_live_queued_worker_once(
                         "queue_lag_exceeds_restricted_worker_once_limit",
                         config=config,
                         redis_metrics=redis_metrics,
+                        runtime_config_locator=runtime_config_locator,
                     )
                 )
             )
@@ -1204,6 +1259,7 @@ async def _run_restricted_live_queued_worker_once(
                         "worker_once_exception",
                         config=config,
                         redis_metrics=redis_metrics,
+                        runtime_config_locator=runtime_config_locator,
                     )
                 )
             )
@@ -1215,6 +1271,7 @@ async def _run_restricted_live_queued_worker_once(
             redis_metrics=redis_metrics,
             worker_code=worker_code,
             worker_payload=worker_payload,
+            runtime_config_locator=runtime_config_locator,
         )
         emit_json(_to_json(payload))
         if payload["status"] in {"pass", "noop"}:
@@ -1227,6 +1284,7 @@ async def _run_restricted_live_queued_worker_once(
                     "restricted_live_queued_worker_once_failed",
                     config=config,
                     redis_metrics=redis_metrics,
+                    runtime_config_locator=runtime_config_locator,
                 )
             )
         )
@@ -2061,12 +2119,14 @@ def _restricted_live_queued_worker_once_rejected_payload(
     *,
     config: NotifierTelegramConfig | None = None,
     redis_metrics: _RedisGroupMetrics | None = None,
+    runtime_config_locator: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _restricted_live_queued_worker_once_base_payload(
         status="rejected",
         reason_code=reason_code or "restricted_live_queued_worker_once_rejected",
         config=config,
         redis_metrics=redis_metrics,
+        runtime_config_locator=runtime_config_locator,
     )
 
 
@@ -2075,12 +2135,14 @@ def _restricted_live_queued_worker_once_noop_payload(
     *,
     config: NotifierTelegramConfig,
     redis_metrics: _RedisGroupMetrics,
+    runtime_config_locator: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _restricted_live_queued_worker_once_base_payload(
         status="noop",
         reason_code=reason_code,
         config=config,
         redis_metrics=redis_metrics,
+        runtime_config_locator=runtime_config_locator,
     )
 
 
@@ -2089,12 +2151,14 @@ def _restricted_live_queued_worker_once_failure_payload(
     *,
     config: NotifierTelegramConfig | None,
     redis_metrics: _RedisGroupMetrics | None = None,
+    runtime_config_locator: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _restricted_live_queued_worker_once_base_payload(
         status="fail",
         reason_code=reason_code,
         config=config,
         redis_metrics=redis_metrics,
+        runtime_config_locator=runtime_config_locator,
     )
 
 
@@ -2104,6 +2168,7 @@ def _restricted_live_queued_worker_once_result_payload(
     redis_metrics: _RedisGroupMetrics,
     worker_code: int,
     worker_payload: dict[str, Any],
+    runtime_config_locator: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     worker_status = _safe_output_token(worker_payload.get("status"), "unknown")
     worker_reason = _safe_output_token(worker_payload.get("reason_code"), "unknown")
@@ -2133,6 +2198,7 @@ def _restricted_live_queued_worker_once_result_payload(
         config=config,
         redis_metrics=redis_metrics,
         worker_payload=worker_payload,
+        runtime_config_locator=runtime_config_locator,
     )
     payload["worker_once"] = worker_once
     if status == "pass":
@@ -2151,8 +2217,9 @@ def _restricted_live_queued_worker_once_base_payload(
     config: NotifierTelegramConfig | None = None,
     redis_metrics: _RedisGroupMetrics | None = None,
     worker_payload: dict[str, Any] | None = None,
+    runtime_config_locator: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "schema_version": RESTRICTED_LIVE_QUEUED_WORKER_ONCE_SCHEMA_VERSION,
         "status": status,
         "reason_code": reason_code,
@@ -2163,6 +2230,9 @@ def _restricted_live_queued_worker_once_base_payload(
         },
         "authority": _restricted_live_queued_worker_once_authority(config, worker_payload=worker_payload),
     }
+    if runtime_config_locator is not None:
+        payload["runtime_config_locator"] = dict(runtime_config_locator)
+    return payload
 
 
 def _restricted_live_queued_worker_once_authority(
@@ -2653,15 +2723,227 @@ def _load_notifier_one_shot_runtime_config(
     env_file_overlay: dict[str, str] | None = None,
 ) -> NotifierTelegramConfig:
     env_file = getattr(args, "env_file", None)
-    if not env_file:
+    if env_file_overlay is None and not env_file:
         raise _NotifierOneShotRuntimeConfigError("env_file_no_runtime_config")
 
     overlay = env_file_overlay if env_file_overlay is not None else _resolve_one_shot_runtime_env_file_overlay(env_file)
+    return _load_notifier_one_shot_runtime_config_from_overlay(overlay)
+
+
+def _load_notifier_one_shot_runtime_config_from_overlay(overlay: Mapping[str, str]) -> NotifierTelegramConfig:
     try:
         with _temporary_environment_defaults(overlay):
             return NotifierTelegramConfig.from_env(require_transport_token=False)
     except (NotifierTelegramConfigurationError, ValueError, TypeError):
         raise _NotifierOneShotRuntimeConfigError("notifier_runtime_config_error") from None
+
+
+def _load_restricted_live_queued_runtime_config(
+    args: argparse.Namespace,
+) -> _RestrictedLiveQueuedRuntimeConfigResult:
+    process_env = getattr(args, "_restricted_live_queued_worker_once_process_env", None)
+    if process_env is None:
+        process_env = os.environ
+    discovery_roots = getattr(args, "_restricted_live_queued_worker_once_discovery_roots", None)
+
+    process_values = _one_shot_runtime_values_from_mapping(process_env)
+    process_config = _notifier_one_shot_runtime_config_from_values(process_values)
+    if process_config is not None:
+        return _RestrictedLiveQueuedRuntimeConfigResult(
+            config=process_config,
+            locator=_restricted_live_queued_runtime_config_locator(
+                process_env_used=True,
+                bounded_candidate_file_count=0,
+                bounded_candidate_files_with_runtime_config_key_count=0,
+                values=process_values,
+                config=process_config,
+            ),
+        )
+
+    env_file = getattr(args, "env_file", None)
+    if env_file:
+        try:
+            env_values = _read_minimal_env_file(str(env_file), allowed_keys=ONE_SHOT_RUNTIME_ENV_KEYS)
+        except ValueError:
+            env_values = {}
+        merged_values = _merge_one_shot_runtime_values(env_values, process_values)
+        env_config = _notifier_one_shot_runtime_config_from_values(merged_values)
+        if env_config is not None:
+            return _RestrictedLiveQueuedRuntimeConfigResult(
+                config=env_config,
+                locator=_restricted_live_queued_runtime_config_locator(
+                    process_env_used=False,
+                    bounded_candidate_file_count=0,
+                    bounded_candidate_files_with_runtime_config_key_count=0,
+                    values=merged_values,
+                    config=env_config,
+                ),
+            )
+
+    discovered = _discover_restricted_live_queued_runtime_config(
+        process_values=process_values,
+        roots=discovery_roots,
+    )
+    if discovered is not None:
+        return discovered
+
+    candidate_count, runtime_key_count, discovered_values = _count_restricted_live_runtime_candidate_files(
+        roots=discovery_roots,
+    )
+    raise _RestrictedLiveQueuedRuntimeConfigDiscoveryError(
+        "runtime_config_not_found",
+        _restricted_live_queued_runtime_config_locator(
+            process_env_used=False,
+            bounded_candidate_file_count=candidate_count,
+            bounded_candidate_files_with_runtime_config_key_count=runtime_key_count,
+            values=_merge_one_shot_runtime_values(discovered_values, process_values),
+        ),
+    )
+
+
+def _notifier_one_shot_runtime_config_from_values(values: Mapping[str, str]) -> NotifierTelegramConfig | None:
+    try:
+        overlay = _resolve_one_shot_runtime_values_overlay(values, source={})
+        return _load_notifier_one_shot_runtime_config_from_overlay(overlay)
+    except _NotifierOneShotRuntimeConfigError:
+        return None
+
+
+def _one_shot_runtime_values_from_mapping(values: Mapping[str, str]) -> dict[str, str]:
+    return {
+        key: str(values.get(key, "") or "").strip()
+        for key in ONE_SHOT_RUNTIME_ENV_KEYS
+        if str(values.get(key, "") or "").strip()
+    }
+
+
+def _merge_one_shot_runtime_values(
+    values: Mapping[str, str],
+    fallback_values: Mapping[str, str],
+) -> dict[str, str]:
+    merged = _one_shot_runtime_values_from_mapping(values)
+    for key, value in _one_shot_runtime_values_from_mapping(fallback_values).items():
+        merged[key] = value
+    return merged
+
+
+def _discover_restricted_live_queued_runtime_config(
+    *,
+    process_values: Mapping[str, str],
+    roots: list[Path] | None = None,
+) -> _RestrictedLiveQueuedRuntimeConfigResult | None:
+    candidate_count = 0
+    runtime_key_count = 0
+    for candidate in _iter_restricted_live_runtime_candidate_files(roots=roots):
+        candidate_count += 1
+        try:
+            values = _read_minimal_env_file(str(candidate), allowed_keys=ONE_SHOT_RUNTIME_ENV_KEYS)
+        except ValueError:
+            values = {}
+        runtime_values = _one_shot_runtime_values_from_mapping(values)
+        if runtime_values:
+            runtime_key_count += 1
+        config_values = _merge_one_shot_runtime_values(runtime_values, process_values)
+        config = _notifier_one_shot_runtime_config_from_values(config_values)
+        if config is not None:
+            return _RestrictedLiveQueuedRuntimeConfigResult(
+                config=config,
+                locator=_restricted_live_queued_runtime_config_locator(
+                    process_env_used=False,
+                    bounded_candidate_file_count=candidate_count,
+                    bounded_candidate_files_with_runtime_config_key_count=runtime_key_count,
+                    values=config_values,
+                    config=config,
+                ),
+            )
+    return None
+
+
+def _count_restricted_live_runtime_candidate_files(
+    *,
+    roots: list[Path] | None = None,
+) -> tuple[int, int, dict[str, str]]:
+    candidate_count = 0
+    runtime_key_count = 0
+    discovered_values: dict[str, str] = {}
+    for candidate in _iter_restricted_live_runtime_candidate_files(roots=roots):
+        candidate_count += 1
+        try:
+            values = _read_minimal_env_file(str(candidate), allowed_keys=ONE_SHOT_RUNTIME_ENV_KEYS)
+        except ValueError:
+            values = {}
+        runtime_values = _one_shot_runtime_values_from_mapping(values)
+        if runtime_values:
+            runtime_key_count += 1
+            discovered_values.update(runtime_values)
+    return candidate_count, runtime_key_count, discovered_values
+
+
+def _restricted_live_queued_runtime_config_locator(
+    *,
+    process_env_used: bool,
+    bounded_candidate_file_count: int,
+    bounded_candidate_files_with_runtime_config_key_count: int,
+    values: Mapping[str, str],
+    config: NotifierTelegramConfig | None = None,
+) -> dict[str, Any]:
+    return {
+        "process_env_checked": True,
+        "process_env_used": process_env_used,
+        "bounded_candidate_file_count": bounded_candidate_file_count,
+        "bounded_candidate_files_with_runtime_config_key_count": bounded_candidate_files_with_runtime_config_key_count,
+        "database_config_present": bool(config.database_url)
+        if config is not None
+        else _runtime_config_key_present(values, "DATABASE_URL"),
+        "redis_config_present": bool(config.redis_url)
+        if config is not None
+        else _runtime_config_key_present(values, "REDIS_URL"),
+        "telegram_bot_token_present": bool(config.telegram_bot_token)
+        if config is not None
+        else _runtime_config_key_present(values, "TELEGRAM_BOT_TOKEN"),
+        "paths_printed": False,
+        "values_printed": False,
+    }
+
+
+def _runtime_config_key_present(values: Mapping[str, str], key: str) -> bool:
+    if str(values.get(key, "") or "").strip():
+        return True
+    return bool(str(values.get(f"{key}_FILE", "") or "").strip())
+
+
+def _iter_restricted_live_runtime_candidate_files(
+    *,
+    roots: list[Path] | None = None,
+):
+    candidate_roots = roots if roots is not None else _restricted_live_runtime_candidate_roots()
+    yield from _iter_notification_ux_preview_db_runtime_candidate_files(roots=candidate_roots)
+
+
+def _restricted_live_runtime_candidate_roots() -> list[Path]:
+    repo_root = Path(__file__).resolve().parents[3]
+    roots = [
+        repo_root,
+        Path("/home/deploy"),
+        Path("/srv/catchbot"),
+        Path("/srv/github_ai_catchbot"),
+        Path("/opt/catchbot"),
+        Path("/opt/github_ai_catchbot"),
+        Path("/etc/catchbot"),
+        Path("/etc/github_ai_catchbot"),
+    ]
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except OSError:
+            resolved = root
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(root)
+    return deduped
 
 
 def _load_notification_ux_preview_config(args: argparse.Namespace) -> _NotificationUxPreviewRuntimeConfigResult:
@@ -2922,6 +3204,14 @@ def _resolve_one_shot_runtime_env_file_overlay(
         raise _NotifierOneShotRuntimeConfigError("env_file_no_runtime_config")
 
     source = os.environ if process_env is None else process_env
+    return _resolve_one_shot_runtime_values_overlay(values, source=source)
+
+
+def _resolve_one_shot_runtime_values_overlay(
+    values: Mapping[str, str],
+    *,
+    source: Mapping[str, str],
+) -> dict[str, str]:
     overlay: dict[str, str] = {}
     for key in ONE_SHOT_RUNTIME_ENV_VALUE_KEYS:
         value = values.get(key, "").strip()
