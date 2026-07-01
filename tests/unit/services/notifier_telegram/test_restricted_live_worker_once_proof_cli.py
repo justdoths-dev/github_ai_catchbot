@@ -10,12 +10,16 @@ import pytest
 
 from services.notifier_telegram.main import (
     RESTRICTED_LIVE_PROOF_SCHEMA_VERSION,
+    _RedisGroupMetrics,
+    _RestrictedLiveProofSetupResult,
+    _restricted_live_proof_result_payload,
     _run_restricted_live_worker_once_proof,
     _run_restricted_live_worker_once_proof_command,
     build_parser,
     create_restricted_live_worker_once_proof_with_repository,
 )
 from services.notifier_telegram.models import NotificationIntentJob, NotificationPlanDraft, StreamMessage
+from services.notifier_telegram.repositories import NotifierTelegramRepository
 from services.notifier_telegram.service import NotifierTelegramService
 from services.notifier_telegram.worker_once import (
     EXPECTED_QUEUE_NAME,
@@ -390,6 +394,52 @@ async def test_cli_xadds_once_invokes_worker_once_once_and_records_live_send() -
 
 
 @pytest.mark.asyncio
+async def test_restricted_live_proof_readback_prefers_final_sent_transition_when_timestamps_tie() -> None:
+    session = _RestrictedProofReadbackSession()
+    repository = NotifierTelegramRepository(session)  # type: ignore[arg-type]
+
+    verification = await repository.load_restricted_live_worker_once_proof_verification(
+        notification_plan_id=session.notification_plan_id,
+    )
+    payload = _restricted_live_proof_result_payload(
+        setup_result=_RestrictedLiveProofSetupResult(
+            notification_plan_id=session.notification_plan_id,
+            source_notification_plan_id=uuid4(),
+            trigger_event_id=uuid4(),
+        ),
+        worker_code=0,
+        worker_payload={
+            "status": "processed",
+            "acked": True,
+            "handler_called": True,
+            "authority": {
+                "telegram_transport_possible": True,
+                "database_session_opened": True,
+                "workers_started": False,
+                "run_forever_started": False,
+                "openai_called": False,
+                "github_called": False,
+                "docker_or_systemd_called": False,
+                "alembic_or_ddl_ran": False,
+            },
+        },
+        db_verification=verification,
+        redis_metrics=_RedisGroupMetrics(pending=0, lag=0),
+    )
+
+    assert "WHEN st.to_state = np.status::text THEN 100" in session.transition_sql
+    assert verification["proof_plan_final_status"] == "sent"
+    assert verification["delivery_status"] == "sent"
+    assert verification["latest_state_transition_to_state"] == "sent"
+    assert verification["latest_state_transition_reason_code"] == "notification_no_recent_delivery"
+    assert payload["status"] == "pass"
+    assert payload["reason_code"] == "restricted_live_worker_once_proof_passed"
+    assert payload["checks"]["latest_transition_sent"] is True
+    assert payload["checks"]["latest_transition_reason_allowed"] is True
+    assert payload["checks_failed"] == []
+
+
+@pytest.mark.asyncio
 async def test_cli_output_is_sanitized_for_success_and_failure() -> None:
     repository, source_plan_id, _ = _proof_repository()
     redis = FakeRedis()
@@ -641,6 +691,104 @@ class RecordingTelegramClient:
         del kwargs
         self.edit_message_text_calls += 1
         raise AssertionError("edit_message_text must not be called")
+
+
+class _ScalarOneResult:
+    def __init__(self, value: int) -> None:
+        self._value = value
+
+    def scalar_one(self) -> int:
+        return self._value
+
+
+class _ScalarOneOrNoneResult:
+    def __init__(self, value: str | None) -> None:
+        self._value = value
+
+    def scalar_one_or_none(self) -> str | None:
+        return self._value
+
+
+class _MappingFirstResult:
+    def __init__(self, row: dict[str, Any] | None) -> None:
+        self._row = row
+
+    def mappings(self):
+        return self
+
+    def first(self):
+        return self._row
+
+
+class _FirstResult:
+    def __init__(self, row: object | None) -> None:
+        self._row = row
+
+    def first(self):
+        return self._row
+
+
+class _RestrictedProofReadbackSession:
+    def __init__(self) -> None:
+        self.notification_plan_id = uuid4()
+        self.transition_sql = ""
+        self._transition_rows = [
+            {"to_state": "rendered", "reason_code": "notification_rendered"},
+            {"to_state": "queued", "reason_code": "notification_transport_queued"},
+            {"to_state": "sent", "reason_code": "notification_no_recent_delivery"},
+        ]
+
+    def in_transaction(self) -> bool:
+        return False
+
+    def begin(self):
+        raise AssertionError("restricted proof readback does not open transactions")
+
+    async def execute(self, statement, params=None):
+        del params
+        sql = str(statement)
+        if "FROM notification_plans" in sql and "SELECT status" in sql:
+            return _ScalarOneOrNoneResult("sent")
+        if "FROM notification_renders" in sql:
+            return _ScalarOneResult(1)
+        if "SELECT count(*)" in sql and "FROM notification_delivery_records" in sql:
+            return _ScalarOneResult(1)
+        if "SELECT delivery_status" in sql and "FROM notification_delivery_records" in sql:
+            return _MappingFirstResult(
+                {
+                    "delivery_status": "sent",
+                    "attempt_count": 1,
+                    "transport_error_code": None,
+                    "telegram_chat_id": 12345,
+                    "telegram_message_id": 9001,
+                }
+            )
+        if "FROM state_transitions" in sql:
+            self.transition_sql = sql
+            return _MappingFirstResult(self._selected_transition(sql))
+        if "FROM event_outbox" in sql:
+            return _FirstResult(object())
+        raise AssertionError(f"unexpected SQL: {sql}")
+
+    def _selected_transition(self, sql: str) -> dict[str, str]:
+        if "WHEN st.to_state = np.status::text THEN 100" not in sql:
+            return self._transition_rows[0]
+        return max(self._transition_rows, key=self._transition_rank)
+
+    @staticmethod
+    def _transition_rank(row: dict[str, str]) -> int:
+        to_state = row["to_state"]
+        if to_state == "sent":
+            return 100
+        if to_state in {"edited", "suppressed", "failed_retryable", "failed_terminal"}:
+            return 90
+        if to_state == "queued":
+            return 20
+        if to_state == "rendered":
+            return 10
+        if to_state == "planned":
+            return 0
+        return -1
 
 
 class ProofRepository(FakeRepository):

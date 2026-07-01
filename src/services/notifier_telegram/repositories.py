@@ -1166,11 +1166,21 @@ class NotifierTelegramRepository:
         transition_result = await self._session.execute(
             sa.text(
                 """
-                SELECT reason_code
-                FROM state_transitions
-                WHERE object_type = 'notification_plan'
-                  AND object_id = CAST(:notification_plan_id AS uuid)
-                ORDER BY created_at DESC
+                SELECT st.reason_code
+                FROM state_transitions st
+                JOIN notification_plans np
+                  ON np.notification_plan_id = CAST(:notification_plan_id AS uuid)
+                WHERE st.object_type = 'notification_plan'
+                  AND st.object_id = np.notification_plan_id
+                ORDER BY st.created_at DESC,
+                         CASE
+                           WHEN st.to_state = np.status::text THEN 100
+                           WHEN st.to_state IN ('sent', 'edited', 'suppressed', 'failed_retryable', 'failed_terminal') THEN 90
+                           WHEN st.to_state = 'queued' THEN 20
+                           WHEN st.to_state = 'rendered' THEN 10
+                           WHEN st.to_state = 'planned' THEN 0
+                           ELSE -1
+                         END DESC
                 LIMIT 1
                 """
             ),
@@ -1254,11 +1264,21 @@ class NotifierTelegramRepository:
         transition_result = await self._session.execute(
             sa.text(
                 """
-                SELECT to_state, reason_code
-                FROM state_transitions
-                WHERE object_type = 'notification_plan'
-                  AND object_id = CAST(:notification_plan_id AS uuid)
-                ORDER BY created_at DESC
+                SELECT st.to_state, st.reason_code
+                FROM state_transitions st
+                JOIN notification_plans np
+                  ON np.notification_plan_id = CAST(:notification_plan_id AS uuid)
+                WHERE st.object_type = 'notification_plan'
+                  AND st.object_id = np.notification_plan_id
+                ORDER BY st.created_at DESC,
+                         CASE
+                           WHEN st.to_state = np.status::text THEN 100
+                           WHEN st.to_state IN ('sent', 'edited', 'suppressed', 'failed_retryable', 'failed_terminal') THEN 90
+                           WHEN st.to_state = 'queued' THEN 20
+                           WHEN st.to_state = 'rendered' THEN 10
+                           WHEN st.to_state = 'planned' THEN 0
+                           ELSE -1
+                         END DESC
                 LIMIT 1
                 """
             ),
