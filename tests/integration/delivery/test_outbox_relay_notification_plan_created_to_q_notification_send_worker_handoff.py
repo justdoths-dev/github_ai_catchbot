@@ -313,7 +313,7 @@ async def test_notification_plan_created_relay_publishes_id_only_q_notification_
     assert len(notifier_repository.renders) == 1
     assert len(notifier_repository.delivery_records) == 1
     assert len(notifier_repository.delivery_outbox) == 1
-    assert notifier_repository.state_transitions[-1]["reason_code"] == "notification_duplicate_terminal_noop"
+    assert notifier_repository.state_transitions[-1]["reason_code"] == "notification_existing_suppressed_noop"
 
     replay_intent = replace(intent, trigger_event_id=uuid4())
     notifier_repository.jobs[replay_intent.trigger_event_id] = replay_intent

@@ -13,6 +13,7 @@ from src.services.outbox_relay.bounded_notification_plan_publish import (
     BoundedNotificationPlanPublishRuntimeConfig,
     BoundedNotificationPlanRedisPublisherHandle,
     BoundedNotificationPlanRepositoryHandle,
+    NotificationPlanSendabilityRow,
     run_bounded_notification_plan_outbox_publish,
 )
 from src.services.outbox_relay.models import OutboxEventRow
@@ -33,17 +34,23 @@ class FakeRepository:
         *,
         pending_count: int = 1,
         row: OutboxEventRow | None = None,
+        rows: list[OutboxEventRow] | None = None,
+        plan_sendability: dict[UUID, NotificationPlanSendabilityRow] | None = None,
         operation_log: list[str] | None = None,
         fail_mark_published: bool = False,
         fail_insert_job_attempt: bool = False,
     ) -> None:
         self.pending_count = pending_count
         self.row = row
+        self.rows = list(rows or ([row] if row is not None else []))
+        self.plan_sendability = dict(plan_sendability or {})
         self.operation_log = operation_log if operation_log is not None else []
         self.fail_mark_published = fail_mark_published
         self.fail_insert_job_attempt = fail_insert_job_attempt
         self.count_calls = 0
         self.fetch_calls = 0
+        self.fetch_by_id_calls: list[UUID] = []
+        self.load_plan_calls: list[UUID] = []
         self.mark_published_calls: list[UUID] = []
         self.job_attempt_calls: list[dict] = []
 
@@ -58,6 +65,23 @@ class FakeRepository:
         self.fetch_calls += 1
         assert event_type == "notification.plan.created.v1"
         return self.row
+
+    async def fetch_event_by_id(self, *, event_id: UUID) -> OutboxEventRow | None:
+        self.operation_log.append("fetch_by_id")
+        self.fetch_by_id_calls.append(event_id)
+        for row in self.rows:
+            if row.event_id == event_id:
+                return row
+        return None
+
+    async def load_notification_plan_sendability(
+        self,
+        *,
+        notification_plan_id: UUID,
+    ) -> NotificationPlanSendabilityRow | None:
+        self.operation_log.append("load_plan")
+        self.load_plan_calls.append(notification_plan_id)
+        return self.plan_sendability.get(notification_plan_id)
 
     async def mark_published(self, *, event_id: UUID, published_at: datetime | None = None) -> None:
         del published_at
@@ -137,8 +161,9 @@ def _raising_runtime_config() -> BoundedNotificationPlanPublishRuntimeConfig:
 
 
 def _payload() -> dict[str, object]:
+    notification_plan_id = uuid4()
     return {
-        "notification_plan_id": str(uuid4()),
+        "notification_plan_id": str(notification_plan_id),
         "analysis_id": str(uuid4()),
         "candidate_group_id": str(uuid4()),
         "target_chat_id": -100123,
@@ -159,6 +184,23 @@ def _row(*, payload_json: dict[str, object] | None = None) -> OutboxEventRow:
         fail_count=0,
         created_at=datetime.now(timezone.utc),
     )
+
+
+def _plan_row(
+    notification_plan_id: UUID,
+    *,
+    delivery_decision: str = "send_now",
+    status: str = "planned",
+) -> NotificationPlanSendabilityRow:
+    return NotificationPlanSendabilityRow(
+        notification_plan_id=notification_plan_id,
+        delivery_decision=delivery_decision,
+        status=status,
+    )
+
+
+def _payload_plan_id(row: OutboxEventRow) -> UUID:
+    return UUID(str(row.payload_json["notification_plan_id"]))
 
 
 def _approved_config(**overrides) -> BoundedNotificationPlanOutboxPublishConfig:
@@ -256,6 +298,25 @@ async def test_pending_count_greater_than_expected_blocks_before_redis() -> None
     assert result.pending_count_observed == 2
     assert result.state.redis_xadd_attempted is False
     assert repository.fetch_calls == 0
+    assert publisher_builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_default_no_target_keeps_exactly_one_pending_requirement() -> None:
+    repository = FakeRepository(pending_count=2, rows=[_row(), _row()])
+    publisher_builder = FakeRedisPublisherBuilder(FakeRedisPublisher())
+
+    result = await run_bounded_notification_plan_outbox_publish(
+        _approved_config(expected_pending_count=2),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(repository),
+        redis_publisher_builder=publisher_builder,
+    )
+
+    assert result.error_code == "pending_count_not_one"
+    assert result.pending_count_observed == 2
+    assert repository.fetch_calls == 0
+    assert repository.fetch_by_id_calls == []
     assert publisher_builder.calls == 0
 
 
@@ -443,6 +504,177 @@ async def test_sanitized_output_omits_full_ids_urls_tokens_raw_payload_message_i
         ),
     )
     assert EXCEPTION_DETAIL not in json.dumps(failing.to_sanitized_dict(), sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_exact_target_publishes_only_selected_event_when_other_pending_event_is_stale() -> None:
+    operation_log: list[str] = []
+    stale = _row()
+    target = _row()
+    target_plan_id = _payload_plan_id(target)
+    repository = FakeRepository(
+        pending_count=2,
+        rows=[stale, target],
+        plan_sendability={target_plan_id: _plan_row(target_plan_id)},
+        operation_log=operation_log,
+    )
+    publisher = FakeRedisPublisher(operation_log=operation_log)
+
+    result = await run_bounded_notification_plan_outbox_publish(
+        _approved_config(target_event_id=target.event_id),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(repository),
+        redis_publisher_builder=FakeRedisPublisherBuilder(publisher),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "pass"
+    assert report["target_event_id_requested"] is True
+    assert report["pending_count_observed"] == 2
+    assert report["selected_event_id_suffix"] == str(target.event_id)[-8:]
+    assert report["target_notification_plan_present"] is True
+    assert report["target_notification_plan_status"] == "planned"
+    assert report["target_notification_plan_delivery_decision"] == "send_now"
+    assert repository.fetch_calls == 0
+    assert repository.fetch_by_id_calls == [target.event_id]
+    assert repository.mark_published_calls == [target.event_id]
+    assert stale.event_id not in repository.mark_published_calls
+    assert repository.job_attempt_calls[0]["root_object_id"] == target.aggregate_id
+    assert len(publisher.publish_calls) == 1
+    _, message = publisher.publish_calls[0]
+    assert message.as_stream_fields() == {
+        "job_id": str(target.event_id),
+        "stage_name": "notify",
+        "root_object_type": target.aggregate_type,
+        "root_object_id": str(target.aggregate_id),
+        "idempotency_key": target.dedupe_key,
+        "pipeline_run_id": "",
+        "not_before": "",
+        "trigger_event_id": str(target.event_id),
+    }
+    assert operation_log == ["count", "fetch_by_id", "load_plan", "publish", "mark_published", "insert_job_attempt"]
+
+
+@pytest.mark.asyncio
+async def test_exact_target_rejects_suppressed_plan_before_redis_xadd() -> None:
+    row = _row()
+    plan_id = _payload_plan_id(row)
+    repository = FakeRepository(
+        row=row,
+        rows=[row],
+        plan_sendability={plan_id: _plan_row(plan_id, status="suppressed")},
+    )
+    publisher_builder = FakeRedisPublisherBuilder(FakeRedisPublisher())
+
+    result = await run_bounded_notification_plan_outbox_publish(
+        _approved_config(target_event_id=row.event_id),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(repository),
+        redis_publisher_builder=publisher_builder,
+    )
+
+    assert result.error_code == "target_notification_plan_terminal"
+    assert result.state.redis_xadd_attempted is False
+    assert result.target_notification_plan_present is True
+    assert result.target_notification_plan_status == "suppressed"
+    assert repository.mark_published_calls == []
+    assert repository.job_attempt_calls == []
+    assert publisher_builder.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["sent", "edited", "failed_terminal"])
+async def test_exact_target_rejects_terminal_plan_before_redis_xadd(terminal_status: str) -> None:
+    row = _row()
+    plan_id = _payload_plan_id(row)
+    repository = FakeRepository(
+        row=row,
+        rows=[row],
+        plan_sendability={plan_id: _plan_row(plan_id, status=terminal_status)},
+    )
+    publisher_builder = FakeRedisPublisherBuilder(FakeRedisPublisher())
+
+    result = await run_bounded_notification_plan_outbox_publish(
+        _approved_config(target_event_id=row.event_id),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(repository),
+        redis_publisher_builder=publisher_builder,
+    )
+
+    assert result.error_code == "target_notification_plan_terminal"
+    assert result.state.redis_xadd_attempted is False
+    assert repository.mark_published_calls == []
+    assert repository.job_attempt_calls == []
+    assert publisher_builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_exact_target_rejects_missing_or_malformed_payload_plan_id_before_plan_lookup() -> None:
+    missing_payload = _payload()
+    missing_payload.pop("notification_plan_id")
+    missing = _row(payload_json=missing_payload)
+    malformed_payload = _payload()
+    malformed_payload["notification_plan_id"] = "not-a-uuid"
+    malformed = _row(payload_json=malformed_payload)
+
+    missing_repository = FakeRepository(row=missing, rows=[missing])
+    missing_result = await run_bounded_notification_plan_outbox_publish(
+        _approved_config(target_event_id=missing.event_id),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(missing_repository),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+    )
+
+    malformed_repository = FakeRepository(row=malformed, rows=[malformed])
+    malformed_result = await run_bounded_notification_plan_outbox_publish(
+        _approved_config(target_event_id=malformed.event_id),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(malformed_repository),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+    )
+
+    assert missing_result.error_code == "malformed_event_payload"
+    assert missing_repository.load_plan_calls == []
+    assert malformed_result.error_code == "target_notification_plan_id_invalid"
+    assert malformed_repository.load_plan_calls == []
+    assert malformed_result.state.redis_xadd_attempted is False
+
+
+@pytest.mark.asyncio
+async def test_exact_target_output_is_sanitized() -> None:
+    row = _row()
+    plan_id = _payload_plan_id(row)
+    repository = FakeRepository(
+        row=row,
+        rows=[row],
+        plan_sendability={plan_id: _plan_row(plan_id)},
+    )
+
+    result = await run_bounded_notification_plan_outbox_publish(
+        _approved_config(target_event_id=row.event_id),
+        runtime_config_loader=_runtime_config,
+        repository_builder=FakeRepositoryBuilder(repository),
+        redis_publisher_builder=FakeRedisPublisherBuilder(FakeRedisPublisher()),
+    )
+    rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
+
+    for raw in (
+        str(row.event_id),
+        str(row.aggregate_id),
+        str(plan_id),
+        str(row.payload_json["analysis_id"]),
+        str(row.payload_json["candidate_group_id"]),
+        str(row.payload_json["target_chat_id"]),
+        str(row.payload_json["material_change_hash"]),
+        str(row.dedupe_key),
+        DB_URL,
+        REDIS_URL,
+        TELEGRAM_TOKEN,
+        REDIS_MESSAGE_ID,
+    ):
+        assert raw not in rendered
+    assert '"payload_json":' not in rendered
+    assert result.ok is True
 
 
 @pytest.mark.asyncio

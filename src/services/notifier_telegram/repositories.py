@@ -374,6 +374,52 @@ class NotifierTelegramRepository:
         inserted = result.scalar_one_or_none()
         return UUID(str(inserted)) if inserted else None
 
+    async def insert_pending_notification_plan_created_outbox(
+        self,
+        *,
+        event_id: UUID,
+        notification_plan_id: UUID,
+        dedupe_key: str,
+        payload_json: dict[str, Any],
+    ) -> UUID | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO event_outbox (
+                    event_id,
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    dedupe_key,
+                    payload_json,
+                    status,
+                    created_at,
+                    published_at
+                ) VALUES (
+                    CAST(:event_id AS uuid),
+                    'notification.plan.created.v1',
+                    'notification_plan',
+                    CAST(:notification_plan_id AS uuid),
+                    :dedupe_key,
+                    CAST(:payload_json AS jsonb),
+                    'pending'::outbox_status_enum,
+                    now(),
+                    NULL
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING event_id
+                """
+            ),
+            {
+                "event_id": str(event_id),
+                "notification_plan_id": str(notification_plan_id),
+                "dedupe_key": dedupe_key,
+                "payload_json": _jsonb_dumps(payload_json),
+            },
+        )
+        inserted = result.scalar_one_or_none()
+        return UUID(str(inserted)) if inserted else None
+
     async def load_analysis(self, analysis_id: UUID) -> AnalysisRenderContext | None:
         result = await self._session.execute(
             sa.text(

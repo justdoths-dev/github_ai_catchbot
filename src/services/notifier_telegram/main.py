@@ -1316,29 +1316,12 @@ async def create_restricted_live_worker_once_proof_with_repository(
     proof_key: str,
     repository,
 ) -> "_RestrictedLiveProofSetupResult":
-    source_plan = await repository.load_notification_plan(source_notification_plan_id)
-    if source_plan is None:
-        return _RestrictedLiveProofSetupResult(reason_code="source_notification_plan_missing")
-    if str(source_plan.get("delivery_decision") or "") != "send_now":
-        return _RestrictedLiveProofSetupResult(reason_code="source_plan_not_send_now")
-
-    source_analysis_id = _uuid_from_row(source_plan.get("analysis_id"))
-    source_candidate_group_id = _uuid_from_row(source_plan.get("candidate_group_id"))
-    target_chat_id = _int_from_row(source_plan.get("target_chat_id"))
-    if source_analysis_id is None:
-        return _RestrictedLiveProofSetupResult(reason_code="source_analysis_missing")
-    if source_candidate_group_id is None:
-        return _RestrictedLiveProofSetupResult(reason_code="source_candidate_group_missing")
-    if target_chat_id is None or target_chat_id == 0:
-        return _RestrictedLiveProofSetupResult(reason_code="source_plan_target_chat_missing")
-
-    analysis = await repository.load_analysis(source_analysis_id)
-    if analysis is None:
-        return _RestrictedLiveProofSetupResult(reason_code="source_analysis_missing")
-    if analysis.delivery_decision != "send_now":
-        return _RestrictedLiveProofSetupResult(reason_code="source_analysis_not_send_now")
-    if analysis.candidate_group_id != source_candidate_group_id:
-        return _RestrictedLiveProofSetupResult(reason_code="source_candidate_group_mismatch")
+    source_context, reason_code = await _load_restricted_live_proof_source_context(
+        source_notification_plan_id,
+        repository,
+    )
+    if reason_code is not None or source_context is None:
+        return _RestrictedLiveProofSetupResult(reason_code=reason_code or "source_notification_plan_missing")
 
     identity = _restricted_live_proof_identity(
         source_notification_plan_id=source_notification_plan_id,
@@ -1350,28 +1333,14 @@ async def create_restricted_live_worker_once_proof_with_repository(
         return _RestrictedLiveProofSetupResult(reason_code="proof_plan_created_event_exists")
 
     material_existing = await repository.load_existing_plan_by_material(
-        analysis_id=source_analysis_id,
-        target_chat_id=target_chat_id,
+        analysis_id=source_context.source_analysis_id,
+        target_chat_id=source_context.target_chat_id,
         material_change_hash=identity.material_change_hash,
     )
     if material_existing is not None:
         return _RestrictedLiveProofSetupResult(reason_code="proof_notification_plan_conflict")
 
-    draft = NotificationPlanDraft(
-        notification_plan_id=identity.notification_plan_id,
-        analysis_id=source_analysis_id,
-        candidate_group_id=source_candidate_group_id,
-        delivery_decision="send_now",
-        urgency_profile=str(source_plan.get("urgency_profile") or "high"),
-        target_chat_id=target_chat_id,
-        target_thread_id=_int_from_row(source_plan.get("target_thread_id")),
-        render_profile=_string_from_row(source_plan.get("render_profile")),
-        dedupe_subject_key=identity.dedupe_subject_key,
-        material_change_hash=identity.material_change_hash,
-        send_after=None,
-        suppress_reason_code=None,
-        status="planned",
-    )
+    draft = _restricted_live_proof_draft(identity, source_context)
     payload_json = _restricted_live_proof_plan_created_payload(draft)
 
     async with repository.transaction():
@@ -1393,6 +1362,100 @@ async def create_restricted_live_worker_once_proof_with_repository(
         trigger_event_id=identity.event_id,
         event_dedupe_key=identity.event_dedupe_key,
         event_payload_json=payload_json,
+    )
+
+
+async def create_restricted_live_queue_chain_proof_target_with_repository(
+    source_notification_plan_id: UUID,
+    proof_key: str,
+    repository,
+) -> "_RestrictedLiveQueueChainProofTargetResult":
+    source_context, reason_code = await _load_restricted_live_proof_source_context(
+        source_notification_plan_id,
+        repository,
+    )
+    if reason_code is not None or source_context is None:
+        return _RestrictedLiveQueueChainProofTargetResult(reason_code=reason_code or "source_notification_plan_missing")
+
+    identity = _restricted_live_proof_identity(
+        source_notification_plan_id=source_notification_plan_id,
+        proof_key=proof_key,
+    )
+    draft = _restricted_live_proof_draft(identity, source_context)
+    payload_json = _restricted_live_proof_plan_created_payload(draft)
+
+    existing_plan = await repository.load_notification_plan(identity.notification_plan_id)
+    existing_event = await repository.load_event_outbox(identity.event_id)
+    material_existing = await repository.load_existing_plan_by_material(
+        analysis_id=source_context.source_analysis_id,
+        target_chat_id=source_context.target_chat_id,
+        material_change_hash=identity.material_change_hash,
+    )
+    if material_existing is not None and _uuid_from_row(material_existing.get("notification_plan_id")) != (
+        identity.notification_plan_id
+    ):
+        return _RestrictedLiveQueueChainProofTargetResult(reason_code="proof_notification_plan_conflict")
+    if existing_plan is not None and not _notification_plan_matches_draft(existing_plan, draft):
+        return _RestrictedLiveQueueChainProofTargetResult(reason_code="proof_notification_plan_conflict")
+    if existing_event is not None and not _notification_plan_created_event_matches(
+        existing_event,
+        identity=identity,
+        payload_json=payload_json,
+    ):
+        return _RestrictedLiveQueueChainProofTargetResult(reason_code="proof_plan_created_event_conflict")
+
+    if existing_event is not None:
+        event_status = str(existing_event.get("status") or "")
+        if event_status == "pending":
+            return _restricted_live_queue_chain_proof_target_result(
+                status="existing_pending",
+                source_notification_plan_id=source_notification_plan_id,
+                source_context=source_context,
+                draft=draft,
+                identity=identity,
+                payload_json=payload_json,
+                created=False,
+                existing=True,
+                outbox_status_before_publish="pending",
+            )
+        if event_status == "published":
+            return _restricted_live_queue_chain_proof_target_result(
+                status="existing_already_published",
+                source_notification_plan_id=source_notification_plan_id,
+                source_context=source_context,
+                draft=draft,
+                identity=identity,
+                payload_json=payload_json,
+                created=False,
+                existing=True,
+                outbox_status_before_publish="published",
+            )
+        return _RestrictedLiveQueueChainProofTargetResult(reason_code="proof_plan_created_event_conflict")
+
+    async with repository.transaction():
+        if existing_plan is None:
+            inserted_plan_id = await repository.insert_notification_plan(draft)
+            if inserted_plan_id != identity.notification_plan_id:
+                return _RestrictedLiveQueueChainProofTargetResult(reason_code="proof_notification_plan_conflict")
+        inserted_event_id = await repository.insert_pending_notification_plan_created_outbox(
+            event_id=identity.event_id,
+            notification_plan_id=identity.notification_plan_id,
+            dedupe_key=identity.event_dedupe_key,
+            payload_json=payload_json,
+        )
+        if inserted_event_id != identity.event_id:
+            return _RestrictedLiveQueueChainProofTargetResult(reason_code="proof_plan_created_event_conflict")
+
+    return _restricted_live_queue_chain_proof_target_result(
+        status="created",
+        source_notification_plan_id=source_notification_plan_id,
+        source_context=source_context,
+        draft=draft,
+        identity=identity,
+        payload_json=payload_json,
+        created=True,
+        existing=existing_plan is not None,
+        outbox_status_before_publish="pending",
     )
 
 
@@ -1585,12 +1648,39 @@ class _RestrictedLiveProofIdentity:
 
 
 @dataclass(slots=True, frozen=True)
+class _RestrictedLiveProofSourceContext:
+    source_plan: Mapping[str, object]
+    source_analysis_id: UUID
+    source_candidate_group_id: UUID
+    target_chat_id: int
+
+
+@dataclass(slots=True, frozen=True)
 class _RestrictedLiveProofSetupResult:
     notification_plan_id: UUID | None = None
     source_notification_plan_id: UUID | None = None
     trigger_event_id: UUID | None = None
     event_dedupe_key: str | None = None
     event_payload_json: dict[str, Any] | None = None
+    reason_code: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class _RestrictedLiveQueueChainProofTargetResult:
+    status: str | None = None
+    notification_plan_id: UUID | None = None
+    source_notification_plan_id: UUID | None = None
+    source_analysis_id: UUID | None = None
+    source_candidate_group_id: UUID | None = None
+    trigger_event_id: UUID | None = None
+    event_dedupe_key: str | None = None
+    event_payload_json: dict[str, Any] | None = None
+    created: bool = False
+    existing: bool = False
+    plan_status: str | None = None
+    delivery_decision: str | None = None
+    urgency_profile: str | None = None
+    outbox_status_before_publish: str | None = None
     reason_code: str | None = None
 
 
@@ -1660,6 +1750,141 @@ def _restricted_live_proof_identity(
         material_change_hash=hashlib.sha256(seed.encode("utf-8")).hexdigest(),
         event_dedupe_key=f"notification-plan-created:restricted-live-proof:{notification_plan_id}",
     )
+
+
+async def _load_restricted_live_proof_source_context(
+    source_notification_plan_id: UUID,
+    repository,
+) -> tuple[_RestrictedLiveProofSourceContext | None, str | None]:
+    source_plan = await repository.load_notification_plan(source_notification_plan_id)
+    if source_plan is None:
+        return None, "source_notification_plan_missing"
+    if str(source_plan.get("delivery_decision") or "") != "send_now":
+        return None, "source_plan_not_send_now"
+
+    source_analysis_id = _uuid_from_row(source_plan.get("analysis_id"))
+    source_candidate_group_id = _uuid_from_row(source_plan.get("candidate_group_id"))
+    target_chat_id = _int_from_row(source_plan.get("target_chat_id"))
+    if source_analysis_id is None:
+        return None, "source_analysis_missing"
+    if source_candidate_group_id is None:
+        return None, "source_candidate_group_missing"
+    if target_chat_id is None or target_chat_id == 0:
+        return None, "source_plan_target_chat_missing"
+
+    analysis = await repository.load_analysis(source_analysis_id)
+    if analysis is None:
+        return None, "source_analysis_missing"
+    if analysis.delivery_decision != "send_now":
+        return None, "source_analysis_not_send_now"
+    if analysis.candidate_group_id != source_candidate_group_id:
+        return None, "source_candidate_group_mismatch"
+
+    return (
+        _RestrictedLiveProofSourceContext(
+            source_plan=source_plan,
+            source_analysis_id=source_analysis_id,
+            source_candidate_group_id=source_candidate_group_id,
+            target_chat_id=target_chat_id,
+        ),
+        None,
+    )
+
+
+def _restricted_live_proof_draft(
+    identity: _RestrictedLiveProofIdentity,
+    source_context: _RestrictedLiveProofSourceContext,
+) -> NotificationPlanDraft:
+    source_plan = source_context.source_plan
+    return NotificationPlanDraft(
+        notification_plan_id=identity.notification_plan_id,
+        analysis_id=source_context.source_analysis_id,
+        candidate_group_id=source_context.source_candidate_group_id,
+        delivery_decision="send_now",
+        urgency_profile=str(source_plan.get("urgency_profile") or "high"),
+        target_chat_id=source_context.target_chat_id,
+        target_thread_id=_int_from_row(source_plan.get("target_thread_id")),
+        render_profile=_string_from_row(source_plan.get("render_profile")),
+        dedupe_subject_key=identity.dedupe_subject_key,
+        material_change_hash=identity.material_change_hash,
+        send_after=None,
+        suppress_reason_code=None,
+        status="planned",
+    )
+
+
+def _restricted_live_queue_chain_proof_target_result(
+    *,
+    status: str,
+    source_notification_plan_id: UUID,
+    source_context: _RestrictedLiveProofSourceContext,
+    draft: NotificationPlanDraft,
+    identity: _RestrictedLiveProofIdentity,
+    payload_json: dict[str, Any],
+    created: bool,
+    existing: bool,
+    outbox_status_before_publish: str,
+) -> _RestrictedLiveQueueChainProofTargetResult:
+    return _RestrictedLiveQueueChainProofTargetResult(
+        status=status,
+        notification_plan_id=draft.notification_plan_id,
+        source_notification_plan_id=source_notification_plan_id,
+        source_analysis_id=source_context.source_analysis_id,
+        source_candidate_group_id=source_context.source_candidate_group_id,
+        trigger_event_id=identity.event_id,
+        event_dedupe_key=identity.event_dedupe_key,
+        event_payload_json=payload_json,
+        created=created,
+        existing=existing,
+        plan_status=draft.status,
+        delivery_decision=draft.delivery_decision,
+        urgency_profile=draft.urgency_profile,
+        outbox_status_before_publish=outbox_status_before_publish,
+    )
+
+
+def _notification_plan_matches_draft(plan: Mapping[str, object], draft: NotificationPlanDraft) -> bool:
+    return (
+        _uuid_from_row(plan.get("notification_plan_id")) == draft.notification_plan_id
+        and _uuid_from_row(plan.get("analysis_id")) == draft.analysis_id
+        and _uuid_from_row(plan.get("candidate_group_id")) == draft.candidate_group_id
+        and str(plan.get("delivery_decision") or "") == draft.delivery_decision
+        and str(plan.get("urgency_profile") or "") == draft.urgency_profile
+        and _int_from_row(plan.get("target_chat_id")) == draft.target_chat_id
+        and _int_from_row(plan.get("target_thread_id")) == draft.target_thread_id
+        and _string_from_row(plan.get("render_profile")) == draft.render_profile
+        and str(plan.get("dedupe_subject_key") or "") == draft.dedupe_subject_key
+        and str(plan.get("material_change_hash") or "") == draft.material_change_hash
+        and _string_from_row(plan.get("send_after")) is None
+        and _string_from_row(plan.get("suppress_reason_code")) is None
+        and str(plan.get("status") or "") == draft.status
+    )
+
+
+def _notification_plan_created_event_matches(
+    row: Mapping[str, object],
+    *,
+    identity: _RestrictedLiveProofIdentity,
+    payload_json: dict[str, Any],
+) -> bool:
+    return (
+        _uuid_from_row(row.get("event_id")) == identity.event_id
+        and str(row.get("event_type") or "") == "notification.plan.created.v1"
+        and str(row.get("aggregate_type") or "") == "notification_plan"
+        and _uuid_from_row(row.get("aggregate_id")) == identity.notification_plan_id
+        and str(row.get("dedupe_key") or "") == identity.event_dedupe_key
+        and _event_payload_from_row(row) == payload_json
+    )
+
+
+def _event_payload_from_row(row: Mapping[str, object]) -> dict[str, Any]:
+    payload = row.get("payload_json")
+    if isinstance(payload, Mapping):
+        return dict(payload)
+    if isinstance(payload, str):
+        parsed = _safe_json_object(payload)
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def _send_disabled_proof_plan_created_payload(draft: NotificationPlanDraft) -> dict[str, Any]:

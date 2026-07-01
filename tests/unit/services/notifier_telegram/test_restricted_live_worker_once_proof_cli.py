@@ -16,6 +16,7 @@ from services.notifier_telegram.main import (
     _run_restricted_live_worker_once_proof,
     _run_restricted_live_worker_once_proof_command,
     build_parser,
+    create_restricted_live_queue_chain_proof_target_with_repository,
     create_restricted_live_worker_once_proof_with_repository,
 )
 from services.notifier_telegram.models import NotificationIntentJob, NotificationPlanDraft, StreamMessage
@@ -329,6 +330,168 @@ async def test_cli_creates_deterministic_proof_plan_event_without_overwriting_so
         f"proof/restricted-live/{source_plan_id}/proof-key-01"
     )
     assert second.reason_code == "proof_notification_plan_exists"
+
+
+@pytest.mark.asyncio
+async def test_queue_chain_target_creator_creates_planned_plan_and_pending_outbox() -> None:
+    repository, source_plan_id, source_event_id = _proof_repository()
+
+    result = await create_restricted_live_queue_chain_proof_target_with_repository(
+        source_plan_id,
+        "proof-key-01",
+        repository,
+    )
+
+    assert result.reason_code is None
+    assert result.status == "created"
+    assert result.created is True
+    assert result.existing is False
+    assert result.notification_plan_id is not None
+    assert result.trigger_event_id is not None
+    assert result.source_analysis_id == repository.plans[source_plan_id].analysis_id
+    assert result.source_candidate_group_id == repository.plans[source_plan_id].candidate_group_id
+    assert result.plan_status == "planned"
+    assert result.delivery_decision == "send_now"
+    assert result.urgency_profile == "high"
+    assert result.outbox_status_before_publish == "pending"
+    assert repository.plans[source_plan_id].status == "sent"
+    assert repository.event_outbox[source_event_id]["event_type"] == "source.existing.v1"
+    assert repository.plans[result.notification_plan_id].status == "planned"
+    assert repository.event_outbox[result.trigger_event_id]["event_type"] == "notification.plan.created.v1"
+    assert repository.event_outbox[result.trigger_event_id]["aggregate_type"] == "notification_plan"
+    assert repository.event_outbox[result.trigger_event_id]["aggregate_id"] == result.notification_plan_id
+    assert repository.event_outbox[result.trigger_event_id]["status"] == "pending"
+    assert "published_at" not in repository.event_outbox[result.trigger_event_id]
+    assert repository.event_outbox[result.trigger_event_id]["payload_json"] == result.event_payload_json
+
+
+@pytest.mark.asyncio
+async def test_queue_chain_target_creator_reuses_existing_pending_target_idempotently() -> None:
+    repository, source_plan_id, _ = _proof_repository()
+
+    first = await create_restricted_live_queue_chain_proof_target_with_repository(
+        source_plan_id,
+        "proof-key-01",
+        repository,
+    )
+    second = await create_restricted_live_queue_chain_proof_target_with_repository(
+        source_plan_id,
+        "proof-key-01",
+        repository,
+    )
+
+    assert first.reason_code is None
+    assert second.reason_code is None
+    assert second.status == "existing_pending"
+    assert second.created is False
+    assert second.existing is True
+    assert second.notification_plan_id == first.notification_plan_id
+    assert second.trigger_event_id == first.trigger_event_id
+    assert len(
+        [row for row in repository.event_outbox.values() if row["event_type"] == "notification.plan.created.v1"]
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_queue_chain_target_creator_reports_existing_published_without_recreating() -> None:
+    repository, source_plan_id, _ = _proof_repository()
+    first = await create_restricted_live_queue_chain_proof_target_with_repository(
+        source_plan_id,
+        "proof-key-01",
+        repository,
+    )
+    assert first.trigger_event_id is not None
+    repository.event_outbox[first.trigger_event_id]["status"] = "published"
+
+    second = await create_restricted_live_queue_chain_proof_target_with_repository(
+        source_plan_id,
+        "proof-key-01",
+        repository,
+    )
+
+    assert second.reason_code is None
+    assert second.status == "existing_already_published"
+    assert second.outbox_status_before_publish == "published"
+    assert second.trigger_event_id == first.trigger_event_id
+    assert len(
+        [row for row in repository.event_outbox.values() if row["event_type"] == "notification.plan.created.v1"]
+    ) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutate", "expected_reason"),
+    [
+        (lambda repository, source_plan_id: repository.plans.pop(source_plan_id), "source_notification_plan_missing"),
+        (
+            lambda repository, source_plan_id: repository.plans.__setitem__(
+                source_plan_id,
+                replace(repository.plans[source_plan_id], delivery_decision="suppress"),
+            ),
+            "source_plan_not_send_now",
+        ),
+        (
+            lambda repository, source_plan_id: repository.plans.__setitem__(
+                source_plan_id,
+                replace(repository.plans[source_plan_id], target_chat_id=None),
+            ),
+            "source_plan_target_chat_missing",
+        ),
+    ],
+)
+async def test_queue_chain_target_creator_blocks_invalid_source_plan(mutate, expected_reason: str) -> None:
+    repository, source_plan_id, _ = _proof_repository()
+    mutate(repository, source_plan_id)
+
+    result = await create_restricted_live_queue_chain_proof_target_with_repository(
+        source_plan_id,
+        "proof-key-01",
+        repository,
+    )
+
+    assert result.reason_code == expected_reason
+    assert result.notification_plan_id is None
+    assert len(
+        [row for row in repository.event_outbox.values() if row["event_type"] == "notification.plan.created.v1"]
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_queue_chain_target_creator_output_data_contains_no_raw_payload_in_report_shape() -> None:
+    repository, source_plan_id, _ = _proof_repository()
+
+    result = await create_restricted_live_queue_chain_proof_target_with_repository(
+        source_plan_id,
+        "proof-key-01",
+        repository,
+    )
+    rendered = json.dumps(
+        {
+            "status": result.status,
+            "created": result.created,
+            "existing": result.existing,
+            "plan_status": result.plan_status,
+            "delivery_decision": result.delivery_decision,
+            "urgency_profile": result.urgency_profile,
+            "outbox_status_before_publish": result.outbox_status_before_publish,
+        },
+        sort_keys=True,
+    )
+
+    assert result.event_payload_json is not None
+    for raw in [
+        str(result.notification_plan_id),
+        str(result.trigger_event_id),
+        str(source_plan_id),
+        str(repository.plans[source_plan_id].analysis_id),
+        str(repository.plans[source_plan_id].candidate_group_id),
+        "payload_json",
+        "source text",
+        "DATABASE_URL",
+        "REDIS_URL",
+        "TELEGRAM_BOT_TOKEN",
+    ]:
+        assert raw not in rendered
 
 
 @pytest.mark.asyncio
@@ -820,6 +983,45 @@ class ProofRepository(FakeRepository):
             "payload_json": payload_json,
             "status": "published",
             "published_at": datetime.now(timezone.utc),
+        }
+        self.jobs[event_id] = NotificationIntentJob(
+            trigger_event_id=event_id,
+            event_type="notification.plan.created.v1",
+            notification_plan_id=notification_plan_id,
+            analysis_id=UUID(str(payload_json["analysis_id"])),
+            candidate_group_id=UUID(str(payload_json["candidate_group_id"])),
+            delivery_decision=payload_json["delivery_decision"],
+            urgency_profile=payload_json["urgency_profile"],
+            target_chat_id=int(payload_json["target_chat_id"]),
+            target_thread_id=payload_json["target_thread_id"],
+            render_profile=payload_json["render_profile"],
+            dedupe_subject_key=payload_json["dedupe_subject_key"],
+            material_change_hash=payload_json["material_change_hash"],
+            send_after=None,
+            suppress_reason_code=payload_json["suppress_reason_code"],
+        )
+        return event_id
+
+    async def insert_pending_notification_plan_created_outbox(
+        self,
+        *,
+        event_id: UUID,
+        notification_plan_id: UUID,
+        dedupe_key: str,
+        payload_json: dict[str, Any],
+    ):
+        if event_id in self.event_outbox:
+            return None
+        if any(row["dedupe_key"] == dedupe_key for row in self.event_outbox.values()):
+            return None
+        self.event_outbox[event_id] = {
+            "event_id": event_id,
+            "event_type": "notification.plan.created.v1",
+            "aggregate_type": "notification_plan",
+            "aggregate_id": notification_plan_id,
+            "dedupe_key": dedupe_key,
+            "payload_json": payload_json,
+            "status": "pending",
         }
         self.jobs[event_id] = NotificationIntentJob(
             trigger_event_id=event_id,

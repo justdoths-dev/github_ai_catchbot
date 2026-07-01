@@ -43,6 +43,7 @@ class BoundedNotificationPlanOutboxPublishConfig:
     allow_redis_write: bool = False
     allow_outbox_status_update: bool = False
     expected_pending_count: int = 1
+    target_event_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,9 +69,22 @@ class BoundedNotificationPlanOutboxPublishError(RuntimeError):
         self.error_code = error_code
 
 
+@dataclass(frozen=True, slots=True)
+class NotificationPlanSendabilityRow:
+    notification_plan_id: UUID
+    delivery_decision: str
+    status: str
+
+
 class BoundedNotificationPlanOutboxRepository(Protocol):
     async def count_pending_events(self, *, event_type: str) -> int: ...
     async def fetch_oldest_pending_event(self, *, event_type: str) -> OutboxEventRow | None: ...
+    async def fetch_event_by_id(self, *, event_id: UUID) -> OutboxEventRow | None: ...
+    async def load_notification_plan_sendability(
+        self,
+        *,
+        notification_plan_id: UUID,
+    ) -> NotificationPlanSendabilityRow | None: ...
     async def mark_published(self, *, event_id: UUID, published_at: datetime | None = None) -> None: ...
     async def insert_job_attempt(
         self,
@@ -128,6 +142,7 @@ class BoundedNotificationPlanOutboxPublishResult:
     redis_write_allowed: bool
     outbox_status_update_allowed: bool
     queue_name: str = QUEUE_NAME
+    target_event_id_requested: bool = False
     pending_count_observed: int | None = None
     selected_event_present: bool = False
     selected_event_status: str | None = None
@@ -139,6 +154,9 @@ class BoundedNotificationPlanOutboxPublishResult:
     payload_has_candidate_group_id: bool = False
     payload_has_target_chat_id: bool = False
     payload_has_material_change_hash: bool = False
+    target_notification_plan_present: bool = False
+    target_notification_plan_status: str | None = None
+    target_notification_plan_delivery_decision: str | None = None
     redis_xadd_count: int = 0
     redis_message_id_present: bool = False
     event_outbox_marked_published: bool = False
@@ -155,6 +173,7 @@ class BoundedNotificationPlanOutboxPublishResult:
             "redis_write_allowed": self.redis_write_allowed,
             "outbox_status_update_allowed": self.outbox_status_update_allowed,
             "queue_name": self.queue_name,
+            "target_event_id_requested": self.target_event_id_requested,
             "database_read_attempted": self.state.database_read_attempted,
             "pending_count_observed": self.pending_count_observed,
             "selected_event_present": self.selected_event_present,
@@ -167,6 +186,9 @@ class BoundedNotificationPlanOutboxPublishResult:
             "payload_has_candidate_group_id": self.payload_has_candidate_group_id,
             "payload_has_target_chat_id": self.payload_has_target_chat_id,
             "payload_has_material_change_hash": self.payload_has_material_change_hash,
+            "target_notification_plan_present": self.target_notification_plan_present,
+            "target_notification_plan_status": self.target_notification_plan_status,
+            "target_notification_plan_delivery_decision": self.target_notification_plan_delivery_decision,
             "redis_write_attempted": self.state.redis_xadd_attempted,
             "redis_xadd_attempted": self.state.redis_xadd_attempted,
             "redis_xadd_count": self.redis_xadd_count,
@@ -250,19 +272,60 @@ class SqlAlchemyBoundedNotificationPlanOutboxRepository:
         row = result.mappings().first()
         if row is None:
             return None
-        payload = row["payload_json"]
-        if isinstance(payload, str):
-            payload = json.loads(payload)
-        return OutboxEventRow(
-            event_id=UUID(str(row["event_id"])),
-            event_type=str(row["event_type"]),
-            aggregate_type=str(row["aggregate_type"]),
-            aggregate_id=UUID(str(row["aggregate_id"])),
-            dedupe_key=str(row["dedupe_key"]),
-            payload_json=payload or {},
+        return _event_row_from_mapping(row)
+
+    async def fetch_event_by_id(self, *, event_id: UUID) -> OutboxEventRow | None:
+        result = await self._session.execute(
+            _sql(
+                """
+                SELECT
+                    event_id,
+                    event_type,
+                    aggregate_type,
+                    aggregate_id,
+                    dedupe_key,
+                    payload_json,
+                    status,
+                    fail_count,
+                    created_at
+                FROM event_outbox
+                WHERE event_id = CAST(:event_id AS uuid)
+                LIMIT 1
+                """
+            ),
+            {"event_id": str(event_id)},
+        )
+        row = result.mappings().first()
+        if row is None:
+            return None
+        return _event_row_from_mapping(row)
+
+    async def load_notification_plan_sendability(
+        self,
+        *,
+        notification_plan_id: UUID,
+    ) -> NotificationPlanSendabilityRow | None:
+        result = await self._session.execute(
+            _sql(
+                """
+                SELECT
+                    notification_plan_id,
+                    delivery_decision::text AS delivery_decision,
+                    status::text AS status
+                FROM notification_plans
+                WHERE notification_plan_id = CAST(:notification_plan_id AS uuid)
+                LIMIT 1
+                """
+            ),
+            {"notification_plan_id": str(notification_plan_id)},
+        )
+        row = result.mappings().first()
+        if row is None:
+            return None
+        return NotificationPlanSendabilityRow(
+            notification_plan_id=UUID(str(row["notification_plan_id"])),
+            delivery_decision=str(row["delivery_decision"]),
             status=str(row["status"]),
-            fail_count=int(row["fail_count"]),
-            created_at=row["created_at"],
         )
 
     async def mark_published(self, *, event_id: UUID, published_at: datetime | None = None) -> None:
@@ -396,33 +459,46 @@ async def run_bounded_notification_plan_outbox_publish(
         repository = repository_handle.repository
         state.database_read_attempted = True
         pending_count = await repository.count_pending_events(event_type=EVENT_TYPE)
-        if pending_count != config.expected_pending_count:
-            return _result(
-                "blocked",
-                "pending_count_mismatch",
-                config=config,
-                state=state,
-                pending_count_observed=pending_count,
-            )
-        if pending_count != 1:
-            return _result(
-                "blocked",
-                "pending_count_not_one",
-                config=config,
-                state=state,
-                pending_count_observed=pending_count,
-            )
+        if config.target_event_id is None:
+            if pending_count != config.expected_pending_count:
+                return _result(
+                    "blocked",
+                    "pending_count_mismatch",
+                    config=config,
+                    state=state,
+                    pending_count_observed=pending_count,
+                )
+            if pending_count != 1:
+                return _result(
+                    "blocked",
+                    "pending_count_not_one",
+                    config=config,
+                    state=state,
+                    pending_count_observed=pending_count,
+                )
+            row = await repository.fetch_oldest_pending_event(event_type=EVENT_TYPE)
+        else:
+            row = await repository.fetch_event_by_id(event_id=config.target_event_id)
 
-        row = await repository.fetch_oldest_pending_event(event_type=EVENT_TYPE)
-        selected = _selected_summary(row)
         if row is None:
             return _result(
                 "blocked",
-                "selected_event_missing",
+                "target_event_missing" if config.target_event_id is not None else "selected_event_missing",
                 config=config,
                 state=state,
                 pending_count_observed=pending_count,
             )
+        if config.target_event_id is not None:
+            target_event_error = _target_event_error(row)
+            if target_event_error is not None:
+                return _result(
+                    "blocked",
+                    target_event_error,
+                    config=config,
+                    state=state,
+                    pending_count_observed=pending_count,
+                    selected_event=row,
+                )
 
         payload_flags = _payload_presence_flags(row.payload_json)
         if not all(payload_flags.values()):
@@ -436,6 +512,35 @@ async def run_bounded_notification_plan_outbox_publish(
                 payload_flags=payload_flags,
             )
 
+        target_plan: NotificationPlanSendabilityRow | None = None
+        if config.target_event_id is not None:
+            notification_plan_id = _notification_plan_id_from_payload(row.payload_json)
+            if notification_plan_id is None:
+                return _result(
+                    "blocked",
+                    "target_notification_plan_id_invalid",
+                    config=config,
+                    state=state,
+                    pending_count_observed=pending_count,
+                    selected_event=row,
+                    payload_flags=payload_flags,
+                )
+            target_plan = await repository.load_notification_plan_sendability(
+                notification_plan_id=notification_plan_id,
+            )
+            plan_error = _target_notification_plan_error(target_plan)
+            if plan_error is not None:
+                return _result(
+                    "blocked",
+                    plan_error,
+                    config=config,
+                    state=state,
+                    pending_count_observed=pending_count,
+                    selected_event=row,
+                    payload_flags=payload_flags,
+                    target_plan=target_plan,
+                )
+
         route = (route_resolver or OutboxRouteResolver()).resolve(row)
         if route.queue_name != QUEUE_NAME or route.stage_name != STAGE_NAME:
             return _result(
@@ -446,6 +551,7 @@ async def run_bounded_notification_plan_outbox_publish(
                 pending_count_observed=pending_count,
                 selected_event=row,
                 payload_flags=payload_flags,
+                target_plan=target_plan,
             )
         if not config.allow_redis_write:
             return _result(
@@ -456,6 +562,7 @@ async def run_bounded_notification_plan_outbox_publish(
                 pending_count_observed=pending_count,
                 selected_event=row,
                 payload_flags=payload_flags,
+                target_plan=target_plan,
             )
 
         publisher_handle = await (redis_publisher_builder or build_default_bounded_notification_plan_redis_publisher)(
@@ -476,6 +583,7 @@ async def run_bounded_notification_plan_outbox_publish(
                 pending_count_observed=pending_count,
                 selected_event=row,
                 payload_flags=payload_flags,
+                target_plan=target_plan,
             )
 
         if not config.allow_outbox_status_update:
@@ -487,6 +595,7 @@ async def run_bounded_notification_plan_outbox_publish(
                 pending_count_observed=pending_count,
                 selected_event=row,
                 payload_flags=payload_flags,
+                target_plan=target_plan,
                 redis_xadd_count=1,
                 redis_message_id_present=bool(redis_message_id),
             )
@@ -506,6 +615,7 @@ async def run_bounded_notification_plan_outbox_publish(
                 pending_count_observed=pending_count,
                 selected_event=row,
                 payload_flags=payload_flags,
+                target_plan=target_plan,
                 redis_xadd_count=1,
                 redis_message_id_present=bool(redis_message_id),
             )
@@ -529,6 +639,7 @@ async def run_bounded_notification_plan_outbox_publish(
                 pending_count_observed=pending_count,
                 selected_event=row,
                 payload_flags=payload_flags,
+                target_plan=target_plan,
                 redis_xadd_count=1,
                 redis_message_id_present=bool(redis_message_id),
             )
@@ -542,6 +653,7 @@ async def run_bounded_notification_plan_outbox_publish(
             pending_count_observed=pending_count,
             selected_event=row,
             payload_flags=payload_flags,
+            target_plan=target_plan,
             redis_xadd_count=1,
             redis_message_id_present=bool(redis_message_id),
             event_outbox_marked_published=True,
@@ -609,6 +721,7 @@ def _result(
     pending_count_observed: int | None = None,
     selected_event: OutboxEventRow | None = None,
     payload_flags: Mapping[str, bool] | None = None,
+    target_plan: NotificationPlanSendabilityRow | None = None,
     redis_xadd_count: int = 0,
     redis_message_id_present: bool = False,
     event_outbox_marked_published: bool = False,
@@ -624,6 +737,7 @@ def _result(
         database_read_allowed=config.allow_database_read,
         redis_write_allowed=config.allow_redis_write,
         outbox_status_update_allowed=config.allow_outbox_status_update,
+        target_event_id_requested=config.target_event_id is not None,
         pending_count_observed=pending_count_observed,
         selected_event_present=selected["present"],
         selected_event_status=selected["status"],
@@ -635,6 +749,11 @@ def _result(
         payload_has_candidate_group_id=flags.get("candidate_group_id", False),
         payload_has_target_chat_id=flags.get("target_chat_id", False),
         payload_has_material_change_hash=flags.get("material_change_hash", False),
+        target_notification_plan_present=target_plan is not None,
+        target_notification_plan_status=target_plan.status if target_plan is not None else None,
+        target_notification_plan_delivery_decision=(
+            target_plan.delivery_decision if target_plan is not None else None
+        ),
         redis_xadd_count=redis_xadd_count,
         redis_message_id_present=redis_message_id_present,
         event_outbox_marked_published=event_outbox_marked_published,
@@ -668,6 +787,36 @@ def _payload_field_present(value: Any) -> bool:
     return True
 
 
+def _notification_plan_id_from_payload(payload: Mapping[str, Any]) -> UUID | None:
+    value = payload.get("notification_plan_id")
+    if value is None:
+        return None
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _target_event_error(row: OutboxEventRow) -> str | None:
+    if row.event_type != EVENT_TYPE:
+        return "target_event_type_mismatch"
+    if row.status != "pending":
+        return "target_event_not_pending"
+    return None
+
+
+def _target_notification_plan_error(row: NotificationPlanSendabilityRow | None) -> str | None:
+    if row is None:
+        return "target_notification_plan_missing"
+    if row.delivery_decision != "send_now":
+        return "target_notification_plan_not_send_now"
+    if row.status in {"sent", "edited", "suppressed", "failed_terminal"}:
+        return "target_notification_plan_terminal"
+    if row.status != "planned":
+        return "target_notification_plan_not_sendable"
+    return None
+
+
 def _selected_summary(row: OutboxEventRow | None) -> dict[str, Any]:
     if row is None:
         return {
@@ -698,6 +847,23 @@ def _env_value(env: Mapping[str, str], name: str, default: str = "") -> str:
     return str(env.get(name, default) or "").strip()
 
 
+def _event_row_from_mapping(row: Mapping[str, Any]) -> OutboxEventRow:
+    payload = row["payload_json"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    return OutboxEventRow(
+        event_id=UUID(str(row["event_id"])),
+        event_type=str(row["event_type"]),
+        aggregate_type=str(row["aggregate_type"]),
+        aggregate_id=UUID(str(row["aggregate_id"])),
+        dedupe_key=str(row["dedupe_key"]),
+        payload_json=payload or {},
+        status=str(row["status"]),
+        fail_count=int(row["fail_count"]),
+        created_at=row["created_at"],
+    )
+
+
 def _sql(statement: str) -> Any:
     if sa is None:
         return statement
@@ -715,6 +881,7 @@ __all__ = [
     "BoundedNotificationPlanRedisPublisherHandle",
     "EVENT_TYPE",
     "MODE",
+    "NotificationPlanSendabilityRow",
     "QUEUE_NAME",
     "REQUIRED_PAYLOAD_FIELDS",
     "RUNNER_NAME",
