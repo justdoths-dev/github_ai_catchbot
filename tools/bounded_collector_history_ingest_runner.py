@@ -16,6 +16,7 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
     BoundedTelegramCollectorHistoryIngestResult,
     BoundedTelegramCollectorHistoryIngestRuntimeBuilder,
     CollectorTelegramConfig,
+    EXECUTE_CONFIRM_TOKEN,
     argument_error_report,
     render_sanitized_json,
     run_bounded_telegram_collector_history_ingest_sync,
@@ -43,12 +44,13 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run one bounded Telegram collector history ingest for one exact registry target.",
         add_help=False,
     )
-    parser.add_argument("--mode", choices=("preview", "execute"), default="preview")
+    parser.add_argument("--mode", choices=("plan", "execute"), default="plan")
     parser.add_argument("--source-kind", default="public_username")
     parser.add_argument("--source-value")
     parser.add_argument("--registry-id-suffix", default=None)
     parser.add_argument("--history-limit", type=int, default=10)
     parser.add_argument("--operator-approved", action="store_true")
+    parser.add_argument("--confirm-token", default=None)
     parser.add_argument("--allow-runtime-config", action="store_true")
     parser.add_argument("--allow-database-read", action="store_true")
     parser.add_argument("--allow-telegram-read", action="store_true")
@@ -80,6 +82,7 @@ def run(
             registry_id_suffix=args.registry_id_suffix,
             history_limit=int(args.history_limit),
             operator_approved=bool(args.operator_approved),
+            confirm_token=args.confirm_token,
             allow_runtime_config=bool(args.allow_runtime_config),
             allow_database_read=bool(args.allow_database_read),
             allow_telegram_read=bool(args.allow_telegram_read),
@@ -122,6 +125,7 @@ __all__ = [
     "BoundedTelegramCollectorHistoryIngestRuntimeBuilder",
     "CliArgumentError",
     "CollectorTelegramConfig",
+    "EXECUTE_CONFIRM_TOKEN",
     "RunnerResult",
     "build_parser",
     "main",

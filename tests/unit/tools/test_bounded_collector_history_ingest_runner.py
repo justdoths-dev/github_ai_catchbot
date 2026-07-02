@@ -162,6 +162,31 @@ class FakeRepository:
     async def update_channel_sync_cursor(self, **kwargs: Any) -> None:
         self.cursor_updates.append(kwargs)
 
+    async def count_source_message_versions(self, source_message_id: str) -> int:
+        return len(self.versions.get(str(source_message_id), []))
+
+    async def count_source_created_events(self, source_message_id: str) -> int:
+        return sum(
+            1
+            for event in self.outbox
+            if str(event.aggregate_id) == str(source_message_id)
+            and event.event_type == "source_message.created.v1"
+        )
+
+    async def count_source_outbox_events(self, source_message_id: str) -> int:
+        return sum(
+            1
+            for event in self.outbox
+            if str(event.aggregate_id) == str(source_message_id)
+            and event.event_type
+            in {
+                "source_message.created.v1",
+                "source_message.edited.v1",
+                "source_message.deleted.v1",
+                "source_message.reconciled.v1",
+            }
+        )
+
 
 class FakeHistoryClient:
     def __init__(self) -> None:
@@ -246,10 +271,11 @@ def _runtime_config() -> CollectorTelegramConfig:
 
 def test_main_with_no_flags_returns_fail_closed_json(capsys) -> None:
     exit_code = runner.main([])
-    parsed = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
 
     assert exit_code == 1
-    assert parsed["schema_version"] == "bounded_collector_history_ingest_v1"
+    assert parsed["schema_version"] == "live_collector_one_channel_source_last_rollout_v1"
     assert parsed["runner_name"] == "bounded_collector_history_ingest_runner"
     assert parsed["operator_approved"] is False
     assert parsed["runtime_config_attempted"] is False
@@ -276,6 +302,7 @@ def test_parser_exposes_only_approved_bounded_flags() -> None:
         "--registry-id-suffix",
         "--history-limit",
         "--operator-approved",
+        "--confirm-token",
         "--allow-runtime-config",
         "--allow-database-read",
         "--allow-telegram-read",
@@ -296,6 +323,8 @@ def test_unsupported_authority_flags_return_sanitized_json(capsys) -> None:
         "--telegram-api-hash",
         "--tdlib-state-dir",
         "--allow-send",
+        "--all-channels",
+        "--live-collector",
         "--chat-id",
         "--registry-id",
     ):
@@ -311,7 +340,7 @@ def test_unsupported_authority_flags_return_sanitized_json(capsys) -> None:
         assert parsed["source_outbox_write_attempted"] is False
 
 
-def test_preview_without_telegram_gate_delegates_to_exact_source_and_writes_nothing(capsys) -> None:
+def test_plan_without_telegram_gate_delegates_to_exact_source_and_writes_nothing(capsys) -> None:
     runtime_builder = FakeRuntimeBuilder()
     exit_code = runner.main(
         [
@@ -328,17 +357,24 @@ def test_preview_without_telegram_gate_delegates_to_exact_source_and_writes_noth
         runtime_config_loader=_runtime_config,
         runtime_builder=runtime_builder,
     )
-    parsed = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
 
     assert exit_code == 0
     assert parsed["ok"] is True
-    assert parsed["mode"] == "preview"
-    assert parsed["source_value_surface"] == "trendingrepo"
+    assert parsed["mode"] == "plan"
+    assert parsed["status"] == "pass"
+    assert parsed["source_value_surface"] is None
+    assert parsed["exact_channel_target_fingerprint"].startswith("sha256:")
+    assert parsed["registry_target_fingerprint"].startswith("sha256:")
     assert parsed["telegram_read_attempted"] is False
+    assert parsed["authority"]["live_telegram_read_attempted"] is False
     assert parsed["database_write_attempted"] is False
+    assert parsed["bounded_counts"]["registry_targets"] == 1
     assert runtime_builder.repository.registry_lookups == ["trendingrepo"]
     assert runtime_builder.history_client.calls == []
     assert runtime_builder.close_commits == [False]
+    assert "trendingrepo" not in captured.out
 
 
 def test_execute_publish_prints_sanitized_json_and_thin_handoff(capsys) -> None:
@@ -349,6 +385,8 @@ def test_execute_publish_prints_sanitized_json_and_thin_handoff(capsys) -> None:
             "--mode",
             "execute",
             "--operator-approved",
+            "--confirm-token",
+            runner.EXECUTE_CONFIRM_TOKEN,
             "--allow-runtime-config",
             "--allow-database-read",
             "--allow-telegram-read",
@@ -378,10 +416,15 @@ def test_execute_publish_prints_sanitized_json_and_thin_handoff(capsys) -> None:
     assert parsed["source_messages_created_count"] == 1
     assert parsed["source_versions_appended_count"] == 1
     assert parsed["outbox_events_inserted_count"] == 1
+    assert parsed["source_created_events_count"] == 1
     assert parsed["redis_events_published_count"] == 1
     assert parsed["event_outbox_marked_published_count"] == 1
+    assert parsed["bounded_counts"]["source_normalize_handoffs"] == 1
+    assert parsed["source_message_fingerprints"]
+    assert parsed["source_outbox_event_fingerprints"]
+    assert parsed["redis_message_fingerprints"]
     assert runtime_builder.history_client.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
-    assert runtime_builder.commit_calls == 2
+    assert runtime_builder.commit_calls == 3
     assert runtime_builder.close_commits == [True]
 
     route, message = redis_publisher.publish_calls[0]
@@ -414,6 +457,8 @@ def test_main_close_failure_returns_sanitized_json_without_stderr(capsys) -> Non
             "--mode",
             "execute",
             "--operator-approved",
+            "--confirm-token",
+            runner.EXECUTE_CONFIRM_TOKEN,
             "--allow-runtime-config",
             "--allow-database-read",
             "--allow-telegram-read",

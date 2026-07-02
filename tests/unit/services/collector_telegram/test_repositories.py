@@ -61,6 +61,8 @@ class _FakeSession:
             )
         if 'UPDATE source_messages' in sql:
             return _FakeMappingResult(first={'source_message_id': call_params['source_message_id']})
+        if 'UPDATE telegram_channel_registry' in sql:
+            return _FakeMappingResult(first=None)
         raise AssertionError(f'unexpected SQL statement: {sql}')
 
 
@@ -197,6 +199,63 @@ class CollectorRepositorySqlContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(version_row)
         self.assertFalse(any('INSERT INTO source_message_versions' in sql for sql, _ in session.calls))
         self.assertFalse(any('UPDATE source_messages' in sql for sql, _ in session.calls))
+
+    async def test_update_channel_sync_cursor_uses_non_regression_sql_for_source_last_fields(
+        self,
+    ) -> None:
+        session = _FakeSession([])
+        repository = CollectorRepository(session)  # type: ignore[arg-type]
+        last_seen_message_date = datetime(2024, 1, 2, 12, 0, tzinfo=timezone.utc)
+        last_history_sync_at = datetime(2024, 1, 2, 12, 5, tzinfo=timezone.utc)
+
+        await repository.update_channel_sync_cursor(
+            registry_id='11111111-1111-1111-1111-111111111111',
+            last_seen_message_id=123,
+            last_seen_message_date=last_seen_message_date,
+            last_history_sync_at=last_history_sync_at,
+        )
+
+        update_sql, update_params = next(
+            (sql, params) for sql, params in session.calls if 'UPDATE telegram_channel_registry' in sql
+        )
+        normalized_update = _normalize_sql(update_sql)
+
+        self.assertIn('UPDATE telegram_channel_registry SET', normalized_update)
+        self.assertIn('last_seen_message_id = CASE', normalized_update)
+        self.assertIn(
+            'WHEN CAST(:last_seen_message_id AS bigint) IS NULL THEN last_seen_message_id',
+            normalized_update,
+        )
+        self.assertIn(
+            'WHEN last_seen_message_id IS NULL THEN CAST(:last_seen_message_id AS bigint)',
+            normalized_update,
+        )
+        self.assertIn(
+            'ELSE GREATEST(last_seen_message_id, CAST(:last_seen_message_id AS bigint))',
+            normalized_update,
+        )
+        self.assertIn('last_seen_message_date = CASE', normalized_update)
+        self.assertIn(
+            'WHEN CAST(:last_seen_message_date AS timestamptz) IS NULL THEN last_seen_message_date',
+            normalized_update,
+        )
+        self.assertIn(
+            'WHEN last_seen_message_date IS NULL THEN CAST(:last_seen_message_date AS timestamptz)',
+            normalized_update,
+        )
+        self.assertIn(
+            'ELSE GREATEST(last_seen_message_date, CAST(:last_seen_message_date AS timestamptz))',
+            normalized_update,
+        )
+        self.assertIn(
+            'last_history_sync_at = COALESCE( CAST(:last_history_sync_at AS timestamptz), last_history_sync_at )',
+            normalized_update,
+        )
+        self.assertIn('WHERE registry_id = CAST(:registry_id AS uuid)', normalized_update)
+        self.assertEqual(update_params['registry_id'], '11111111-1111-1111-1111-111111111111')
+        self.assertEqual(update_params['last_seen_message_id'], 123)
+        self.assertEqual(update_params['last_seen_message_date'], last_seen_message_date)
+        self.assertEqual(update_params['last_history_sync_at'], last_history_sync_at)
 
 
 if __name__ == '__main__':

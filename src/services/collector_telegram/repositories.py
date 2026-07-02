@@ -516,6 +516,54 @@ class CollectorRepository:
         )
         return result.scalar_one_or_none() is not None
 
+    async def count_source_message_versions(self, source_message_id: str) -> int:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM source_message_versions
+                WHERE source_message_id = CAST(:source_message_id AS uuid)
+                """
+            ),
+            {"source_message_id": source_message_id},
+        )
+        return int(result.scalar_one())
+
+    async def count_source_created_events(self, source_message_id: str) -> int:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM event_outbox
+                WHERE aggregate_type = 'source_message'
+                  AND aggregate_id = CAST(:source_message_id AS uuid)
+                  AND event_type = 'source_message.created.v1'
+                """
+            ),
+            {"source_message_id": source_message_id},
+        )
+        return int(result.scalar_one())
+
+    async def count_source_outbox_events(self, source_message_id: str) -> int:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT count(*)
+                FROM event_outbox
+                WHERE aggregate_type = 'source_message'
+                  AND aggregate_id = CAST(:source_message_id AS uuid)
+                  AND event_type IN (
+                    'source_message.created.v1',
+                    'source_message.edited.v1',
+                    'source_message.deleted.v1',
+                    'source_message.reconciled.v1'
+                  )
+                """
+            ),
+            {"source_message_id": source_message_id},
+        )
+        return int(result.scalar_one())
+
     async def find_public_username_registry_targets(
         self,
         normalized_source_value: str,
@@ -647,9 +695,24 @@ class CollectorRepository:
                 """
                 UPDATE telegram_channel_registry
                 SET
-                    last_seen_message_id = COALESCE(:last_seen_message_id, last_seen_message_id),
-                    last_seen_message_date = COALESCE(:last_seen_message_date, last_seen_message_date),
-                    last_history_sync_at = COALESCE(:last_history_sync_at, last_history_sync_at),
+                    last_seen_message_id = CASE
+                        WHEN CAST(:last_seen_message_id AS bigint) IS NULL
+                            THEN last_seen_message_id
+                        WHEN last_seen_message_id IS NULL
+                            THEN CAST(:last_seen_message_id AS bigint)
+                        ELSE GREATEST(last_seen_message_id, CAST(:last_seen_message_id AS bigint))
+                    END,
+                    last_seen_message_date = CASE
+                        WHEN CAST(:last_seen_message_date AS timestamptz) IS NULL
+                            THEN last_seen_message_date
+                        WHEN last_seen_message_date IS NULL
+                            THEN CAST(:last_seen_message_date AS timestamptz)
+                        ELSE GREATEST(last_seen_message_date, CAST(:last_seen_message_date AS timestamptz))
+                    END,
+                    last_history_sync_at = COALESCE(
+                        CAST(:last_history_sync_at AS timestamptz),
+                        last_history_sync_at
+                    ),
                     updated_at = now()
                 WHERE registry_id = CAST(:registry_id AS uuid)
                 """

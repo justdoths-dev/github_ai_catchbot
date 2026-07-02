@@ -27,10 +27,11 @@ from .outbox import CollectorOutboxBuilder
 from .repositories import CollectorRepository
 from .tdlib_client import TDJsonTransport, TDLibClient
 
-SCHEMA_VERSION = "bounded_collector_history_ingest_v1"
+SCHEMA_VERSION = "live_collector_one_channel_source_last_rollout_v1"
 RUNNER_NAME = "bounded_collector_history_ingest_runner"
-MODE_PREVIEW = "preview"
+MODE_PLAN = "plan"
 MODE_EXECUTE = "execute"
+EXECUTE_CONFIRM_TOKEN = "LIVE_COLLECTOR_1_CHANNEL_SOURCE_LAST_EXECUTE"
 DEFAULT_HISTORY_LIMIT = 10
 MAX_HISTORY_LIMIT = 30
 DEFAULT_MAX_MESSAGES = DEFAULT_HISTORY_LIMIT
@@ -136,6 +137,12 @@ class BoundedHistoryRepository(Protocol):
         last_history_sync_at: datetime | None = None,
     ) -> None: ...
 
+    async def count_source_message_versions(self, source_message_id: str) -> int: ...
+
+    async def count_source_created_events(self, source_message_id: str) -> int: ...
+
+    async def count_source_outbox_events(self, source_message_id: str) -> int: ...
+
 
 class BoundedHistoryClient(Protocol):
     async def fetch_newest_history_messages(self, *, chat_id: int, limit: int) -> Sequence[Mapping[str, Any]]: ...
@@ -148,12 +155,13 @@ class BoundedHistoryRedisPublisher(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class BoundedTelegramCollectorHistoryIngestConfig:
-    mode: str = MODE_PREVIEW
+    mode: str = MODE_PLAN
     source_kind: str = SOURCE_KIND_PUBLIC_USERNAME
     source_value: str | None = None
     registry_id_suffix: str | None = None
     history_limit: int = DEFAULT_HISTORY_LIMIT
     operator_approved: bool = False
+    confirm_token: str | None = None
     allow_runtime_config: bool = False
     allow_database_read: bool = False
     allow_telegram_read: bool = False
@@ -176,6 +184,7 @@ class BoundedTelegramCollectorHistoryIngestState:
     runtime_builder_attempted: bool = False
     database_read_attempted: bool = False
     registry_lookup_attempted: bool = False
+    registry_targets_seen_count: int = 0
     tdlib_auth_ready_checked: bool = False
     tdlib_auth_ready: bool = False
     tdlib_parameters_submitted: bool = False
@@ -243,8 +252,17 @@ class HistoryMessagePreviewResult:
 class PublishEventsResult:
     published_count: int = 0
     marked_published_count: int = 0
-    event_id_suffixes: tuple[str, ...] = ()
-    redis_message_id_suffixes: tuple[str, ...] = ()
+    event_fingerprints: tuple[str, ...] = ()
+    redis_message_fingerprints: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SourceLastReadbackResult:
+    source_current_found_count: int = 0
+    source_version_rows_count: int = 0
+    source_created_events_count: int = 0
+    source_outbox_events_count: int = 0
+    source_message_fingerprints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +272,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
     error_code: str | None
     config: BoundedTelegramCollectorHistoryIngestConfig
     state: BoundedTelegramCollectorHistoryIngestState = field(default_factory=BoundedTelegramCollectorHistoryIngestState)
-    mode: str = MODE_PREVIEW
+    mode: str = MODE_PLAN
     source_kind: str = SOURCE_KIND_PUBLIC_USERNAME
     source_value_surface: str | None = None
     target_registry_id_suffix: str | None = None
@@ -269,17 +287,27 @@ class BoundedTelegramCollectorHistoryIngestResult:
     source_messages_created_count: int = 0
     source_versions_appended_count: int = 0
     outbox_events_inserted_count: int = 0
+    source_created_events_count: int = 0
     idempotent_noop_count: int = 0
+    duplicate_noop_proof_count: int = 0
     redis_events_published_count: int = 0
     event_outbox_marked_published_count: int = 0
     source_message_id_suffixes: tuple[str, ...] = ()
     event_id_suffixes: tuple[str, ...] = ()
     redis_message_id_suffixes: tuple[str, ...] = ()
+    exact_channel_target_fingerprint: str | None = None
+    registry_target_fingerprint: str | None = None
+    source_message_fingerprints: tuple[str, ...] = ()
+    source_outbox_event_fingerprints: tuple[str, ...] = ()
+    redis_message_fingerprints: tuple[str, ...] = ()
+    readback: SourceLastReadbackResult = field(default_factory=SourceLastReadbackResult)
     error_class: str | None = None
 
     def to_sanitized_dict(self) -> dict[str, Any]:
         gates = {
             "operator_approved": self.config.operator_approved,
+            "confirm_token_present": bool((self.config.confirm_token or "").strip()),
+            "confirm_token_valid": _confirm_token_valid(self.config),
             "runtime_config_allowed": self.config.allow_runtime_config,
             "database_read_allowed": self.config.allow_database_read,
             "telegram_read_allowed": self.config.allow_telegram_read,
@@ -306,13 +334,91 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "docker_called": False,
             "alembic_called": False,
         }
+        authority = {
+            "live_telegram_read_attempted": self.state.telegram_read_attempted,
+            "telegram_send_attempted": False,
+            "openai_attempted": False,
+            "github_attempted": False,
+            "x_attempted": False,
+            "web_attempted": False,
+            "redis_consume_or_ack": False,
+            "broad_registry_ingest": False,
+            "docker_or_systemd_called": False,
+            "alembic_or_ddl_ran": False,
+        }
+        bounded_counts = {
+            "registry_targets": self.state.registry_targets_seen_count,
+            "source_messages_created": self.source_messages_created_count,
+            "source_versions_created": self.source_versions_appended_count,
+            "source_created_events": self.source_created_events_count,
+            "source_normalize_handoffs": self.redis_events_published_count,
+            "duplicate_noops": self.duplicate_noop_proof_count,
+        }
+        readback = {
+            "source_current_found_count": self.readback.source_current_found_count,
+            "source_version_rows_count": self.readback.source_version_rows_count,
+            "source_created_events_count": self.readback.source_created_events_count,
+            "source_outbox_events_count": self.readback.source_outbox_events_count,
+        }
+        redactions_applied = {
+            "full_chat_id_omitted": True,
+            "full_registry_id_omitted": True,
+            "source_ref_omitted": True,
+            "full_source_message_id_omitted": True,
+            "full_event_id_omitted": True,
+            "full_redis_message_id_omitted": True,
+            "raw_message_json_omitted": True,
+            "message_text_omitted": True,
+            "entities_json_omitted": True,
+            "url_surface_json_omitted": True,
+            "database_url_omitted": True,
+            "redis_url_omitted": True,
+            "telegram_credentials_omitted": True,
+            "tdlib_session_paths_omitted": True,
+            "exception_detail_omitted": True,
+            "traceback_omitted": True,
+            "stderr_omitted": True,
+        }
+        raw_values_printed = {
+            "source_text": False,
+            "source_ref": False,
+            "url": False,
+            "raw_id": False,
+            "tdlib_payload": False,
+            "database_url": False,
+            "redis_url": False,
+            "secret": False,
+            "runtime_value": False,
+            "stderr": False,
+            "traceback": False,
+            "exception_body": False,
+        }
+        rollback_stop_readback = {
+            "always_on_collector_started": False,
+            "broad_worker_started": False,
+            "exact_runner_completed": self.ok,
+        }
         return {
             "schema_version": SCHEMA_VERSION,
             "runner_name": RUNNER_NAME,
             "mode": self.mode,
+            "status": _report_status(self.status, self.ok),
+            "reason_code": self.error_code or "ok",
+            "exact_channel_target_fingerprint": self.exact_channel_target_fingerprint,
+            "registry_target_fingerprint": self.registry_target_fingerprint,
+            "source_message_fingerprints": list(self.source_message_fingerprints),
+            "source_outbox_event_fingerprints": list(self.source_outbox_event_fingerprints),
+            "bounded_counts": bounded_counts,
+            "authority": authority,
+            "redactions_applied": redactions_applied,
+            "raw_values_printed": raw_values_printed,
+            "rollback_stop_readback": rollback_stop_readback,
+            "readback": readback,
             "source_kind": self.source_kind,
-            "source_value_surface": self.source_value_surface,
-            "target_registry_id_suffix": self.target_registry_id_suffix,
+            "source_value_surface": None,
+            "source_value_fingerprint": self.exact_channel_target_fingerprint,
+            "target_registry_id_suffix": None,
+            "target_registry_fingerprint": self.registry_target_fingerprint,
             "target_joined": self.target_joined,
             "target_chat_id_present": self.target_chat_id_present,
             "gates": gates,
@@ -330,6 +436,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "runtime_builder_attempted": self.state.runtime_builder_attempted,
             "database_read_attempted": self.state.database_read_attempted,
             "registry_lookup_attempted": self.state.registry_lookup_attempted,
+            "registry_targets_seen_count": self.state.registry_targets_seen_count,
             "tdlib_auth_ready_checked": self.state.tdlib_auth_ready_checked,
             "tdlib_auth_ready": self.state.tdlib_auth_ready,
             "tdlib_parameters_submitted": self.state.tdlib_parameters_submitted,
@@ -355,32 +462,18 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "source_messages_created_count": self.source_messages_created_count,
             "source_versions_appended_count": self.source_versions_appended_count,
             "outbox_events_inserted_count": self.outbox_events_inserted_count,
+            "source_created_events_count": self.source_created_events_count,
             "idempotent_noop_count": self.idempotent_noop_count,
+            "duplicate_noop_proof_count": self.duplicate_noop_proof_count,
             "redis_events_published_count": self.redis_events_published_count,
             "event_outbox_marked_published_count": self.event_outbox_marked_published_count,
-            "source_message_id_suffixes": list(self.source_message_id_suffixes),
-            "event_id_suffixes": list(self.event_id_suffixes),
-            "redis_message_id_suffixes": list(self.redis_message_id_suffixes),
-            "status": self.status,
+            "source_message_id_suffixes": [],
+            "event_id_suffixes": [],
+            "redis_message_id_suffixes": [],
+            "redis_message_fingerprints": list(self.redis_message_fingerprints),
             "ok": self.ok,
             "error_code": self.error_code,
             "error_class": self.error_class,
-            "redactions_applied": [
-                "full_chat_id_omitted",
-                "full_registry_id_omitted",
-                "full_source_message_id_omitted",
-                "full_event_id_omitted",
-                "full_redis_message_id_omitted",
-                "raw_message_json_omitted",
-                "message_text_omitted",
-                "entities_json_omitted",
-                "url_surface_json_omitted",
-                "database_url_omitted",
-                "redis_url_omitted",
-                "telegram_credentials_omitted",
-                "tdlib_session_paths_omitted",
-                "exception_detail_omitted",
-            ],
             "side_effects": side_effects,
         }
 
@@ -714,10 +807,17 @@ async def run_bounded_telegram_collector_history_ingest(
         created_count: int = 0,
         version_count: int = 0,
         outbox_count: int = 0,
+        created_event_count: int = 0,
         noop_count: int = 0,
+        duplicate_noop_count: int = 0,
         publish: PublishEventsResult | None = None,
         source_message_suffixes: Sequence[str] = (),
+        source_outbox_event_fingerprints: Sequence[str] = (),
+        readback: SourceLastReadbackResult | None = None,
     ) -> BoundedTelegramCollectorHistoryIngestResult:
+        source_readback = readback or SourceLastReadbackResult()
+        publish_event_fingerprints = () if publish is None else publish.event_fingerprints
+        publish_redis_fingerprints = () if publish is None else publish.redis_message_fingerprints
         return BoundedTelegramCollectorHistoryIngestResult(
             status=status,
             ok=ok,
@@ -739,18 +839,31 @@ async def run_bounded_telegram_collector_history_ingest(
             source_messages_created_count=created_count,
             source_versions_appended_count=version_count,
             outbox_events_inserted_count=outbox_count,
+            source_created_events_count=created_event_count,
             idempotent_noop_count=noop_count,
+            duplicate_noop_proof_count=duplicate_noop_count,
             redis_events_published_count=0 if publish is None else publish.published_count,
             event_outbox_marked_published_count=0 if publish is None else publish.marked_published_count,
             source_message_id_suffixes=tuple(source_message_suffixes),
-            event_id_suffixes=() if publish is None else publish.event_id_suffixes,
-            redis_message_id_suffixes=() if publish is None else publish.redis_message_id_suffixes,
+            event_id_suffixes=(),
+            redis_message_id_suffixes=(),
+            exact_channel_target_fingerprint=_fingerprint(
+                "channel_target",
+                f"{SOURCE_KIND_PUBLIC_USERNAME}:{normalized_source_value}",
+            )
+            if normalized_source_value is not None
+            else None,
+            registry_target_fingerprint=_target_fingerprint(target),
+            source_message_fingerprints=source_readback.source_message_fingerprints,
+            source_outbox_event_fingerprints=tuple(source_outbox_event_fingerprints or publish_event_fingerprints),
+            redis_message_fingerprints=publish_redis_fingerprints,
+            readback=source_readback,
             error_class=error_class,
         )
 
     if not config.operator_approved:
         return make_result("blocked", "operator_approval_missing")
-    if mode not in {MODE_PREVIEW, MODE_EXECUTE}:
+    if mode not in {MODE_PLAN, MODE_EXECUTE}:
         return make_result("blocked", "mode_invalid")
     if config.source_kind != SOURCE_KIND_PUBLIC_USERNAME:
         return make_result("blocked", "source_kind_unsupported")
@@ -760,6 +873,15 @@ async def run_bounded_telegram_collector_history_ingest(
         return make_result("blocked", "direct_chat_or_registry_id_target_not_allowed")
     if not _valid_history_limit(history_limit):
         return make_result("blocked", "history_limit_out_of_bounds")
+    if mode == MODE_EXECUTE and not _confirm_token_valid(config):
+        return make_result(
+            "blocked",
+            "confirm_token_missing" if not (config.confirm_token or "").strip() else "confirm_token_invalid",
+        )
+    if mode == MODE_PLAN:
+        plan_error = _plan_authority_gate_error(config)
+        if plan_error is not None:
+            return make_result("blocked", plan_error)
     if not config.allow_runtime_config:
         return make_result("blocked", "runtime_config_not_allowed")
 
@@ -788,8 +910,8 @@ async def run_bounded_telegram_collector_history_ingest(
         runtime = await builder(runtime_config, state, effective_logger)
         target = await _resolve_exact_public_username_target(config, runtime.repository, state)
 
-        if mode == MODE_PREVIEW and not config.allow_telegram_read:
-            result = make_result("preview_completed", None, ok=True, target=target)
+        if mode == MODE_PLAN:
+            result = make_result("plan_completed", None, ok=True, target=target)
             raise _RunResultReady
 
         if not config.allow_telegram_read:
@@ -802,6 +924,9 @@ async def run_bounded_telegram_collector_history_ingest(
             limit=history_limit,
         )
         state.telegram_read_called = True
+        if len(messages) > history_limit:
+            result = make_result("blocked", "history_result_exceeds_requested_limit", target=target)
+            raise _RunResultReady
         selected_messages = [dict(message) for message in messages if isinstance(message, Mapping)][:history_limit]
 
         processor = HistoryMessageIngestProcessor(
@@ -811,35 +936,13 @@ async def run_bounded_telegram_collector_history_ingest(
             state=state,
         )
 
-        if mode == MODE_PREVIEW:
-            would_insert = 0
-            would_append = 0
-            would_outbox = 0
-            would_skip = 0
-            for message in reversed(selected_messages):
-                preview = await processor.preview_history_message(message)
-                would_insert += int(preview.would_insert_source_message)
-                would_append += int(preview.would_append_source_version)
-                would_outbox += int(preview.would_insert_outbox_event)
-                would_skip += int(preview.would_skip_same_hash)
-            result = make_result(
-                "preview_completed",
-                None,
-                ok=True,
-                target=target,
-                messages_seen=len(selected_messages),
-                would_insert=would_insert,
-                would_append=would_append,
-                would_outbox=would_outbox,
-                would_skip=would_skip,
-            )
-            raise _RunResultReady
-
         created_count = 0
         version_count = 0
         outbox_count = 0
+        created_event_count = 0
         noop_count = 0
         outbox_events: list[OutboxEventRow] = []
+        outbox_event_fingerprints: list[str] = []
         source_message_suffixes: list[str] = []
         last_seen_message_id: int | None = None
         last_seen_message_date: datetime | None = None
@@ -853,6 +956,8 @@ async def run_bounded_telegram_collector_history_ingest(
                 source_message_suffixes.append(applied.source_message_id_suffix)
             if applied.outbox_event is not None:
                 outbox_events.append(applied.outbox_event)
+                outbox_event_fingerprints.append(_fingerprint("source_outbox_event", applied.outbox_event.event_id))
+                created_event_count += int(applied.outbox_event.event_type == "source_message.created.v1")
             message_id = _message_id(message)
             message_date = _message_date(message)
             if message_id is not None and (last_seen_message_id is None or message_id > last_seen_message_id):
@@ -881,8 +986,10 @@ async def run_bounded_telegram_collector_history_ingest(
                     created_count=created_count,
                     version_count=version_count,
                     outbox_count=outbox_count,
+                    created_event_count=created_event_count,
                     noop_count=noop_count,
                     source_message_suffixes=source_message_suffixes,
+                    source_outbox_event_fingerprints=outbox_event_fingerprints,
                 )
                 raise _RunResultReady
             except Exception as exc:
@@ -895,11 +1002,67 @@ async def run_bounded_telegram_collector_history_ingest(
                     created_count=created_count,
                     version_count=version_count,
                     outbox_count=outbox_count,
+                    created_event_count=created_event_count,
                     noop_count=noop_count,
                     source_message_suffixes=source_message_suffixes,
+                    source_outbox_event_fingerprints=outbox_event_fingerprints,
                 )
                 raise _RunResultReady
         close_commit = True
+
+        readback = SourceLastReadbackResult()
+        duplicate_noop_count = 0
+        try:
+            duplicate_noop_count = await _prove_duplicate_noop(
+                processor=processor,
+                messages=selected_messages,
+            )
+            readback = await _readback_source_last_proof(
+                repository=runtime.repository,
+                projection_builder=MessageProjectionBuilder(logger=effective_logger),
+                messages=selected_messages,
+                target=target,
+                state=state,
+            )
+            if runtime.commit is not None:
+                await _commit_source_ingest(runtime)
+        except BoundedHistoryIngestError as exc:
+            close_commit = False
+            result = make_result(
+                "failed",
+                exc.error_code,
+                target=target,
+                messages_seen=len(selected_messages),
+                created_count=created_count,
+                version_count=version_count,
+                outbox_count=outbox_count,
+                created_event_count=created_event_count,
+                noop_count=noop_count,
+                duplicate_noop_count=duplicate_noop_count,
+                source_message_suffixes=source_message_suffixes,
+                source_outbox_event_fingerprints=outbox_event_fingerprints,
+                readback=readback,
+            )
+            raise _RunResultReady
+        except Exception as exc:
+            close_commit = False
+            result = make_result(
+                "failed",
+                "source_readback_commit_failed",
+                error_class=_safe_exception_class(exc),
+                target=target,
+                messages_seen=len(selected_messages),
+                created_count=created_count,
+                version_count=version_count,
+                outbox_count=outbox_count,
+                created_event_count=created_event_count,
+                noop_count=noop_count,
+                duplicate_noop_count=duplicate_noop_count,
+                source_message_suffixes=source_message_suffixes,
+                source_outbox_event_fingerprints=outbox_event_fingerprints,
+                readback=readback,
+            )
+            raise _RunResultReady
 
         publish_result = PublishEventsResult()
         if config.allow_source_outbox_publish:
@@ -913,8 +1076,12 @@ async def run_bounded_telegram_collector_history_ingest(
                     created_count=created_count,
                     version_count=version_count,
                     outbox_count=outbox_count,
+                    created_event_count=created_event_count,
                     noop_count=noop_count,
+                    duplicate_noop_count=duplicate_noop_count,
                     source_message_suffixes=source_message_suffixes,
+                    source_outbox_event_fingerprints=outbox_event_fingerprints,
+                    readback=readback,
                 )
                 raise _RunResultReady
             try:
@@ -936,9 +1103,13 @@ async def run_bounded_telegram_collector_history_ingest(
                     created_count=created_count,
                     version_count=version_count,
                     outbox_count=outbox_count,
+                    created_event_count=created_event_count,
                     noop_count=noop_count,
+                    duplicate_noop_count=duplicate_noop_count,
                     publish=exc.partial_publish,
                     source_message_suffixes=source_message_suffixes,
+                    source_outbox_event_fingerprints=outbox_event_fingerprints,
+                    readback=readback,
                 )
                 raise _RunResultReady
 
@@ -951,9 +1122,13 @@ async def run_bounded_telegram_collector_history_ingest(
             created_count=created_count,
             version_count=version_count,
             outbox_count=outbox_count,
+            created_event_count=created_event_count,
             noop_count=noop_count,
+            duplicate_noop_count=duplicate_noop_count,
             publish=publish_result,
             source_message_suffixes=source_message_suffixes,
+            source_outbox_event_fingerprints=outbox_event_fingerprints,
+            readback=readback,
         )
         raise _RunResultReady
     except _RunResultReady:
@@ -1018,6 +1193,7 @@ async def _resolve_exact_public_username_target(
     state.registry_lookup_attempted = True
     state.database_read_attempted = True
     rows = list(await repository.find_public_username_registry_targets(normalized_source_value))
+    state.registry_targets_seen_count = len(rows)
     if not rows:
         raise BoundedHistoryIngestError("registry_target_missing")
     if len(rows) > 1:
@@ -1062,6 +1238,78 @@ async def _commit_source_ingest(runtime: BoundedTelegramCollectorHistoryIngestRu
     await runtime.commit()
 
 
+async def _prove_duplicate_noop(
+    *,
+    processor: HistoryMessageIngestProcessor,
+    messages: Sequence[Mapping[str, Any]],
+) -> int:
+    duplicate_noops = 0
+    for message in reversed([dict(item) for item in messages if isinstance(item, Mapping)]):
+        applied = await processor.apply_history_message(message)
+        if not applied.idempotent_noop:
+            raise BoundedHistoryIngestError("duplicate_noop_proof_failed")
+        duplicate_noops += 1
+    return duplicate_noops
+
+
+async def _readback_source_last_proof(
+    *,
+    repository: BoundedHistoryRepository,
+    projection_builder: MessageProjectionBuilder,
+    messages: Sequence[Mapping[str, Any]],
+    target: _ResolvedTarget,
+    state: BoundedTelegramCollectorHistoryIngestState,
+) -> SourceLastReadbackResult:
+    source_current_found = 0
+    source_version_rows = 0
+    source_created_events = 0
+    source_outbox_events = 0
+    fingerprints: list[str] = []
+    seen_source_ids: set[str] = set()
+
+    for message in reversed([dict(item) for item in messages if isinstance(item, Mapping)]):
+        projection = projection_builder.build_source_projection(message)
+        if projection.chat_id != target.chat_id:
+            raise BoundedHistoryIngestError("non_target_channel_readback_mismatch")
+        state.database_read_attempted = True
+        row = await repository.get_source_message(
+            platform="telegram",
+            chat_id=projection.chat_id,
+            message_id=projection.message_id,
+        )
+        if row is None:
+            raise BoundedHistoryIngestError("source_current_readback_missing")
+        source_message_id = _require_source_message_id(row)
+        if source_message_id in seen_source_ids:
+            continue
+        seen_source_ids.add(source_message_id)
+        latest = await repository.get_latest_version(source_message_id)
+        if latest is None:
+            raise BoundedHistoryIngestError("source_version_readback_missing")
+        if str(latest.get("content_hash")) != projection.content_hash:
+            raise BoundedHistoryIngestError("source_version_content_hash_mismatch")
+        version_count = await repository.count_source_message_versions(source_message_id)
+        created_count = await repository.count_source_created_events(source_message_id)
+        outbox_count = await repository.count_source_outbox_events(source_message_id)
+        if version_count < 1:
+            raise BoundedHistoryIngestError("source_version_readback_missing")
+        if outbox_count < 1:
+            raise BoundedHistoryIngestError("source_outbox_readback_missing")
+        source_current_found += 1
+        source_version_rows += version_count
+        source_created_events += created_count
+        source_outbox_events += outbox_count
+        fingerprints.append(_fingerprint("source_message", source_message_id))
+
+    return SourceLastReadbackResult(
+        source_current_found_count=source_current_found,
+        source_version_rows_count=source_version_rows,
+        source_created_events_count=source_created_events,
+        source_outbox_events_count=source_outbox_events,
+        source_message_fingerprints=tuple(fingerprints),
+    )
+
+
 async def _publish_source_outbox_events(
     *,
     repository: BoundedHistoryRepository,
@@ -1073,8 +1321,8 @@ async def _publish_source_outbox_events(
     resolver = OutboxRouteResolver()
     published = 0
     marked = 0
-    event_suffixes: list[str] = []
-    redis_suffixes: list[str] = []
+    event_fingerprints: list[str] = []
+    redis_fingerprints: list[str] = []
     for row in events:
         if row.status != "pending":
             continue
@@ -1096,11 +1344,11 @@ async def _publish_source_outbox_events(
         partial_after_xadd = PublishEventsResult(
             published_count=published + 1,
             marked_published_count=marked,
-            event_id_suffixes=tuple(
-                value for value in [*event_suffixes, _safe_suffix(row.event_id) or ""] if value
+            event_fingerprints=tuple(
+                value for value in [*event_fingerprints, _fingerprint("source_outbox_event", row.event_id)] if value
             ),
-            redis_message_id_suffixes=tuple(
-                value for value in [*redis_suffixes, _safe_suffix(redis_message_id) or ""] if value
+            redis_message_fingerprints=tuple(
+                value for value in [*redis_fingerprints, _fingerprint("redis_message", redis_message_id)] if value
             ),
         )
         try:
@@ -1142,13 +1390,13 @@ async def _publish_source_outbox_events(
             ) from exc
         published += 1
         marked += 1
-        event_suffixes.append(_safe_suffix(row.event_id) or "")
-        redis_suffixes.append(_safe_suffix(redis_message_id) or "")
+        event_fingerprints.append(_fingerprint("source_outbox_event", row.event_id))
+        redis_fingerprints.append(_fingerprint("redis_message", redis_message_id))
     return PublishEventsResult(
         published_count=published,
         marked_published_count=marked,
-        event_id_suffixes=tuple(value for value in event_suffixes if value),
-        redis_message_id_suffixes=tuple(value for value in redis_suffixes if value),
+        event_fingerprints=tuple(value for value in event_fingerprints if value),
+        redis_message_fingerprints=tuple(value for value in redis_fingerprints if value),
     )
 
 
@@ -1203,7 +1451,8 @@ def _is_bounded_auth_extra(value: object) -> bool:
 
 
 def _normalize_mode(value: str) -> str:
-    return str(value or "").strip().lower()
+    normalized = str(value or "").strip().lower()
+    return normalized
 
 
 def _history_limit(config: BoundedTelegramCollectorHistoryIngestConfig) -> int:
@@ -1224,6 +1473,25 @@ def _normalize_source_value(value: str | None) -> str | None:
 
 def _source_outbox_write_allowed(config: BoundedTelegramCollectorHistoryIngestConfig) -> bool:
     return bool(config.allow_source_outbox_write or config.allow_outbox_write)
+
+
+def _confirm_token_valid(config: BoundedTelegramCollectorHistoryIngestConfig) -> bool:
+    return (config.confirm_token or "").strip() == EXECUTE_CONFIRM_TOKEN
+
+
+def _plan_authority_gate_error(config: BoundedTelegramCollectorHistoryIngestConfig) -> str | None:
+    if config.allow_telegram_read:
+        return "plan_telegram_read_not_allowed"
+    if (
+        config.allow_database_write
+        or config.allow_source_message_write
+        or config.allow_source_version_write
+        or _source_outbox_write_allowed(config)
+    ):
+        return "plan_database_write_not_allowed"
+    if config.allow_source_outbox_publish or config.allow_redis_publish:
+        return "plan_redis_write_not_allowed"
+    return None
 
 
 def _execute_write_gate_error(config: BoundedTelegramCollectorHistoryIngestConfig) -> str | None:
@@ -1320,6 +1588,25 @@ def _safe_hash12(value: object | None) -> str | None:
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:12]
 
 
+def _fingerprint(kind: str, value: object | None) -> str:
+    digest = hashlib.sha256(f"{kind}:{value}".encode("utf-8")).hexdigest()[:16]
+    return f"sha256:{digest}"
+
+
+def _target_fingerprint(target: _ResolvedTarget | None) -> str | None:
+    if target is None:
+        return None
+    return _fingerprint("registry_target", f"{target.registry_id}:{target.chat_id}")
+
+
+def _report_status(status: str, ok: bool) -> str:
+    if ok:
+        return "pass"
+    if status == "failed":
+        return "failed"
+    return "blocked"
+
+
 def _runtime_close_error_code(commit: bool) -> str:
     return "runtime_commit_failed" if commit else "runtime_rollback_failed"
 
@@ -1340,6 +1627,7 @@ __all__ = [
     "BoundedTelegramCollectorHistoryIngestState",
     "DEFAULT_HISTORY_LIMIT",
     "DEFAULT_MAX_MESSAGES",
+    "EXECUTE_CONFIRM_TOKEN",
     "MAX_HISTORY_LIMIT",
     "MAX_MESSAGES_HARD_LIMIT",
     "RUNNER_NAME",
