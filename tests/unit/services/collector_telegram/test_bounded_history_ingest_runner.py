@@ -18,6 +18,7 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
     BoundedTelegramCollectorHistoryIngestRuntimeHandle,
     BoundedTelegramCollectorHistoryIngestState,
     EXECUTE_CONFIRM_TOKEN,
+    FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN,
     THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
     _TDLibBoundedHistoryClient,
     run_bounded_telegram_collector_history_ingest,
@@ -153,6 +154,10 @@ class FakeRepository:
                 }
             )
         return rows
+
+    async def list_reconcile_targets(self, limit: int) -> list[TrackedChat]:
+        self.registry_lookups.append(f"list_reconcile_targets:{limit}")
+        return [target for target in [self.tracked, *self.extra_targets] if target is not None][:limit]
 
     async def get_active_joined_tracked_chat_by_registry_id(self, registry_id: str) -> TrackedChat | None:
         self.registry_lookups.append(registry_id)
@@ -590,6 +595,12 @@ class ImplicitTransactionRepository:
             }
         ]
 
+    async def list_reconcile_targets(self, limit: int) -> list[TrackedChat]:
+        self.registry_lookups.append(f"list_reconcile_targets:{limit}")
+        self.implicit_transaction_open = True
+        self.ensure_pending()
+        return [self.tracked][:limit]
+
     async def get_active_joined_tracked_chat_by_registry_id(self, registry_id: str) -> TrackedChat | None:
         self.registry_lookups.append(registry_id)
         self.implicit_transaction_open = True
@@ -837,6 +848,27 @@ def _approved_three_channel_config(**overrides: Any) -> BoundedTelegramCollector
         "source_values": ("alpha_tools", "beta_tools", "gamma_tools"),
         "operator_approved": True,
         "confirm_token": THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
+        "allow_runtime_config": True,
+        "allow_database_read": True,
+        "allow_telegram_read": True,
+        "allow_database_write": True,
+        "allow_source_message_write": True,
+        "allow_source_version_write": True,
+        "allow_source_outbox_write": True,
+        "history_limit": 1,
+    }
+    values.update(overrides)
+    return BoundedTelegramCollectorHistoryIngestConfig(**values)
+
+
+def _approved_full_registry_config(**overrides: Any) -> BoundedTelegramCollectorHistoryIngestConfig:
+    values = {
+        "mode": "execute",
+        "rollout_scope": "full_tracked_registry",
+        "source_kind": "public_username",
+        "max_targets": 3,
+        "operator_approved": True,
+        "confirm_token": FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN,
         "allow_runtime_config": True,
         "allow_database_read": True,
         "allow_telegram_read": True,
@@ -1783,6 +1815,406 @@ async def test_three_channel_redis_publish_failure_preserves_committed_source_an
     assert builder.commit_calls == 6
     assert builder.close_commits == [False]
     assert "private redis xadd failure detail" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_full_registry_plan_uses_reconcile_selector_without_fetch_writes_or_raw_output() -> None:
+    repository = _three_target_repository()
+    result, _loader, builder, repository, history = await _run(
+        _approved_full_registry_config(
+            mode="plan",
+            confirm_token=None,
+            allow_telegram_read=False,
+            allow_database_write=False,
+            allow_source_message_write=False,
+            allow_source_version_write=False,
+            allow_source_outbox_write=False,
+        ),
+        repository=repository,
+        history=_three_channel_history(),
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is True
+    assert report["schema_version"] == "live_collector_full_registry_source_last_rollout_v1"
+    assert report["rollout_scope"] == "full_tracked_registry"
+    assert report["mode"] == "plan"
+    assert report["target_count"] == 3
+    assert report["max_targets"] == 3
+    assert len(report["target_fingerprints"]) == 3
+    assert len(report["per_channel_results"]) == 3
+    assert report["registry_read_count"] == 3
+    assert report["telegram_read_attempted"] is False
+    assert report["database_write_attempted"] is False
+    assert repository.registry_lookups == ["list_reconcile_targets:4"]
+    assert repository.messages == {}
+    assert repository.outbox == []
+    assert history.calls == []
+    assert builder.close_commits == [False]
+    for raw_value in ("alpha_tools", "beta_tools", "gamma_tools", str(RAW_CHAT_ID), RAW_MESSAGE_TEXT):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_missing_full_registry_scope_still_rejects_missing_source_before_runtime_config() -> None:
+    result, loader, builder, repository, history = await _run(
+        BoundedTelegramCollectorHistoryIngestConfig(
+            mode="plan",
+            operator_approved=True,
+            allow_runtime_config=True,
+            allow_database_read=True,
+        ),
+        repository=_three_target_repository(),
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is False
+    assert result.error_code == "source_value_missing"
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "error_code"),
+    [
+        ({"max_targets": None}, "max_targets_required"),
+        ({"max_targets": 0}, "max_targets_out_of_bounds"),
+        ({"max_targets": 31}, "max_targets_exceeds_hard_cap"),
+        ({"source_value": "alpha_tools"}, "full_registry_source_value_not_allowed"),
+        ({"chat_id": RAW_CHAT_ID}, "direct_chat_or_registry_id_target_not_allowed"),
+        ({"registry_id": "11111111-1111-1111-1111-111111111111"}, "direct_chat_or_registry_id_target_not_allowed"),
+    ],
+)
+async def test_full_registry_plan_rejects_invalid_scope_inputs_before_runtime_config(
+    overrides: dict[str, Any],
+    error_code: str,
+) -> None:
+    config = _approved_full_registry_config(
+        mode="plan",
+        confirm_token=None,
+        allow_telegram_read=False,
+        allow_database_write=False,
+        allow_source_message_write=False,
+        allow_source_version_write=False,
+        allow_source_outbox_write=False,
+        **overrides,
+    )
+    result, loader, builder, repository, history = await _run(
+        config,
+        repository=_three_target_repository(),
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is False
+    assert result.error_code == error_code
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "error_code"),
+    [
+        ({"allow_telegram_read": True}, "plan_telegram_read_not_allowed"),
+        ({"allow_database_write": True}, "plan_database_write_not_allowed"),
+        ({"allow_source_message_write": True}, "plan_database_write_not_allowed"),
+        ({"allow_source_version_write": True}, "plan_database_write_not_allowed"),
+        ({"allow_source_outbox_write": True}, "plan_database_write_not_allowed"),
+        ({"allow_source_outbox_publish": True}, "plan_redis_write_not_allowed"),
+        ({"allow_redis_publish": True}, "plan_redis_write_not_allowed"),
+        ({"allow_database_read": False}, "database_read_not_allowed"),
+    ],
+)
+async def test_full_registry_plan_rejects_forbidden_authority_before_selector(
+    overrides: dict[str, Any],
+    error_code: str,
+) -> None:
+    values = {
+        "mode": "plan",
+        "confirm_token": None,
+        "allow_telegram_read": False,
+        "allow_database_write": False,
+        "allow_source_message_write": False,
+        "allow_source_version_write": False,
+        "allow_source_outbox_write": False,
+    }
+    values.update(overrides)
+    config = _approved_full_registry_config(**values)
+    result, loader, builder, repository, history = await _run(
+        config,
+        repository=_three_target_repository(),
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is False
+    assert result.error_code == error_code
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+    if error_code == "database_read_not_allowed":
+        assert loader.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("repository", "max_targets", "error_code", "registry_lookups"),
+    [
+        (FakeRepository(tracked=None), 3, "registry_targets_empty", ["list_reconcile_targets:4"]),
+        (_three_target_repository(), 2, "target_count_exceeds_max_targets", ["list_reconcile_targets:3"]),
+        (
+            _three_target_repository(
+                second=_tracked_chat(
+                    "22222222-2222-2222-2222-222222222222",
+                    source_value="beta_tools",
+                    chat_id=RAW_CHAT_ID + 1,
+                    access_state="unresolved",
+                )
+            ),
+            3,
+            "registry_target_not_joined",
+            ["list_reconcile_targets:4"],
+        ),
+    ],
+)
+async def test_full_registry_plan_rejects_empty_over_cap_or_unready_rows_before_history_read(
+    repository: FakeRepository,
+    max_targets: int,
+    error_code: str,
+    registry_lookups: list[str],
+) -> None:
+    result, _loader, builder, repository, history = await _run(
+        _approved_full_registry_config(
+            mode="plan",
+            max_targets=max_targets,
+            confirm_token=None,
+            allow_telegram_read=False,
+            allow_database_write=False,
+            allow_source_message_write=False,
+            allow_source_version_write=False,
+            allow_source_outbox_write=False,
+        ),
+        repository=repository,
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is False
+    assert result.error_code == error_code
+    assert repository.registry_lookups == registry_lookups
+    assert history.calls == []
+    assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirm_token", [None, EXECUTE_CONFIRM_TOKEN, THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN, "wrong-token"])
+async def test_full_registry_execute_requires_f3_confirm_token_before_runtime_config(
+    confirm_token: str | None,
+) -> None:
+    result, loader, builder, repository, history = await _run(
+        _approved_full_registry_config(confirm_token=confirm_token),
+        repository=_three_target_repository(),
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is False
+    assert result.error_code == ("confirm_token_missing" if confirm_token is None else "confirm_token_invalid")
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+
+
+@pytest.mark.asyncio
+async def test_full_registry_execute_processes_selected_targets_once_with_sanitized_proof() -> None:
+    repository = _three_target_repository()
+    history = _three_channel_history()
+    result, _loader, builder, repository, history = await _run(
+        _approved_full_registry_config(),
+        repository=repository,
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is True
+    assert report["schema_version"] == "live_collector_full_registry_source_last_rollout_v1"
+    assert report["rollout_scope"] == "full_tracked_registry"
+    assert report["target_count"] == 3
+    assert report["max_targets"] == 3
+    assert len(report["target_fingerprints"]) == 3
+    assert len(report["per_channel_results"]) == 3
+    assert report["messages_seen"] == 3
+    assert report["source_messages_created_count"] == 3
+    assert report["source_versions_appended_count"] == 3
+    assert report["outbox_events_inserted_count"] == 3
+    assert report["duplicate_noop_proof_count"] == 3
+    assert report["readback"]["source_current_found_count"] == 3
+    assert report["partial_committed_target_fingerprints"] == []
+    assert repository.registry_lookups == ["list_reconcile_targets:4"]
+    assert history.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1},
+        {"chat_id": RAW_CHAT_ID + 1, "limit": 1},
+        {"chat_id": RAW_CHAT_ID + 2, "limit": 1},
+    ]
+    assert len(repository.messages) == 3
+    assert len(repository.outbox) == 3
+    assert len(repository.cursor_updates) == 3
+    assert builder.commit_calls == 6
+    assert builder.close_commits == [True]
+    for raw_value in ("alpha_tools", "beta_tools", "gamma_tools", str(RAW_CHAT_ID), RAW_MESSAGE_TEXT, DB_URL, RAW_SECRET):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_full_registry_execute_preserves_cursor_non_regression_for_selected_target() -> None:
+    newer_registry_date = datetime.fromtimestamp(1713560000, tz=timezone.utc)
+    third = _tracked_chat(
+        "33333333-3333-3333-3333-333333333333",
+        source_value="gamma_tools",
+        chat_id=RAW_CHAT_ID + 2,
+        last_seen_message_id=RAW_MESSAGE_ID + 100,
+        last_seen_message_date=newer_registry_date,
+    )
+    repository = _three_target_repository(third=third)
+    result, _loader, builder, repository, history = await _run(
+        _approved_full_registry_config(),
+        repository=repository,
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is True
+    assert len(repository.cursor_updates) == 3
+    assert repository.cursor_updates[-1]["last_seen_message_id"] == RAW_MESSAGE_ID + 2
+    assert repository.extra_targets[1].last_seen_message_id == RAW_MESSAGE_ID + 100
+    assert repository.extra_targets[1].last_seen_message_date == newer_registry_date
+    assert history.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1},
+        {"chat_id": RAW_CHAT_ID + 1, "limit": 1},
+        {"chat_id": RAW_CHAT_ID + 2, "limit": 1},
+    ]
+    assert builder.close_commits == [True]
+
+
+@pytest.mark.asyncio
+async def test_full_registry_source_normalize_publish_happens_after_all_target_proofs() -> None:
+    repository = _three_target_repository()
+    history = _three_channel_history()
+    builder = FakeRuntimeBuilder(repository, history)
+
+    class CommitObservingPublisher(FakeRedisPublisher):
+        def __init__(self) -> None:
+            super().__init__(message_id="9999999999-0")
+            self.commit_calls_at_publish: list[int] = []
+
+        async def publish(self, route: Any, message: Any) -> str:
+            self.commit_calls_at_publish.append(builder.commit_calls)
+            return await super().publish(route, message)
+
+    publisher = CommitObservingPublisher()
+    builder.redis_publisher = publisher
+
+    result = await run_bounded_telegram_collector_history_ingest(
+        _approved_full_registry_config(allow_source_outbox_publish=True, allow_redis_publish=True),
+        runtime_config_loader=Loader(),
+        runtime_builder=builder,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is True
+    assert report["redis_events_published_count"] == 3
+    assert report["event_outbox_marked_published_count"] == 3
+    assert report["bounded_counts"]["source_normalize_handoffs"] == 3
+    assert publisher.commit_calls_at_publish == [6, 7, 8]
+    assert builder.commit_calls == 9
+    assert len(repository.mark_published_calls) == 3
+    assert all(route.queue_name == "q.source.normalize" for route, _message in publisher.publish_calls)
+    for _route, message in publisher.publish_calls:
+        fields = message.as_stream_fields()
+        assert fields["stage_name"] == "normalize"
+        assert fields["root_object_type"] == "source_message"
+        assert "payload_json" not in fields
+
+
+@pytest.mark.asyncio
+async def test_full_registry_partial_failures_and_post_commit_redis_failure_stay_sanitized() -> None:
+    first_failure_history = _three_channel_history(
+        failure_by_chat={RAW_CHAT_ID: RuntimeError(EXCEPTION_DETAIL)},
+    )
+    first_result, _loader, first_builder, first_repository, first_history = await _run(
+        _approved_full_registry_config(),
+        repository=_three_target_repository(),
+        history=first_failure_history,
+    )
+    first_report = first_result.to_sanitized_dict()
+
+    assert first_result.ok is False
+    assert first_report["status"] == "failed"
+    assert first_report["database_write_attempted"] is False
+    assert first_report["partial_committed_target_fingerprints"] == []
+    assert first_repository.messages == {}
+    assert first_builder.commit_calls == 0
+    assert first_builder.close_commits == [False]
+    assert first_history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
+
+    partial_repository = _three_target_repository(fail_upsert_chat_id=RAW_CHAT_ID + 1)
+    partial_result, _loader, partial_builder, partial_repository, partial_history = await _run(
+        _approved_full_registry_config(),
+        repository=partial_repository,
+        history=_three_channel_history(),
+    )
+    partial_report = partial_result.to_sanitized_dict()
+    partial_rendered = json.dumps(partial_report, sort_keys=True)
+
+    assert partial_result.ok is False
+    assert partial_report["status"] == "failed"
+    assert partial_report["source_messages_created_count"] == 1
+    assert len(partial_report["partial_committed_target_fingerprints"]) == 1
+    assert len(partial_repository.messages) == 1
+    assert partial_builder.commit_calls == 2
+    assert partial_builder.close_commits == [False]
+    assert partial_history.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1},
+        {"chat_id": RAW_CHAT_ID + 1, "limit": 1},
+    ]
+
+    redis_publisher = FakeRedisPublisher(failure=RuntimeError("private redis xadd failure detail"))
+    redis_result, _loader, redis_builder, redis_repository, _history = await _run(
+        _approved_full_registry_config(allow_source_outbox_publish=True, allow_redis_publish=True),
+        repository=_three_target_repository(),
+        history=_three_channel_history(),
+        redis_publisher=redis_publisher,
+    )
+    redis_report = redis_result.to_sanitized_dict()
+    redis_rendered = json.dumps(redis_report, sort_keys=True)
+
+    assert redis_result.ok is False
+    assert redis_report["status"] == "failed"
+    assert redis_report["error_code"] == "redis_publish_failed"
+    assert redis_report["source_messages_created_count"] == 3
+    assert redis_report["redis_events_published_count"] == 0
+    assert redis_report["event_outbox_marked_published_count"] == 0
+    assert len(redis_report["partial_committed_target_fingerprints"]) == 3
+    assert len(redis_repository.messages) == 3
+    assert len(redis_repository.outbox) == 3
+    assert redis_repository.mark_published_calls == []
+    assert redis_builder.commit_calls == 6
+    assert redis_builder.close_commits == [False]
+
+    for rendered in (json.dumps(first_report, sort_keys=True), partial_rendered, redis_rendered):
+        for raw_value in (
+            EXCEPTION_DETAIL,
+            RAW_MESSAGE_TEXT,
+            str(RAW_CHAT_ID),
+            DB_URL,
+            RAW_SECRET,
+            "private redis xadd failure detail",
+        ):
+            assert raw_value not in rendered
 
 
 @pytest.mark.asyncio

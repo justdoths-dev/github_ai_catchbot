@@ -17,6 +17,7 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
     BoundedTelegramCollectorHistoryIngestRuntimeBuilder,
     CollectorTelegramConfig,
     EXECUTE_CONFIRM_TOKEN,
+    FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN,
     THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
     argument_error_report,
     render_sanitized_json,
@@ -42,13 +43,15 @@ class RunnerResult:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = JsonOnlyArgumentParser(
-        description="Run bounded Telegram collector history ingest for one or exactly three registry targets.",
+        description="Run bounded Telegram collector history ingest for exact or capped full-registry targets.",
         add_help=False,
     )
     parser.add_argument("--mode", choices=("plan", "execute"), default="plan")
+    parser.add_argument("--rollout-scope", default="exact-targets")
     parser.add_argument("--source-kind", default="public_username")
     parser.add_argument("--source-value", action="append", dest="source_values")
     parser.add_argument("--registry-id-suffix", default=None)
+    parser.add_argument("--max-targets", type=int, default=None)
     parser.add_argument("--history-limit", type=int, default=10)
     parser.add_argument("--operator-approved", action="store_true")
     parser.add_argument("--confirm-token", default=None)
@@ -79,10 +82,12 @@ def run(
     result = run_bounded_telegram_collector_history_ingest_sync(
         BoundedTelegramCollectorHistoryIngestConfig(
             mode=str(args.mode),
+            rollout_scope=str(args.rollout_scope),
             source_kind=str(args.source_kind),
             source_value=source_values[0] if len(source_values) == 1 else None,
             source_values=source_values,
             registry_id_suffix=args.registry_id_suffix,
+            max_targets=args.max_targets,
             history_limit=int(args.history_limit),
             operator_approved=bool(args.operator_approved),
             confirm_token=args.confirm_token,
@@ -129,6 +134,7 @@ __all__ = [
     "CliArgumentError",
     "CollectorTelegramConfig",
     "EXECUTE_CONFIRM_TOKEN",
+    "FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN",
     "RunnerResult",
     "THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN",
     "build_parser",

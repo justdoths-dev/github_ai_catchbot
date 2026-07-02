@@ -29,12 +29,17 @@ from .tdlib_client import TDJsonTransport, TDLibClient
 
 SCHEMA_VERSION = "live_collector_one_channel_source_last_rollout_v1"
 THREE_CHANNEL_SCHEMA_VERSION = "live_collector_three_channel_source_last_rollout_v1"
+FULL_REGISTRY_SCHEMA_VERSION = "live_collector_full_registry_source_last_rollout_v1"
 RUNNER_NAME = "bounded_collector_history_ingest_runner"
 MODE_PLAN = "plan"
 MODE_EXECUTE = "execute"
 EXECUTE_CONFIRM_TOKEN = "LIVE_COLLECTOR_1_CHANNEL_SOURCE_LAST_EXECUTE"
 THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN = "LIVE_COLLECTOR_3_CHANNEL_SOURCE_LAST_EXECUTE"
+FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN = "LIVE_COLLECTOR_FULL_REGISTRY_SOURCE_LAST_EXECUTE"
 THREE_CHANNEL_TARGET_COUNT = 3
+MAX_FULL_REGISTRY_TARGETS = 30
+ROLLOUT_SCOPE_EXACT_TARGETS = "exact_targets"
+ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY = "full_tracked_registry"
 DEFAULT_HISTORY_LIMIT = 10
 MAX_HISTORY_LIMIT = 30
 DEFAULT_MAX_MESSAGES = DEFAULT_HISTORY_LIMIT
@@ -92,6 +97,8 @@ class BoundedHistoryRepository(Protocol):
     def transaction(self) -> Any: ...
 
     async def find_public_username_registry_targets(self, normalized_source_value: str) -> Sequence[Any]: ...
+
+    async def list_reconcile_targets(self, limit: int) -> Sequence[Any]: ...
 
     async def get_source_message(
         self,
@@ -159,10 +166,12 @@ class BoundedHistoryRedisPublisher(Protocol):
 @dataclass(frozen=True, slots=True)
 class BoundedTelegramCollectorHistoryIngestConfig:
     mode: str = MODE_PLAN
+    rollout_scope: str = ROLLOUT_SCOPE_EXACT_TARGETS
     source_kind: str = SOURCE_KIND_PUBLIC_USERNAME
     source_value: str | None = None
     source_values: tuple[str, ...] = ()
     registry_id_suffix: str | None = None
+    max_targets: int | None = None
     history_limit: int = DEFAULT_HISTORY_LIMIT
     operator_approved: bool = False
     confirm_token: str | None = None
@@ -277,6 +286,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
     config: BoundedTelegramCollectorHistoryIngestConfig
     state: BoundedTelegramCollectorHistoryIngestState = field(default_factory=BoundedTelegramCollectorHistoryIngestState)
     mode: str = MODE_PLAN
+    rollout_scope: str = ROLLOUT_SCOPE_EXACT_TARGETS
     source_kind: str = SOURCE_KIND_PUBLIC_USERNAME
     source_value_surface: str | None = None
     target_registry_id_suffix: str | None = None
@@ -306,6 +316,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
     redis_message_fingerprints: tuple[str, ...] = ()
     readback: SourceLastReadbackResult = field(default_factory=SourceLastReadbackResult)
     target_count: int = 0
+    max_targets: int | None = None
     target_fingerprints: tuple[str, ...] = ()
     per_channel_results: tuple[JsonDict, ...] = ()
     partial_committed_target_fingerprints: tuple[str, ...] = ()
@@ -351,6 +362,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "web_attempted": False,
             "redis_consume_or_ack": False,
             "broad_registry_ingest": False,
+            "bounded_full_registry_rollout": self.rollout_scope == ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY,
             "docker_or_systemd_called": False,
             "alembic_or_ddl_ran": False,
         }
@@ -421,9 +433,11 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "schema_version": _schema_version_for_result(self.config),
             "runner_name": RUNNER_NAME,
             "mode": self.mode,
+            "rollout_scope": self.rollout_scope,
             "status": _report_status(self.status, self.ok),
             "reason_code": self.error_code or "ok",
             "target_count": self.target_count,
+            "max_targets": self.max_targets,
             "target_fingerprints": list(self.target_fingerprints),
             "per_channel_results": list(self.per_channel_results),
             "duplicate_noop_proof": duplicate_noop_proof,
@@ -460,6 +474,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "runtime_builder_attempted": self.state.runtime_builder_attempted,
             "database_read_attempted": self.state.database_read_attempted,
             "registry_lookup_attempted": self.state.registry_lookup_attempted,
+            "registry_read_count": self.state.registry_targets_seen_count,
             "registry_targets_seen_count": self.state.registry_targets_seen_count,
             "tdlib_auth_ready_checked": self.state.tdlib_auth_ready_checked,
             "tdlib_auth_ready": self.state.tdlib_auth_ready,
@@ -844,10 +859,16 @@ async def run_bounded_telegram_collector_history_ingest(
     state = BoundedTelegramCollectorHistoryIngestState()
     effective_logger = logger or logging.getLogger(__name__)
     mode = _normalize_mode(config.mode)
+    rollout_scope, rollout_scope_error = _normalize_rollout_scope(config.rollout_scope)
     history_limit = _history_limit(config)
     normalized_source_values, target_error = _normalize_source_values(config)
     normalized_source_value = normalized_source_values[0] if len(normalized_source_values) == 1 else None
     input_target_fingerprints = tuple(_input_target_fingerprint(value) for value in normalized_source_values)
+
+    def target_report_fingerprint(target: _ResolvedTarget) -> str:
+        if rollout_scope == ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY:
+            return _target_fingerprint(target) or _input_target_fingerprint(target.source_value_surface)
+        return _input_target_fingerprint(target.source_value_surface)
 
     def make_result(
         status: str,
@@ -881,11 +902,21 @@ async def run_bounded_telegram_collector_history_ingest(
         resolved_target_fingerprints = tuple(
             _input_target_fingerprint(item.source_value_surface) for item in targets
         )
+        registry_target_fingerprints = tuple(
+            fingerprint for fingerprint in (_target_fingerprint(item) for item in targets) if fingerprint
+        )
         report_target_fingerprints = (
+            registry_target_fingerprints
+            if rollout_scope == ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY
+            else
             tuple(input_target_fingerprints)
             if input_target_fingerprints
             else resolved_target_fingerprints
         )
+        if rollout_scope == ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY:
+            target_count = len(targets) if targets else state.registry_targets_seen_count
+        else:
+            target_count = len(normalized_source_values)
         return BoundedTelegramCollectorHistoryIngestResult(
             status=status,
             ok=ok,
@@ -893,6 +924,7 @@ async def run_bounded_telegram_collector_history_ingest(
             config=config,
             state=state,
             mode=mode,
+            rollout_scope=rollout_scope,
             source_kind=SOURCE_KIND_PUBLIC_USERNAME,
             source_value_surface=normalized_source_value,
             target_registry_id_suffix=_safe_suffix(target.registry_id) if target is not None else None,
@@ -926,7 +958,8 @@ async def run_bounded_telegram_collector_history_ingest(
             source_outbox_event_fingerprints=tuple(source_outbox_event_fingerprints or publish_event_fingerprints),
             redis_message_fingerprints=publish_redis_fingerprints,
             readback=source_readback,
-            target_count=len(normalized_source_values),
+            target_count=target_count,
+            max_targets=config.max_targets,
             target_fingerprints=report_target_fingerprints,
             per_channel_results=tuple(dict(item) for item in channel_results),
             partial_committed_target_fingerprints=tuple(partial_committed_target_fingerprints),
@@ -937,16 +970,24 @@ async def run_bounded_telegram_collector_history_ingest(
         return make_result("blocked", "operator_approval_missing")
     if mode not in {MODE_PLAN, MODE_EXECUTE}:
         return make_result("blocked", "mode_invalid")
+    if rollout_scope_error is not None:
+        return make_result("blocked", rollout_scope_error)
     if config.source_kind != SOURCE_KIND_PUBLIC_USERNAME:
         return make_result("blocked", "source_kind_unsupported")
     if config.chat_id is not None or config.registry_id is not None:
         return make_result("blocked", "direct_chat_or_registry_id_target_not_allowed")
     if target_error is not None:
         return make_result("blocked", target_error)
+    if rollout_scope == ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY and config.registry_id_suffix:
+        return make_result("blocked", "registry_id_suffix_not_allowed_for_full_registry_rollout")
     if _is_three_channel_rollout(config) and config.registry_id_suffix:
         return make_result("blocked", "registry_id_suffix_not_allowed_for_three_channel_rollout")
     if not _valid_history_limit(history_limit):
         return make_result("blocked", "history_limit_out_of_bounds")
+    if rollout_scope == ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY:
+        full_registry_error = _full_registry_bound_error(config)
+        if full_registry_error is not None:
+            return make_result("blocked", full_registry_error)
     if mode == MODE_EXECUTE and not _confirm_token_valid(config):
         return make_result(
             "blocked",
@@ -958,6 +999,8 @@ async def run_bounded_telegram_collector_history_ingest(
             return make_result("blocked", plan_error)
     if not config.allow_runtime_config:
         return make_result("blocked", "runtime_config_not_allowed")
+    if not config.allow_database_read:
+        return make_result("blocked", "database_read_not_allowed")
 
     loader = runtime_config_loader or CollectorTelegramConfig.from_env
     state.runtime_config_attempted = True
@@ -966,8 +1009,6 @@ async def run_bounded_telegram_collector_history_ingest(
     except Exception as exc:
         return make_result("blocked", "runtime_config_failed", error_class=_safe_exception_class(exc))
 
-    if not config.allow_database_read:
-        return make_result("blocked", "database_read_not_allowed")
     if mode == MODE_EXECUTE:
         write_error = _execute_write_gate_error(config)
         if write_error is not None:
@@ -982,12 +1023,19 @@ async def run_bounded_telegram_collector_history_ingest(
     result: BoundedTelegramCollectorHistoryIngestResult | None = None
     try:
         runtime = await builder(runtime_config, state, effective_logger)
-        targets = await _resolve_exact_public_username_targets(
-            config=config,
-            repository=runtime.repository,
-            state=state,
-            normalized_source_values=normalized_source_values,
-        )
+        if rollout_scope == ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY:
+            targets = await _resolve_full_tracked_registry_targets(
+                config=config,
+                repository=runtime.repository,
+                state=state,
+            )
+        else:
+            targets = await _resolve_exact_public_username_targets(
+                config=config,
+                repository=runtime.repository,
+                state=state,
+                normalized_source_values=normalized_source_values,
+            )
 
         if mode == MODE_PLAN:
             channel_results = [
@@ -1044,9 +1092,7 @@ async def run_bounded_telegram_collector_history_ingest(
                     ),
                 ]
                 if exc.partial.source_commit_durable:
-                    source_committed_target_fingerprints.append(
-                        _input_target_fingerprint(exc.partial.target.source_value_surface)
-                    )
+                    source_committed_target_fingerprints.append(target_report_fingerprint(exc.partial.target))
                 aggregate = _aggregate_target_executions([*executions, exc.partial])
                 result = make_result(
                     "failed",
@@ -1070,7 +1116,7 @@ async def run_bounded_telegram_collector_history_ingest(
                 raise _RunResultReady
 
             executions.append(execution)
-            source_committed_target_fingerprints.append(_input_target_fingerprint(target.source_value_surface))
+            source_committed_target_fingerprints.append(target_report_fingerprint(target))
             channel_reports.append(
                 _channel_report(
                     target=target,
@@ -1249,6 +1295,47 @@ async def _resolve_exact_public_username_targets(
     return tuple(targets)
 
 
+async def _resolve_full_tracked_registry_targets(
+    *,
+    config: BoundedTelegramCollectorHistoryIngestConfig,
+    repository: BoundedHistoryRepository,
+    state: BoundedTelegramCollectorHistoryIngestState,
+) -> tuple[_ResolvedTarget, ...]:
+    max_targets = _required_full_registry_max_targets(config)
+    state.registry_lookup_attempted = True
+    state.database_read_attempted = True
+    rows = list(await repository.list_reconcile_targets(max_targets + 1))
+    state.registry_targets_seen_count += len(rows)
+    if not rows:
+        raise BoundedHistoryIngestError("registry_targets_empty")
+    if len(rows) > max_targets:
+        raise BoundedHistoryIngestError("target_count_exceeds_max_targets")
+
+    targets: list[_ResolvedTarget] = []
+    target_fingerprints: set[str] = set()
+    source_fingerprints: set[str] = set()
+    for row in rows:
+        source_value = _normalize_source_value(_row_value(row, "source_value"))
+        if source_value is None:
+            raise BoundedHistoryIngestError("registry_target_source_value_invalid")
+        if _looks_like_direct_chat_id(source_value) or _looks_like_registry_id(source_value):
+            raise BoundedHistoryIngestError("registry_target_source_value_invalid")
+        target = _resolved_target_from_registry_row(
+            config=config,
+            row=row,
+            normalized_source_value=source_value,
+        )
+        target_fingerprint = _target_fingerprint(target)
+        source_fingerprint = _input_target_fingerprint(target.source_value_surface)
+        if target_fingerprint in target_fingerprints or source_fingerprint in source_fingerprints:
+            raise BoundedHistoryIngestError("registry_target_duplicate")
+        if target_fingerprint is not None:
+            target_fingerprints.add(target_fingerprint)
+        source_fingerprints.add(source_fingerprint)
+        targets.append(target)
+    return tuple(targets)
+
+
 async def _resolve_exact_public_username_target_value(
     *,
     config: BoundedTelegramCollectorHistoryIngestConfig,
@@ -1267,13 +1354,29 @@ async def _resolve_exact_public_username_target_value(
     if len(rows) > 1:
         raise BoundedHistoryIngestError("registry_target_multiple")
 
-    row = rows[0]
+    return _resolved_target_from_registry_row(
+        config=config,
+        row=rows[0],
+        normalized_source_value=normalized_source_value,
+    )
+
+
+def _resolved_target_from_registry_row(
+    *,
+    config: BoundedTelegramCollectorHistoryIngestConfig,
+    row: Any,
+    normalized_source_value: str,
+) -> _ResolvedTarget:
     registry_id = _row_value(row, "registry_id")
     if not isinstance(registry_id, str) or not registry_id:
         registry_id = str(registry_id) if isinstance(registry_id, UUID) else ""
     if not registry_id:
         raise BoundedHistoryIngestError("registry_id_invalid")
-    if config.registry_id_suffix and not registry_id.endswith(config.registry_id_suffix):
+    if (
+        _normalize_rollout_scope(config.rollout_scope)[0] != ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY
+        and config.registry_id_suffix
+        and not registry_id.endswith(config.registry_id_suffix)
+    ):
         raise BoundedHistoryIngestError("registry_id_suffix_mismatch")
     if _row_value(row, "source_kind") != SOURCE_KIND_PUBLIC_USERNAME:
         raise BoundedHistoryIngestError("source_kind_unsupported")
@@ -1748,7 +1851,24 @@ def _valid_history_limit(value: int) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_HISTORY_LIMIT
 
 
+def _normalize_rollout_scope(value: str) -> tuple[str, str | None]:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"", ROLLOUT_SCOPE_EXACT_TARGETS, "exact", "exact_target", "exact_targets"}:
+        return ROLLOUT_SCOPE_EXACT_TARGETS, None
+    if normalized in {ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY, "full_registry"}:
+        return ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY, None
+    return normalized, "rollout_scope_unsupported"
+
+
 def _normalize_source_values(config: BoundedTelegramCollectorHistoryIngestConfig) -> tuple[tuple[str, ...], str | None]:
+    rollout_scope, rollout_scope_error = _normalize_rollout_scope(config.rollout_scope)
+    if rollout_scope_error is not None:
+        return (), None
+    if rollout_scope == ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY:
+        if config.source_value is not None or config.source_values:
+            return (), "full_registry_source_value_not_allowed"
+        return (), None
+
     raw_values: Sequence[str | None]
     if config.source_values:
         raw_values = tuple(config.source_values)
@@ -1777,8 +1897,10 @@ def _normalize_source_values(config: BoundedTelegramCollectorHistoryIngestConfig
     return tuple(normalized_values), None
 
 
-def _normalize_source_value(value: str | None) -> str | None:
+def _normalize_source_value(value: object | None) -> str | None:
     if value is None:
+        return None
+    if not isinstance(value, str):
         return None
     normalized = value.strip().lstrip("@").strip().lower()
     return normalized or None
@@ -1789,17 +1911,49 @@ def _source_outbox_write_allowed(config: BoundedTelegramCollectorHistoryIngestCo
 
 
 def _confirm_token_valid(config: BoundedTelegramCollectorHistoryIngestConfig) -> bool:
-    expected = THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN if _is_three_channel_rollout(config) else EXECUTE_CONFIRM_TOKEN
+    if _is_full_registry_rollout(config):
+        expected = FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN
+    elif _is_three_channel_rollout(config):
+        expected = THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN
+    else:
+        expected = EXECUTE_CONFIRM_TOKEN
     return (config.confirm_token or "").strip() == expected
 
 
 def _is_three_channel_rollout(config: BoundedTelegramCollectorHistoryIngestConfig) -> bool:
+    if _is_full_registry_rollout(config):
+        return False
     normalized_values, error_code = _normalize_source_values(config)
     return error_code is None and len(normalized_values) == THREE_CHANNEL_TARGET_COUNT
 
 
+def _is_full_registry_rollout(config: BoundedTelegramCollectorHistoryIngestConfig) -> bool:
+    return _normalize_rollout_scope(config.rollout_scope)[0] == ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY
+
+
 def _schema_version_for_result(config: BoundedTelegramCollectorHistoryIngestConfig) -> str:
+    if _is_full_registry_rollout(config):
+        return FULL_REGISTRY_SCHEMA_VERSION
     return THREE_CHANNEL_SCHEMA_VERSION if _is_three_channel_rollout(config) else SCHEMA_VERSION
+
+
+def _full_registry_bound_error(config: BoundedTelegramCollectorHistoryIngestConfig) -> str | None:
+    max_targets = config.max_targets
+    if max_targets is None:
+        return "max_targets_required"
+    if not isinstance(max_targets, int) or isinstance(max_targets, bool) or max_targets < 1:
+        return "max_targets_out_of_bounds"
+    if max_targets > MAX_FULL_REGISTRY_TARGETS:
+        return "max_targets_exceeds_hard_cap"
+    return None
+
+
+def _required_full_registry_max_targets(config: BoundedTelegramCollectorHistoryIngestConfig) -> int:
+    error = _full_registry_bound_error(config)
+    if error is not None:
+        raise BoundedHistoryIngestError(error)
+    assert config.max_targets is not None
+    return config.max_targets
 
 
 def _looks_like_direct_chat_id(value: str) -> bool:
@@ -1986,13 +2140,18 @@ __all__ = [
     "DEFAULT_HISTORY_LIMIT",
     "DEFAULT_MAX_MESSAGES",
     "EXECUTE_CONFIRM_TOKEN",
+    "FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN",
+    "FULL_REGISTRY_SCHEMA_VERSION",
     "MAX_HISTORY_LIMIT",
+    "MAX_FULL_REGISTRY_TARGETS",
     "MAX_MESSAGES_HARD_LIMIT",
     "RUNNER_NAME",
     "SCHEMA_VERSION",
     "THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN",
     "THREE_CHANNEL_SCHEMA_VERSION",
     "THREE_CHANNEL_TARGET_COUNT",
+    "ROLLOUT_SCOPE_EXACT_TARGETS",
+    "ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY",
     "argument_error_report",
     "build_default_bounded_history_ingest_runtime",
     "render_sanitized_json",

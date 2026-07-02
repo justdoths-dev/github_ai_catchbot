@@ -96,6 +96,10 @@ class FakeRepository:
             )
         return rows
 
+    async def list_reconcile_targets(self, limit: int) -> list[TrackedChat]:
+        self.registry_lookups.append(f"list_reconcile_targets:{limit}")
+        return self.targets[:limit]
+
     async def get_source_message(self, *, platform: str, chat_id: int, message_id: int):
         assert platform == "telegram"
         return self.messages.get((chat_id, message_id))
@@ -341,9 +345,11 @@ def test_parser_exposes_only_approved_bounded_flags() -> None:
 
     assert parser_flags == {
         "--mode",
+        "--rollout-scope",
         "--source-kind",
         "--source-value",
         "--registry-id-suffix",
+        "--max-targets",
         "--history-limit",
         "--operator-approved",
         "--confirm-token",
@@ -485,6 +491,77 @@ def test_three_channel_execute_requires_f2_token_through_cli_before_runtime_conf
             "beta_tools",
             "--source-value",
             "gamma_tools",
+            "--history-limit",
+            "1",
+        ],
+        runtime_config_loader=_runtime_config,
+        runtime_builder=runtime_builder,
+    )
+    parsed = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert parsed["error_code"] == "confirm_token_invalid"
+    assert parsed["runtime_config_attempted"] is False
+    assert parsed["runtime_builder_attempted"] is False
+    assert runtime_builder.repository.registry_lookups == []
+    assert runtime_builder.history_client.calls == []
+
+
+def test_full_registry_plan_delegates_with_explicit_scope_and_max_targets(capsys) -> None:
+    runtime_builder = FakeRuntimeBuilder(repository=FakeRepository(targets=_three_cli_targets()))
+    exit_code = runner.main(
+        [
+            "--operator-approved",
+            "--allow-runtime-config",
+            "--allow-database-read",
+            "--rollout-scope",
+            "full-tracked-registry",
+            "--max-targets",
+            "3",
+            "--history-limit",
+            "5",
+        ],
+        runtime_config_loader=_runtime_config,
+        runtime_builder=runtime_builder,
+    )
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert parsed["schema_version"] == "live_collector_full_registry_source_last_rollout_v1"
+    assert parsed["ok"] is True
+    assert parsed["mode"] == "plan"
+    assert parsed["rollout_scope"] == "full_tracked_registry"
+    assert parsed["target_count"] == 3
+    assert parsed["max_targets"] == 3
+    assert len(parsed["target_fingerprints"]) == 3
+    assert runtime_builder.repository.registry_lookups == ["list_reconcile_targets:4"]
+    assert runtime_builder.history_client.calls == []
+    assert runtime_builder.close_commits == [False]
+    for raw in ("alpha_tools", "beta_tools", "gamma_tools", str(RAW_CHAT_ID), RAW_MESSAGE_TEXT):
+        assert raw not in captured.out
+
+
+def test_full_registry_execute_requires_f3_token_through_cli_before_runtime_config(capsys) -> None:
+    runtime_builder = FakeRuntimeBuilder(repository=FakeRepository(targets=_three_cli_targets()))
+    exit_code = runner.main(
+        [
+            "--mode",
+            "execute",
+            "--operator-approved",
+            "--confirm-token",
+            runner.THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
+            "--allow-runtime-config",
+            "--allow-database-read",
+            "--allow-telegram-read",
+            "--allow-database-write",
+            "--allow-source-message-write",
+            "--allow-source-version-write",
+            "--allow-source-outbox-write",
+            "--rollout-scope",
+            "full-tracked-registry",
+            "--max-targets",
+            "3",
             "--history-limit",
             "1",
         ],
