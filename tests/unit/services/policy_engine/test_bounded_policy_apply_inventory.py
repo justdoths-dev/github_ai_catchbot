@@ -610,7 +610,7 @@ def test_recovery_target_prefers_published_missing_redis_before_unpublished_outb
 
 def test_inventory_counts_suppress_processed_notification_and_blocked_classes() -> None:
     repository = FakeRepository()
-    _seed_target(repository, scores=_skip_scores(), created_offset=1)
+    _seed_target(repository, scores=_skip_scores(), model_proposed_verdict="skip", created_offset=1)
 
     processed_suppress_output = _offset_uuid(JUDGE_OUTPUT_ID, 10)
     _seed_target(
@@ -621,6 +621,7 @@ def test_inventory_counts_suppress_processed_notification_and_blocked_classes() 
         bundle_id=_offset_uuid(BUNDLE_ID, 10),
         candidate_group_id=_offset_uuid(CANDIDATE_GROUP_ID, 10),
         scores=_skip_scores(),
+        model_proposed_verdict="skip",
         existing_delivery_decision="suppress",
         existing_verdict="skip",
         created_offset=2,
@@ -717,6 +718,11 @@ def test_inventory_counts_suppress_processed_notification_and_blocked_classes() 
         "processed_notification_invalid",
         "blocked",
     } <= classifications
+    candidates_by_class = {candidate["classification"]: candidate for candidate in report["candidates"]}
+    assert candidates_by_class["unprocessed_suppress"]["predicted_verdict"] == "skip"
+    assert candidates_by_class["unprocessed_suppress"]["predicted_delivery_decision"] == "suppress"
+    assert candidates_by_class["processed_suppress"]["predicted_verdict"] == "skip"
+    assert candidates_by_class["processed_suppress"]["predicted_delivery_decision"] == "suppress"
 
 
 def test_blocked_class_covers_refusal_schema_and_malformed_payload() -> None:

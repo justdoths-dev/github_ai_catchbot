@@ -5,10 +5,10 @@ import json
 import logging
 import os
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from json import JSONDecodeError
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 from uuid import UUID
 
 try:
@@ -42,10 +42,13 @@ from .models import (
     AnalysisDraft,
     BundlePolicyContext,
     CandidatePolicyContext,
+    DeliveryDecision,
     JudgeOutputPolicyContext,
     JudgeRunPolicyContext,
     NotificationPlanIntent,
     PolicyEvaluation,
+    UrgencyProfile,
+    Verdict,
 )
 from .notification_intent import NotificationIntentBuilder
 from .repositories import PolicyEngineRepository
@@ -887,7 +890,12 @@ async def _classify_event(
             redis_message=redis_message,
         )
 
-    if existing_analysis.delivery_decision == "suppress":
+    analysis_draft, evaluation = _apply_existing_analysis_decision(
+        analysis=analysis_draft,
+        evaluation=evaluation,
+        existing_analysis=existing_analysis,
+    )
+    if analysis_draft.delivery_decision == "suppress":
         return _candidate_from_context(
             classification="processed_suppress",
             event=event,
@@ -1144,6 +1152,53 @@ def _candidate_from_context(
         reason_code=reason_code,
         created_at=event.created_at,
     )
+
+
+def _apply_existing_analysis_decision(
+    *,
+    analysis: AnalysisDraft,
+    evaluation: PolicyEvaluation,
+    existing_analysis: ExistingAnalysisInventoryRecord,
+) -> tuple[AnalysisDraft, PolicyEvaluation]:
+    verdict = cast(Verdict, existing_analysis.verdict)
+    delivery_decision = cast(DeliveryDecision, existing_analysis.delivery_decision)
+    urgency_profile = _urgency_profile_from_existing_analysis(
+        verdict=verdict,
+        delivery_decision=delivery_decision,
+        fallback=evaluation.urgency_profile,
+    )
+    suppress_reason_code = evaluation.suppress_reason_code
+    if delivery_decision == "suppress" and suppress_reason_code is None:
+        suppress_reason_code = "existing_analysis_suppress"
+    if delivery_decision != "suppress":
+        suppress_reason_code = None
+    return (
+        replace(analysis, verdict=verdict, delivery_decision=delivery_decision),
+        replace(
+            evaluation,
+            verdict=verdict,
+            delivery_decision=delivery_decision,
+            urgency_profile=urgency_profile,
+            suppress_reason_code=suppress_reason_code,
+        ),
+    )
+
+
+def _urgency_profile_from_existing_analysis(
+    *,
+    verdict: Verdict,
+    delivery_decision: DeliveryDecision,
+    fallback: UrgencyProfile,
+) -> UrgencyProfile:
+    if delivery_decision == "suppress":
+        return "suppressed"
+    if delivery_decision == "send_digest":
+        return "digest"
+    if verdict == "inspect_now":
+        return "high"
+    if verdict == "later":
+        return "normal_silent"
+    return fallback
 
 
 def _blocked_candidate(
