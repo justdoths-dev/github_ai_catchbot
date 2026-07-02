@@ -45,16 +45,18 @@ class FakeTransaction:
 
 
 class FakeRepository:
-    def __init__(self) -> None:
-        self.tracked = TrackedChat(
-            registry_id="11111111-1111-1111-1111-111111111111",
-            chat_id=RAW_CHAT_ID,
-            desired_state="active",
-            access_state="joined",
-            source_kind="public_username",
-            source_value="trendingrepo",
-            priority_weight=100,
-        )
+    def __init__(self, targets: list[TrackedChat] | None = None) -> None:
+        self.targets = targets or [
+            TrackedChat(
+                registry_id="11111111-1111-1111-1111-111111111111",
+                chat_id=RAW_CHAT_ID,
+                desired_state="active",
+                access_state="joined",
+                source_kind="public_username",
+                source_value="trendingrepo",
+                priority_weight=100,
+            )
+        ]
         self.messages: dict[tuple[int, int], dict[str, Any]] = {}
         self.versions: dict[str, list[dict[str, Any]]] = {}
         self.outbox: list[Any] = []
@@ -73,22 +75,26 @@ class FakeRepository:
 
     async def find_public_username_registry_targets(self, normalized_source_value: str):
         self.registry_lookups.append(normalized_source_value)
-        if normalized_source_value != "trendingrepo":
-            return []
-        return [
-            {
-                "registry_id": self.tracked.registry_id,
-                "chat_id": self.tracked.chat_id,
-                "desired_state": self.tracked.desired_state,
-                "access_state": self.tracked.access_state,
-                "source_kind": self.tracked.source_kind,
-                "source_value": self.tracked.source_value,
-                "username_snapshot": "@trendingrepo",
-                "priority_weight": self.tracked.priority_weight,
-                "last_seen_message_id": None,
-                "last_seen_message_date": None,
-            }
-        ]
+        rows = []
+        for target in self.targets:
+            source_value = target.source_value.strip().lstrip("@").lower()
+            if source_value != normalized_source_value:
+                continue
+            rows.append(
+                {
+                    "registry_id": target.registry_id,
+                    "chat_id": target.chat_id,
+                    "desired_state": target.desired_state,
+                    "access_state": target.access_state,
+                    "source_kind": target.source_kind,
+                    "source_value": target.source_value,
+                    "username_snapshot": f"@{target.source_value}",
+                    "priority_weight": target.priority_weight,
+                    "last_seen_message_id": None,
+                    "last_seen_message_date": None,
+                }
+            )
+        return rows
 
     async def get_source_message(self, *, platform: str, chat_id: int, message_id: int):
         assert platform == "telegram"
@@ -221,8 +227,14 @@ class FakeRedisPublisher:
 
 
 class FakeRuntimeBuilder:
-    def __init__(self, *, close_error: Exception | None = None, redis_publisher: FakeRedisPublisher | None = None) -> None:
-        self.repository = FakeRepository()
+    def __init__(
+        self,
+        *,
+        close_error: Exception | None = None,
+        redis_publisher: FakeRedisPublisher | None = None,
+        repository: FakeRepository | None = None,
+    ) -> None:
+        self.repository = repository or FakeRepository()
         self.history_client = FakeHistoryClient()
         self.redis_publisher = redis_publisher
         self.close_error = close_error
@@ -267,6 +279,38 @@ def _runtime_config() -> CollectorTelegramConfig:
         warm_backfill_limit=1,
         history_page_limit=3,
     )
+
+
+def _three_cli_targets() -> list[TrackedChat]:
+    return [
+        TrackedChat(
+            registry_id="11111111-1111-1111-1111-111111111111",
+            chat_id=RAW_CHAT_ID,
+            desired_state="active",
+            access_state="joined",
+            source_kind="public_username",
+            source_value="alpha_tools",
+            priority_weight=100,
+        ),
+        TrackedChat(
+            registry_id="22222222-2222-2222-2222-222222222222",
+            chat_id=RAW_CHAT_ID + 1,
+            desired_state="active",
+            access_state="joined",
+            source_kind="public_username",
+            source_value="beta_tools",
+            priority_weight=100,
+        ),
+        TrackedChat(
+            registry_id="33333333-3333-3333-3333-333333333333",
+            chat_id=RAW_CHAT_ID + 2,
+            desired_state="active",
+            access_state="joined",
+            source_kind="public_username",
+            source_value="gamma_tools",
+            priority_weight=100,
+        ),
+    ]
 
 
 def test_main_with_no_flags_returns_fail_closed_json(capsys) -> None:
@@ -375,6 +419,86 @@ def test_plan_without_telegram_gate_delegates_to_exact_source_and_writes_nothing
     assert runtime_builder.history_client.calls == []
     assert runtime_builder.close_commits == [False]
     assert "trendingrepo" not in captured.out
+
+
+def test_three_channel_plan_repeated_source_values_delegate_without_live_read_or_raw_output(capsys) -> None:
+    runtime_builder = FakeRuntimeBuilder(repository=FakeRepository(targets=_three_cli_targets()))
+    exit_code = runner.main(
+        [
+            "--operator-approved",
+            "--allow-runtime-config",
+            "--allow-database-read",
+            "--source-kind",
+            "public_username",
+            "--source-value",
+            "@alpha_tools",
+            "--source-value",
+            "beta_tools",
+            "--source-value",
+            "gamma_tools",
+            "--history-limit",
+            "5",
+        ],
+        runtime_config_loader=_runtime_config,
+        runtime_builder=runtime_builder,
+    )
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert parsed["schema_version"] == "live_collector_three_channel_source_last_rollout_v1"
+    assert parsed["ok"] is True
+    assert parsed["mode"] == "plan"
+    assert parsed["target_count"] == 3
+    assert len(parsed["target_fingerprints"]) == 3
+    assert len(parsed["per_channel_results"]) == 3
+    assert parsed["telegram_read_attempted"] is False
+    assert parsed["database_write_attempted"] is False
+    assert runtime_builder.repository.registry_lookups == ["alpha_tools", "beta_tools", "gamma_tools"]
+    assert runtime_builder.history_client.calls == []
+    assert runtime_builder.close_commits == [False]
+    for raw in ("alpha_tools", "beta_tools", "gamma_tools", str(RAW_CHAT_ID), RAW_MESSAGE_TEXT):
+        assert raw not in captured.out
+
+
+def test_three_channel_execute_requires_f2_token_through_cli_before_runtime_config(capsys) -> None:
+    runtime_builder = FakeRuntimeBuilder(repository=FakeRepository(targets=_three_cli_targets()))
+    exit_code = runner.main(
+        [
+            "--mode",
+            "execute",
+            "--operator-approved",
+            "--confirm-token",
+            runner.EXECUTE_CONFIRM_TOKEN,
+            "--allow-runtime-config",
+            "--allow-database-read",
+            "--allow-telegram-read",
+            "--allow-database-write",
+            "--allow-source-message-write",
+            "--allow-source-version-write",
+            "--allow-source-outbox-write",
+            "--source-kind",
+            "public_username",
+            "--source-value",
+            "alpha_tools",
+            "--source-value",
+            "beta_tools",
+            "--source-value",
+            "gamma_tools",
+            "--history-limit",
+            "1",
+        ],
+        runtime_config_loader=_runtime_config,
+        runtime_builder=runtime_builder,
+    )
+    parsed = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert parsed["error_code"] == "confirm_token_invalid"
+    assert parsed["runtime_config_attempted"] is False
+    assert parsed["runtime_builder_attempted"] is False
+    assert runtime_builder.repository.registry_lookups == []
+    assert runtime_builder.history_client.calls == []
 
 
 def test_execute_publish_prints_sanitized_json_and_thin_handoff(capsys) -> None:

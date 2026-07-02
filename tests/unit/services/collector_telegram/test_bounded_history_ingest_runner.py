@@ -18,6 +18,7 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
     BoundedTelegramCollectorHistoryIngestRuntimeHandle,
     BoundedTelegramCollectorHistoryIngestState,
     EXECUTE_CONFIRM_TOKEN,
+    THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
     _TDLibBoundedHistoryClient,
     run_bounded_telegram_collector_history_ingest,
 )
@@ -69,6 +70,7 @@ class FakeRepository:
         *,
         tracked: TrackedChat | None | object = _DEFAULT_TRACKED_CHAT,
         fail_upsert: Exception | None = None,
+        fail_upsert_chat_id: int | None = None,
         return_uuid_source_message_id: bool = False,
         upsert_source_message_id: object = _DEFAULT_SOURCE_MESSAGE_ID,
         omit_upsert_source_message_id: bool = False,
@@ -87,6 +89,7 @@ class FakeRepository:
         else:
             self.tracked = tracked
         self.fail_upsert = fail_upsert
+        self.fail_upsert_chat_id = fail_upsert_chat_id
         self.extra_targets = list(extra_targets or [])
         self.return_uuid_source_message_id = return_uuid_source_message_id
         self.upsert_source_message_id = upsert_source_message_id
@@ -104,6 +107,7 @@ class FakeRepository:
     def snapshot(self) -> Any:
         return (
             self.tracked,
+            deepcopy(self.extra_targets),
             deepcopy(self.messages),
             deepcopy(self.versions),
             list(self.outbox),
@@ -112,7 +116,15 @@ class FakeRepository:
         )
 
     def restore(self, snapshot: Any) -> None:
-        self.tracked, self.messages, self.versions, self.outbox, self.dedupe_keys, self.upsert_calls = snapshot
+        (
+            self.tracked,
+            self.extra_targets,
+            self.messages,
+            self.versions,
+            self.outbox,
+            self.dedupe_keys,
+            self.upsert_calls,
+        ) = snapshot
 
     def transaction(self) -> FakeTransaction:
         return FakeTransaction(self)
@@ -163,6 +175,8 @@ class FakeRepository:
     async def upsert_source_message(self, projection: Any, *, platform: str = "telegram") -> dict[str, Any]:
         if self.fail_upsert is not None:
             raise self.fail_upsert
+        if self.fail_upsert_chat_id is not None and projection.chat_id == self.fail_upsert_chat_id:
+            raise RuntimeError(EXCEPTION_DETAIL)
         assert platform == "telegram"
         self.upsert_calls += 1
         key = (projection.chat_id, projection.message_id)
@@ -238,21 +252,34 @@ class FakeRepository:
 
     async def update_channel_sync_cursor(self, **kwargs: Any) -> None:
         self.cursor_updates.append(kwargs)
-        if self.tracked is None:
+        registry_id = kwargs.get("registry_id")
+        if self.tracked is None or registry_id is None:
             return
+        targets = [self.tracked, *self.extra_targets]
+        matched_index = next(
+            (index for index, target in enumerate(targets) if target.registry_id == registry_id),
+            None,
+        )
+        if matched_index is None:
+            return
+        tracked = targets[matched_index]
         requested_id = kwargs.get("last_seen_message_id")
         requested_date = kwargs.get("last_seen_message_date")
-        effective_id = self.tracked.last_seen_message_id
-        effective_date = self.tracked.last_seen_message_date
+        effective_id = tracked.last_seen_message_id
+        effective_date = tracked.last_seen_message_date
         if requested_id is not None and (effective_id is None or requested_id > effective_id):
             effective_id = requested_id
         if requested_date is not None and (effective_date is None or requested_date > effective_date):
             effective_date = requested_date
-        self.tracked = replace(
-            self.tracked,
+        updated = replace(
+            tracked,
             last_seen_message_id=effective_id,
             last_seen_message_date=effective_date,
         )
+        if matched_index == 0:
+            self.tracked = updated
+        else:
+            self.extra_targets[matched_index - 1] = updated
 
     async def count_source_message_versions(self, source_message_id: str) -> int:
         return len(self.versions.get(str(source_message_id), []))
@@ -281,14 +308,24 @@ class FakeRepository:
 
 
 class FakeHistoryClient:
-    def __init__(self, messages: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        messages_by_chat: dict[int, list[dict[str, Any]]] | None = None,
+        failure_by_chat: dict[int, Exception] | None = None,
+    ) -> None:
         self.messages = messages
+        self.messages_by_chat = messages_by_chat or {}
+        self.failure_by_chat = failure_by_chat or {}
         self.calls: list[dict[str, int]] = []
         self.closed = False
 
     async def fetch_newest_history_messages(self, *, chat_id: int, limit: int):
         self.calls.append({"chat_id": chat_id, "limit": limit})
-        return tuple(deepcopy(self.messages))
+        if chat_id in self.failure_by_chat:
+            raise self.failure_by_chat[chat_id]
+        return tuple(deepcopy(self.messages_by_chat.get(chat_id, self.messages)))
 
     async def close(self) -> None:
         self.closed = True
@@ -757,10 +794,11 @@ def _message(
     text: str = RAW_MESSAGE_TEXT,
     message_id: int = RAW_MESSAGE_ID,
     date: int = 1713550000,
+    chat_id: int = RAW_CHAT_ID,
 ) -> dict[str, Any]:
     return {
         "@type": "message",
-        "chat_id": RAW_CHAT_ID,
+        "chat_id": chat_id,
         "id": message_id,
         "date": date,
         "is_channel_post": True,
@@ -779,6 +817,26 @@ def _approved_config(**overrides: Any) -> BoundedTelegramCollectorHistoryIngestC
         "source_value": "trendingrepo",
         "operator_approved": True,
         "confirm_token": EXECUTE_CONFIRM_TOKEN,
+        "allow_runtime_config": True,
+        "allow_database_read": True,
+        "allow_telegram_read": True,
+        "allow_database_write": True,
+        "allow_source_message_write": True,
+        "allow_source_version_write": True,
+        "allow_source_outbox_write": True,
+        "history_limit": 1,
+    }
+    values.update(overrides)
+    return BoundedTelegramCollectorHistoryIngestConfig(**values)
+
+
+def _approved_three_channel_config(**overrides: Any) -> BoundedTelegramCollectorHistoryIngestConfig:
+    values = {
+        "mode": "execute",
+        "source_kind": "public_username",
+        "source_values": ("alpha_tools", "beta_tools", "gamma_tools"),
+        "operator_approved": True,
+        "confirm_token": THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
         "allow_runtime_config": True,
         "allow_database_read": True,
         "allow_telegram_read": True,
@@ -812,6 +870,70 @@ def _tracked_chat(
         priority_weight=100,
         last_seen_message_id=last_seen_message_id,
         last_seen_message_date=last_seen_message_date,
+    )
+
+
+def _three_targets() -> tuple[TrackedChat, TrackedChat, TrackedChat]:
+    return (
+        _tracked_chat(
+            "11111111-1111-1111-1111-111111111111",
+            source_value="alpha_tools",
+            chat_id=RAW_CHAT_ID,
+        ),
+        _tracked_chat(
+            "22222222-2222-2222-2222-222222222222",
+            source_value="beta_tools",
+            chat_id=RAW_CHAT_ID + 1,
+        ),
+        _tracked_chat(
+            "33333333-3333-3333-3333-333333333333",
+            source_value="gamma_tools",
+            chat_id=RAW_CHAT_ID + 2,
+        ),
+    )
+
+
+def _three_target_repository(
+    *,
+    second: TrackedChat | None = None,
+    third: TrackedChat | None = None,
+    fail_upsert_chat_id: int | None = None,
+) -> FakeRepository:
+    first_target, second_target, third_target = _three_targets()
+    return FakeRepository(
+        tracked=first_target,
+        extra_targets=[
+            second if second is not None else second_target,
+            third if third is not None else third_target,
+        ],
+        fail_upsert_chat_id=fail_upsert_chat_id,
+    )
+
+
+def _three_channel_history(
+    *,
+    second_message_text: str = RAW_MESSAGE_TEXT,
+    failure_by_chat: dict[int, Exception] | None = None,
+) -> FakeHistoryClient:
+    return FakeHistoryClient(
+        [],
+        messages_by_chat={
+            RAW_CHAT_ID: [_message(chat_id=RAW_CHAT_ID, message_id=RAW_MESSAGE_ID)],
+            RAW_CHAT_ID + 1: [
+                _message(
+                    chat_id=RAW_CHAT_ID + 1,
+                    message_id=RAW_MESSAGE_ID + 1,
+                    text=second_message_text,
+                )
+            ],
+            RAW_CHAT_ID + 2: [
+                _message(
+                    chat_id=RAW_CHAT_ID + 2,
+                    message_id=RAW_MESSAGE_ID + 2,
+                )
+            ],
+        },
+        failure_by_chat=failure_by_chat,
     )
 
 
@@ -1296,6 +1418,371 @@ async def test_plan_mode_rejects_live_read_authority_even_when_requested() -> No
     assert builder.calls == 0
     assert str(RAW_CHAT_ID) not in rendered
     assert RAW_MESSAGE_TEXT not in rendered
+
+
+@pytest.mark.asyncio
+async def test_three_channel_plan_resolves_exact_targets_without_fetch_or_writes() -> None:
+    result, _loader, builder, repository, history = await _run(
+        _approved_three_channel_config(
+            mode="plan",
+            confirm_token=None,
+            allow_telegram_read=False,
+            allow_database_write=False,
+            allow_source_message_write=False,
+            allow_source_version_write=False,
+            allow_source_outbox_write=False,
+        ),
+        repository=_three_target_repository(),
+        history=_three_channel_history(),
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is True
+    assert report["schema_version"] == "live_collector_three_channel_source_last_rollout_v1"
+    assert report["mode"] == "plan"
+    assert report["status"] == "pass"
+    assert report["target_count"] == 3
+    assert len(report["target_fingerprints"]) == 3
+    assert len(report["per_channel_results"]) == 3
+    assert report["bounded_counts"]["registry_targets"] == 3
+    assert report["telegram_read_attempted"] is False
+    assert report["database_write_attempted"] is False
+    assert repository.messages == {}
+    assert repository.outbox == []
+    assert repository.registry_lookups == ["alpha_tools", "beta_tools", "gamma_tools"]
+    assert history.calls == []
+    assert builder.close_commits == [False]
+    for raw_value in ("alpha_tools", "beta_tools", "gamma_tools", str(RAW_CHAT_ID), RAW_MESSAGE_TEXT):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_values", "error_code"),
+    [
+        (("alpha_tools", "beta_tools"), "target_count_must_equal_three"),
+        (("alpha_tools", "beta_tools", "gamma_tools", "delta_tools"), "target_count_must_equal_three"),
+        (("alpha_tools", "@Alpha_Tools", "gamma_tools"), "target_duplicate"),
+        ((str(RAW_CHAT_ID), "beta_tools", "gamma_tools"), "direct_chat_id_target_not_allowed"),
+        (("11111111-1111-1111-1111-111111111111", "beta_tools", "gamma_tools"), "direct_registry_id_target_not_allowed"),
+    ],
+)
+async def test_three_channel_plan_rejects_invalid_target_sets_before_runtime_config(
+    source_values: tuple[str, ...],
+    error_code: str,
+) -> None:
+    result, loader, builder, repository, history = await _run(
+        _approved_three_channel_config(
+            mode="plan",
+            source_values=source_values,
+            confirm_token=None,
+            allow_telegram_read=False,
+            allow_database_write=False,
+            allow_source_message_write=False,
+            allow_source_version_write=False,
+            allow_source_outbox_write=False,
+        ),
+        repository=_three_target_repository(),
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is False
+    assert result.error_code == error_code
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("second_target", "error_code"),
+    [
+        (_tracked_chat("22222222-2222-2222-2222-222222222222", source_value="beta_tools", chat_id=RAW_CHAT_ID + 1, access_state="unresolved"), "registry_target_not_joined"),
+        (_tracked_chat("22222222-2222-2222-2222-222222222222", source_value="beta_tools", chat_id=RAW_CHAT_ID + 1, desired_state="paused"), "registry_target_not_active"),
+        (_tracked_chat("22222222-2222-2222-2222-222222222222", source_value="beta_tools", chat_id=None), "registry_target_chat_id_missing"),
+    ],
+)
+async def test_three_channel_plan_rejects_unready_registry_rows_before_history_read(
+    second_target: TrackedChat,
+    error_code: str,
+) -> None:
+    result, _loader, builder, repository, history = await _run(
+        _approved_three_channel_config(
+            mode="plan",
+            confirm_token=None,
+            allow_telegram_read=False,
+            allow_database_write=False,
+            allow_source_message_write=False,
+            allow_source_version_write=False,
+            allow_source_outbox_write=False,
+        ),
+        repository=_three_target_repository(second=second_target),
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is False
+    assert result.error_code == error_code
+    assert repository.registry_lookups == ["alpha_tools", "beta_tools"]
+    assert history.calls == []
+    assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+async def test_three_channel_plan_rejects_ambiguous_registry_match_before_history_read() -> None:
+    first_target, second_target, third_target = _three_targets()
+    duplicate_beta = _tracked_chat(
+        "44444444-4444-4444-4444-444444444444",
+        source_value="beta_tools",
+        chat_id=RAW_CHAT_ID + 10,
+    )
+    result, _loader, builder, repository, history = await _run(
+        _approved_three_channel_config(
+            mode="plan",
+            confirm_token=None,
+            allow_telegram_read=False,
+            allow_database_write=False,
+            allow_source_message_write=False,
+            allow_source_version_write=False,
+            allow_source_outbox_write=False,
+        ),
+        repository=FakeRepository(
+            tracked=first_target,
+            extra_targets=[second_target, duplicate_beta, third_target],
+        ),
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is False
+    assert result.error_code == "registry_target_multiple"
+    assert repository.registry_lookups == ["alpha_tools", "beta_tools"]
+    assert history.calls == []
+    assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirm_token", [None, EXECUTE_CONFIRM_TOKEN, "wrong-token"])
+async def test_three_channel_execute_requires_f2_confirm_token_before_runtime_config(
+    confirm_token: str | None,
+) -> None:
+    result, loader, builder, _repository, history = await _run(
+        _approved_three_channel_config(confirm_token=confirm_token),
+        repository=_three_target_repository(),
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is False
+    assert result.error_code == ("confirm_token_missing" if confirm_token is None else "confirm_token_invalid")
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert history.calls == []
+
+
+@pytest.mark.asyncio
+async def test_three_channel_execute_processes_each_channel_once_with_sanitized_per_channel_proof() -> None:
+    repository = _three_target_repository()
+    history = _three_channel_history()
+    result, _loader, builder, repository, history = await _run(
+        _approved_three_channel_config(),
+        repository=repository,
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is True
+    assert report["schema_version"] == "live_collector_three_channel_source_last_rollout_v1"
+    assert report["target_count"] == 3
+    assert len(report["target_fingerprints"]) == 3
+    assert len(report["per_channel_results"]) == 3
+    assert report["messages_seen"] == 3
+    assert report["source_messages_created_count"] == 3
+    assert report["source_versions_appended_count"] == 3
+    assert report["outbox_events_inserted_count"] == 3
+    assert report["duplicate_noop_proof_count"] == 3
+    assert report["duplicate_noop_proof"]["proved_count"] == 3
+    assert report["readback"]["source_current_found_count"] == 3
+    assert report["readback"]["source_version_rows_count"] == 3
+    assert report["partial_committed_target_fingerprints"] == []
+    assert history.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1},
+        {"chat_id": RAW_CHAT_ID + 1, "limit": 1},
+        {"chat_id": RAW_CHAT_ID + 2, "limit": 1},
+    ]
+    assert len(repository.messages) == 3
+    assert len(repository.outbox) == 3
+    assert len(repository.cursor_updates) == 3
+    assert builder.commit_calls == 6
+    assert builder.close_commits == [True]
+    for channel in report["per_channel_results"]:
+        assert channel["status"] == "pass"
+        assert channel["bounded_counts"]["source_messages_created"] == 1
+        assert channel["duplicate_noop_proof"]["proved_count"] == 1
+        assert channel["source_commit_durable"] is True
+    for raw_value in ("alpha_tools", "beta_tools", "gamma_tools", str(RAW_CHAT_ID), RAW_MESSAGE_TEXT, DB_URL, RAW_SECRET):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_three_channel_execute_preserves_per_channel_cursor_non_regression() -> None:
+    newer_registry_date = datetime.fromtimestamp(1713560000, tz=timezone.utc)
+    third = _tracked_chat(
+        "33333333-3333-3333-3333-333333333333",
+        source_value="gamma_tools",
+        chat_id=RAW_CHAT_ID + 2,
+        last_seen_message_id=RAW_MESSAGE_ID + 100,
+        last_seen_message_date=newer_registry_date,
+    )
+    repository = _three_target_repository(third=third)
+    result, _loader, builder, repository, history = await _run(
+        _approved_three_channel_config(),
+        repository=repository,
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is True
+    assert len(repository.cursor_updates) == 3
+    assert repository.cursor_updates[-1]["registry_id"] == "33333333-3333-3333-3333-333333333333"
+    assert repository.cursor_updates[-1]["last_seen_message_id"] == RAW_MESSAGE_ID + 2
+    assert repository.extra_targets[1].last_seen_message_id == RAW_MESSAGE_ID + 100
+    assert repository.extra_targets[1].last_seen_message_date == newer_registry_date
+    assert history.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1},
+        {"chat_id": RAW_CHAT_ID + 1, "limit": 1},
+        {"chat_id": RAW_CHAT_ID + 2, "limit": 1},
+    ]
+    assert builder.close_commits == [True]
+
+
+@pytest.mark.asyncio
+async def test_three_channel_source_normalize_publish_happens_after_all_channel_proofs() -> None:
+    repository = _three_target_repository()
+    history = _three_channel_history()
+    builder = FakeRuntimeBuilder(repository, history)
+
+    class CommitObservingPublisher(FakeRedisPublisher):
+        def __init__(self) -> None:
+            super().__init__(message_id="9999999999-0")
+            self.commit_calls_at_publish: list[int] = []
+
+        async def publish(self, route: Any, message: Any) -> str:
+            self.commit_calls_at_publish.append(builder.commit_calls)
+            return await super().publish(route, message)
+
+    publisher = CommitObservingPublisher()
+    builder.redis_publisher = publisher
+
+    result = await run_bounded_telegram_collector_history_ingest(
+        _approved_three_channel_config(allow_source_outbox_publish=True, allow_redis_publish=True),
+        runtime_config_loader=Loader(),
+        runtime_builder=builder,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is True
+    assert report["redis_events_published_count"] == 3
+    assert report["event_outbox_marked_published_count"] == 3
+    assert report["bounded_counts"]["source_normalize_handoffs"] == 3
+    assert publisher.commit_calls_at_publish == [6, 7, 8]
+    assert builder.commit_calls == 9
+    assert len(repository.mark_published_calls) == 3
+    assert all(route.queue_name == "q.source.normalize" for route, _message in publisher.publish_calls)
+    for _route, message in publisher.publish_calls:
+        fields = message.as_stream_fields()
+        assert fields["stage_name"] == "normalize"
+        assert fields["root_object_type"] == "source_message"
+        assert "payload_json" not in fields
+
+
+@pytest.mark.asyncio
+async def test_three_channel_failure_before_any_write_commits_nothing_and_stays_sanitized() -> None:
+    repository = _three_target_repository()
+    history = _three_channel_history(
+        failure_by_chat={RAW_CHAT_ID: RuntimeError(EXCEPTION_DETAIL)},
+    )
+    result, _loader, builder, repository, history = await _run(
+        _approved_three_channel_config(),
+        repository=repository,
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["status"] == "failed"
+    assert report["error_code"] == "unexpected_failure"
+    assert report["database_write_attempted"] is False
+    assert report["partial_committed_target_fingerprints"] == []
+    assert repository.messages == {}
+    assert repository.outbox == []
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
+    for raw_value in (EXCEPTION_DETAIL, RAW_MESSAGE_TEXT, str(RAW_CHAT_ID), DB_URL, RAW_SECRET):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_three_channel_partial_failure_reports_only_committed_fingerprints_without_false_pass() -> None:
+    repository = _three_target_repository(fail_upsert_chat_id=RAW_CHAT_ID + 1)
+    history = _three_channel_history()
+    result, _loader, builder, repository, history = await _run(
+        _approved_three_channel_config(),
+        repository=repository,
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["status"] == "failed"
+    assert report["error_code"] == "unexpected_failure"
+    assert report["source_messages_created_count"] == 1
+    assert report["readback"]["source_current_found_count"] == 1
+    assert len(report["partial_committed_target_fingerprints"]) == 1
+    assert len(report["per_channel_results"]) == 2
+    assert report["per_channel_results"][0]["status"] == "pass"
+    assert report["per_channel_results"][1]["status"] == "failed"
+    assert len(repository.messages) == 1
+    assert len(repository.outbox) == 1
+    assert builder.commit_calls == 2
+    assert builder.close_commits == [False]
+    assert history.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1},
+        {"chat_id": RAW_CHAT_ID + 1, "limit": 1},
+    ]
+    for raw_value in (EXCEPTION_DETAIL, RAW_MESSAGE_TEXT, str(RAW_CHAT_ID), DB_URL, RAW_SECRET):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_three_channel_redis_publish_failure_preserves_committed_source_and_pending_outbox() -> None:
+    repository = _three_target_repository()
+    history = _three_channel_history()
+    publisher = FakeRedisPublisher(failure=RuntimeError("private redis xadd failure detail"))
+    result, _loader, builder, repository, _history = await _run(
+        _approved_three_channel_config(allow_source_outbox_publish=True, allow_redis_publish=True),
+        repository=repository,
+        history=history,
+        redis_publisher=publisher,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["status"] == "failed"
+    assert report["error_code"] == "redis_publish_failed"
+    assert report["source_messages_created_count"] == 3
+    assert report["redis_events_published_count"] == 0
+    assert report["event_outbox_marked_published_count"] == 0
+    assert len(report["partial_committed_target_fingerprints"]) == 3
+    assert len(repository.messages) == 3
+    assert len(repository.outbox) == 3
+    assert repository.mark_published_calls == []
+    assert builder.commit_calls == 6
+    assert builder.close_commits == [False]
+    assert "private redis xadd failure detail" not in rendered
 
 
 @pytest.mark.asyncio

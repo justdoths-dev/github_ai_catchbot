@@ -17,6 +17,7 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
     BoundedTelegramCollectorHistoryIngestRuntimeBuilder,
     CollectorTelegramConfig,
     EXECUTE_CONFIRM_TOKEN,
+    THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
     argument_error_report,
     render_sanitized_json,
     run_bounded_telegram_collector_history_ingest_sync,
@@ -41,12 +42,12 @@ class RunnerResult:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = JsonOnlyArgumentParser(
-        description="Run one bounded Telegram collector history ingest for one exact registry target.",
+        description="Run bounded Telegram collector history ingest for one or exactly three registry targets.",
         add_help=False,
     )
     parser.add_argument("--mode", choices=("plan", "execute"), default="plan")
     parser.add_argument("--source-kind", default="public_username")
-    parser.add_argument("--source-value")
+    parser.add_argument("--source-value", action="append", dest="source_values")
     parser.add_argument("--registry-id-suffix", default=None)
     parser.add_argument("--history-limit", type=int, default=10)
     parser.add_argument("--operator-approved", action="store_true")
@@ -74,11 +75,13 @@ def run(
     }
     if runtime_config_loader is not None:
         runner_kwargs["runtime_config_loader"] = runtime_config_loader
+    source_values = tuple(args.source_values or ())
     result = run_bounded_telegram_collector_history_ingest_sync(
         BoundedTelegramCollectorHistoryIngestConfig(
             mode=str(args.mode),
             source_kind=str(args.source_kind),
-            source_value=args.source_value,
+            source_value=source_values[0] if len(source_values) == 1 else None,
+            source_values=source_values,
             registry_id_suffix=args.registry_id_suffix,
             history_limit=int(args.history_limit),
             operator_approved=bool(args.operator_approved),
@@ -127,6 +130,7 @@ __all__ = [
     "CollectorTelegramConfig",
     "EXECUTE_CONFIRM_TOKEN",
     "RunnerResult",
+    "THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN",
     "build_parser",
     "main",
     "run",
