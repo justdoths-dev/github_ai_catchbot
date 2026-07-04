@@ -4,10 +4,11 @@ import argparse
 import json
 import subprocess
 import sys
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable
 from uuid import UUID
 
 
@@ -34,6 +35,95 @@ RUNTIME_ENV_FILE_PLACEHOLDER = "<RUNTIME_ENV_FILE>"
 SCHEMA_VERSION = "restricted_live_collector_one_channel_source_read_env_overlay_runner_v1"
 
 SubprocessRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+_SAFE_STRING_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-")
+_AUTHORITY_PROJECTION_KEYS = (
+    "live_telegram_read_attempted",
+    "telegram_send_attempted",
+    "openai_attempted",
+    "github_attempted",
+    "x_attempted",
+    "web_attempted",
+    "redis_consume_or_ack",
+    "broad_registry_ingest",
+    "docker_or_systemd_called",
+    "alembic_or_ddl_ran",
+)
+_GATE_PROJECTION_KEYS = (
+    "operator_approved",
+    "confirm_token_valid",
+    "runtime_config_allowed",
+    "database_read_allowed",
+    "telegram_read_allowed",
+    "database_write_allowed",
+    "source_message_write_allowed",
+    "source_version_write_allowed",
+    "source_outbox_write_allowed",
+    "source_outbox_publish_allowed",
+    "redis_publish_allowed",
+)
+_ATTEMPT_PROJECTION_KEYS = (
+    "telegram_read_attempted",
+    "telegram_read_called",
+    "database_read_attempted",
+    "database_write_attempted",
+    "source_message_write_attempted",
+    "source_version_write_attempted",
+    "source_outbox_write_attempted",
+    "source_outbox_publish_attempted",
+    "redis_publish_attempted",
+)
+_BOUNDED_COUNT_PROJECTION_KEYS = (
+    "registry_targets",
+    "source_messages_created",
+    "source_versions_created",
+    "source_created_events",
+    "source_normalize_handoffs",
+    "duplicate_noops",
+)
+_READBACK_PROJECTION_KEYS = (
+    "source_current_found_count",
+    "source_version_rows_count",
+    "source_created_events_count",
+    "source_outbox_events_count",
+)
+_RAW_VALUES_PRINTED_KEYS = (
+    "source_text",
+    "source_ref",
+    "url",
+    "raw_id",
+    "tdlib_payload",
+    "database_url",
+    "redis_url",
+    "secret",
+    "runtime_value",
+    "stderr",
+    "traceback",
+    "exception_body",
+)
+_REDACTIONS_APPLIED_KEYS = (
+    "full_chat_id_omitted",
+    "full_registry_id_omitted",
+    "source_ref_omitted",
+    "full_source_message_id_omitted",
+    "full_event_id_omitted",
+    "full_redis_message_id_omitted",
+    "raw_message_json_omitted",
+    "message_text_omitted",
+    "entities_json_omitted",
+    "url_surface_json_omitted",
+    "database_url_omitted",
+    "redis_url_omitted",
+    "telegram_credentials_omitted",
+    "tdlib_session_paths_omitted",
+    "exception_detail_omitted",
+    "traceback_omitted",
+    "stderr_omitted",
+)
+_SIDE_EFFECT_PROJECTION_KEYS = (
+    "telegram_send_called",
+    "telegram_edit_called",
+)
 
 
 class CliArgumentError(ValueError):
@@ -220,6 +310,25 @@ def _base_report(
     child_runner_returncode: int | None = None,
     child_runner_report: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    child_report = _compact_child_report(child_runner_report)
+    child_report_projection = _project_child_report(child_runner_report)
+    redaction_audit = {
+        "runtime_env_values_printed": False,
+        "runtime_env_file_contents_printed": False,
+        "runtime_env_file_path_printed": False,
+        "raw_source_value_printed": False,
+        "child_stdout_printed": False,
+        "child_stderr_printed": False,
+        "token_or_secret_printed": False,
+    }
+    f1_live_readback_closure = _build_f1_live_readback_closure(
+        child_report_projection,
+        child_report=child_report,
+        child_runner_returncode=child_runner_returncode,
+        redaction_audit=redaction_audit,
+        wrapper_reason_code=reason_code,
+        wrapper_status=status,
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
@@ -288,30 +397,180 @@ def _base_report(
             "docker_or_systemd_called": False,
             "alembic_called": False,
         },
-        "child_report": {
-            "stdout_parsed_as_json": bool(child_runner_report),
-            "status": None if child_runner_report is None else child_runner_report.get("status"),
-            "reason_code": None if child_runner_report is None else child_runner_report.get("reason_code"),
-            "stdout_printed": False,
-            "stderr_printed": False,
-        },
-        "redaction_audit": {
-            "runtime_env_values_printed": False,
-            "runtime_env_file_contents_printed": False,
-            "runtime_env_file_path_printed": False,
-            "raw_source_value_printed": False,
-            "child_stdout_printed": False,
-            "child_stderr_printed": False,
-            "token_or_secret_printed": False,
-        },
+        "child_report": child_report,
+        "child_report_projection": child_report_projection,
+        "f1_live_readback_closure": f1_live_readback_closure,
+        "redaction_audit": redaction_audit,
         "completion_claims": {
             "F1_COLLECTOR_ONLY_RUNTIME_ENV_OVERLAY_PREFLIGHT_READY": status == "pass",
+            "F1_CHILD_READBACK_PROJECTION_READY": child_report_projection["stdout_parsed_as_json"] is True,
+            "F1_LIVE_EXECUTION_REVIEWABILITY_REPAIRED": f1_live_readback_closure[
+                "safe_to_review_for_f1_live_read_closure"
+            ],
             "LIVE_TELEGRAM_READ_AUTHORITY_REMAINS_CLOSED_IN_THIS_TASK": not child_runner_invoked,
             "LIVE_COLLECTOR_1_CHANNEL_CLOSED": False,
             "production_complete": False,
             "production_rollout_complete": False,
         },
     }
+
+
+def _compact_child_report(child_runner_report: Mapping[str, Any] | None) -> dict[str, Any]:
+    return {
+        "stdout_parsed_as_json": child_runner_report is not None,
+        "status": None if child_runner_report is None else _safe_report_string(child_runner_report.get("status")),
+        "reason_code": None if child_runner_report is None else _safe_report_string(child_runner_report.get("reason_code")),
+        "stdout_printed": False,
+        "stderr_printed": False,
+    }
+
+
+def _project_child_report(child_report: Mapping[str, Any] | None) -> dict[str, Any]:
+    parsed = child_report is not None
+    report = child_report if isinstance(child_report, Mapping) else {}
+    duplicate_noop_proof = _mapping_child(report, "duplicate_noop_proof")
+    projection: dict[str, Any] = {
+        "stdout_parsed_as_json": parsed,
+        "status": _safe_report_string(report.get("status")),
+        "reason_code": _safe_report_string(report.get("reason_code")),
+        "schema_version": _safe_report_string(report.get("schema_version")),
+        "runner_name": _safe_report_string(report.get("runner_name")),
+        "mode": _safe_report_string(report.get("mode")),
+        "rollout_scope": _safe_report_string(report.get("rollout_scope")),
+        "authority": _project_bool_mapping(_mapping_child(report, "authority"), _AUTHORITY_PROJECTION_KEYS),
+        "gates": _project_bool_mapping(_mapping_child(report, "gates"), _GATE_PROJECTION_KEYS),
+        "bounded_counts": _project_count_mapping(_mapping_child(report, "bounded_counts"), _BOUNDED_COUNT_PROJECTION_KEYS),
+        "readback": _project_count_mapping(_mapping_child(report, "readback"), _READBACK_PROJECTION_KEYS),
+        "duplicate_noop_proof": {
+            "proved_count": _safe_nonnegative_int(duplicate_noop_proof.get("proved_count")),
+            "without_second_telegram_read": _safe_bool(duplicate_noop_proof.get("without_second_telegram_read")),
+        },
+        "target_fingerprints": _safe_fingerprint_list(report.get("target_fingerprints")),
+        "source_message_fingerprints": _safe_fingerprint_list(report.get("source_message_fingerprints")),
+        "source_outbox_event_fingerprints": _safe_fingerprint_list(report.get("source_outbox_event_fingerprints")),
+        "exact_channel_target_fingerprint": _safe_fingerprint(report.get("exact_channel_target_fingerprint")),
+        "registry_target_fingerprint": _safe_fingerprint(report.get("registry_target_fingerprint")),
+        "raw_values_printed": _project_bool_mapping(_mapping_child(report, "raw_values_printed"), _RAW_VALUES_PRINTED_KEYS),
+        "redactions_applied": _project_bool_mapping(_mapping_child(report, "redactions_applied"), _REDACTIONS_APPLIED_KEYS),
+        "rollback_stop_readback": {
+            "exact_runner_completed": _safe_bool(_mapping_child(report, "rollback_stop_readback").get("exact_runner_completed")),
+        },
+        "side_effects": _project_bool_mapping(_mapping_child(report, "side_effects"), _SIDE_EFFECT_PROJECTION_KEYS),
+        "ok": _safe_bool(report.get("ok")),
+        "error_code": _safe_report_string(report.get("error_code")),
+        "error_class": _safe_report_string(report.get("error_class")),
+        "duplicate_noop_proof_count": _safe_nonnegative_int(report.get("duplicate_noop_proof_count")),
+    }
+    for key in _ATTEMPT_PROJECTION_KEYS:
+        projection[key] = _safe_bool(report.get(key))
+    projection["messages_requested"] = _safe_nonnegative_int(report.get("messages_requested"))
+    projection["messages_seen"] = _safe_nonnegative_int(report.get("messages_seen"))
+    return projection
+
+
+def _build_f1_live_readback_closure(
+    projection: Mapping[str, Any],
+    *,
+    child_report: Mapping[str, Any],
+    child_runner_returncode: int | None,
+    redaction_audit: Mapping[str, Any],
+    wrapper_reason_code: str,
+    wrapper_status: str,
+) -> dict[str, bool]:
+    authority = _mapping_child(projection, "authority")
+    gates = _mapping_child(projection, "gates")
+    readback = _mapping_child(projection, "readback")
+    duplicate_noop_proof = _mapping_child(projection, "duplicate_noop_proof")
+    raw_values_printed = _mapping_child(projection, "raw_values_printed")
+    side_effects = _mapping_child(projection, "side_effects")
+
+    child_report_available = projection.get("stdout_parsed_as_json") is True
+    child_runner_returncode_zero = child_runner_returncode == 0
+    wrapper_child_execution_passed = (
+        wrapper_status == "pass"
+        and wrapper_reason_code == "child_bounded_runner_passed"
+        and child_runner_returncode_zero
+    )
+    exact_child_runner_passed = (
+        wrapper_child_execution_passed
+        and projection.get("status") == "pass"
+        and projection.get("reason_code") == "ok"
+        and projection.get("ok") is True
+    )
+    live_telegram_read_attempted = authority.get("live_telegram_read_attempted") is True
+    telegram_read_called = projection.get("telegram_read_called") is True
+    database_write_attempted = projection.get("database_write_attempted") is True
+    source_message_write_attempted = projection.get("source_message_write_attempted") is True
+    source_version_write_attempted = projection.get("source_version_write_attempted") is True
+    source_outbox_write_attempted = projection.get("source_outbox_write_attempted") is True
+    source_outbox_publish_disabled = (
+        projection.get("source_outbox_publish_attempted") is False
+        and gates.get("source_outbox_publish_allowed") is False
+    )
+    redis_publish_disabled = (
+        projection.get("redis_publish_attempted") is False and gates.get("redis_publish_allowed") is False
+    )
+    telegram_send_disabled = (
+        authority.get("telegram_send_attempted") is False
+        and side_effects.get("telegram_send_called") is False
+        and side_effects.get("telegram_edit_called") is False
+    )
+    provider_calls_disabled = all(
+        authority.get(key) is False for key in ("openai_attempted", "github_attempted", "x_attempted", "web_attempted")
+    )
+    docker_systemd_alembic_disabled = (
+        authority.get("docker_or_systemd_called") is False and authority.get("alembic_or_ddl_ran") is False
+    )
+    source_current_readback_present = _count_at_least(readback.get("source_current_found_count"), 1)
+    source_version_readback_present = _count_at_least(readback.get("source_version_rows_count"), 1)
+    source_outbox_readback_present = _count_at_least(
+        readback.get("source_outbox_events_count"), 1
+    ) and _count_at_least(readback.get("source_created_events_count"), 1)
+    duplicate_noop_count = duplicate_noop_proof.get("proved_count")
+    if duplicate_noop_count is None:
+        duplicate_noop_count = projection.get("duplicate_noop_proof_count")
+    duplicate_noop_proof_present = _count_at_least(duplicate_noop_count, 1)
+    duplicate_noop_without_second_telegram_read = duplicate_noop_proof.get("without_second_telegram_read") is True
+    raw_values_not_printed = (
+        _all_required_false(raw_values_printed, _RAW_VALUES_PRINTED_KEYS)
+        and child_report.get("stdout_printed") is False
+        and child_report.get("stderr_printed") is False
+        and redaction_audit.get("child_stdout_printed") is False
+        and redaction_audit.get("child_stderr_printed") is False
+    )
+    runtime_values_not_printed = (
+        raw_values_printed.get("runtime_value") is False
+        and redaction_audit.get("runtime_env_values_printed") is False
+        and redaction_audit.get("runtime_env_file_contents_printed") is False
+        and redaction_audit.get("runtime_env_file_path_printed") is False
+    )
+
+    closure = {
+        "child_report_available": child_report_available,
+        "child_runner_returncode_zero": child_runner_returncode_zero,
+        "wrapper_child_execution_passed": wrapper_child_execution_passed,
+        "exact_child_runner_passed": exact_child_runner_passed,
+        "live_telegram_read_attempted": live_telegram_read_attempted,
+        "telegram_read_called": telegram_read_called,
+        "database_write_attempted": database_write_attempted,
+        "source_message_write_attempted": source_message_write_attempted,
+        "source_version_write_attempted": source_version_write_attempted,
+        "source_outbox_write_attempted": source_outbox_write_attempted,
+        "source_outbox_publish_disabled": source_outbox_publish_disabled,
+        "redis_publish_disabled": redis_publish_disabled,
+        "telegram_send_disabled": telegram_send_disabled,
+        "provider_calls_disabled": provider_calls_disabled,
+        "docker_systemd_alembic_disabled": docker_systemd_alembic_disabled,
+        "source_current_readback_present": source_current_readback_present,
+        "source_version_readback_present": source_version_readback_present,
+        "source_outbox_readback_present": source_outbox_readback_present,
+        "duplicate_noop_proof_present": duplicate_noop_proof_present,
+        "duplicate_noop_without_second_telegram_read": duplicate_noop_without_second_telegram_read,
+        "raw_values_not_printed": raw_values_not_printed,
+        "runtime_values_not_printed": runtime_values_not_printed,
+    }
+    closure["safe_to_review_for_f1_live_read_closure"] = all(closure.values())
+    return closure
 
 
 def _child_command_tokens(*, source_value: str, max_messages: int) -> tuple[str, ...]:
@@ -426,6 +685,81 @@ def _parse_child_report(stdout: str) -> dict[str, Any] | None:
     if not isinstance(parsed, dict):
         return None
     return parsed
+
+
+def _mapping_child(mapping: Mapping[str, Any], key: str) -> Mapping[str, Any]:
+    value = mapping.get(key)
+    if isinstance(value, Mapping):
+        return value
+    return {}
+
+
+def _project_bool_mapping(mapping: Mapping[str, Any], keys: Sequence[str]) -> dict[str, bool | None]:
+    return {key: _safe_bool(mapping.get(key)) for key in keys}
+
+
+def _project_count_mapping(mapping: Mapping[str, Any], keys: Sequence[str]) -> dict[str, int | None]:
+    return {key: _safe_nonnegative_int(mapping.get(key)) for key in keys}
+
+
+def _safe_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _safe_nonnegative_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0:
+        return None
+    return value
+
+
+def _safe_report_string(value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped or len(stripped) > 128:
+        return None
+    if not all(char in _SAFE_STRING_CHARS for char in stripped):
+        return "unsafe_string_redacted"
+    return stripped
+
+
+def _safe_fingerprint(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped.startswith("sha256:"):
+        return None
+    digest = stripped.removeprefix("sha256:")
+    if len(digest) < 8 or len(digest) > 64:
+        return None
+    if not all(char in "0123456789abcdef" for char in digest):
+        return None
+    return stripped
+
+
+def _safe_fingerprint_list(value: object) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    projected = []
+    for item in value:
+        fingerprint = _safe_fingerprint(item)
+        if fingerprint is not None:
+            projected.append(fingerprint)
+    return projected
+
+
+def _count_at_least(value: object, minimum: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def _all_required_false(mapping: Mapping[str, Any], keys: Sequence[str]) -> bool:
+    return all(mapping.get(key) is False for key in keys)
 
 
 __all__ = [
