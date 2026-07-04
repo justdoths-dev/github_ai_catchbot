@@ -351,6 +351,7 @@ def test_parser_exposes_only_approved_bounded_flags() -> None:
         "--registry-id-suffix",
         "--max-targets",
         "--history-limit",
+        "--max-messages",
         "--operator-approved",
         "--confirm-token",
         "--allow-runtime-config",
@@ -425,6 +426,58 @@ def test_plan_without_telegram_gate_delegates_to_exact_source_and_writes_nothing
     assert runtime_builder.history_client.calls == []
     assert runtime_builder.close_commits == [False]
     assert "trendingrepo" not in captured.out
+
+
+def test_execute_accepts_max_messages_alias_for_exact_one_channel_live_read(capsys) -> None:
+    runtime_builder = FakeRuntimeBuilder()
+    exit_code = runner.main(
+        [
+            "--mode",
+            "execute",
+            "--operator-approved",
+            "--confirm-token",
+            runner.EXECUTE_CONFIRM_TOKEN,
+            "--allow-runtime-config",
+            "--allow-database-read",
+            "--allow-telegram-read",
+            "--allow-database-write",
+            "--allow-source-message-write",
+            "--allow-source-version-write",
+            "--allow-source-outbox-write",
+            "--source-kind",
+            "public_username",
+            "--source-value",
+            "trendingrepo",
+            "--max-messages",
+            "1",
+        ],
+        runtime_config_loader=_runtime_config,
+        runtime_builder=runtime_builder,
+    )
+    output = capsys.readouterr().out
+    parsed = json.loads(output)
+
+    assert exit_code == 0
+    assert parsed["ok"] is True
+    assert parsed["messages_requested"] == 1
+    assert parsed["messages_seen"] == 1
+    assert parsed["source_messages_created_count"] == 1
+    assert parsed["source_versions_appended_count"] == 1
+    assert parsed["outbox_events_inserted_count"] == 1
+    assert parsed["source_outbox_publish_attempted"] is False
+    assert parsed["redis_publish_attempted"] is False
+    assert parsed["redis_events_published_count"] == 0
+    assert parsed["event_outbox_marked_published_count"] == 0
+    assert runtime_builder.history_client.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
+    assert runtime_builder.close_commits == [True]
+    for raw in (
+        str(RAW_CHAT_ID),
+        RAW_MESSAGE_TEXT,
+        DB_URL,
+        REDIS_URL,
+        RAW_SECRET,
+    ):
+        assert raw not in output
 
 
 def test_three_channel_plan_repeated_source_values_delegate_without_live_read_or_raw_output(capsys) -> None:

@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.services.collector_telegram.bounded_history_ingest_runner import render_sanitized_json
 from src.services.collector_telegram.restricted_source_read_rollout import (
     RestrictedLiveCollectorOneChannelSourceReadProofRequest,
+    build_restricted_live_collector_one_channel_source_read_preflight_packet,
     build_restricted_live_collector_one_channel_source_read_rollout_packet,
     restricted_live_collector_one_channel_source_read_argument_error_report,
 )
@@ -42,16 +43,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source-value", action="append", dest="source_values")
     parser.add_argument("--max-messages", type=int, default=None)
+    parser.add_argument("--emit-live-preflight-command", action="store_true")
     return parser
 
 
 def run(args: argparse.Namespace) -> RunnerResult:
-    report = build_restricted_live_collector_one_channel_source_read_rollout_packet(
-        RestrictedLiveCollectorOneChannelSourceReadProofRequest(
-            source_values=tuple(args.source_values or ()),
-            requested_max_messages=args.max_messages,
-        )
+    request = RestrictedLiveCollectorOneChannelSourceReadProofRequest(
+        source_values=tuple(args.source_values or ()),
+        requested_max_messages=args.max_messages,
     )
+    builder = (
+        build_restricted_live_collector_one_channel_source_read_preflight_packet
+        if args.emit_live_preflight_command
+        else build_restricted_live_collector_one_channel_source_read_rollout_packet
+    )
+    report = builder(request)
     return RunnerResult(exit_code=0 if report["status"] == "pass" else 1, report=report)
 
 

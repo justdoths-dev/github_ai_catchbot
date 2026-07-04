@@ -5,12 +5,18 @@ import json
 import pytest
 
 from src.services.collector_telegram.restricted_source_read_rollout import (
+    BOUNDED_RUNNER_PATH,
+    COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS,
     FAKE_CHAT_ID,
     FAKE_CONFIG_VALUE,
     FAKE_MESSAGE_ID,
     FAKE_MESSAGE_TEXT,
     PASS_REASON_CODE,
+    PREFLIGHT_PASS_REASON_CODE,
+    RUNTIME_ENV_FILE_PLACEHOLDER,
+    SOURCE_VALUE_PLACEHOLDER,
     RestrictedLiveCollectorOneChannelSourceReadProofRequest,
+    build_restricted_live_collector_one_channel_source_read_preflight_packet,
     build_restricted_live_collector_one_channel_source_read_rollout_packet,
 )
 
@@ -22,6 +28,17 @@ def _packet(**overrides):
     }
     values.update(overrides)
     return build_restricted_live_collector_one_channel_source_read_rollout_packet(
+        RestrictedLiveCollectorOneChannelSourceReadProofRequest(**values)
+    )
+
+
+def _preflight_packet(**overrides):
+    values = {
+        "source_value": "@trendingrepo",
+        "requested_max_messages": 1,
+    }
+    values.update(overrides)
+    return build_restricted_live_collector_one_channel_source_read_preflight_packet(
         RestrictedLiveCollectorOneChannelSourceReadProofRequest(**values)
     )
 
@@ -82,6 +99,159 @@ def test_one_channel_source_read_rollout_packet_uses_fake_collector_path_without
         assert raw not in rendered
 
 
+def test_live_preflight_command_packet_reuses_bounded_runner_without_live_authority() -> None:
+    report = _preflight_packet()
+    rendered = json.dumps(report, sort_keys=True)
+    command = report["future_execution_command"]
+    command_tokens = command["command_tokens"]
+    runtime_env = command["runtime_env"]
+    safe_loader = runtime_env["safe_loader_pattern"]
+
+    assert report["schema_version"] == "restricted_live_collector_one_channel_source_read_preflight_v1"
+    assert report["status"] == "pass"
+    assert report["reason_code"] == PREFLIGHT_PASS_REASON_CODE
+    assert report["target_scope"]["exact_single_channel_required"] is True
+    assert report["target_scope"]["target_count"] == 1
+    assert report["target_scope"]["target_fingerprint"].startswith("sha256:")
+    assert report["bounded_read"]["requested_max_messages"] == 1
+    assert report["bounded_read"]["hard_max_messages"] == 30
+    assert report["bounded_read"]["unbounded_history_allowed"] is False
+    assert report["actual_attempted_operations"]["collector_bounded_runner_invoked"] is False
+    assert report["actual_attempted_operations"]["fake_telegram_history_read_attempted"] is False
+    assert report["authority"]["live_telegram_read_attempted"] is False
+    assert report["authority"]["live_telegram_send_attempted"] is False
+    assert report["authority"]["openai_attempted"] is False
+    assert report["authority"]["github_attempted"] is False
+    assert report["authority"]["x_attempted"] is False
+    assert report["authority"]["web_attempted"] is False
+    assert report["authority"]["redis_mutation_attempted"] is False
+    assert report["authority"]["database_write_attempted"] is False
+    assert report["runtime_authority_opened_in_this_run"]["live_telegram_read"] is False
+    assert report["runtime_authority_opened_in_this_run"]["production_database_write"] is False
+    assert report["runtime_authority_opened_in_this_run"]["redis_mutation"] is False
+    assert command["runner_path"] == BOUNDED_RUNNER_PATH
+    assert command["max_messages_required"] is True
+    assert command["max_messages_argument"] == "--max-messages"
+    assert command["max_messages_hard_limit"] == 30
+    assert command["exact_confirm_required"] is True
+    assert command["confirm_token_value"] == "LIVE_COLLECTOR_1_CHANNEL_SOURCE_LAST_EXECUTE"
+    assert command["send_disabled"] is True
+    assert command["redis_publish_disabled"] is True
+    assert command["source_outbox_publish_disabled"] is True
+    assert runtime_env["placeholder"] == RUNTIME_ENV_FILE_PLACEHOLDER
+    assert runtime_env["runtime_env_file_placeholder"] == RUNTIME_ENV_FILE_PLACEHOLDER
+    assert runtime_env["exact_runtime_env_file_placeholder_required"] is True
+    assert runtime_env["values_printed"] is False
+    assert runtime_env["path_printed"] is False
+    assert runtime_env["runtime_env_values_redacted"] is True
+    assert runtime_env["runtime_env_loaded"] is False
+    assert runtime_env["actual_runtime_env_file_read_in_this_task"] is False
+    assert runtime_env["safe_loader_pattern_available"] is True
+    assert safe_loader["exact_runtime_env_file_placeholder_required"] is True
+    assert safe_loader["runtime_env_file_placeholder"] == RUNTIME_ENV_FILE_PLACEHOLDER
+    assert safe_loader["runtime_env_file_path_printed"] is False
+    assert safe_loader["runtime_env_values_printed"] is False
+    assert safe_loader["runtime_env_values_redacted"] is True
+    assert safe_loader["runtime_env_loaded"] is False
+    assert safe_loader["actual_runtime_env_file_read_in_this_task"] is False
+    assert safe_loader["allowed_env_keys"] == list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS)
+    assert safe_loader["allowed_env_keys"]
+    assert set(safe_loader["allowed_env_keys"]) == set(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS)
+    assert safe_loader["reject_unknown_env_keys"] is True
+    assert safe_loader["load_values_into_child_env_overlay_only"] is True
+    assert safe_loader["uses_sys_executable_for_child"] is True
+    assert safe_loader["entrypoint_uses_sys_executable"] is True
+    assert safe_loader["child_command_uses_existing_runner"] is True
+    assert safe_loader["child_command_runner_path"] == BOUNDED_RUNNER_PATH
+    assert safe_loader["child_command_tokens"] == command_tokens
+    assert safe_loader["child_command_omits_runtime_env_file_token"] is True
+    assert safe_loader["child_command_omits_source_outbox_publish"] is True
+    assert safe_loader["child_command_omits_redis_publish"] is True
+    assert safe_loader["child_command_omits_send_edit"] is True
+    assert safe_loader["child_command_omits_chat_id"] is True
+    assert safe_loader["child_command_omits_registry_id"] is True
+    assert safe_loader["child_command_omits_docker_systemd_alembic"] is True
+    assert command_tokens[:2] == ["venv/bin/python", BOUNDED_RUNNER_PATH]
+    for required_token in (
+        "--mode",
+        "execute",
+        "--operator-approved",
+        "--allow-runtime-config",
+        "--allow-database-read",
+        "--allow-telegram-read",
+        "--allow-database-write",
+        "--allow-source-message-write",
+        "--allow-source-version-write",
+        "--allow-source-outbox-write",
+        "--source-kind",
+        "public_username",
+        "--source-value",
+        SOURCE_VALUE_PLACEHOLDER,
+        "--max-messages",
+        "1",
+        "--confirm-token",
+        "LIVE_COLLECTOR_1_CHANNEL_SOURCE_LAST_EXECUTE",
+    ):
+        assert required_token in command_tokens
+    assert "--allow-source-outbox-publish" not in command_tokens
+    assert "--allow-redis-publish" not in command_tokens
+    assert "--allow-send" not in command_tokens
+    assert "--chat-id" not in command_tokens
+    assert "--registry-id" not in command_tokens
+    assert "--runtime-env-file" not in command_tokens
+    assert "--runtime-env-path" not in command_tokens
+    assert "--env-file" not in command_tokens
+    assert "docker" not in command_tokens
+    assert "systemctl" not in command_tokens
+    assert "alembic" not in command_tokens
+    assert report["future_readback_plan"]["source_messages"]["expected_count_field"] == (
+        "source_current_found_count"
+    )
+    assert report["future_readback_plan"]["source_message_versions"]["expected_count_field"] == (
+        "source_version_rows_count"
+    )
+    assert report["future_readback_plan"]["source_outbox_events"]["publish_expected"] is False
+    assert report["future_readback_plan"]["duplicate_noop_proof"]["expected_count_field"] == (
+        "duplicate_noop_proof_count"
+    )
+    assert report["future_readback_plan"]["authority_transition"][
+        "live_telegram_read_attempted_true_only_in_future_execution"
+    ] is True
+    assert report["redaction_audit"]["command_uses_target_placeholder"] is True
+    assert report["redaction_audit"]["runtime_env_path_printed"] is False
+    assert report["redaction_audit"]["runtime_env_values_redacted"] is True
+    assert report["redaction_audit"]["actual_runtime_env_file_read_in_this_task"] is False
+    assert report["completion_claims"]["F1_LIVE_ONE_CHANNEL_SOURCE_READ_PREFLIGHT_PACKET_READY"] is True
+    assert report["completion_claims"]["F1_LIVE_ONE_CHANNEL_EXACT_COMMAND_PACKET_READY"] is True
+    assert report["completion_claims"]["LIVE_TELEGRAM_READ_AUTHORITY_REMAINS_CLOSED_IN_THIS_TASK"] is True
+    assert report["completion_claims"]["LIVE_COLLECTOR_1_CHANNEL_CLOSED"] is False
+    assert report["completion_claims"]["production_complete"] is False
+    assert report["open_gates"]["AUTHORITY_OPEN"] is True
+    assert report["open_gates"]["ROLLOUT_OPEN"] is True
+    assert report["open_gates"]["FUNCTION_COMPLETE_OPEN"] is True
+    assert report["open_gates"]["PRODUCTION_ROLLOUT_OPEN"] is True
+    assert report["open_gates"]["PRODUCT_COMPLETE_CLOSED"] is False
+    assert report["open_gates"]["PRODUCTION_ROLLOUT_CLOSED"] is False
+
+    for raw in (
+        "trendingrepo",
+        str(FAKE_CHAT_ID),
+        str(FAKE_MESSAGE_ID),
+        FAKE_MESSAGE_TEXT,
+        FAKE_CONFIG_VALUE,
+        "not-used-by-fake-proof",
+        "runtime.env",
+        "SENTINEL_DATABASE_URL_VALUE",
+        "SENTINEL_REDIS_URL_VALUE",
+        "SENTINEL_TELEGRAM_API_HASH_VALUE",
+        "SENTINEL_TELEGRAM_PHONE_NUMBER_VALUE",
+        "SENTINEL_TDLIB_STATE_PATH_VALUE",
+        "Traceback",
+        "private stderr",
+    ):
+        assert raw not in rendered
+
+
 @pytest.mark.parametrize(
     ("overrides", "reason_code", "target_count"),
     [
@@ -120,6 +290,44 @@ def test_source_read_rollout_packet_rejects_non_exact_targets_before_fake_read(
 
 
 @pytest.mark.parametrize(
+    ("overrides", "reason_code", "target_count"),
+    [
+        ({"source_value": None}, "target_count_must_equal_one", 0),
+        ({"source_value": "*"}, "broad_target_not_allowed", 1),
+        ({"source_value": "123456789"}, "direct_chat_id_target_not_allowed", 1),
+        (
+            {"source_value": "11111111-1111-1111-1111-111111111111"},
+            "direct_registry_id_target_not_allowed",
+            1,
+        ),
+        (
+            {"source_value": None, "source_values": ("alpha_tools", "beta_tools")},
+            "target_count_must_equal_one",
+            2,
+        ),
+    ],
+)
+def test_live_preflight_command_packet_rejects_non_exact_targets_before_command(
+    overrides: dict[str, object],
+    reason_code: str,
+    target_count: int,
+) -> None:
+    report = _preflight_packet(**overrides)
+
+    assert report["schema_version"] == "restricted_live_collector_one_channel_source_read_preflight_v1"
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == reason_code
+    assert report["target_scope"]["target_count"] == target_count
+    assert report["future_execution_command"]["command_tokens"] == []
+    assert report["future_execution_command"]["runtime_env"]["safe_loader_pattern_available"] is False
+    assert report["future_execution_command"]["runtime_env"]["safe_loader_pattern"] is None
+    assert report["actual_attempted_operations"]["collector_bounded_runner_invoked"] is False
+    assert report["actual_attempted_operations"]["fake_telegram_history_read_attempted"] is False
+    assert report["authority"]["live_telegram_read_attempted"] is False
+    assert report["runtime_authority_opened_in_this_run"]["live_telegram_read"] is False
+
+
+@pytest.mark.parametrize(
     ("requested_max_messages", "reason_code"),
     [
         (None, "requested_max_messages_required"),
@@ -139,4 +347,30 @@ def test_source_read_rollout_packet_requires_explicit_bounded_message_cap(
     assert report["bounded_read"]["unbounded_history_allowed"] is False
     assert report["actual_attempted_operations"]["collector_bounded_runner_invoked"] is False
     assert report["actual_attempted_operations"]["fake_telegram_history_read_attempted"] is False
+    assert report["authority"]["live_telegram_read_attempted"] is False
+
+
+@pytest.mark.parametrize(
+    ("requested_max_messages", "reason_code"),
+    [
+        (None, "requested_max_messages_required"),
+        (0, "requested_max_messages_out_of_bounds"),
+        (31, "requested_max_messages_out_of_bounds"),
+    ],
+)
+def test_live_preflight_command_packet_requires_explicit_bounded_message_cap(
+    requested_max_messages: int | None,
+    reason_code: str,
+) -> None:
+    report = _preflight_packet(requested_max_messages=requested_max_messages)
+
+    assert report["schema_version"] == "restricted_live_collector_one_channel_source_read_preflight_v1"
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == reason_code
+    assert report["bounded_read"]["hard_max_messages"] == 30
+    assert report["future_execution_command"]["command_tokens"] == []
+    assert report["future_execution_command"]["runtime_env"]["safe_loader_pattern_available"] is False
+    assert report["future_execution_command"]["runtime_env"]["safe_loader_pattern"] is None
+    assert report["completion_claims"]["F1_LIVE_ONE_CHANNEL_SOURCE_READ_PREFLIGHT_PACKET_READY"] is False
+    assert report["completion_claims"]["F1_LIVE_ONE_CHANNEL_EXACT_COMMAND_PACKET_READY"] is False
     assert report["authority"]["live_telegram_read_attempted"] is False

@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--registry-id-suffix", default=None)
     parser.add_argument("--max-targets", type=int, default=None)
     parser.add_argument("--history-limit", type=int, default=10)
+    parser.add_argument("--max-messages", type=int, default=None)
     parser.add_argument("--operator-approved", action="store_true")
     parser.add_argument("--confirm-token", default=None)
     parser.add_argument("--allow-runtime-config", action="store_true")
@@ -89,6 +90,7 @@ def run(
             registry_id_suffix=args.registry_id_suffix,
             max_targets=args.max_targets,
             history_limit=int(args.history_limit),
+            max_messages=args.max_messages,
             operator_approved=bool(args.operator_approved),
             confirm_token=args.confirm_token,
             allow_runtime_config=bool(args.allow_runtime_config),

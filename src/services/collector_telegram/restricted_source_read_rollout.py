@@ -22,12 +22,42 @@ from .models import CollectorEnvironment, CollectorMode, TrackedChat
 
 
 SCHEMA_VERSION = "restricted_live_collector_one_channel_source_read_rollout_v1"
+PREFLIGHT_SCHEMA_VERSION = "restricted_live_collector_one_channel_source_read_preflight_v1"
 PASS_REASON_CODE = "one_channel_source_read_rollout_proof_ready"
+PREFLIGHT_PASS_REASON_CODE = "one_channel_live_read_preflight_command_packet_ready"
 SOURCE_KIND_PUBLIC_USERNAME = "public_username"
 FAKE_CHAT_ID = 9876543210123
 FAKE_MESSAGE_ID = 444555666
 FAKE_MESSAGE_TEXT = "sentinel restricted one channel source read proof text"
 FAKE_CONFIG_VALUE = "placeholder-value"
+BOUNDED_RUNNER_PATH = "tools/bounded_collector_history_ingest_runner.py"
+PYTHON_EXECUTABLE_PLACEHOLDER = "venv/bin/python"
+SOURCE_VALUE_PLACEHOLDER = "<PUBLIC_USERNAME_SOURCE_VALUE>"
+RUNTIME_ENV_FILE_PLACEHOLDER = "<RUNTIME_ENV_FILE>"
+COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS = (
+    "APP_ENV",
+    "COLLECTOR_MODE",
+    "DATABASE_URL",
+    "REDIS_URL",
+    "TELEGRAM_API_ID",
+    "TELEGRAM_API_HASH",
+    "TELEGRAM_API_HASH_FILE",
+    "TELEGRAM_PHONE_NUMBER",
+    "TELEGRAM_2FA_PASSWORD",
+    "TELEGRAM_2FA_PASSWORD_FILE",
+    "TDLIB_STATE_DIR",
+    "TDLIB_FILES_DIR",
+    "TDLIB_DB_ENCRYPTION_KEY",
+    "TDLIB_DB_ENCRYPTION_KEY_FILE",
+    "RECONCILE_INTERVAL_SEC",
+    "RECONCILE_BACKFILL_LIMIT",
+    "WARM_BACKFILL_LIMIT",
+    "HISTORY_PAGE_LIMIT",
+    "COLLECTOR_SINGLETON_LOCK_PATH",
+    "STARTUP_PROBE_TIMEOUT_SEC",
+    "STARTUP_WARM_BACKFILL_ENABLED",
+    "LOG_LEVEL",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +419,48 @@ def build_restricted_live_collector_one_channel_source_read_rollout_packet(
     return packet
 
 
+def build_restricted_live_collector_one_channel_source_read_preflight_packet(
+    request: RestrictedLiveCollectorOneChannelSourceReadProofRequest,
+) -> dict[str, Any]:
+    source_values = _request_source_values(request)
+    normalized_source_values = tuple(
+        value for value in (_normalize_source_value(value) for value in source_values) if value is not None
+    )
+    target_error = _target_error(source_values, normalized_source_values)
+    if target_error is not None:
+        return _preflight_packet(
+            status="blocked",
+            reason_code=target_error,
+            requested_max_messages=request.requested_max_messages,
+            target_count=len(source_values),
+            target_fingerprint=None,
+            command_tokens=(),
+        )
+
+    max_messages_error = _requested_max_messages_error(request.requested_max_messages)
+    target_fingerprint = _fingerprint("source_value", normalized_source_values[0])
+    if max_messages_error is not None:
+        return _preflight_packet(
+            status="blocked",
+            reason_code=max_messages_error,
+            requested_max_messages=request.requested_max_messages,
+            target_count=1,
+            target_fingerprint=target_fingerprint,
+            command_tokens=(),
+        )
+
+    requested_max_messages = int(request.requested_max_messages)
+    command_tokens = _future_live_read_command_tokens(requested_max_messages=requested_max_messages)
+    return _preflight_packet(
+        status="pass",
+        reason_code=PREFLIGHT_PASS_REASON_CODE,
+        requested_max_messages=requested_max_messages,
+        target_count=1,
+        target_fingerprint=target_fingerprint,
+        command_tokens=command_tokens,
+    )
+
+
 def restricted_live_collector_one_channel_source_read_argument_error_report(error_code: str) -> dict[str, Any]:
     return _base_packet(
         status="blocked",
@@ -561,6 +633,239 @@ def _base_packet(
     }
 
 
+def _future_live_read_command_tokens(*, requested_max_messages: int) -> tuple[str, ...]:
+    return (
+        PYTHON_EXECUTABLE_PLACEHOLDER,
+        BOUNDED_RUNNER_PATH,
+        "--mode",
+        "execute",
+        "--operator-approved",
+        "--allow-runtime-config",
+        "--allow-database-read",
+        "--allow-telegram-read",
+        "--allow-database-write",
+        "--allow-source-message-write",
+        "--allow-source-version-write",
+        "--allow-source-outbox-write",
+        "--source-kind",
+        SOURCE_KIND_PUBLIC_USERNAME,
+        "--source-value",
+        SOURCE_VALUE_PLACEHOLDER,
+        "--max-messages",
+        str(requested_max_messages),
+        "--confirm-token",
+        EXECUTE_CONFIRM_TOKEN,
+    )
+
+
+def _runtime_env_safe_loader_pattern(
+    *,
+    command_tokens: Sequence[str],
+) -> dict[str, Any]:
+    forbidden_child_tokens = (
+        RUNTIME_ENV_FILE_PLACEHOLDER,
+        "--runtime-env-file",
+        "--runtime-env-path",
+        "--env-file",
+        "--allow-source-outbox-publish",
+        "--allow-redis-publish",
+        "--allow-send",
+        "--chat-id",
+        "--registry-id",
+        "docker",
+        "systemctl",
+        "alembic",
+    )
+    child_command_tokens = tuple(command_tokens)
+    child_command_text = " ".join(child_command_tokens)
+    return {
+        "loader": "safe_allowlisted_env_overlay_pattern_for_CollectorTelegramConfig.from_env",
+        "runtime_env_loaded": False,
+        "actual_runtime_env_file_read_in_this_task": False,
+        "exact_runtime_env_file_placeholder_required": True,
+        "runtime_env_file_placeholder": RUNTIME_ENV_FILE_PLACEHOLDER,
+        "runtime_env_file_path_printed": False,
+        "runtime_env_values_printed": False,
+        "runtime_env_values_redacted": True,
+        "allowed_env_keys": list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS),
+        "reject_unknown_env_keys": True,
+        "load_values_into_child_env_overlay_only": True,
+        "uses_sys_executable_for_child": True,
+        "entrypoint_uses_sys_executable": True,
+        "child_command_uses_existing_runner": child_command_tokens[:2] == (
+            PYTHON_EXECUTABLE_PLACEHOLDER,
+            BOUNDED_RUNNER_PATH,
+        ),
+        "child_command_runner_path": BOUNDED_RUNNER_PATH,
+        "child_command_tokens": list(child_command_tokens),
+        "child_command_omits_runtime_env_file_token": not any(
+            token in child_command_tokens for token in ("--runtime-env-file", "--runtime-env-path", "--env-file")
+        )
+        and RUNTIME_ENV_FILE_PLACEHOLDER not in child_command_tokens,
+        "child_command_omits_source_outbox_publish": "--allow-source-outbox-publish" not in child_command_tokens,
+        "child_command_omits_redis_publish": "--allow-redis-publish" not in child_command_tokens,
+        "child_command_omits_send_edit": "--allow-send" not in child_command_tokens,
+        "child_command_omits_chat_id": "--chat-id" not in child_command_tokens,
+        "child_command_omits_registry_id": "--registry-id" not in child_command_tokens,
+        "child_command_omits_docker_systemd_alembic": not any(
+            token in child_command_text for token in ("docker", "systemctl", "alembic")
+        ),
+        "child_command_forbidden_tokens_absent": list(forbidden_child_tokens),
+    }
+
+
+def _preflight_packet(
+    *,
+    status: str,
+    reason_code: str,
+    requested_max_messages: int | None,
+    target_count: int,
+    target_fingerprint: str | None,
+    command_tokens: Sequence[str],
+) -> dict[str, Any]:
+    packet = _base_packet(
+        status=status,
+        reason_code=reason_code,
+        requested_max_messages=requested_max_messages,
+        target_count=target_count,
+        target_fingerprint=target_fingerprint,
+    )
+    safe_loader_pattern = (
+        _runtime_env_safe_loader_pattern(command_tokens=command_tokens) if status == "pass" else None
+    )
+    packet["schema_version"] = PREFLIGHT_SCHEMA_VERSION
+    packet["bounded_read"]["exactly_one_history_request"] = status == "pass"
+    packet["planned_readiness_state"].update(
+        {
+            "state": "static_preflight_command_packet",
+            "existing_collector_runner": RUNNER_NAME,
+            "existing_runner_path": BOUNDED_RUNNER_PATH,
+            "existing_runner_consumed": True,
+            "existing_runner_command_uses_max_messages_alias": True,
+            "fake_runtime_builder_used": False,
+            "default_runtime_builder_used": False,
+            "runtime_env_loaded": False,
+            "runtime_env_file_placeholder": RUNTIME_ENV_FILE_PLACEHOLDER,
+            "future_execution_requires_explicit_operator_approval_after_chatgpt_pass": True,
+            "future_execution_requires_exact_command_copy_after_user_approval": True,
+            "future_execution_source_outbox_write_is_database_only": True,
+            "future_execution_source_outbox_publish_disabled": True,
+        }
+    )
+    packet["future_execution_command"] = {
+        "runner_path": BOUNDED_RUNNER_PATH,
+        "runner_name": RUNNER_NAME,
+        "command_tokens": list(command_tokens),
+        "placeholders": {
+            "runtime_env_file": RUNTIME_ENV_FILE_PLACEHOLDER,
+            "source_value": SOURCE_VALUE_PLACEHOLDER,
+        },
+        "exact_confirm_required": True,
+        "confirm_token_label": "EXECUTE_CONFIRM_TOKEN",
+        "confirm_token_value": EXECUTE_CONFIRM_TOKEN if status == "pass" else None,
+        "confirm_token_value_is_repo_constant": status == "pass",
+        "max_messages_required": True,
+        "max_messages_argument": "--max-messages",
+        "max_messages_hard_limit": MAX_MESSAGES_HARD_LIMIT,
+        "live_read_authority_required": True,
+        "operator_approval_required": True,
+        "send_disabled": True,
+        "redis_publish_disabled": True,
+        "source_outbox_publish_disabled": True,
+        "source_outbox_write_enabled_for_future_database_readback": status == "pass",
+        "production_database_write_authority_required_for_future_execution": True,
+        "runtime_env": {
+            "required": True,
+            "loader": "CollectorTelegramConfig.from_env",
+            "command_token_included": False,
+            "placeholder": RUNTIME_ENV_FILE_PLACEHOLDER,
+            "exact_runtime_env_file_placeholder_required": status == "pass",
+            "runtime_env_file_placeholder": RUNTIME_ENV_FILE_PLACEHOLDER,
+            "path_printed": False,
+            "values_printed": False,
+            "runtime_env_file_path_printed": False,
+            "runtime_env_values_printed": False,
+            "runtime_env_values_redacted": True,
+            "runtime_env_loaded": False,
+            "actual_runtime_env_file_read_in_this_task": False,
+            "safe_loader_pattern_available": status == "pass",
+            "safe_loader_pattern": safe_loader_pattern,
+        },
+        "forbidden_tokens_absent": [
+            "--allow-source-outbox-publish",
+            "--allow-redis-publish",
+            "--allow-send",
+            "--chat-id",
+            "--registry-id",
+            "--rollout-scope full-tracked-registry",
+            "docker",
+            "systemctl",
+            "alembic",
+        ],
+    }
+    packet["runtime_authority_opened_in_this_run"].update(
+        {
+            "live_telegram_send": False,
+            "openai": False,
+            "github": False,
+            "x": False,
+            "web": False,
+            "database_write": False,
+        }
+    )
+    packet["future_readback_plan"] = {
+        "actual_readback_in_this_task": "static_preflight_only",
+        "source_messages": {
+            "expected_count_field": "source_current_found_count",
+            "expected_fingerprint_field": "source_message_fingerprints",
+        },
+        "source_message_versions": {
+            "expected_count_field": "source_version_rows_count",
+            "expected_fingerprint_field": "source_message_fingerprints",
+        },
+        "source_outbox_events": {
+            "expected_count_field": "source_outbox_events_count",
+            "expected_fingerprint_field": "source_outbox_event_fingerprints",
+            "publish_expected": False,
+        },
+        "duplicate_noop_proof": {
+            "expected_count_field": "duplicate_noop_proof_count",
+        },
+        "target": {
+            "expected_fingerprint_field": "target_fingerprints",
+            "target_fingerprint": target_fingerprint,
+        },
+        "authority_transition": {
+            "live_telegram_read_attempted_true_only_in_future_execution": True,
+            "live_telegram_read_attempted_in_this_task": False,
+        },
+    }
+    packet["redaction_audit"].update(
+        {
+            "runtime_env_path_printed": False,
+            "runtime_env_file_path_printed": False,
+            "command_uses_target_placeholder": SOURCE_VALUE_PLACEHOLDER in command_tokens,
+            "command_uses_runtime_env_placeholder_only": True,
+            "runtime_env_values_redacted": True,
+            "actual_runtime_env_file_read_in_this_task": False,
+            "confirm_token_is_repo_constant": status == "pass",
+            "raw_source_value_printed": False,
+        }
+    )
+    packet["completion_claims"].update(
+        {
+            "F1_LIVE_ONE_CHANNEL_SOURCE_READ_PREFLIGHT_PACKET_READY": status == "pass",
+            "F1_LIVE_ONE_CHANNEL_EXACT_COMMAND_PACKET_READY": status == "pass",
+            "LIVE_TELEGRAM_READ_AUTHORITY_REMAINS_CLOSED_IN_THIS_TASK": True,
+            "LIVE_COLLECTOR_1_CHANNEL_CLOSED": False,
+            "TDLib_session_health_proof_closed": False,
+            "production_database_connectivity_proof_closed": False,
+            "redis_publish_proof_closed": False,
+        }
+    )
+    return packet
+
+
 def _fake_runtime_config() -> CollectorTelegramConfig:
     return CollectorTelegramConfig(
         app_env=CollectorEnvironment.TEST,
@@ -615,9 +920,16 @@ def _fingerprint(kind: str, value: object | None) -> str | None:
 
 
 __all__ = [
+    "BOUNDED_RUNNER_PATH",
+    "COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS",
     "PASS_REASON_CODE",
+    "PREFLIGHT_PASS_REASON_CODE",
+    "PREFLIGHT_SCHEMA_VERSION",
+    "RUNTIME_ENV_FILE_PLACEHOLDER",
     "SCHEMA_VERSION",
+    "SOURCE_VALUE_PLACEHOLDER",
     "RestrictedLiveCollectorOneChannelSourceReadProofRequest",
+    "build_restricted_live_collector_one_channel_source_read_preflight_packet",
     "build_restricted_live_collector_one_channel_source_read_rollout_packet",
     "restricted_live_collector_one_channel_source_read_argument_error_report",
 ]
