@@ -89,7 +89,7 @@ async def test_notification_operator_acceptance_consolidates_closed_readbacks_wi
     assert consolidated["status"] == "pass"
     assert consolidated["reason_code"] == ACCEPTANCE_REASON_PASSED
     assert consolidated["closed_capabilities"] == [
-        "UX_ACCEPTANCE_CLOSED_REAFFIRMED_OVER_CE70BD0",
+        "UX_ACCEPTANCE_CLOSED_REAFFIRMED",
         "OPERATOR_NOTIFICATION_ACCEPTANCE_PACKET_CLOSED",
     ]
     assert consolidated["open_gates"] == [
@@ -206,6 +206,7 @@ async def test_notification_operator_acceptance_consolidates_closed_readbacks_wi
     }
 
     rendered = json.dumps(consolidated, ensure_ascii=False, sort_keys=True)
+    assert all("_OVER_" not in capability for capability in consolidated["closed_capabilities"])
     for forbidden in (
         "postgresql+psycopg" + "://",
         "redis" + "://",
@@ -440,6 +441,7 @@ async def test_operator_acceptance_packet_runner_consumes_existing_json_readback
     assert payload["completion_claims"]["final_bot_complete"] is False
     assert payload["completion_claims"]["one_hundred_percent_complete"] is False
     assert payload["completion_claims"]["production_rollout_complete"] is False
+    assert "_OVER_" not in output
 
     for forbidden in (
         str(tmp_path),
