@@ -181,6 +181,34 @@ async def build_redis_rebuild_execution_report(
             authority=_authority(redis_read_attempted=True, db_read_attempted=True),
         )
 
+    create_missing_groups_before_xadd = False
+    if missing_groups and target_before.stream_present is True:
+        if target_before.stream_length is None:
+            return _report(
+                request,
+                queue_spec=queue_spec,
+                status="blocked",
+                reason_code="group_create_stream_length_unknown",
+                preflight_readiness_summary=preflight_summary,
+                target_before=target_before,
+                eligible_count=len(candidate_messages.messages),
+                missing_group_count=len(missing_groups),
+                authority=_authority(redis_read_attempted=True, db_read_attempted=True),
+            )
+        if target_before.stream_length > 0:
+            return _report(
+                request,
+                queue_spec=queue_spec,
+                status="blocked",
+                reason_code="nonempty_stream_group_create_requires_skip_history_policy",
+                preflight_readiness_summary=preflight_summary,
+                target_before=target_before,
+                eligible_count=len(candidate_messages.messages),
+                missing_group_count=len(missing_groups),
+                authority=_authority(redis_read_attempted=True, db_read_attempted=True),
+            )
+        create_missing_groups_before_xadd = True
+
     existing_keys_result = await _load_existing_idempotency_keys(redis_client, queue_spec, target_before)
     if existing_keys_result.reason_code is not None:
         return _report(
@@ -199,6 +227,32 @@ async def build_redis_rebuild_execution_report(
     duplicate_count = 0
     xadd_attempted = False
     known_idempotency_keys = set(existing_keys_result.keys)
+    created_group_count = 0
+    xgroup_attempted = False
+    if create_missing_groups_before_xadd:
+        created_group_count, xgroup_attempted, group_error = await _create_missing_groups(
+            redis_client,
+            queue_spec,
+            missing_groups,
+        )
+        if group_error is not None:
+            return _report(
+                request,
+                queue_spec=queue_spec,
+                status="failed",
+                reason_code=group_error,
+                preflight_readiness_summary=preflight_summary,
+                target_before=target_before,
+                eligible_count=len(candidate_messages.messages),
+                missing_group_count=len(missing_groups),
+                created_group_count=created_group_count,
+                authority=_authority(
+                    redis_read_attempted=True,
+                    redis_xgroup_create_attempted=True,
+                    db_read_attempted=True,
+                ),
+            )
+
     for message in candidate_messages.messages:
         fields = message.as_stream_fields()
         if set(fields) != THIN_STREAM_FIELDS:
@@ -231,45 +285,43 @@ async def build_redis_rebuild_execution_report(
                 inserted_count=inserted_count,
                 duplicate_count=duplicate_count,
                 missing_group_count=len(missing_groups),
+                created_group_count=created_group_count,
                 authority=_authority(
                     redis_read_attempted=True,
                     redis_xadd_attempted=True,
+                    redis_xgroup_create_attempted=xgroup_attempted,
                     db_read_attempted=True,
                 ),
             )
         inserted_count += 1
         known_idempotency_keys.add(message.idempotency_key)
 
-    created_group_count = 0
-    xgroup_attempted = False
-    if missing_groups and (target_before.stream_present is True or inserted_count > 0):
-        for group_name in missing_groups:
-            try:
-                xgroup_attempted = True
-                await redis_client.xgroup_create(queue_spec.stream_name, group_name, id="0", mkstream=False)
-                created_group_count += 1
-            except Exception as exc:
-                if "BUSYGROUP" in str(exc):
-                    continue
-                return _report(
-                    request,
-                    queue_spec=queue_spec,
-                    status="failed",
-                    reason_code="redis_xgroup_create_failed",
-                    preflight_readiness_summary=preflight_summary,
-                    target_before=target_before,
-                    eligible_count=len(candidate_messages.messages),
-                    inserted_count=inserted_count,
-                    duplicate_count=duplicate_count,
-                    missing_group_count=len(missing_groups),
-                    created_group_count=created_group_count,
-                    authority=_authority(
-                        redis_read_attempted=True,
-                        redis_xadd_attempted=xadd_attempted,
-                        redis_xgroup_create_attempted=True,
-                        db_read_attempted=True,
-                    ),
-                )
+    if not create_missing_groups_before_xadd and missing_groups and inserted_count > 0:
+        created_group_count, xgroup_attempted, group_error = await _create_missing_groups(
+            redis_client,
+            queue_spec,
+            missing_groups,
+        )
+        if group_error is not None:
+            return _report(
+                request,
+                queue_spec=queue_spec,
+                status="failed",
+                reason_code=group_error,
+                preflight_readiness_summary=preflight_summary,
+                target_before=target_before,
+                eligible_count=len(candidate_messages.messages),
+                inserted_count=inserted_count,
+                duplicate_count=duplicate_count,
+                missing_group_count=len(missing_groups),
+                created_group_count=created_group_count,
+                authority=_authority(
+                    redis_read_attempted=True,
+                    redis_xadd_attempted=xadd_attempted,
+                    redis_xgroup_create_attempted=True,
+                    db_read_attempted=True,
+                ),
+            )
 
     target_after = await _inspect_target_queue(redis_reader, queue_spec)
     reason_code = (
@@ -490,6 +542,25 @@ async def _load_existing_idempotency_keys(
         if value:
             keys.add(_decode_value(value))
     return _ExistingIdempotencyKeys(keys=frozenset(keys))
+
+
+async def _create_missing_groups(
+    redis_client: RedisRebuildExecutionClient,
+    queue_spec: KnownQueueSpec,
+    missing_groups: Sequence[str],
+) -> tuple[int, bool, str | None]:
+    created_group_count = 0
+    xgroup_attempted = False
+    for group_name in missing_groups:
+        try:
+            xgroup_attempted = True
+            await redis_client.xgroup_create(queue_spec.stream_name, group_name, id="0", mkstream=False)
+            created_group_count += 1
+        except Exception as exc:
+            if "BUSYGROUP" in str(exc):
+                continue
+            return created_group_count, xgroup_attempted, "redis_xgroup_create_failed"
+    return created_group_count, xgroup_attempted, None
 
 
 def _preflight_readiness_summary(

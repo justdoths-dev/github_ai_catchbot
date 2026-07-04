@@ -14,7 +14,12 @@ from services.maintenance.redis_rebuild_execution import (
     build_redis_rebuild_execution_report,
     render_sanitized_json,
 )
-from services.maintenance.redis_rebuild_readiness import DurableCategoryInventory, DurableInventorySnapshot
+from services.maintenance.redis_rebuild_readiness import (
+    DurableCategoryInventory,
+    DurableInventorySnapshot,
+    RedisInventorySnapshot,
+    RedisQueueInventory,
+)
 from services.outbox_relay.models import OutboxEventRow
 from tests.component.services.maintenance._fakes import config
 
@@ -36,12 +41,22 @@ RAW_URL = "raw-url-sentinel"
 
 
 class FakeRedis:
-    def __init__(self, *, stream_present: bool = True, group_present: bool = True) -> None:
-        self.streams: dict[str, list[tuple[str, dict[str, str]]]] = {"q.maintenance": []} if stream_present else {}
-        self.groups: dict[str, set[str]] = {"q.maintenance": {"maintenance"} if group_present else set()}
+    def __init__(
+        self,
+        *,
+        stream_name: str = "q.maintenance",
+        group_name: str = "maintenance",
+        stream_present: bool = True,
+        group_present: bool = True,
+    ) -> None:
+        self.stream_name = stream_name
+        self.group_name = group_name
+        self.streams: dict[str, list[tuple[str, dict[str, str]]]] = {stream_name: []} if stream_present else {}
+        self.groups: dict[str, set[str]] = {stream_name: {group_name} if group_present else set()}
         self.xadd_calls: list[tuple[str, dict[str, str]]] = []
-        self.xgroup_create_calls: list[tuple[str, str, bool]] = []
+        self.xgroup_create_calls: list[tuple[str, str, str, bool]] = []
         self.xrange_calls: list[tuple[str, int | None]] = []
+        self.operations: list[tuple[str, str, str | None, bool | None]] = []
         self.forbidden_calls: list[str] = []
 
     async def ping(self):
@@ -71,13 +86,15 @@ class FakeRedis:
 
     async def xadd(self, name, fields):
         self.xadd_calls.append((name, dict(fields)))
+        self.operations.append(("xadd", name, None, None))
         self.streams.setdefault(name, [])
         message_id = f"1711111111111-{len(self.streams[name]) + 1}"
         self.streams[name].append((message_id, dict(fields)))
         return message_id
 
     async def xgroup_create(self, name, groupname, id="0", mkstream=False):
-        self.xgroup_create_calls.append((name, groupname, mkstream))
+        self.xgroup_create_calls.append((name, groupname, id, mkstream))
+        self.operations.append(("xgroup_create", name, groupname, mkstream))
         if name not in self.streams and not mkstream:
             raise RuntimeError("stream missing")
         groups = self.groups.setdefault(name, set())
@@ -124,8 +141,9 @@ class FakeRedis:
 
 
 class FakeDurableReader:
-    def __init__(self, rows: list[OutboxEventRow]) -> None:
+    def __init__(self, rows: list[OutboxEventRow], *, queue_name: str = "q.maintenance") -> None:
         self.rows = rows
+        self.queue_name = queue_name
         self.inventory_calls: list[int] = []
         self.row_calls: list[tuple[str, int]] = []
         self.commit_called = False
@@ -140,7 +158,7 @@ class FakeDurableReader:
                     state="present",
                     total_count=len(self.rows),
                     status_counts={"pending": len(self.rows)} if self.rows else {},
-                    queue_counts={"maintenance": len(self.rows)} if self.rows else {},
+                    queue_counts={_queue_bucket(self.queue_name): len(self.rows)} if self.rows else {},
                     age_counts={"fresh": len(self.rows)} if self.rows else {},
                     sample_shape_count=min(max_sample, len(self.rows)),
                 ),
@@ -149,7 +167,7 @@ class FakeDurableReader:
 
     async def load_rebuildable_event_outbox_rows(self, *, queue_name: str, limit: int):
         self.row_calls.append((queue_name, limit))
-        return tuple(self.rows[:limit]) if queue_name == "q.maintenance" else ()
+        return tuple(self.rows[:limit]) if queue_name == self.queue_name else ()
 
     async def commit(self):
         self.commit_called = True
@@ -160,6 +178,16 @@ class FakeDurableReader:
         raise AssertionError("db write must not be called")
 
 
+class StaticRedisReader:
+    def __init__(self, inventory: RedisQueueInventory) -> None:
+        self.inventory = inventory
+        self.calls: list[tuple[str, ...]] = []
+
+    async def inspect_queues(self, queues):
+        self.calls.append(tuple(queue.key for queue in queues))
+        return RedisInventorySnapshot(queues=(self.inventory,))
+
+
 def _row() -> OutboxEventRow:
     return OutboxEventRow(
         event_id=RAW_EVENT_ID,
@@ -168,6 +196,25 @@ def _row() -> OutboxEventRow:
         aggregate_id=RAW_OBJECT_ID,
         dedupe_key=RAW_DEDUPE_KEY,
         payload_json={"payload_json": RAW_PAYLOAD, "source_text": RAW_SOURCE_TEXT, "url": RAW_URL},
+        status="pending",
+        fail_count=0,
+        created_at=datetime(2026, 7, 4, tzinfo=timezone.utc),
+    )
+
+
+def _web_row() -> OutboxEventRow:
+    return OutboxEventRow(
+        event_id=RAW_EVENT_ID,
+        event_type="artifact.enrich.requested.v1",
+        aggregate_type="artifact",
+        aggregate_id=RAW_OBJECT_ID,
+        dedupe_key=RAW_DEDUPE_KEY,
+        payload_json={
+            "provider_route": "web",
+            "payload_json": RAW_PAYLOAD,
+            "source_text": RAW_SOURCE_TEXT,
+            "url": RAW_URL,
+        },
         status="pending",
         fail_count=0,
         created_at=datetime(2026, 7, 4, tzinfo=timezone.utc),
@@ -222,6 +269,15 @@ def _assert_runtime_authority(
     assert runtime_authority["production_rollout_authority_opened"] is False
 
 
+def _assert_no_mutation_attempted(report: dict) -> None:
+    authority = report["authority"]
+    assert authority["redis_mutation_attempted"] is False
+    assert authority["redis_xadd_attempted"] is False
+    assert authority["redis_xgroup_create_attempted"] is False
+    assert authority["db_write_attempted"] is False
+    assert report["completion_claims"]["ACTUAL_REDIS_REBUILD_MUTATION_EXECUTED_IN_THIS_RUN"] is False
+
+
 def _assert_final_closure_claims_false(report: dict) -> None:
     claims = report["completion_claims"]
     assert claims["REDIS_REBUILD_CLOSED"] is False
@@ -231,6 +287,13 @@ def _assert_final_closure_claims_false(report: dict) -> None:
     assert claims["one_hundred_percent_complete"] is False
     assert claims["production_rollout_complete"] is False
     assert "ACTUAL_REDIS_REBUILD_EXECUTED_IN_THIS_RUN" not in claims
+
+
+def _queue_bucket(queue_name: str) -> str:
+    return {
+        "q.maintenance": "maintenance",
+        "q.artifact.enrich.web": "artifact_enrich_web",
+    }.get(queue_name, queue_name)
 
 
 @pytest.mark.asyncio
@@ -342,7 +405,11 @@ async def test_execute_xadds_only_exact_queue_and_creates_missing_group_with_pos
         "trigger_event_id",
     }
     assert redis.xadd_calls[0][1]["stage_name"] == "maintenance"
-    assert redis.xgroup_create_calls == [("q.maintenance", "maintenance", False)]
+    assert redis.xgroup_create_calls == [("q.maintenance", "maintenance", "0", False)]
+    assert redis.operations == [
+        ("xadd", "q.maintenance", None, None),
+        ("xgroup_create", "q.maintenance", "maintenance", False),
+    ]
     assert redis.forbidden_calls == []
     assert durable.commit_called is False
     assert durable.write_called is False
@@ -372,6 +439,173 @@ async def test_execute_xadds_only_exact_queue_and_creates_missing_group_with_pos
         "sentinel-token",
     ):
         assert raw not in output
+
+
+@pytest.mark.asyncio
+async def test_execute_blocks_nonempty_existing_stream_missing_group_without_rebuild_rows() -> None:
+    redis = FakeRedis(
+        stream_name="q.artifact.enrich.web",
+        group_name="web-enricher",
+        stream_present=True,
+        group_present=False,
+    )
+    redis.streams["q.artifact.enrich.web"].append((RAW_STREAM_ID, {"idempotency_key": "already-present"}))
+    durable = FakeDurableReader([], queue_name="q.artifact.enrich.web")
+
+    report = await build_redis_rebuild_execution_report(
+        _execute_request(queue_selector="artifact_enrich_web"),
+        config=config(),
+        redis_client=redis,
+        durable_reader=durable,
+    )
+
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == "nonempty_stream_group_create_requires_skip_history_policy"
+    assert redis.xgroup_create_calls == []
+    assert redis.xadd_calls == []
+    assert redis.xrange_calls == []
+    assert durable.commit_called is False
+    assert durable.write_called is False
+    _assert_no_mutation_attempted(report)
+    _assert_runtime_authority(report, redis_xadd=True, redis_xgroup_create=True)
+    _assert_global_open_gates(report)
+    _assert_final_closure_claims_false(report)
+
+
+@pytest.mark.asyncio
+async def test_execute_blocks_nonempty_existing_stream_missing_group_before_rebuild_xadd() -> None:
+    redis = FakeRedis(
+        stream_name="q.artifact.enrich.web",
+        group_name="web-enricher",
+        stream_present=True,
+        group_present=False,
+    )
+    redis.streams["q.artifact.enrich.web"].append((RAW_STREAM_ID, {"idempotency_key": "already-present"}))
+    durable = FakeDurableReader([_web_row()], queue_name="q.artifact.enrich.web")
+
+    report = await build_redis_rebuild_execution_report(
+        _execute_request(queue_selector="artifact_enrich_web"),
+        config=config(),
+        redis_client=redis,
+        durable_reader=durable,
+    )
+
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == "nonempty_stream_group_create_requires_skip_history_policy"
+    assert report["execution_summary"]["eligible_event_outbox_count_bucket"] == "one"
+    assert report["execution_summary"]["missing_group_count_bucket"] == "one"
+    assert redis.xgroup_create_calls == []
+    assert redis.xadd_calls == []
+    assert redis.xrange_calls == []
+    assert durable.commit_called is False
+    assert durable.write_called is False
+    _assert_no_mutation_attempted(report)
+    _assert_runtime_authority(report, redis_xadd=True, redis_xgroup_create=True)
+    _assert_global_open_gates(report)
+    _assert_final_closure_claims_false(report)
+
+
+@pytest.mark.asyncio
+async def test_execute_creates_missing_group_on_existing_empty_stream_without_xadd() -> None:
+    redis = FakeRedis(stream_present=True, group_present=False)
+    durable = FakeDurableReader([])
+
+    report = await build_redis_rebuild_execution_report(
+        _execute_request(),
+        config=config(),
+        redis_client=redis,
+        durable_reader=durable,
+    )
+
+    assert report["status"] == "pass"
+    assert report["reason_code"] == "redis_rebuild_execution_pass"
+    assert redis.xgroup_create_calls == [("q.maintenance", "maintenance", "0", False)]
+    assert redis.xadd_calls == []
+    assert redis.operations == [("xgroup_create", "q.maintenance", "maintenance", False)]
+    assert report["post_write_readback"]["performed"] is True
+    assert report["post_write_readback"]["stream_presence_bucket"] == "present"
+    assert report["post_write_readback"]["group_presence_bucket"] == "one"
+    assert report["post_write_readback"]["stream_length_count_bucket"] == "zero"
+    assert report["authority"]["redis_xadd_attempted"] is False
+    assert report["authority"]["redis_xgroup_create_attempted"] is True
+    assert report["authority"]["db_write_attempted"] is False
+    assert durable.commit_called is False
+    assert durable.write_called is False
+    _assert_runtime_authority(report, redis_xadd=True, redis_xgroup_create=True)
+    _assert_global_open_gates(report)
+    _assert_final_closure_claims_false(report)
+
+
+@pytest.mark.asyncio
+async def test_execute_creates_missing_group_before_xadd_on_existing_empty_stream() -> None:
+    redis = FakeRedis(stream_present=True, group_present=False)
+    durable = FakeDurableReader([_row()])
+
+    report = await build_redis_rebuild_execution_report(
+        _execute_request(),
+        config=config(),
+        redis_client=redis,
+        durable_reader=durable,
+    )
+
+    assert report["status"] == "pass"
+    assert report["reason_code"] == "redis_rebuild_execution_pass"
+    assert redis.xgroup_create_calls == [("q.maintenance", "maintenance", "0", False)]
+    assert len(redis.xadd_calls) == 1
+    assert redis.operations == [
+        ("xgroup_create", "q.maintenance", "maintenance", False),
+        ("xadd", "q.maintenance", None, None),
+    ]
+    assert redis.forbidden_calls == []
+    assert durable.commit_called is False
+    assert durable.write_called is False
+    assert report["post_write_readback"]["performed"] is True
+    assert report["post_write_readback"]["stream_length_delta_bucket"] == "one"
+    assert report["authority"]["redis_xadd_attempted"] is True
+    assert report["authority"]["redis_xgroup_create_attempted"] is True
+    assert report["authority"]["db_write_attempted"] is False
+    _assert_runtime_authority(report, redis_xadd=True, redis_xgroup_create=True)
+    _assert_global_open_gates(report)
+    _assert_final_closure_claims_false(report)
+
+
+@pytest.mark.asyncio
+async def test_execute_blocks_existing_stream_unknown_length_missing_group_before_mutation() -> None:
+    redis = FakeRedis(stream_present=True, group_present=False)
+    durable = FakeDurableReader([_row()])
+    redis_reader = StaticRedisReader(
+        RedisQueueInventory(
+            queue_key="maintenance",
+            stream_present=True,
+            stream_type_bucket="stream",
+            stream_length=None,
+            configured_group_count=1,
+            present_group_count=0,
+            missing_group_count=1,
+            pending_count=0,
+            reason_code="consumer_group_missing",
+        )
+    )
+
+    report = await build_redis_rebuild_execution_report(
+        _execute_request(),
+        config=config(),
+        redis_client=redis,
+        durable_reader=durable,
+        redis_reader=redis_reader,
+    )
+
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == "group_create_stream_length_unknown"
+    assert redis.xgroup_create_calls == []
+    assert redis.xadd_calls == []
+    assert redis.xrange_calls == []
+    assert durable.commit_called is False
+    assert durable.write_called is False
+    _assert_no_mutation_attempted(report)
+    _assert_runtime_authority(report, redis_xadd=True, redis_xgroup_create=True)
+    _assert_global_open_gates(report)
+    _assert_final_closure_claims_false(report)
 
 
 @pytest.mark.asyncio
