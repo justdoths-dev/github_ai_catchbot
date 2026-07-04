@@ -47,3 +47,16 @@ class RedisQueuedMessage:
             "not_before": self.not_before or "",
             "trigger_event_id": self.trigger_event_id,
         }
+
+
+def redis_queued_message_from_outbox_row(row: OutboxEventRow, route: QueueRoute) -> RedisQueuedMessage:
+    return RedisQueuedMessage(
+        job_id=str(row.event_id),
+        stage_name=route.stage_name,
+        root_object_type=row.aggregate_type,
+        root_object_id=str(row.aggregate_id),
+        idempotency_key=row.dedupe_key,
+        pipeline_run_id=None,
+        not_before=None,
+        trigger_event_id=str(row.event_id),
+    )

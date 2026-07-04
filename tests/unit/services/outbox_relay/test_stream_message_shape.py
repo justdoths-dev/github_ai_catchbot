@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from services.outbox_relay.config import OutboxRelayConfig
-from services.outbox_relay.models import OutboxEventRow
+from services.outbox_relay.models import OutboxEventRow, redis_queued_message_from_outbox_row
 from services.outbox_relay.routing import OutboxRouteResolver
 from services.outbox_relay.service import OutboxRelayService
 
@@ -54,8 +54,10 @@ def test_stream_message_is_id_only_payload() -> None:
 
     route = OutboxRouteResolver().resolve(row)
     message = service._build_stream_message(row, route)
+    helper_message = redis_queued_message_from_outbox_row(row, route)
     fields = message.as_stream_fields()
 
+    assert message == helper_message
     assert message.job_id == str(row.event_id)
     assert message.trigger_event_id == str(row.event_id)
     assert message.root_object_type == row.aggregate_type

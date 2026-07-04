@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 
 from .config import OutboxRelayConfig
-from .models import OutboxEventRow, QueueRoute, RedisQueuedMessage
+from .models import OutboxEventRow, QueueRoute, RedisQueuedMessage, redis_queued_message_from_outbox_row
 from .redis_streams import RedisStreamsPublisher
 from .repositories import OutboxRelayRepository
 from .routing import OutboxRouteResolver, UnsupportedOutboxEventTypeError
@@ -137,16 +137,7 @@ class OutboxRelayService:
             )
 
     def _build_stream_message(self, row: OutboxEventRow, route: QueueRoute) -> RedisQueuedMessage:
-        return RedisQueuedMessage(
-            job_id=str(row.event_id),
-            stage_name=route.stage_name,
-            root_object_type=row.aggregate_type,
-            root_object_id=str(row.aggregate_id),
-            idempotency_key=row.dedupe_key,
-            pipeline_run_id=None,
-            not_before=None,
-            trigger_event_id=str(row.event_id),
-        )
+        return redis_queued_message_from_outbox_row(row, route)
 
     def _safe_route(self, row: OutboxEventRow) -> QueueRoute:
         try:

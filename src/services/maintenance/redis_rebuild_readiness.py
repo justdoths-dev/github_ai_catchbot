@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
+from ..outbox_relay.eligibility import canonical_relay_eligible_sql
+from ..outbox_relay.models import OutboxEventRow
 from .config import MaintenanceConfig
 
 
@@ -44,8 +46,6 @@ O3B_AUTHORITY = (
     "operator_approved_exact_redis_target",
     "redis_xgroup_create_for_missing_groups",
     "redis_xadd_for_rebuildable_durable_rows",
-    "redis_pending_consume_ack_or_delete_only_if_explicitly_scoped",
-    "db_write_for_abandoned_job_transition_if_selected",
     "post_write_read_only_audit",
 )
 
@@ -223,6 +223,39 @@ class SqlAlchemyDurableRebuildInventoryRepository:
                 read_error_code="durable_inventory_read_failed",
             )
         return DurableInventorySnapshot(categories=tuple(categories))
+
+    async def load_rebuildable_event_outbox_rows(
+        self,
+        *,
+        queue_name: str,
+        limit: int,
+    ) -> tuple[OutboxEventRow, ...]:
+        if limit <= 0 or not await self._table_present("event_outbox"):
+            return ()
+        queue_predicate = _event_outbox_queue_predicate(queue_name)
+        if queue_predicate is None:
+            return ()
+        rows = await self._all(
+            f"""
+            SELECT
+                eo.event_id,
+                eo.event_type,
+                eo.aggregate_type,
+                eo.aggregate_id,
+                eo.dedupe_key,
+                eo.payload_json,
+                eo.status,
+                eo.fail_count,
+                eo.created_at
+            FROM event_outbox eo
+            WHERE {canonical_relay_eligible_sql("eo")}
+              AND ({queue_predicate})
+            ORDER BY eo.created_at ASC, eo.event_id ASC
+            LIMIT :limit
+            """,
+            {"limit": min(limit, 25)},
+        )
+        return tuple(_outbox_row_from_mapping(row) for row in rows)
 
     async def _table_present(self, table_name: str) -> bool:
         result = await self._session.execute(
@@ -966,6 +999,57 @@ def _event_type_queue_bucket(event_type: object, provider_route: object) -> str:
         "notification.delivery.result.v1": "maintenance",
     }
     return mapping.get(text, "unsupported_or_unknown")
+
+
+def _event_outbox_queue_predicate(queue_name: str) -> str | None:
+    event_type_predicates = {
+        "q.source.normalize": (
+            "eo.event_type IN ("
+            "'source_message.created.v1',"
+            "'source_message.edited.v1',"
+            "'source_message.deleted.v1',"
+            "'source_message.reconciled.v1'"
+            ")"
+        ),
+        "q.candidate.bundle": "eo.event_type IN ('candidate.bundle.refresh.v1','artifact.snapshot.updated.v1')",
+        "q.analysis.route": "eo.event_type = 'analysis.requested.v1'",
+        "q.analysis.judge": "eo.event_type = 'judge.call.requested.v1'",
+        "q.analysis.validate": "eo.event_type = 'judge.output.ready.v1'",
+        "q.analysis.policy": "eo.event_type = 'analysis.policy.apply.v1'",
+        "q.notification.send": "eo.event_type = 'notification.plan.created.v1'",
+        "q.replay": "eo.event_type = 'replay.requested.v1'",
+        "q.maintenance": "eo.event_type = 'notification.delivery.result.v1'",
+        "q.artifact.enrich.github": (
+            "eo.event_type = 'artifact.enrich.requested.v1' "
+            "AND eo.payload_json->>'provider_route' = 'github'"
+        ),
+        "q.artifact.enrich.x": (
+            "eo.event_type = 'artifact.enrich.requested.v1' "
+            "AND eo.payload_json->>'provider_route' = 'x'"
+        ),
+        "q.artifact.enrich.web": (
+            "eo.event_type = 'artifact.enrich.requested.v1' "
+            "AND eo.payload_json->>'provider_route' = 'web'"
+        ),
+    }
+    return event_type_predicates.get(queue_name)
+
+
+def _outbox_row_from_mapping(row: Mapping[str, Any]) -> OutboxEventRow:
+    payload = row["payload_json"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    return OutboxEventRow(
+        event_id=row["event_id"],
+        event_type=str(row["event_type"]),
+        aggregate_type=str(row["aggregate_type"]),
+        aggregate_id=row["aggregate_id"],
+        dedupe_key=str(row["dedupe_key"]),
+        payload_json=payload if isinstance(payload, dict) else {},
+        status=str(row["status"]),
+        fail_count=_safe_int(row["fail_count"]),
+        created_at=row["created_at"],
+    )
 
 
 def _safe_status(value: object) -> str:
