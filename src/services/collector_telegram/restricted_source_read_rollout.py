@@ -19,6 +19,10 @@ from .bounded_history_ingest_runner import (
 )
 from .config import CollectorTelegramConfig
 from .models import CollectorEnvironment, CollectorMode, TrackedChat
+from .runtime_env_overlay import (
+    COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS,
+    COLLECTOR_RUNTIME_ENV_FORBIDDEN_SOURCE_KEYS,
+)
 
 
 SCHEMA_VERSION = "restricted_live_collector_one_channel_source_read_rollout_v1"
@@ -31,33 +35,10 @@ FAKE_MESSAGE_ID = 444555666
 FAKE_MESSAGE_TEXT = "sentinel restricted one channel source read proof text"
 FAKE_CONFIG_VALUE = "placeholder-value"
 BOUNDED_RUNNER_PATH = "tools/bounded_collector_history_ingest_runner.py"
+ENV_OVERLAY_RUNNER_PATH = "tools/restricted_live_collector_one_channel_source_read_env_overlay_runner.py"
 PYTHON_EXECUTABLE_PLACEHOLDER = "venv/bin/python"
 SOURCE_VALUE_PLACEHOLDER = "<PUBLIC_USERNAME_SOURCE_VALUE>"
 RUNTIME_ENV_FILE_PLACEHOLDER = "<RUNTIME_ENV_FILE>"
-COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS = (
-    "APP_ENV",
-    "COLLECTOR_MODE",
-    "DATABASE_URL",
-    "REDIS_URL",
-    "TELEGRAM_API_ID",
-    "TELEGRAM_API_HASH",
-    "TELEGRAM_API_HASH_FILE",
-    "TELEGRAM_PHONE_NUMBER",
-    "TELEGRAM_2FA_PASSWORD",
-    "TELEGRAM_2FA_PASSWORD_FILE",
-    "TDLIB_STATE_DIR",
-    "TDLIB_FILES_DIR",
-    "TDLIB_DB_ENCRYPTION_KEY",
-    "TDLIB_DB_ENCRYPTION_KEY_FILE",
-    "RECONCILE_INTERVAL_SEC",
-    "RECONCILE_BACKFILL_LIMIT",
-    "WARM_BACKFILL_LIMIT",
-    "HISTORY_PAGE_LIMIT",
-    "COLLECTOR_SINGLETON_LOCK_PATH",
-    "STARTUP_PROBE_TIMEOUT_SEC",
-    "STARTUP_WARM_BACKFILL_ENABLED",
-    "LOG_LEVEL",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -636,6 +617,24 @@ def _base_packet(
 def _future_live_read_command_tokens(*, requested_max_messages: int) -> tuple[str, ...]:
     return (
         PYTHON_EXECUTABLE_PLACEHOLDER,
+        ENV_OVERLAY_RUNNER_PATH,
+        "--mode",
+        "execute",
+        "--runtime-env-file",
+        RUNTIME_ENV_FILE_PLACEHOLDER,
+        "--source-value",
+        SOURCE_VALUE_PLACEHOLDER,
+        "--max-messages",
+        str(requested_max_messages),
+        "--operator-approved",
+        "--confirm-token",
+        EXECUTE_CONFIRM_TOKEN,
+    )
+
+
+def _future_live_read_child_command_tokens(*, requested_max_messages: int) -> tuple[str, ...]:
+    return (
+        "sys.executable",
         BOUNDED_RUNNER_PATH,
         "--mode",
         "execute",
@@ -660,8 +659,22 @@ def _future_live_read_command_tokens(*, requested_max_messages: int) -> tuple[st
 
 def _runtime_env_safe_loader_pattern(
     *,
-    command_tokens: Sequence[str],
+    operator_command_tokens: Sequence[str],
+    child_command_tokens: Sequence[str],
 ) -> dict[str, Any]:
+    forbidden_operator_tokens = (
+        "--allow-source-outbox-publish",
+        "--allow-redis-publish",
+        "--allow-send",
+        "--chat-id",
+        "--registry-id",
+        "--all-channels",
+        "--docker",
+        "--systemd",
+        "docker",
+        "systemctl",
+        "alembic",
+    )
     forbidden_child_tokens = (
         RUNTIME_ENV_FILE_PLACEHOLDER,
         "--runtime-env-file",
@@ -676,28 +689,51 @@ def _runtime_env_safe_loader_pattern(
         "systemctl",
         "alembic",
     )
-    child_command_tokens = tuple(command_tokens)
+    operator_command_tokens = tuple(operator_command_tokens)
+    child_command_tokens = tuple(child_command_tokens)
+    operator_command_text = " ".join(operator_command_tokens)
     child_command_text = " ".join(child_command_tokens)
     return {
-        "loader": "safe_allowlisted_env_overlay_pattern_for_CollectorTelegramConfig.from_env",
+        "loader": "collector_runtime_env_overlay.build_collector_runtime_env_overlay",
         "runtime_env_loaded": False,
         "actual_runtime_env_file_read_in_this_task": False,
         "exact_runtime_env_file_placeholder_required": True,
         "runtime_env_file_placeholder": RUNTIME_ENV_FILE_PLACEHOLDER,
         "runtime_env_file_path_printed": False,
         "runtime_env_values_printed": False,
+        "runtime_env_file_contents_printed": False,
         "runtime_env_values_redacted": True,
+        "source_runtime_env_allows_extra_keys": True,
+        "source_unknown_keys_ignored": True,
+        "source_forbidden_keys_ignored": True,
+        "source_forbidden_keys": list(COLLECTOR_RUNTIME_ENV_FORBIDDEN_SOURCE_KEYS),
         "allowed_env_keys": list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS),
-        "reject_unknown_env_keys": True,
+        "child_overlay_allowed_keys": list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS),
+        "reject_unknown_env_keys": False,
+        "source_reject_unknown_env_keys": False,
+        "child_overlay_only": True,
         "load_values_into_child_env_overlay_only": True,
+        "reject_unknown_child_overlay_keys": True,
+        "reject_forbidden_child_overlay_keys": True,
+        "child_overlay_rejects_unknown_keys": True,
+        "child_overlay_rejects_forbidden_keys": True,
         "uses_sys_executable_for_child": True,
         "entrypoint_uses_sys_executable": True,
-        "child_command_uses_existing_runner": child_command_tokens[:2] == (
+        "wrapper_runner_path": ENV_OVERLAY_RUNNER_PATH,
+        "operator_command_uses_wrapper_runner": operator_command_tokens[:2] == (
             PYTHON_EXECUTABLE_PLACEHOLDER,
+            ENV_OVERLAY_RUNNER_PATH,
+        ),
+        "operator_command_tokens": list(operator_command_tokens),
+        "child_command_uses_existing_runner": child_command_tokens[:2] == (
+            "sys.executable",
             BOUNDED_RUNNER_PATH,
         ),
+        "child_runner_path": BOUNDED_RUNNER_PATH,
         "child_command_runner_path": BOUNDED_RUNNER_PATH,
         "child_command_tokens": list(child_command_tokens),
+        "operator_command_includes_runtime_env_file_token": "--runtime-env-file" in operator_command_tokens,
+        "operator_command_uses_runtime_env_placeholder_only": RUNTIME_ENV_FILE_PLACEHOLDER in operator_command_tokens,
         "child_command_omits_runtime_env_file_token": not any(
             token in child_command_tokens for token in ("--runtime-env-file", "--runtime-env-path", "--env-file")
         )
@@ -710,6 +746,15 @@ def _runtime_env_safe_loader_pattern(
         "child_command_omits_docker_systemd_alembic": not any(
             token in child_command_text for token in ("docker", "systemctl", "alembic")
         ),
+        "operator_command_omits_source_outbox_publish": "--allow-source-outbox-publish" not in operator_command_tokens,
+        "operator_command_omits_redis_publish": "--allow-redis-publish" not in operator_command_tokens,
+        "operator_command_omits_send_edit": "--allow-send" not in operator_command_tokens,
+        "operator_command_omits_chat_id": "--chat-id" not in operator_command_tokens,
+        "operator_command_omits_registry_id": "--registry-id" not in operator_command_tokens,
+        "operator_command_omits_docker_systemd_alembic": not any(
+            token in operator_command_text for token in ("docker", "systemctl", "alembic")
+        ),
+        "operator_command_forbidden_tokens_absent": list(forbidden_operator_tokens),
         "child_command_forbidden_tokens_absent": list(forbidden_child_tokens),
     }
 
@@ -730,8 +775,18 @@ def _preflight_packet(
         target_count=target_count,
         target_fingerprint=target_fingerprint,
     )
+    child_command_tokens = (
+        _future_live_read_child_command_tokens(requested_max_messages=int(requested_max_messages))
+        if status == "pass" and requested_max_messages is not None
+        else ()
+    )
     safe_loader_pattern = (
-        _runtime_env_safe_loader_pattern(command_tokens=command_tokens) if status == "pass" else None
+        _runtime_env_safe_loader_pattern(
+            operator_command_tokens=command_tokens,
+            child_command_tokens=child_command_tokens,
+        )
+        if status == "pass"
+        else None
     )
     packet["schema_version"] = PREFLIGHT_SCHEMA_VERSION
     packet["bounded_read"]["exactly_one_history_request"] = status == "pass"
@@ -739,6 +794,7 @@ def _preflight_packet(
         {
             "state": "static_preflight_command_packet",
             "existing_collector_runner": RUNNER_NAME,
+            "existing_env_overlay_runner_path": ENV_OVERLAY_RUNNER_PATH,
             "existing_runner_path": BOUNDED_RUNNER_PATH,
             "existing_runner_consumed": True,
             "existing_runner_command_uses_max_messages_alias": True,
@@ -753,8 +809,12 @@ def _preflight_packet(
         }
     )
     packet["future_execution_command"] = {
-        "runner_path": BOUNDED_RUNNER_PATH,
+        "runner_path": ENV_OVERLAY_RUNNER_PATH,
+        "wrapper_runner_path": ENV_OVERLAY_RUNNER_PATH,
+        "child_runner_path": BOUNDED_RUNNER_PATH,
         "runner_name": RUNNER_NAME,
+        "operator_command_tokens": list(command_tokens),
+        "child_command_tokens": list(child_command_tokens),
         "command_tokens": list(command_tokens),
         "placeholders": {
             "runtime_env_file": RUNTIME_ENV_FILE_PLACEHOLDER,
@@ -776,8 +836,18 @@ def _preflight_packet(
         "production_database_write_authority_required_for_future_execution": True,
         "runtime_env": {
             "required": True,
-            "loader": "CollectorTelegramConfig.from_env",
-            "command_token_included": False,
+            "loader": "collector_runtime_env_overlay.build_collector_runtime_env_overlay",
+            "source_runtime_env_allows_extra_keys": status == "pass",
+            "source_unknown_keys_ignored": status == "pass",
+            "source_forbidden_keys_ignored": status == "pass",
+            "child_overlay_only": status == "pass",
+            "child_overlay_allowed_keys": list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS),
+            "child_overlay_rejects_unknown_keys": status == "pass",
+            "child_overlay_rejects_forbidden_keys": status == "pass",
+            "uses_sys_executable_for_child": status == "pass",
+            "child_runner_path": BOUNDED_RUNNER_PATH,
+            "wrapper_runner_path": ENV_OVERLAY_RUNNER_PATH,
+            "command_token_included": status == "pass",
             "placeholder": RUNTIME_ENV_FILE_PLACEHOLDER,
             "exact_runtime_env_file_placeholder_required": status == "pass",
             "runtime_env_file_placeholder": RUNTIME_ENV_FILE_PLACEHOLDER,
@@ -785,6 +855,7 @@ def _preflight_packet(
             "values_printed": False,
             "runtime_env_file_path_printed": False,
             "runtime_env_values_printed": False,
+            "runtime_env_file_contents_printed": False,
             "runtime_env_values_redacted": True,
             "runtime_env_loaded": False,
             "actual_runtime_env_file_read_in_this_task": False,
@@ -856,6 +927,7 @@ def _preflight_packet(
         {
             "F1_LIVE_ONE_CHANNEL_SOURCE_READ_PREFLIGHT_PACKET_READY": status == "pass",
             "F1_LIVE_ONE_CHANNEL_EXACT_COMMAND_PACKET_READY": status == "pass",
+            "F1_COLLECTOR_ONLY_RUNTIME_ENV_OVERLAY_PREFLIGHT_READY": status == "pass",
             "LIVE_TELEGRAM_READ_AUTHORITY_REMAINS_CLOSED_IN_THIS_TASK": True,
             "LIVE_COLLECTOR_1_CHANNEL_CLOSED": False,
             "TDLib_session_health_proof_closed": False,
@@ -922,6 +994,7 @@ def _fingerprint(kind: str, value: object | None) -> str | None:
 __all__ = [
     "BOUNDED_RUNNER_PATH",
     "COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS",
+    "ENV_OVERLAY_RUNNER_PATH",
     "PASS_REASON_CODE",
     "PREFLIGHT_PASS_REASON_CODE",
     "PREFLIGHT_SCHEMA_VERSION",

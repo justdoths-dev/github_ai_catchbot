@@ -7,6 +7,7 @@ import pytest
 from src.services.collector_telegram.restricted_source_read_rollout import (
     BOUNDED_RUNNER_PATH,
     COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS,
+    ENV_OVERLAY_RUNNER_PATH,
     FAKE_CHAT_ID,
     FAKE_CONFIG_VALUE,
     FAKE_MESSAGE_ID,
@@ -104,6 +105,7 @@ def test_live_preflight_command_packet_reuses_bounded_runner_without_live_author
     rendered = json.dumps(report, sort_keys=True)
     command = report["future_execution_command"]
     command_tokens = command["command_tokens"]
+    child_command_tokens = command["child_command_tokens"]
     runtime_env = command["runtime_env"]
     safe_loader = runtime_env["safe_loader_pattern"]
 
@@ -129,7 +131,10 @@ def test_live_preflight_command_packet_reuses_bounded_runner_without_live_author
     assert report["runtime_authority_opened_in_this_run"]["live_telegram_read"] is False
     assert report["runtime_authority_opened_in_this_run"]["production_database_write"] is False
     assert report["runtime_authority_opened_in_this_run"]["redis_mutation"] is False
-    assert command["runner_path"] == BOUNDED_RUNNER_PATH
+    assert command["runner_path"] == ENV_OVERLAY_RUNNER_PATH
+    assert command["wrapper_runner_path"] == ENV_OVERLAY_RUNNER_PATH
+    assert command["child_runner_path"] == BOUNDED_RUNNER_PATH
+    assert command["operator_command_tokens"] == command_tokens
     assert command["max_messages_required"] is True
     assert command["max_messages_argument"] == "--max-messages"
     assert command["max_messages_hard_limit"] == 30
@@ -140,9 +145,21 @@ def test_live_preflight_command_packet_reuses_bounded_runner_without_live_author
     assert command["source_outbox_publish_disabled"] is True
     assert runtime_env["placeholder"] == RUNTIME_ENV_FILE_PLACEHOLDER
     assert runtime_env["runtime_env_file_placeholder"] == RUNTIME_ENV_FILE_PLACEHOLDER
+    assert runtime_env["source_runtime_env_allows_extra_keys"] is True
+    assert runtime_env["source_unknown_keys_ignored"] is True
+    assert runtime_env["source_forbidden_keys_ignored"] is True
+    assert runtime_env["child_overlay_only"] is True
+    assert runtime_env["child_overlay_allowed_keys"] == list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS)
+    assert runtime_env["child_overlay_rejects_unknown_keys"] is True
+    assert runtime_env["child_overlay_rejects_forbidden_keys"] is True
+    assert runtime_env["uses_sys_executable_for_child"] is True
+    assert runtime_env["child_runner_path"] == BOUNDED_RUNNER_PATH
+    assert runtime_env["wrapper_runner_path"] == ENV_OVERLAY_RUNNER_PATH
+    assert runtime_env["command_token_included"] is True
     assert runtime_env["exact_runtime_env_file_placeholder_required"] is True
     assert runtime_env["values_printed"] is False
     assert runtime_env["path_printed"] is False
+    assert runtime_env["runtime_env_file_contents_printed"] is False
     assert runtime_env["runtime_env_values_redacted"] is True
     assert runtime_env["runtime_env_loaded"] is False
     assert runtime_env["actual_runtime_env_file_read_in_this_task"] is False
@@ -157,13 +174,29 @@ def test_live_preflight_command_packet_reuses_bounded_runner_without_live_author
     assert safe_loader["allowed_env_keys"] == list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS)
     assert safe_loader["allowed_env_keys"]
     assert set(safe_loader["allowed_env_keys"]) == set(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS)
-    assert safe_loader["reject_unknown_env_keys"] is True
+    assert safe_loader["source_runtime_env_allows_extra_keys"] is True
+    assert safe_loader["source_unknown_keys_ignored"] is True
+    assert safe_loader["source_forbidden_keys_ignored"] is True
+    assert safe_loader["reject_unknown_env_keys"] is False
+    assert safe_loader["source_reject_unknown_env_keys"] is False
+    assert safe_loader["child_overlay_allowed_keys"] == list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS)
+    assert safe_loader["child_overlay_only"] is True
+    assert safe_loader["reject_unknown_child_overlay_keys"] is True
+    assert safe_loader["reject_forbidden_child_overlay_keys"] is True
+    assert safe_loader["child_overlay_rejects_unknown_keys"] is True
+    assert safe_loader["child_overlay_rejects_forbidden_keys"] is True
     assert safe_loader["load_values_into_child_env_overlay_only"] is True
     assert safe_loader["uses_sys_executable_for_child"] is True
     assert safe_loader["entrypoint_uses_sys_executable"] is True
+    assert safe_loader["wrapper_runner_path"] == ENV_OVERLAY_RUNNER_PATH
+    assert safe_loader["operator_command_uses_wrapper_runner"] is True
+    assert safe_loader["operator_command_tokens"] == command_tokens
     assert safe_loader["child_command_uses_existing_runner"] is True
+    assert safe_loader["child_runner_path"] == BOUNDED_RUNNER_PATH
     assert safe_loader["child_command_runner_path"] == BOUNDED_RUNNER_PATH
-    assert safe_loader["child_command_tokens"] == command_tokens
+    assert safe_loader["child_command_tokens"] == child_command_tokens
+    assert safe_loader["operator_command_includes_runtime_env_file_token"] is True
+    assert safe_loader["operator_command_uses_runtime_env_placeholder_only"] is True
     assert safe_loader["child_command_omits_runtime_env_file_token"] is True
     assert safe_loader["child_command_omits_source_outbox_publish"] is True
     assert safe_loader["child_command_omits_redis_publish"] is True
@@ -171,7 +204,22 @@ def test_live_preflight_command_packet_reuses_bounded_runner_without_live_author
     assert safe_loader["child_command_omits_chat_id"] is True
     assert safe_loader["child_command_omits_registry_id"] is True
     assert safe_loader["child_command_omits_docker_systemd_alembic"] is True
-    assert command_tokens[:2] == ["venv/bin/python", BOUNDED_RUNNER_PATH]
+    assert command_tokens[:2] == ["venv/bin/python", ENV_OVERLAY_RUNNER_PATH]
+    assert child_command_tokens[:2] == ["sys.executable", BOUNDED_RUNNER_PATH]
+    for required_token in (
+        "--mode",
+        "execute",
+        "--runtime-env-file",
+        RUNTIME_ENV_FILE_PLACEHOLDER,
+        "--source-value",
+        SOURCE_VALUE_PLACEHOLDER,
+        "--max-messages",
+        "1",
+        "--operator-approved",
+        "--confirm-token",
+        "LIVE_COLLECTOR_1_CHANNEL_SOURCE_LAST_EXECUTE",
+    ):
+        assert required_token in command_tokens
     for required_token in (
         "--mode",
         "execute",
@@ -192,18 +240,26 @@ def test_live_preflight_command_packet_reuses_bounded_runner_without_live_author
         "--confirm-token",
         "LIVE_COLLECTOR_1_CHANNEL_SOURCE_LAST_EXECUTE",
     ):
-        assert required_token in command_tokens
+        assert required_token in child_command_tokens
     assert "--allow-source-outbox-publish" not in command_tokens
     assert "--allow-redis-publish" not in command_tokens
     assert "--allow-send" not in command_tokens
     assert "--chat-id" not in command_tokens
     assert "--registry-id" not in command_tokens
-    assert "--runtime-env-file" not in command_tokens
-    assert "--runtime-env-path" not in command_tokens
-    assert "--env-file" not in command_tokens
+    assert "--allow-source-outbox-publish" not in child_command_tokens
+    assert "--allow-redis-publish" not in child_command_tokens
+    assert "--allow-send" not in child_command_tokens
+    assert "--chat-id" not in child_command_tokens
+    assert "--registry-id" not in child_command_tokens
+    assert "--runtime-env-file" not in child_command_tokens
+    assert "--runtime-env-path" not in child_command_tokens
+    assert "--env-file" not in child_command_tokens
     assert "docker" not in command_tokens
     assert "systemctl" not in command_tokens
     assert "alembic" not in command_tokens
+    assert "docker" not in child_command_tokens
+    assert "systemctl" not in child_command_tokens
+    assert "alembic" not in child_command_tokens
     assert report["future_readback_plan"]["source_messages"]["expected_count_field"] == (
         "source_current_found_count"
     )
@@ -223,6 +279,7 @@ def test_live_preflight_command_packet_reuses_bounded_runner_without_live_author
     assert report["redaction_audit"]["actual_runtime_env_file_read_in_this_task"] is False
     assert report["completion_claims"]["F1_LIVE_ONE_CHANNEL_SOURCE_READ_PREFLIGHT_PACKET_READY"] is True
     assert report["completion_claims"]["F1_LIVE_ONE_CHANNEL_EXACT_COMMAND_PACKET_READY"] is True
+    assert report["completion_claims"]["F1_COLLECTOR_ONLY_RUNTIME_ENV_OVERLAY_PREFLIGHT_READY"] is True
     assert report["completion_claims"]["LIVE_TELEGRAM_READ_AUTHORITY_REMAINS_CLOSED_IN_THIS_TASK"] is True
     assert report["completion_claims"]["LIVE_COLLECTOR_1_CHANNEL_CLOSED"] is False
     assert report["completion_claims"]["production_complete"] is False

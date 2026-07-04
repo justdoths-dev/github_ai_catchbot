@@ -7,10 +7,12 @@ from pathlib import Path
 from src.services.collector_telegram.restricted_source_read_rollout import (
     BOUNDED_RUNNER_PATH,
     COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS,
+    ENV_OVERLAY_RUNNER_PATH,
     FAKE_CHAT_ID,
     FAKE_CONFIG_VALUE,
     FAKE_MESSAGE_ID,
     FAKE_MESSAGE_TEXT,
+    RUNTIME_ENV_FILE_PLACEHOLDER,
     SOURCE_VALUE_PLACEHOLDER,
 )
 from tools import restricted_live_collector_one_channel_source_read_rollout_runner as runner
@@ -71,6 +73,7 @@ def test_runner_prints_preflight_command_packet_without_live_authority_or_raw_va
     report = json.loads(captured.out)
     command = report["future_execution_command"]
     command_tokens = command["command_tokens"]
+    child_command_tokens = command["child_command_tokens"]
     runtime_env = command["runtime_env"]
     safe_loader = runtime_env["safe_loader_pattern"]
 
@@ -82,13 +85,17 @@ def test_runner_prints_preflight_command_packet_without_live_authority_or_raw_va
     assert report["runtime_authority_opened_in_this_run"]["live_telegram_read"] is False
     assert report["actual_attempted_operations"]["collector_bounded_runner_invoked"] is False
     assert report["actual_attempted_operations"]["fake_telegram_history_read_attempted"] is False
-    assert command["runner_path"] == BOUNDED_RUNNER_PATH
+    assert command["runner_path"] == ENV_OVERLAY_RUNNER_PATH
+    assert command["wrapper_runner_path"] == ENV_OVERLAY_RUNNER_PATH
+    assert command["child_runner_path"] == BOUNDED_RUNNER_PATH
     assert command["max_messages_argument"] == "--max-messages"
     assert command["source_outbox_publish_disabled"] is True
     assert command["redis_publish_disabled"] is True
     assert command["send_disabled"] is True
-    assert command_tokens[:2] == ["venv/bin/python", BOUNDED_RUNNER_PATH]
+    assert command_tokens[:2] == ["venv/bin/python", ENV_OVERLAY_RUNNER_PATH]
+    assert child_command_tokens[:2] == ["sys.executable", BOUNDED_RUNNER_PATH]
     assert SOURCE_VALUE_PLACEHOLDER in command_tokens
+    assert RUNTIME_ENV_FILE_PLACEHOLDER in command_tokens
     assert "--max-messages" in command_tokens
     assert runtime_env["runtime_env_file_placeholder"] == "<RUNTIME_ENV_FILE>"
     assert runtime_env["runtime_env_loaded"] is False
@@ -99,12 +106,22 @@ def test_runner_prints_preflight_command_packet_without_live_authority_or_raw_va
     assert safe_loader["runtime_env_loaded"] is False
     assert safe_loader["actual_runtime_env_file_read_in_this_task"] is False
     assert safe_loader["allowed_env_keys"] == list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS)
-    assert safe_loader["reject_unknown_env_keys"] is True
+    assert safe_loader["source_runtime_env_allows_extra_keys"] is True
+    assert safe_loader["source_unknown_keys_ignored"] is True
+    assert safe_loader["source_forbidden_keys_ignored"] is True
+    assert safe_loader["reject_unknown_env_keys"] is False
+    assert safe_loader["child_overlay_only"] is True
+    assert safe_loader["child_overlay_allowed_keys"] == list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS)
+    assert safe_loader["child_overlay_rejects_unknown_keys"] is True
+    assert safe_loader["child_overlay_rejects_forbidden_keys"] is True
     assert safe_loader["load_values_into_child_env_overlay_only"] is True
     assert safe_loader["uses_sys_executable_for_child"] is True
+    assert safe_loader["wrapper_runner_path"] == ENV_OVERLAY_RUNNER_PATH
+    assert safe_loader["operator_command_uses_wrapper_runner"] is True
     assert safe_loader["child_command_uses_existing_runner"] is True
+    assert safe_loader["child_runner_path"] == BOUNDED_RUNNER_PATH
     assert safe_loader["child_command_runner_path"] == BOUNDED_RUNNER_PATH
-    assert safe_loader["child_command_tokens"] == command_tokens
+    assert safe_loader["child_command_tokens"] == child_command_tokens
     assert safe_loader["child_command_omits_runtime_env_file_token"] is True
     assert safe_loader["child_command_omits_source_outbox_publish"] is True
     assert safe_loader["child_command_omits_redis_publish"] is True
@@ -117,9 +134,15 @@ def test_runner_prints_preflight_command_packet_without_live_authority_or_raw_va
     assert "--allow-send" not in command_tokens
     assert "--chat-id" not in command_tokens
     assert "--registry-id" not in command_tokens
-    assert "--env-file" not in command_tokens
+    assert "--allow-source-outbox-publish" not in child_command_tokens
+    assert "--allow-redis-publish" not in child_command_tokens
+    assert "--allow-send" not in child_command_tokens
+    assert "--chat-id" not in child_command_tokens
+    assert "--registry-id" not in child_command_tokens
+    assert "--env-file" not in child_command_tokens
     assert report["completion_claims"]["F1_LIVE_ONE_CHANNEL_SOURCE_READ_PREFLIGHT_PACKET_READY"] is True
     assert report["completion_claims"]["F1_LIVE_ONE_CHANNEL_EXACT_COMMAND_PACKET_READY"] is True
+    assert report["completion_claims"]["F1_COLLECTOR_ONLY_RUNTIME_ENV_OVERLAY_PREFLIGHT_READY"] is True
     assert report["completion_claims"]["LIVE_TELEGRAM_READ_AUTHORITY_REMAINS_CLOSED_IN_THIS_TASK"] is True
     for raw in (
         "trendingrepo",
