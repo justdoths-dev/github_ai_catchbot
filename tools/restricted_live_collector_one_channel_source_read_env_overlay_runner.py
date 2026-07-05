@@ -20,6 +20,8 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
     EXECUTE_CONFIRM_TOKEN,
     MAX_MESSAGES_HARD_LIMIT,
     SOURCE_KIND_PUBLIC_USERNAME,
+    THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
+    THREE_CHANNEL_TARGET_COUNT,
     render_sanitized_json,
 )
 from src.services.collector_telegram.runtime_env_overlay import (
@@ -149,7 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mode", choices=("plan", "execute"), default="plan")
     parser.add_argument("--runtime-env-file", default=None)
-    parser.add_argument("--source-value", default=None)
+    parser.add_argument("--source-value", action="append", dest="source_values")
     parser.add_argument("--max-messages", type=int, default=None)
     parser.add_argument("--operator-approved", action="store_true")
     parser.add_argument("--confirm-token", default=None)
@@ -162,10 +164,15 @@ def run(
     subprocess_runner: SubprocessRunner | None = None,
 ) -> RunnerResult:
     mode = str(args.mode or "plan")
-    normalized_source, target_error = _normalize_public_username(args.source_value)
+    normalized_sources, target_error = _normalize_public_username_targets(tuple(args.source_values or ()))
     max_messages = args.max_messages
     max_messages_error = _max_messages_error(max_messages)
-    target_fingerprint = _fingerprint("source_value", normalized_source) if normalized_source else None
+    target_fingerprints = tuple(
+        fingerprint
+        for fingerprint in (_fingerprint("source_value", source) for source in normalized_sources)
+        if fingerprint is not None
+    )
+    target_fingerprint = target_fingerprints[0] if len(target_fingerprints) == 1 else None
 
     if target_error is not None:
         report = _base_report(
@@ -174,6 +181,7 @@ def run(
             mode=mode,
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
+            target_fingerprints=target_fingerprints,
         )
         return RunnerResult(exit_code=1, report=report)
     if max_messages_error is not None:
@@ -183,6 +191,7 @@ def run(
             mode=mode,
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
+            target_fingerprints=target_fingerprints,
         )
         return RunnerResult(exit_code=1, report=report)
     if mode == "execute" and not bool(args.operator_approved):
@@ -192,15 +201,22 @@ def run(
             mode=mode,
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
+            target_fingerprints=target_fingerprints,
         )
         return RunnerResult(exit_code=1, report=report)
-    if mode == "execute" and str(args.confirm_token or "").strip() != EXECUTE_CONFIRM_TOKEN:
+    expected_confirm_token = (
+        THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN
+        if len(normalized_sources) == THREE_CHANNEL_TARGET_COUNT
+        else EXECUTE_CONFIRM_TOKEN
+    )
+    if mode == "execute" and str(args.confirm_token or "").strip() != expected_confirm_token:
         report = _base_report(
             status="blocked",
             reason_code="confirm_token_missing" if not str(args.confirm_token or "").strip() else "confirm_token_invalid",
             mode=mode,
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
+            target_fingerprints=target_fingerprints,
         )
         return RunnerResult(exit_code=1, report=report)
     if not args.runtime_env_file:
@@ -210,10 +226,11 @@ def run(
             mode=mode,
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
+            target_fingerprints=target_fingerprints,
         )
         return RunnerResult(exit_code=1, report=report)
 
-    assert normalized_source is not None
+    assert normalized_sources
     assert isinstance(max_messages, int)
     overlay_result = build_collector_runtime_env_overlay(str(args.runtime_env_file))
     if not overlay_result.ok:
@@ -223,12 +240,13 @@ def run(
             mode=mode,
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
+            target_fingerprints=target_fingerprints,
             runtime_env_read_attempted=True,
             overlay_report=overlay_result.to_sanitized_dict(),
         )
         return RunnerResult(exit_code=1, report=report)
 
-    child_command = _child_command_tokens(source_value=normalized_source, max_messages=max_messages)
+    child_command = _child_command_tokens(source_values=normalized_sources, max_messages=max_messages)
     if mode == "plan":
         report = _base_report(
             status="pass",
@@ -236,9 +254,13 @@ def run(
             mode=mode,
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
+            target_fingerprints=target_fingerprints,
             runtime_env_read_attempted=True,
             overlay_report=overlay_result.to_sanitized_dict(),
-            redacted_child_command_tokens=_redacted_child_command_tokens(max_messages=max_messages),
+            redacted_child_command_tokens=_redacted_child_plan_command_tokens(
+                target_count=len(normalized_sources),
+                max_messages=max_messages,
+            ),
         )
         return RunnerResult(exit_code=0, report=report)
 
@@ -261,9 +283,13 @@ def run(
         mode=mode,
         requested_max_messages=max_messages,
         target_fingerprint=target_fingerprint,
+        target_fingerprints=target_fingerprints,
         runtime_env_read_attempted=True,
         overlay_report=overlay_result.to_sanitized_dict(),
-        redacted_child_command_tokens=_redacted_child_command_tokens(max_messages=max_messages),
+        redacted_child_command_tokens=_redacted_child_execute_command_tokens(
+            target_count=len(normalized_sources),
+            max_messages=max_messages,
+        ),
         child_runner_invoked=True,
         child_runner_returncode=child_returncode,
         child_runner_report=child_report,
@@ -303,6 +329,7 @@ def _base_report(
     mode: str,
     requested_max_messages: int | None,
     target_fingerprint: str | None,
+    target_fingerprints: Sequence[str] = (),
     runtime_env_read_attempted: bool = False,
     overlay_report: Mapping[str, Any] | None = None,
     redacted_child_command_tokens: Sequence[str] = (),
@@ -310,6 +337,7 @@ def _base_report(
     child_runner_returncode: int | None = None,
     child_runner_report: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    report_target_fingerprints = tuple(target_fingerprints or ((target_fingerprint,) if target_fingerprint else ()))
     child_report = _compact_child_report(child_runner_report)
     child_report_projection = _project_child_report(child_runner_report)
     redaction_audit = {
@@ -329,14 +357,58 @@ def _base_report(
         wrapper_reason_code=reason_code,
         wrapper_status=status,
     )
+    source_truth_readback_closure = _build_source_truth_readback_closure(
+        child_report_projection,
+        child_report=child_report,
+        child_runner_returncode=child_runner_returncode,
+        redaction_audit=redaction_audit,
+        wrapper_reason_code=reason_code,
+        wrapper_status=status,
+    )
+    f1_duplicate_noop_readback_closure = _build_f1_duplicate_noop_readback_closure(
+        child_report_projection,
+        source_truth_readback_closure=source_truth_readback_closure,
+    )
+    f1_fresh_write_readback_closure = _build_f1_fresh_write_readback_closure(
+        child_report_projection,
+        source_truth_readback_closure=source_truth_readback_closure,
+    )
+    f1_exact_live_readback_review_closure = {
+        "duplicate_noop_readback_closed": f1_duplicate_noop_readback_closure["closed"],
+        "fresh_write_readback_closed": f1_fresh_write_readback_closure["closed"],
+        "closed": (
+            f1_duplicate_noop_readback_closure["closed"] is True
+            or f1_fresh_write_readback_closure["closed"] is True
+        ),
+    }
+    f2_three_channel_readback_closure = _build_f2_three_channel_readback_closure(
+        child_report_projection,
+        child_report=child_report,
+        child_runner_returncode=child_runner_returncode,
+        redaction_audit=redaction_audit,
+        wrapper_reason_code=reason_code,
+        wrapper_status=status,
+    )
+    three_channel_target_requested = len(report_target_fingerprints) == THREE_CHANNEL_TARGET_COUNT
+    overlay_plan_ready = (
+        status == "pass"
+        and mode == "plan"
+        and runtime_env_read_attempted
+        and (overlay_report or {}).get("status") == "pass"
+    )
     return {
         "schema_version": SCHEMA_VERSION,
         "status": status,
         "reason_code": reason_code,
         "mode": mode,
         "target_scope": {
-            "exact_single_public_username_required": True,
+            "exact_single_public_username_supported": True,
+            "exact_three_public_usernames_supported": True,
+            "exact_single_public_username_required": len(report_target_fingerprints) <= 1,
+            "exact_three_public_usernames_required": three_channel_target_requested,
+            "target_count": len(report_target_fingerprints),
             "target_fingerprint": target_fingerprint,
+            "target_fingerprints": list(report_target_fingerprints),
             "raw_source_value_printed": False,
             "direct_chat_id_allowed": False,
             "direct_registry_id_allowed": False,
@@ -400,15 +472,32 @@ def _base_report(
         "child_report": child_report,
         "child_report_projection": child_report_projection,
         "f1_live_readback_closure": f1_live_readback_closure,
+        "source_truth_readback_closure": source_truth_readback_closure,
+        "f1_duplicate_noop_readback_closure": f1_duplicate_noop_readback_closure,
+        "f1_fresh_write_readback_closure": f1_fresh_write_readback_closure,
+        "f1_exact_live_readback_review_closure": f1_exact_live_readback_review_closure,
+        "f2_three_channel_readback_closure": f2_three_channel_readback_closure,
         "redaction_audit": redaction_audit,
         "completion_claims": {
             "F1_COLLECTOR_ONLY_RUNTIME_ENV_OVERLAY_PREFLIGHT_READY": status == "pass",
             "F1_CHILD_READBACK_PROJECTION_READY": child_report_projection["stdout_parsed_as_json"] is True,
-            "F1_LIVE_EXECUTION_REVIEWABILITY_REPAIRED": f1_live_readback_closure[
-                "safe_to_review_for_f1_live_read_closure"
+            "F1_LIVE_EXECUTION_REVIEWABILITY_REPAIRED": f1_exact_live_readback_review_closure["closed"],
+            "F1_SOURCE_TRUTH_DURABLE_READBACK_REVIEWABLE": source_truth_readback_closure[
+                "durable_readback_present"
             ],
+            "F1_DUPLICATE_NOOP_READBACK_REVIEWABLE": f1_duplicate_noop_readback_closure["closed"],
+            "F1_EXACT_LIVE_READBACK_REVIEWABLE": f1_exact_live_readback_review_closure["closed"],
+            "F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY": (
+                three_channel_target_requested and (overlay_plan_ready or status == "pass")
+            ),
+            "F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY": f2_three_channel_readback_closure["closed"],
             "LIVE_TELEGRAM_READ_AUTHORITY_REMAINS_CLOSED_IN_THIS_TASK": not child_runner_invoked,
             "LIVE_COLLECTOR_1_CHANNEL_CLOSED": False,
+            "LIVE_COLLECTOR_3_CHANNEL_CLOSED": False,
+            "LIVE_COLLECTOR_FULL_REGISTRY_CLOSED": False,
+            "FUNCTION_COMPLETE_CLOSED": False,
+            "PRODUCTION_ROLLOUT_CLOSED": False,
+            "PRODUCT_COMPLETE_CLOSED": False,
             "production_complete": False,
             "production_rollout_complete": False,
         },
@@ -437,6 +526,8 @@ def _project_child_report(child_report: Mapping[str, Any] | None) -> dict[str, A
         "runner_name": _safe_report_string(report.get("runner_name")),
         "mode": _safe_report_string(report.get("mode")),
         "rollout_scope": _safe_report_string(report.get("rollout_scope")),
+        "target_count": _safe_nonnegative_int(report.get("target_count")),
+        "max_targets": _safe_nonnegative_int(report.get("max_targets")),
         "authority": _project_bool_mapping(_mapping_child(report, "authority"), _AUTHORITY_PROJECTION_KEYS),
         "gates": _project_bool_mapping(_mapping_child(report, "gates"), _GATE_PROJECTION_KEYS),
         "bounded_counts": _project_count_mapping(_mapping_child(report, "bounded_counts"), _BOUNDED_COUNT_PROJECTION_KEYS),
@@ -446,6 +537,7 @@ def _project_child_report(child_report: Mapping[str, Any] | None) -> dict[str, A
             "without_second_telegram_read": _safe_bool(duplicate_noop_proof.get("without_second_telegram_read")),
         },
         "target_fingerprints": _safe_fingerprint_list(report.get("target_fingerprints")),
+        "per_channel_results": _project_per_channel_results(report.get("per_channel_results")),
         "source_message_fingerprints": _safe_fingerprint_list(report.get("source_message_fingerprints")),
         "source_outbox_event_fingerprints": _safe_fingerprint_list(report.get("source_outbox_event_fingerprints")),
         "exact_channel_target_fingerprint": _safe_fingerprint(report.get("exact_channel_target_fingerprint")),
@@ -469,6 +561,212 @@ def _project_child_report(child_report: Mapping[str, Any] | None) -> dict[str, A
 
 
 def _build_f1_live_readback_closure(
+    projection: Mapping[str, Any],
+    *,
+    child_report: Mapping[str, Any],
+    child_runner_returncode: int | None,
+    redaction_audit: Mapping[str, Any],
+    wrapper_reason_code: str,
+    wrapper_status: str,
+) -> dict[str, bool]:
+    closure = _build_readback_closure_evidence(
+        projection,
+        child_report=child_report,
+        child_runner_returncode=child_runner_returncode,
+        redaction_audit=redaction_audit,
+        wrapper_reason_code=wrapper_reason_code,
+        wrapper_status=wrapper_status,
+    )
+    legacy_keys = (
+        "child_report_available",
+        "child_runner_returncode_zero",
+        "wrapper_child_execution_passed",
+        "exact_child_runner_passed",
+        "live_telegram_read_attempted",
+        "telegram_read_called",
+        "database_write_attempted",
+        "source_message_write_attempted",
+        "source_version_write_attempted",
+        "source_outbox_write_attempted",
+        "source_outbox_publish_disabled",
+        "redis_publish_disabled",
+        "telegram_send_disabled",
+        "provider_calls_disabled",
+        "docker_systemd_alembic_disabled",
+        "source_current_readback_present",
+        "source_version_readback_present",
+        "source_outbox_readback_present",
+        "duplicate_noop_proof_present",
+        "duplicate_noop_without_second_telegram_read",
+        "raw_values_not_printed",
+        "runtime_values_not_printed",
+    )
+    legacy_closure = {key: closure[key] for key in legacy_keys}
+    legacy_closure["safe_to_review_for_f1_live_read_closure"] = all(legacy_closure.values())
+    return legacy_closure
+
+
+def _build_source_truth_readback_closure(
+    projection: Mapping[str, Any],
+    *,
+    child_report: Mapping[str, Any],
+    child_runner_returncode: int | None,
+    redaction_audit: Mapping[str, Any],
+    wrapper_reason_code: str,
+    wrapper_status: str,
+) -> dict[str, bool]:
+    evidence = _build_readback_closure_evidence(
+        projection,
+        child_report=child_report,
+        child_runner_returncode=child_runner_returncode,
+        redaction_audit=redaction_audit,
+        wrapper_reason_code=wrapper_reason_code,
+        wrapper_status=wrapper_status,
+    )
+    closure = {
+        "child_report_available": evidence["child_report_available"],
+        "wrapper_child_execution_passed": evidence["wrapper_child_execution_passed"],
+        "exact_child_runner_passed": evidence["exact_child_runner_passed"],
+        "live_telegram_read_attempted": evidence["live_telegram_read_attempted"],
+        "telegram_read_called": evidence["telegram_read_called"],
+        "messages_seen_present": evidence["messages_seen_present"],
+        "source_current_readback_present": evidence["source_current_readback_present"],
+        "source_version_readback_present": evidence["source_version_readback_present"],
+        "source_created_events_readback_present": evidence["source_created_events_readback_present"],
+        "source_outbox_events_readback_present": evidence["source_outbox_events_readback_present"],
+        "source_outbox_publish_disabled": evidence["source_outbox_publish_disabled"],
+        "redis_publish_disabled": evidence["redis_publish_disabled"],
+        "telegram_send_disabled": evidence["telegram_send_disabled"],
+        "provider_calls_disabled": evidence["provider_calls_disabled"],
+        "docker_systemd_alembic_disabled": evidence["docker_systemd_alembic_disabled"],
+        "raw_values_not_printed": evidence["raw_values_not_printed"],
+        "runtime_values_not_printed": evidence["runtime_values_not_printed"],
+    }
+    closure["durable_readback_present"] = all(closure.values())
+    return closure
+
+
+def _build_f1_duplicate_noop_readback_closure(
+    projection: Mapping[str, Any],
+    *,
+    source_truth_readback_closure: Mapping[str, Any],
+) -> dict[str, bool]:
+    duplicate_noop_proof = _mapping_child(projection, "duplicate_noop_proof")
+    duplicate_noop_count = duplicate_noop_proof.get("proved_count")
+    if duplicate_noop_count is None:
+        duplicate_noop_count = projection.get("duplicate_noop_proof_count")
+    closure = {
+        "one_channel_or_legacy_child_report": _one_channel_or_legacy_child_report(projection),
+        "source_truth_durable_readback_present": source_truth_readback_closure.get("durable_readback_present") is True,
+        "duplicate_noop_proof_present": _count_at_least(duplicate_noop_count, 1),
+        "duplicate_noop_without_second_telegram_read": (
+            duplicate_noop_proof.get("without_second_telegram_read") is True
+        ),
+    }
+    closure["closed"] = all(closure.values())
+    return closure
+
+
+def _build_f1_fresh_write_readback_closure(
+    projection: Mapping[str, Any],
+    *,
+    source_truth_readback_closure: Mapping[str, Any],
+) -> dict[str, bool]:
+    closure = {
+        "one_channel_or_legacy_child_report": _one_channel_or_legacy_child_report(projection),
+        "source_truth_durable_readback_present": source_truth_readback_closure.get("durable_readback_present") is True,
+        "database_write_attempted": projection.get("database_write_attempted") is True,
+        "source_message_write_attempted": projection.get("source_message_write_attempted") is True,
+        "source_version_write_attempted": projection.get("source_version_write_attempted") is True,
+        "source_outbox_write_attempted": projection.get("source_outbox_write_attempted") is True,
+    }
+    closure["closed"] = all(closure.values())
+    return closure
+
+
+def _build_f2_three_channel_readback_closure(
+    projection: Mapping[str, Any],
+    *,
+    child_report: Mapping[str, Any],
+    child_runner_returncode: int | None,
+    redaction_audit: Mapping[str, Any],
+    wrapper_reason_code: str,
+    wrapper_status: str,
+) -> dict[str, bool]:
+    evidence = _build_readback_closure_evidence(
+        projection,
+        child_report=child_report,
+        child_runner_returncode=child_runner_returncode,
+        redaction_audit=redaction_audit,
+        wrapper_reason_code=wrapper_reason_code,
+        wrapper_status=wrapper_status,
+    )
+    readback = _mapping_child(projection, "readback")
+    bounded_counts = _mapping_child(projection, "bounded_counts")
+    duplicate_noop_proof = _mapping_child(projection, "duplicate_noop_proof")
+    per_channel_results = projection.get("per_channel_results")
+    safe_per_channel_results = per_channel_results if isinstance(per_channel_results, Sequence) else ()
+    safe_per_channel_results = (
+        ()
+        if isinstance(safe_per_channel_results, (str, bytes, bytearray))
+        else tuple(item for item in safe_per_channel_results if isinstance(item, Mapping))
+    )
+    per_channel_readbacks_present = all(
+        _per_channel_source_truth_present(item) for item in safe_per_channel_results
+    )
+    aggregate_duplicate_noop_sufficient = (
+        _count_at_least(duplicate_noop_proof.get("proved_count"), THREE_CHANNEL_TARGET_COUNT)
+        and duplicate_noop_proof.get("without_second_telegram_read") is True
+    )
+    aggregate_fresh_write_sufficient = (
+        evidence["database_write_attempted"]
+        and evidence["source_message_write_attempted"]
+        and evidence["source_version_write_attempted"]
+        and evidence["source_outbox_write_attempted"]
+        and _count_at_least(bounded_counts.get("source_messages_created"), THREE_CHANNEL_TARGET_COUNT)
+        and _count_at_least(bounded_counts.get("source_versions_created"), THREE_CHANNEL_TARGET_COUNT)
+        and _count_at_least(bounded_counts.get("source_created_events"), THREE_CHANNEL_TARGET_COUNT)
+    )
+    closure = {
+        "child_report_available": evidence["child_report_available"],
+        "wrapper_child_execution_passed": evidence["wrapper_child_execution_passed"],
+        "exact_child_runner_passed": evidence["exact_child_runner_passed"],
+        "target_count_is_three": projection.get("target_count") == THREE_CHANNEL_TARGET_COUNT,
+        "target_fingerprint_count_is_three": len(projection.get("target_fingerprints") or ()) == THREE_CHANNEL_TARGET_COUNT,
+        "per_channel_result_count_is_three": len(safe_per_channel_results) == THREE_CHANNEL_TARGET_COUNT,
+        "per_channel_status_passed": all(item.get("status") == "pass" for item in safe_per_channel_results),
+        "per_channel_messages_seen_present": all(
+            _count_at_least(item.get("messages_seen"), 1) for item in safe_per_channel_results
+        ),
+        "per_channel_readbacks_present": per_channel_readbacks_present,
+        "aggregate_source_current_readback_present": _count_at_least(
+            readback.get("source_current_found_count"), THREE_CHANNEL_TARGET_COUNT
+        ),
+        "aggregate_source_version_readback_present": _count_at_least(
+            readback.get("source_version_rows_count"), THREE_CHANNEL_TARGET_COUNT
+        ),
+        "aggregate_source_created_events_readback_present": _count_at_least(
+            readback.get("source_created_events_count"), THREE_CHANNEL_TARGET_COUNT
+        ),
+        "aggregate_source_outbox_events_readback_present": _count_at_least(
+            readback.get("source_outbox_events_count"), THREE_CHANNEL_TARGET_COUNT
+        ),
+        "aggregate_duplicate_noop_or_fresh_write_sufficient": (
+            aggregate_duplicate_noop_sufficient or aggregate_fresh_write_sufficient
+        ),
+        "source_outbox_publish_disabled": evidence["source_outbox_publish_disabled"],
+        "redis_publish_disabled": evidence["redis_publish_disabled"],
+        "telegram_send_disabled": evidence["telegram_send_disabled"],
+        "provider_calls_disabled": evidence["provider_calls_disabled"],
+        "docker_systemd_alembic_disabled": evidence["docker_systemd_alembic_disabled"],
+        "raw_values_not_printed": evidence["raw_values_not_printed"],
+        "runtime_values_not_printed": evidence["runtime_values_not_printed"],
+    }
+    closure["closed"] = all(closure.values())
+    return closure
+
+
+def _build_readback_closure_evidence(
     projection: Mapping[str, Any],
     *,
     child_report: Mapping[str, Any],
@@ -523,6 +821,8 @@ def _build_f1_live_readback_closure(
     )
     source_current_readback_present = _count_at_least(readback.get("source_current_found_count"), 1)
     source_version_readback_present = _count_at_least(readback.get("source_version_rows_count"), 1)
+    source_created_events_readback_present = _count_at_least(readback.get("source_created_events_count"), 1)
+    source_outbox_events_readback_present = _count_at_least(readback.get("source_outbox_events_count"), 1)
     source_outbox_readback_present = _count_at_least(
         readback.get("source_outbox_events_count"), 1
     ) and _count_at_least(readback.get("source_created_events_count"), 1)
@@ -545,13 +845,14 @@ def _build_f1_live_readback_closure(
         and redaction_audit.get("runtime_env_file_path_printed") is False
     )
 
-    closure = {
+    return {
         "child_report_available": child_report_available,
         "child_runner_returncode_zero": child_runner_returncode_zero,
         "wrapper_child_execution_passed": wrapper_child_execution_passed,
         "exact_child_runner_passed": exact_child_runner_passed,
         "live_telegram_read_attempted": live_telegram_read_attempted,
         "telegram_read_called": telegram_read_called,
+        "messages_seen_present": _count_at_least(projection.get("messages_seen"), 1),
         "database_write_attempted": database_write_attempted,
         "source_message_write_attempted": source_message_write_attempted,
         "source_version_write_attempted": source_version_write_attempted,
@@ -563,17 +864,25 @@ def _build_f1_live_readback_closure(
         "docker_systemd_alembic_disabled": docker_systemd_alembic_disabled,
         "source_current_readback_present": source_current_readback_present,
         "source_version_readback_present": source_version_readback_present,
+        "source_created_events_readback_present": source_created_events_readback_present,
+        "source_outbox_events_readback_present": source_outbox_events_readback_present,
         "source_outbox_readback_present": source_outbox_readback_present,
         "duplicate_noop_proof_present": duplicate_noop_proof_present,
         "duplicate_noop_without_second_telegram_read": duplicate_noop_without_second_telegram_read,
         "raw_values_not_printed": raw_values_not_printed,
         "runtime_values_not_printed": runtime_values_not_printed,
     }
-    closure["safe_to_review_for_f1_live_read_closure"] = all(closure.values())
-    return closure
 
 
-def _child_command_tokens(*, source_value: str, max_messages: int) -> tuple[str, ...]:
+def _child_command_tokens(*, source_values: Sequence[str], max_messages: int) -> tuple[str, ...]:
+    confirm_token = (
+        THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN
+        if len(source_values) == THREE_CHANNEL_TARGET_COUNT
+        else EXECUTE_CONFIRM_TOKEN
+    )
+    source_tokens: list[str] = []
+    for source_value in source_values:
+        source_tokens.extend(("--source-value", source_value))
     return (
         sys.executable,
         CHILD_RUNNER_PATH,
@@ -589,16 +898,42 @@ def _child_command_tokens(*, source_value: str, max_messages: int) -> tuple[str,
         "--allow-source-outbox-write",
         "--source-kind",
         SOURCE_KIND_PUBLIC_USERNAME,
-        "--source-value",
-        source_value,
+        *source_tokens,
         "--max-messages",
         str(max_messages),
         "--confirm-token",
-        EXECUTE_CONFIRM_TOKEN,
+        confirm_token,
     )
 
 
-def _redacted_child_command_tokens(*, max_messages: int) -> tuple[str, ...]:
+def _redacted_child_plan_command_tokens(*, target_count: int, max_messages: int) -> tuple[str, ...]:
+    source_tokens: list[str] = []
+    for _ in range(target_count):
+        source_tokens.extend(("--source-value", SOURCE_VALUE_PLACEHOLDER))
+    return (
+        "sys.executable",
+        CHILD_RUNNER_PATH,
+        "--mode",
+        "plan",
+        "--allow-runtime-config",
+        "--allow-database-read",
+        "--source-kind",
+        SOURCE_KIND_PUBLIC_USERNAME,
+        *source_tokens,
+        "--max-messages",
+        str(max_messages),
+    )
+
+
+def _redacted_child_execute_command_tokens(*, target_count: int, max_messages: int) -> tuple[str, ...]:
+    confirm_token_placeholder = (
+        "THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN"
+        if target_count == THREE_CHANNEL_TARGET_COUNT
+        else "EXECUTE_CONFIRM_TOKEN"
+    )
+    source_tokens: list[str] = []
+    for _ in range(target_count):
+        source_tokens.extend(("--source-value", SOURCE_VALUE_PLACEHOLDER))
     return (
         "sys.executable",
         CHILD_RUNNER_PATH,
@@ -614,13 +949,29 @@ def _redacted_child_command_tokens(*, max_messages: int) -> tuple[str, ...]:
         "--allow-source-outbox-write",
         "--source-kind",
         SOURCE_KIND_PUBLIC_USERNAME,
-        "--source-value",
-        SOURCE_VALUE_PLACEHOLDER,
+        *source_tokens,
         "--max-messages",
         str(max_messages),
         "--confirm-token",
-        "EXECUTE_CONFIRM_TOKEN",
+        confirm_token_placeholder,
     )
+
+
+def _normalize_public_username_targets(values: Sequence[object | None]) -> tuple[tuple[str, ...], str | None]:
+    if not values:
+        return (), "exact_source_value_required"
+    normalized_values: list[str] = []
+    for value in values:
+        normalized, error = _normalize_public_username(value)
+        if normalized is not None:
+            normalized_values.append(normalized)
+        if error is not None:
+            return tuple(normalized_values), error
+    if len(normalized_values) not in {1, THREE_CHANNEL_TARGET_COUNT}:
+        return tuple(normalized_values), "target_count_must_equal_three"
+    if len(set(normalized_values)) != len(normalized_values):
+        return tuple(normalized_values), "target_duplicate"
+    return tuple(normalized_values), None
 
 
 def _normalize_public_username(value: object | None) -> tuple[str | None, str | None]:
@@ -700,6 +1051,60 @@ def _project_bool_mapping(mapping: Mapping[str, Any], keys: Sequence[str]) -> di
 
 def _project_count_mapping(mapping: Mapping[str, Any], keys: Sequence[str]) -> dict[str, int | None]:
     return {key: _safe_nonnegative_int(mapping.get(key)) for key in keys}
+
+
+def _project_per_channel_results(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    projected: list[dict[str, Any]] = []
+    for item in value[:THREE_CHANNEL_TARGET_COUNT]:
+        if not isinstance(item, Mapping):
+            continue
+        duplicate_noop_proof = _mapping_child(item, "duplicate_noop_proof")
+        projected.append(
+            {
+                "target_fingerprint": _safe_fingerprint(item.get("target_fingerprint")),
+                "registry_target_fingerprint": _safe_fingerprint(item.get("registry_target_fingerprint")),
+                "status": _safe_report_string(item.get("status")),
+                "reason_code": _safe_report_string(item.get("reason_code")),
+                "messages_requested": _safe_nonnegative_int(item.get("messages_requested")),
+                "messages_seen": _safe_nonnegative_int(item.get("messages_seen")),
+                "bounded_counts": _project_count_mapping(
+                    _mapping_child(item, "bounded_counts"),
+                    _BOUNDED_COUNT_PROJECTION_KEYS,
+                ),
+                "readback": _project_count_mapping(_mapping_child(item, "readback"), _READBACK_PROJECTION_KEYS),
+                "source_message_fingerprints": _safe_fingerprint_list(item.get("source_message_fingerprints")),
+                "source_outbox_event_fingerprints": _safe_fingerprint_list(
+                    item.get("source_outbox_event_fingerprints")
+                ),
+                "duplicate_noop_proof": {
+                    "proved_count": _safe_nonnegative_int(duplicate_noop_proof.get("proved_count")),
+                    "without_second_telegram_read": _safe_bool(
+                        duplicate_noop_proof.get("without_second_telegram_read")
+                    ),
+                },
+                "source_commit_durable": _safe_bool(item.get("source_commit_durable")),
+            }
+        )
+    return projected
+
+
+def _one_channel_or_legacy_child_report(projection: Mapping[str, Any]) -> bool:
+    target_count = projection.get("target_count")
+    return target_count is None or target_count == 1
+
+
+def _per_channel_source_truth_present(channel_result: Mapping[str, Any]) -> bool:
+    readback = _mapping_child(channel_result, "readback")
+    return (
+        channel_result.get("status") == "pass"
+        and _count_at_least(channel_result.get("messages_seen"), 1)
+        and _count_at_least(readback.get("source_current_found_count"), 1)
+        and _count_at_least(readback.get("source_version_rows_count"), 1)
+        and _count_at_least(readback.get("source_created_events_count"), 1)
+        and _count_at_least(readback.get("source_outbox_events_count"), 1)
+    )
 
 
 def _safe_bool(value: object) -> bool | None:
