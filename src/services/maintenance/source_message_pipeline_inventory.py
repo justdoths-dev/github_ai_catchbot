@@ -32,10 +32,12 @@ from ..router_normalizer.trigger_rules import evaluate_triggers
 from ..router_normalizer.url_extraction import extract_urls
 
 
-SCHEMA_VERSION = "source_message_pipeline_inventory_report_v1"
+SCHEMA_VERSION = "source_message_pipeline_inventory_report_v2"
 CONFIRM_TOKEN = "exact-source-normalization"
 SELECTION_CONFIRM_TOKEN = "latest-unnormalized-source-created"
 PLACEHOLDER_REDIS_URL = "redis_locator_not_attempted"
+F2_APPROVED_PUBLIC_USERNAMES = ("@trendingrepo", "@baekhuinform", "@justcryt")
+CHANNEL_BUCKETS = {"selected", "missing", "already_normalized", "ambiguous", "blocked"}
 
 RUNTIME_VALUE_KEYS = {
     "APP_ENV",
@@ -100,6 +102,14 @@ class SourceCreatedTarget:
 
 
 @dataclass(slots=True, frozen=True)
+class SourceCreatedChannelCandidate:
+    approved_public_username: str
+    bucket: str
+    reason_code: str
+    target: SourceCreatedTarget | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class CurrentRulePreview:
     signal_detected: bool
     candidate_eligible: bool
@@ -125,9 +135,37 @@ class SelectedTarget:
 
 
 @dataclass(slots=True, frozen=True)
+class ChannelPlan:
+    approved_public_username: str
+    bucket: str
+    reason_code: str
+    target: SourceCreatedTarget | None = None
+    preview: CurrentRulePreview | None = None
+
+    @property
+    def approved_public_username_fingerprint(self) -> str:
+        return _fingerprint(self.approved_public_username)
+
+    @property
+    def target_event_fingerprint(self) -> str | None:
+        if self.target is None:
+            return None
+        return _fingerprint(self.target.event_id)
+
+    @property
+    def source_message_fingerprint(self) -> str | None:
+        if self.target is None:
+            return None
+        return _fingerprint(self.target.source_message_id)
+
+
+@dataclass(slots=True, frozen=True)
 class NormalizationReadback:
     normalization_run_count: int = 0
-    candidate_group_count: int = 0
+    artifact_registry_count: int = 0
+    artifact_observation_count: int = 0
+    candidate_group_proposal_count: int = 0
+    candidate_group_member_count: int = 0
     candidate_group_primary_member_count: int = 0
     artifact_enrichment_request_count: int = 0
     suppression_reason_counts: tuple[tuple[str, int], ...] = ()
@@ -157,6 +195,11 @@ class SourceMessagePipelineInventoryReport:
     analysis_requested_count: int
     judge_call_requested_count: int
     notification_plan_intent_count: int
+    approved_channel_count: int
+    selected_count: int
+    executed_target_count: int
+    per_channel: list[dict[str, Any]]
+    normalization_readbacks: list[dict[str, Any]]
     current_rule_candidate_eligible_count: int
     current_rule_text_idea_candidate_count: int
     current_rule_url_candidate_count: int
@@ -178,6 +221,13 @@ class SourceMessagePipelineInventoryReport:
     redis_attempted: bool
     telegram_attempted: bool
     openai_attempted: bool
+    github_provider_attempted: bool
+    x_provider_attempted: bool
+    web_provider_attempted: bool
+    notifier_attempted: bool
+    systemd_attempted: bool
+    docker_attempted: bool
+    alembic_attempted: bool
     external_network_attempted: bool
     redactions_applied: bool
     cleanup_completed: bool
@@ -190,6 +240,8 @@ class SourceMessagePipelineInventoryRequest:
     sample_limit: int
     select_latest_unnormalized_source_created: bool = False
     expected_target_event_fingerprint: str | None = None
+    expected_target_event_fingerprints: tuple[str, ...] = ()
+    approved_public_usernames: tuple[str, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -213,7 +265,8 @@ class InventoryRepositoryProtocol(Protocol):
         lookback_hours: int,
         sample_limit: int,
         normalizer_version: str,
-    ) -> Sequence[SourceCreatedTarget]: ...
+        approved_public_usernames: Sequence[str],
+    ) -> Sequence[SourceCreatedChannelCandidate]: ...
 
     async def load_normalization_readback(
         self,
@@ -396,10 +449,34 @@ class SqlSourceMessagePipelineInventoryRepository:
         lookback_hours: int,
         sample_limit: int,
         normalizer_version: str,
-    ) -> Sequence[SourceCreatedTarget]:
+        approved_public_usernames: Sequence[str],
+    ) -> Sequence[SourceCreatedChannelCandidate]:
         rows = await self._rows(
             """
-            WITH source_created AS (
+            WITH approved_public_username AS (
+                SELECT
+                    lower(trim(leading '@' from input_username)) AS approved_public_username,
+                    input_ordinal
+                FROM unnest(CAST(:approved_public_usernames AS text[]))
+                    WITH ORDINALITY AS approved(input_username, input_ordinal)
+            ),
+            registry_status AS (
+                SELECT
+                    apu.approved_public_username,
+                    apu.input_ordinal,
+                    count(tcr.registry_id) AS registry_match_count,
+                    max(tcr.chat_id) AS chat_id
+                FROM approved_public_username apu
+                LEFT JOIN telegram_channel_registry tcr
+                  ON tcr.source_kind = 'public_username'
+                 AND (
+                        lower(trim(leading '@' from tcr.source_value)) = apu.approved_public_username
+                        OR lower(trim(leading '@' from coalesce(tcr.username_snapshot, '')))
+                            = apu.approved_public_username
+                 )
+                GROUP BY apu.approved_public_username, apu.input_ordinal
+            ),
+            source_created AS (
                 SELECT
                     eo.event_id,
                     eo.created_at,
@@ -414,8 +491,45 @@ class SqlSourceMessagePipelineInventoryRepository:
                 FROM event_outbox eo
                 WHERE eo.event_type = 'source_message.created.v1'
                   AND eo.created_at >= now() - make_interval(hours => :lookback_hours)
+            ),
+            ranked_source_created AS (
+                SELECT
+                    rs.approved_public_username,
+                    sc.event_id,
+                    sc.created_at,
+                    sc.source_message_id,
+                    sc.source_version_no,
+                    row_number() OVER (
+                        PARTITION BY rs.approved_public_username
+                        ORDER BY sc.created_at DESC, sc.event_id DESC
+                    ) AS source_rank
+                FROM registry_status rs
+                JOIN source_messages sm
+                  ON sm.platform = 'telegram'
+                 AND sm.chat_id = rs.chat_id
+                JOIN source_created sc
+                  ON sc.source_message_id = sm.source_message_id
+                WHERE rs.registry_match_count = 1
+                  AND rs.chat_id IS NOT NULL
             )
             SELECT
+                '@' || rs.approved_public_username AS approved_public_username,
+                CASE
+                    WHEN rs.registry_match_count = 0 THEN 'missing'
+                    WHEN rs.registry_match_count > 1 THEN 'ambiguous'
+                    WHEN rs.chat_id IS NULL THEN 'blocked'
+                    WHEN sc.event_id IS NULL THEN 'missing'
+                    WHEN sc.source_version_no IS NULL THEN 'blocked'
+                    ELSE 'target'
+                END AS channel_status,
+                CASE
+                    WHEN rs.registry_match_count = 0 THEN 'registry_target_missing'
+                    WHEN rs.registry_match_count > 1 THEN 'registry_target_ambiguous'
+                    WHEN rs.chat_id IS NULL THEN 'registry_chat_id_missing'
+                    WHEN sc.event_id IS NULL THEN 'source_created_event_missing'
+                    WHEN sc.source_version_no IS NULL THEN 'source_created_version_missing'
+                    ELSE 'source_created_target_loaded'
+                END AS channel_reason_code,
                 sc.event_id,
                 sc.source_message_id,
                 sc.source_version_no,
@@ -439,8 +553,11 @@ class SqlSourceMessagePipelineInventoryRepository:
                     WHERE cgp.source_message_id = sc.source_message_id
                       AND cgp.source_version_no = sc.source_version_no
                 ) AS has_candidate_group
-            FROM source_created sc
-            JOIN source_messages sm ON sm.source_message_id = sc.source_message_id
+            FROM registry_status rs
+            LEFT JOIN ranked_source_created sc
+              ON sc.approved_public_username = rs.approved_public_username
+             AND sc.source_rank = 1
+            LEFT JOIN source_messages sm ON sm.source_message_id = sc.source_message_id
             LEFT JOIN source_message_versions smv
               ON smv.source_message_id = sc.source_message_id
              AND smv.version_no = sc.source_version_no
@@ -449,30 +566,15 @@ class SqlSourceMessagePipelineInventoryRepository:
               ON nr.source_message_id = sc.source_message_id
              AND nr.source_version_no = sc.source_version_no
              AND nr.normalizer_version = :normalizer_version
-            WHERE sc.source_version_no IS NOT NULL
-              AND (
-                    sm.current_version_no = sc.source_version_no
-                    OR smv.source_message_id IS NOT NULL
-              )
-              AND (
-                    nr.normalization_run_id IS NULL
-                    OR NOT EXISTS (
-                        SELECT 1
-                        FROM candidate_group_proposals cgp
-                        WHERE cgp.source_message_id = sc.source_message_id
-                          AND cgp.source_version_no = sc.source_version_no
-                    )
-              )
-            ORDER BY sc.created_at DESC, sc.event_id DESC
-            LIMIT :sample_limit
+            ORDER BY rs.input_ordinal ASC
             """,
             {
+                "approved_public_usernames": list(approved_public_usernames),
                 "lookback_hours": lookback_hours,
-                "sample_limit": sample_limit,
                 "normalizer_version": normalizer_version,
             },
         )
-        return tuple(target for row in rows if (target := _target_from_row(row)) is not None)
+        return tuple(_channel_candidate_from_row(row) for row in rows)
 
     async def load_normalization_readback(
         self,
@@ -496,7 +598,31 @@ class SqlSourceMessagePipelineInventoryRepository:
                     FROM candidate_group_proposals cgp
                     WHERE cgp.source_message_id = CAST(:source_message_id AS uuid)
                       AND cgp.source_version_no = :source_version_no
-                ) AS candidate_group_count,
+                ) AS candidate_group_proposal_count,
+                (
+                    SELECT count(DISTINCT ar.artifact_id)
+                    FROM artifact_registry ar
+                    JOIN candidate_group_members cgm
+                      ON cgm.artifact_id = ar.artifact_id
+                    JOIN candidate_group_proposals cgp
+                      ON cgp.candidate_group_id = cgm.candidate_group_id
+                    WHERE cgp.source_message_id = CAST(:source_message_id AS uuid)
+                      AND cgp.source_version_no = :source_version_no
+                ) AS artifact_registry_count,
+                (
+                    SELECT count(*)
+                    FROM artifact_observations ao
+                    WHERE ao.source_message_id = CAST(:source_message_id AS uuid)
+                      AND ao.source_version_no = :source_version_no
+                ) AS artifact_observation_count,
+                (
+                    SELECT count(*)
+                    FROM candidate_group_members cgm
+                    JOIN candidate_group_proposals cgp
+                      ON cgp.candidate_group_id = cgm.candidate_group_id
+                    WHERE cgp.source_message_id = CAST(:source_message_id AS uuid)
+                      AND cgp.source_version_no = :source_version_no
+                ) AS candidate_group_member_count,
                 (
                     SELECT count(*)
                     FROM candidate_group_members cgm
@@ -541,7 +667,10 @@ class SqlSourceMessagePipelineInventoryRepository:
         )
         return NormalizationReadback(
             normalization_run_count=_int(row["normalization_run_count"]),
-            candidate_group_count=_int(row["candidate_group_count"]),
+            artifact_registry_count=_int(row["artifact_registry_count"]),
+            artifact_observation_count=_int(row["artifact_observation_count"]),
+            candidate_group_proposal_count=_int(row["candidate_group_proposal_count"]),
+            candidate_group_member_count=_int(row["candidate_group_member_count"]),
             candidate_group_primary_member_count=_int(row["candidate_group_primary_member_count"]),
             artifact_enrichment_request_count=_int(row["artifact_enrichment_request_count"]),
             suppression_reason_counts=tuple((str(item["reason_code"]), _int(item["reason_count"])) for item in reasons),
@@ -570,85 +699,146 @@ async def run_source_message_pipeline_inventory(
         sample_limit=request.sample_limit,
     )
     try:
+        approved_public_usernames = (
+            _normalize_approved_public_usernames(request.approved_public_usernames)
+            if request.select_latest_unnormalized_source_created
+            else ()
+        )
+        expected_target_event_fingerprints = _expected_target_event_fingerprints(request)
         counts = await components.inventory_repository.load_inventory_counts(
             lookback_hours=request.lookback_hours,
             normalizer_version=router_config.normalizer_version,
         )
-        previews = await _load_current_rule_previews(
-            components.inventory_repository,
-            lookback_hours=request.lookback_hours,
-            sample_limit=request.sample_limit,
-            router_config=router_config,
+        channel_plans = (
+            await _load_current_rule_channel_plans(
+                components.inventory_repository,
+                lookback_hours=request.lookback_hours,
+                sample_limit=request.sample_limit,
+                router_config=router_config,
+                approved_public_usernames=approved_public_usernames,
+            )
+            if request.select_latest_unnormalized_source_created
+            else ()
         )
         report = _apply_counts(report, counts)
-        report = _apply_current_rule_summary(report, _current_rule_summary(previews))
-        selected = _select_latest_target(previews) if request.select_latest_unnormalized_source_created else None
-        report = _apply_selected_target(report, selected)
+        report = _apply_current_rule_summary(report, _current_rule_summary(_channel_preview_pairs(channel_plans)))
+        report = _apply_channel_plans(report, channel_plans)
+        selected_plans = _selected_channel_plans(channel_plans)
+        target_plans = _targeted_channel_plans(channel_plans)
+        report = _apply_selected_target(report, selected_plans[0] if selected_plans else None)
 
         if request.mode == "plan":
-            if selected is not None:
+            if not request.select_latest_unnormalized_source_created:
+                return replace(report, status="pass", reason_code="inventory_plan_complete")
+            if selected_plans and not _has_hard_stop_channel_plan(channel_plans):
                 return replace(
                     report,
                     status="pass",
                     reason_code="normalization_target_plan_ready",
-                )
-            if not request.select_latest_unnormalized_source_created:
-                return replace(report, status="pass", reason_code="inventory_plan_complete")
+            )
+            if channel_plans and all(plan.bucket == "already_normalized" for plan in channel_plans):
+                return replace(report, status="pass", reason_code="source_normalization_already_materialized")
+            if channel_plans and _has_hard_stop_channel_plan(channel_plans):
+                return replace(report, status="blocked", reason_code=_channel_plan_hard_stop_reason(channel_plans))
             return replace(report, status="blocked", reason_code=_no_target_reason(counts))
 
-        if selected is None:
+        if not request.select_latest_unnormalized_source_created:
+            return replace(report, status="blocked", reason_code="selector_required_for_execute")
+        if _has_hard_stop_channel_plan(channel_plans):
+            return replace(report, status="blocked", reason_code=_channel_plan_hard_stop_reason(channel_plans))
+        if not target_plans:
             return replace(report, status="blocked", reason_code=_no_target_reason(counts))
-        if request.expected_target_event_fingerprint != selected.target_event_fingerprint:
+        current_target_fingerprints = tuple(
+            fingerprint for plan in target_plans if (fingerprint := plan.target_event_fingerprint) is not None
+        )
+        if expected_target_event_fingerprints != current_target_fingerprints:
             return replace(report, status="blocked", reason_code="target_event_fingerprint_mismatch")
 
-        report = replace(report, normalization_attempted=True)
-        result = await components.normalizer_service.process_stream_message(
-            _normalize_message_for_target(selected.target)
-        )
-        try:
-            await components.commit_active_transaction()
-        except Exception:
-            return replace(report, status="failed", reason_code="normalization_commit_failed")
+        results: list[NormalizationResult] = []
+        if selected_plans:
+            report = replace(report, normalization_attempted=True)
+            for plan in selected_plans:
+                if plan.target is None:
+                    return replace(report, status="blocked", reason_code="selected_target_missing")
+                results.append(
+                    await components.normalizer_service.process_stream_message(
+                        _normalize_message_for_target(plan.target)
+                    )
+                )
+            if any((not result.candidate_eligible or result.suppression_reason_codes) for result in results):
+                return replace(report, status="failed", reason_code="normalization_suppressed_unexpectedly")
+            try:
+                await components.commit_active_transaction()
+            except Exception:
+                return replace(report, status="failed", reason_code="normalization_commit_failed")
 
-        readback = await components.inventory_repository.load_normalization_readback(
-            source_message_id=selected.target.source_message_id,
-            source_version_no=selected.target.source_version_no,
-            normalizer_version=router_config.normalizer_version,
-        )
-        report = _apply_readback(report, readback)
-        if not result.candidate_eligible or result.suppression_reason_codes:
-            return replace(report, status="failed", reason_code="normalization_suppressed_unexpectedly")
-        if readback.normalization_run_count < 1:
+        readbacks: list[tuple[ChannelPlan, NormalizationReadback]] = []
+        for plan in target_plans:
+            if plan.target is None:
+                continue
+            readbacks.append(
+                (
+                    plan,
+                    await components.inventory_repository.load_normalization_readback(
+                        source_message_id=plan.target.source_message_id,
+                        source_version_no=plan.target.source_version_no,
+                        normalizer_version=router_config.normalizer_version,
+                    ),
+                )
+            )
+        report = _apply_readbacks(report, readbacks)
+        selected_readbacks = [readback for plan, readback in readbacks if plan.bucket == "selected"]
+        if any(readback.normalization_run_count < 1 for readback in selected_readbacks):
             return replace(report, status="failed", reason_code="normalization_run_missing_after_normalization")
-        if readback.candidate_group_count < 1:
+        if any(readback.candidate_group_proposal_count < 1 for readback in selected_readbacks):
             return replace(report, status="failed", reason_code="candidate_group_missing_after_normalization")
-        return replace(report, status="pass", reason_code="source_normalization_materialized")
+        if any(readback.candidate_group_member_count < 1 for readback in selected_readbacks):
+            return replace(report, status="failed", reason_code="candidate_group_member_missing_after_normalization")
+        if selected_plans:
+            return replace(
+                report,
+                status="pass",
+                reason_code="source_normalization_materialized",
+                executed_target_count=len(selected_plans),
+            )
+        return replace(report, status="pass", reason_code="source_normalization_already_materialized")
     except SourceMessagePipelineInventoryConfigError as exc:
         return replace(report, status="blocked", reason_code=_safe_reason_code(exc))
     except Exception:
         return replace(report, status="failed", reason_code="unhandled_error")
 
 
-async def _load_current_rule_previews(
+async def _load_current_rule_channel_plans(
     repository: InventoryRepositoryProtocol,
     *,
     lookback_hours: int,
     sample_limit: int,
     router_config: RouterNormalizerConfig,
-) -> tuple[tuple[SourceCreatedTarget, CurrentRulePreview], ...]:
+    approved_public_usernames: Sequence[str],
+) -> tuple[ChannelPlan, ...]:
     rows = await repository.load_source_created_preview_targets(
         lookback_hours=lookback_hours,
         sample_limit=sample_limit,
         normalizer_version=router_config.normalizer_version,
+        approved_public_usernames=approved_public_usernames,
     )
-    previews: list[tuple[SourceCreatedTarget, CurrentRulePreview]] = []
+    plans: list[ChannelPlan] = []
     for row in rows:
+        if row.target is None:
+            plans.append(
+                ChannelPlan(
+                    approved_public_username=row.approved_public_username,
+                    bucket=row.bucket,
+                    reason_code=row.reason_code,
+                )
+            )
+            continue
         preview = await _build_current_rule_preview(
-            row.snapshot,
+            row.target.snapshot,
             short_url_allowlist=router_config.short_url_allowlist,
         )
-        previews.append((row, preview))
-    return tuple(previews)
+        plans.append(_channel_plan_from_preview(row.approved_public_username, row.target, preview))
+    return tuple(plans)
 
 
 async def _build_current_rule_preview(
@@ -691,8 +881,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lookback-hours", type=int, default=72)
     parser.add_argument("--sample-limit", type=int, default=100)
     parser.add_argument("--select-latest-unnormalized-source-created", action="store_true")
+    parser.add_argument("--approved-public-username", action="append", default=[])
     parser.add_argument("--selection-confirm", default=None)
-    parser.add_argument("--expected-target-event-fingerprint", default=None)
+    parser.add_argument("--expected-target-event-fingerprint", action="append", default=[])
     parser.add_argument("--confirm", default=None)
     return parser
 
@@ -755,7 +946,12 @@ async def run_cli(
         lookback_hours=int(args.lookback_hours),
         sample_limit=int(args.sample_limit),
         select_latest_unnormalized_source_created=bool(args.select_latest_unnormalized_source_created),
-        expected_target_event_fingerprint=_optional_str(args.expected_target_event_fingerprint),
+        expected_target_event_fingerprints=tuple(
+            value for raw in args.expected_target_event_fingerprint if (value := _optional_str(raw)) is not None
+        ),
+        approved_public_usernames=tuple(
+            value for raw in args.approved_public_username if (value := _optional_str(raw)) is not None
+        ),
     )
 
     builder = components_builder or sql_inventory_components
@@ -850,14 +1046,26 @@ def _cli_request_error(args: argparse.Namespace) -> str | None:
         return "selection_confirm_missing"
     if not args.select_latest_unnormalized_source_created and args.selection_confirm is not None:
         return "selection_confirm_without_selector"
-    if args.mode == "plan" and args.expected_target_event_fingerprint is not None:
+    if not args.select_latest_unnormalized_source_created and args.approved_public_username:
+        return "approved_public_username_without_selector"
+    try:
+        approved_public_usernames = _normalize_approved_public_usernames(args.approved_public_username)
+    except SourceMessagePipelineInventoryConfigError as exc:
+        return _safe_reason_code(exc)
+    if args.select_latest_unnormalized_source_created and not approved_public_usernames:
+        return "approved_public_username_required"
+    try:
+        expected_fingerprints = _normalize_expected_fingerprints(args.expected_target_event_fingerprint)
+    except SourceMessagePipelineInventoryConfigError as exc:
+        return _safe_reason_code(exc)
+    if args.mode == "plan" and expected_fingerprints:
         return "expected_target_event_fingerprint_not_allowed_for_plan"
     if args.mode == "execute-normalize":
         if args.confirm != CONFIRM_TOKEN:
             return "exact_source_normalization_confirm_missing"
         if not args.select_latest_unnormalized_source_created:
             return "selector_required_for_execute"
-        if not _optional_str(args.expected_target_event_fingerprint):
+        if not expected_fingerprints:
             return "expected_target_event_fingerprint_missing"
     return None
 
@@ -884,20 +1092,161 @@ def _current_rule_summary(
     )
 
 
-def _select_latest_target(
-    previews: Sequence[tuple[SourceCreatedTarget, CurrentRulePreview]],
-) -> SelectedTarget | None:
-    for target, preview in previews:
-        if target.snapshot.deleted_at is not None:
+def _channel_preview_pairs(plans: Sequence[ChannelPlan]) -> tuple[tuple[SourceCreatedTarget, CurrentRulePreview], ...]:
+    return tuple((plan.target, plan.preview) for plan in plans if plan.target is not None and plan.preview is not None)
+
+
+def _channel_plan_from_preview(
+    approved_public_username: str,
+    target: SourceCreatedTarget,
+    preview: CurrentRulePreview,
+) -> ChannelPlan:
+    if target.snapshot.deleted_at is not None:
+        return ChannelPlan(
+            approved_public_username=approved_public_username,
+            bucket="blocked",
+            reason_code="source_message_deleted",
+            target=target,
+            preview=preview,
+        )
+    if target.has_current_normalization:
+        return ChannelPlan(
+            approved_public_username=approved_public_username,
+            bucket="already_normalized",
+            reason_code="source_version_already_normalized",
+            target=target,
+            preview=preview,
+        )
+    if target.has_candidate_group:
+        return ChannelPlan(
+            approved_public_username=approved_public_username,
+            bucket="already_normalized",
+            reason_code="candidate_group_already_present",
+            target=target,
+            preview=preview,
+        )
+    if not preview.candidate_eligible:
+        return ChannelPlan(
+            approved_public_username=approved_public_username,
+            bucket="blocked",
+            reason_code="current_rule_not_candidate_eligible",
+            target=target,
+            preview=preview,
+        )
+    return ChannelPlan(
+        approved_public_username=approved_public_username,
+        bucket="selected",
+        reason_code="latest_unnormalized_source_created_candidate_eligible",
+        target=target,
+        preview=preview,
+    )
+
+
+def _selected_channel_plans(plans: Sequence[ChannelPlan]) -> tuple[ChannelPlan, ...]:
+    return tuple(plan for plan in plans if plan.bucket == "selected" and plan.target is not None)
+
+
+def _targeted_channel_plans(plans: Sequence[ChannelPlan]) -> tuple[ChannelPlan, ...]:
+    return tuple(
+        plan
+        for plan in plans
+        if plan.bucket in {"selected", "already_normalized"} and plan.target is not None
+    )
+
+
+def _has_hard_stop_channel_plan(plans: Sequence[ChannelPlan]) -> bool:
+    return any(plan.bucket in {"missing", "ambiguous", "blocked"} for plan in plans)
+
+
+def _channel_plan_hard_stop_reason(plans: Sequence[ChannelPlan]) -> str:
+    if any(plan.bucket == "ambiguous" for plan in plans):
+        return "approved_channel_selection_ambiguous"
+    if any(plan.bucket == "blocked" for plan in plans):
+        return "approved_channel_selection_blocked"
+    if any(plan.bucket == "missing" for plan in plans):
+        return "approved_channel_selection_missing"
+    return "approved_channel_selection_incomplete"
+
+
+def _normalize_approved_public_usernames(values: Sequence[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for raw in values:
+        value = _optional_str(raw)
+        if value is None:
+            raise SourceMessagePipelineInventoryConfigError("approved_public_username_missing")
+        lowered = value.lower()
+        if not lowered.startswith("@"):
+            raise SourceMessagePipelineInventoryConfigError("approved_public_username_not_explicit")
+        if re.fullmatch(r"@[a-z0-9_]{1,64}", lowered) is None:
+            raise SourceMessagePipelineInventoryConfigError("approved_public_username_invalid")
+        if lowered not in F2_APPROVED_PUBLIC_USERNAMES:
+            raise SourceMessagePipelineInventoryConfigError("approved_public_username_not_f2_approved")
+        if lowered in normalized:
+            raise SourceMessagePipelineInventoryConfigError("approved_public_username_duplicate")
+        normalized.append(lowered)
+    return tuple(normalized)
+
+
+def _expected_target_event_fingerprints(request: SourceMessagePipelineInventoryRequest) -> tuple[str, ...]:
+    values: list[str] = []
+    if request.expected_target_event_fingerprint:
+        values.append(request.expected_target_event_fingerprint)
+    values.extend(request.expected_target_event_fingerprints)
+    return _normalize_expected_fingerprints(values)
+
+
+def _normalize_expected_fingerprints(values: Sequence[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for raw in values:
+        value = _optional_str(raw)
+        if value is None:
             continue
-        if target.has_current_normalization:
-            continue
-        if target.has_candidate_group:
-            continue
-        if not preview.candidate_eligible:
-            continue
-        return SelectedTarget(target=target, preview=preview)
-    return None
+        lowered = value.lower()
+        if re.fullmatch(r"[a-f0-9]{16}", lowered) is None:
+            raise SourceMessagePipelineInventoryConfigError("expected_target_event_fingerprint_invalid")
+        if lowered in normalized:
+            raise SourceMessagePipelineInventoryConfigError("expected_target_event_fingerprint_duplicate")
+        normalized.append(lowered)
+    return tuple(normalized)
+
+
+def _channel_plan_report(plan: ChannelPlan) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "approved_public_username_fingerprint": plan.approved_public_username_fingerprint,
+        "bucket": plan.bucket,
+        "reason_code": plan.reason_code if _safe_token(plan.reason_code) else "channel_selection_status",
+    }
+    if plan.target is not None:
+        payload.update(
+            {
+                "target_event_fingerprint": plan.target_event_fingerprint,
+                "source_message_fingerprint": plan.source_message_fingerprint,
+                "source_version_no": plan.target.source_version_no,
+            }
+        )
+    if plan.preview is not None:
+        payload.update(
+            {
+                "current_rule_signal_detected": plan.preview.signal_detected,
+                "current_rule_candidate_eligible": plan.preview.candidate_eligible,
+                "current_rule_trigger_strength": plan.preview.trigger_strength,
+                "current_rule_reason_codes": list(plan.preview.reason_codes),
+            }
+        )
+    return payload
+
+
+def _readback_report(plan: ChannelPlan, readback: NormalizationReadback) -> dict[str, Any]:
+    return {
+        "target_event_fingerprint": plan.target_event_fingerprint,
+        "source_message_fingerprint": plan.source_message_fingerprint,
+        "source_version_no": None if plan.target is None else plan.target.source_version_no,
+        "normalization_runs": readback.normalization_run_count,
+        "artifact_registry": readback.artifact_registry_count,
+        "artifact_observations": readback.artifact_observation_count,
+        "candidate_group_proposals": readback.candidate_group_proposal_count,
+        "candidate_group_members": readback.candidate_group_member_count,
+    }
 
 
 def _no_target_reason(counts: InventoryCounts) -> str:
@@ -952,6 +1301,11 @@ def _report(
         analysis_requested_count=0,
         judge_call_requested_count=0,
         notification_plan_intent_count=0,
+        approved_channel_count=0,
+        selected_count=0,
+        executed_target_count=0,
+        per_channel=[],
+        normalization_readbacks=[],
         current_rule_candidate_eligible_count=0,
         current_rule_text_idea_candidate_count=0,
         current_rule_url_candidate_count=0,
@@ -973,6 +1327,13 @@ def _report(
         redis_attempted=False,
         telegram_attempted=False,
         openai_attempted=False,
+        github_provider_attempted=False,
+        x_provider_attempted=False,
+        web_provider_attempted=False,
+        notifier_attempted=False,
+        systemd_attempted=False,
+        docker_attempted=False,
+        alembic_attempted=False,
         external_network_attempted=False,
         redactions_applied=True,
         cleanup_completed=True,
@@ -1032,16 +1393,16 @@ def _apply_current_rule_summary(
 
 def _apply_selected_target(
     report: SourceMessagePipelineInventoryReport,
-    selected: SelectedTarget | None,
+    selected: ChannelPlan | None,
 ) -> SourceMessagePipelineInventoryReport:
-    if selected is None:
+    if selected is None or selected.target is None or selected.preview is None:
         return report
     return replace(
         report,
         selected_target_event_fingerprint=selected.target_event_fingerprint,
         selected_source_message_fingerprint=selected.source_message_fingerprint,
         selected_source_version_no=selected.target.source_version_no,
-        selected_target_reason_code="latest_unnormalized_source_created_candidate_eligible",
+        selected_target_reason_code=selected.reason_code,
         selected_current_rule_signal_detected=selected.preview.signal_detected,
         selected_current_rule_candidate_eligible=selected.preview.candidate_eligible,
         selected_current_rule_trigger_strength=selected.preview.trigger_strength,
@@ -1049,17 +1410,66 @@ def _apply_selected_target(
     )
 
 
-def _apply_readback(
+def _apply_channel_plans(
     report: SourceMessagePipelineInventoryReport,
-    readback: NormalizationReadback,
+    plans: Sequence[ChannelPlan],
 ) -> SourceMessagePipelineInventoryReport:
     return replace(
         report,
-        normalization_created_or_updated=readback.normalization_run_count > 0,
-        candidate_group_created_or_present=readback.candidate_group_count > 0,
-        enrichment_request_created_or_present=readback.artifact_enrichment_request_count > 0,
-        candidate_group_primary_member_count=readback.candidate_group_primary_member_count,
-        suppression_reason_counts=_reason_counts(readback.suppression_reason_counts) or report.suppression_reason_counts,
+        approved_channel_count=len(plans),
+        selected_count=sum(1 for plan in plans if plan.bucket == "selected"),
+        per_channel=[_channel_plan_report(plan) for plan in plans],
+    )
+
+
+def _apply_readbacks(
+    report: SourceMessagePipelineInventoryReport,
+    readbacks: Sequence[tuple[ChannelPlan, NormalizationReadback]],
+) -> SourceMessagePipelineInventoryReport:
+    normalization_count = sum(readback.normalization_run_count for _plan, readback in readbacks)
+    candidate_group_count = sum(readback.candidate_group_proposal_count for _plan, readback in readbacks)
+    artifact_enrichment_count = sum(readback.artifact_enrichment_request_count for _plan, readback in readbacks)
+    suppression_reason_counts: dict[str, int] = {}
+    for _plan, readback in readbacks:
+        for reason, count in readback.suppression_reason_counts:
+            suppression_reason_counts[reason] = suppression_reason_counts.get(reason, 0) + int(count)
+    return replace(
+        report,
+        normalization_created_or_updated=normalization_count > 0,
+        candidate_group_created_or_present=candidate_group_count > 0,
+        enrichment_request_created_or_present=artifact_enrichment_count > 0,
+        candidate_group_primary_member_count=sum(
+            readback.candidate_group_primary_member_count for _plan, readback in readbacks
+        ),
+        normalization_readbacks=[_readback_report(plan, readback) for plan, readback in readbacks],
+        suppression_reason_counts=_reason_counts(tuple(suppression_reason_counts.items()))
+        or report.suppression_reason_counts,
+    )
+
+
+def _channel_candidate_from_row(row: Mapping[str, Any]) -> SourceCreatedChannelCandidate:
+    approved_public_username = _optional_str(row.get("approved_public_username")) or "@unknown"
+    bucket = str(row.get("channel_status") or "blocked")
+    if bucket == "target":
+        target = _target_from_row(row)
+        if target is None:
+            return SourceCreatedChannelCandidate(
+                approved_public_username=approved_public_username,
+                bucket="blocked",
+                reason_code="source_created_version_missing",
+            )
+        return SourceCreatedChannelCandidate(
+            approved_public_username=approved_public_username,
+            bucket="selected",
+            reason_code="source_created_target_loaded",
+            target=target,
+        )
+    if bucket not in CHANNEL_BUCKETS:
+        bucket = "blocked"
+    return SourceCreatedChannelCandidate(
+        approved_public_username=approved_public_username,
+        bucket=bucket,
+        reason_code=str(row.get("channel_reason_code") or "channel_selection_blocked"),
     )
 
 

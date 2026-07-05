@@ -10,10 +10,12 @@ import pytest
 
 from services.maintenance.source_message_pipeline_inventory import (
     CONFIRM_TOKEN,
+    F2_APPROVED_PUBLIC_USERNAMES,
     SELECTION_CONFIRM_TOKEN,
     InventoryCounts,
     NormalizationReadback,
     RuntimeConfigBundle,
+    SourceCreatedChannelCandidate,
     SourceCreatedTarget,
     SourceMessagePipelineInventoryComponents,
     SourceMessagePipelineInventoryRequest,
@@ -31,6 +33,8 @@ RAW_GITHUB_URL = "https://" + "github.com/" + "example/private-tool"
 RAW_TEXT = f"sentinel raw source text {RAW_UUID} {RAW_GITHUB_URL}"
 RAW_DB_LOCATOR = "database_locator_sentinel_redacted"
 RAW_ERROR_SENTINEL = "error_sentinel_value"
+APPROVED_ONE = (F2_APPROVED_PUBLIC_USERNAMES[0],)
+APPROVED_THREE = F2_APPROVED_PUBLIC_USERNAMES
 
 
 class FakeRepository:
@@ -39,10 +43,12 @@ class FakeRepository:
         *,
         counts: InventoryCounts | None = None,
         targets: list[SourceCreatedTarget] | None = None,
+        channel_candidates: list[SourceCreatedChannelCandidate] | None = None,
         readback: NormalizationReadback | None = None,
     ) -> None:
         self.counts = counts or InventoryCounts()
         self.targets = targets or []
+        self.channel_candidates = channel_candidates
         self.readback = readback or NormalizationReadback()
         self.inventory_calls = 0
         self.preview_calls = 0
@@ -60,12 +66,36 @@ class FakeRepository:
         lookback_hours: int,
         sample_limit: int,
         normalizer_version: str,
-    ) -> list[SourceCreatedTarget]:
+        approved_public_usernames: tuple[str, ...],
+    ) -> list[SourceCreatedChannelCandidate]:
         assert lookback_hours >= 1
         assert sample_limit >= 1
         assert normalizer_version == "test-normalizer"
+        assert approved_public_usernames
         self.preview_calls += 1
-        return list(self.targets[:sample_limit])
+        if self.channel_candidates is not None:
+            return list(self.channel_candidates)
+        candidates: list[SourceCreatedChannelCandidate] = []
+        for index, approved_public_username in enumerate(approved_public_usernames):
+            target = self.targets[index] if index < len(self.targets) else None
+            if target is None:
+                candidates.append(
+                    SourceCreatedChannelCandidate(
+                        approved_public_username=approved_public_username,
+                        bucket="missing",
+                        reason_code="source_created_event_missing",
+                    )
+                )
+            else:
+                candidates.append(
+                    SourceCreatedChannelCandidate(
+                        approved_public_username=approved_public_username,
+                        bucket="selected",
+                        reason_code="source_created_target_loaded",
+                        target=target,
+                    )
+                )
+        return candidates
 
     async def load_normalization_readback(
         self,
@@ -256,10 +286,52 @@ def _counts(**overrides: int) -> InventoryCounts:
                 "--select-latest-unnormalized-source-created",
                 "--selection-confirm",
                 SELECTION_CONFIRM_TOKEN,
+                "--approved-public-username",
+                APPROVED_ONE[0],
                 "--confirm",
                 CONFIRM_TOKEN,
             ],
             "expected_target_event_fingerprint_missing",
+        ),
+        (
+            [
+                "--mode",
+                "plan",
+                "--env-file",
+                "/tmp/runtime.env",
+                "--select-latest-unnormalized-source-created",
+                "--selection-confirm",
+                SELECTION_CONFIRM_TOKEN,
+            ],
+            "approved_public_username_required",
+        ),
+        (
+            [
+                "--mode",
+                "plan",
+                "--env-file",
+                "/tmp/runtime.env",
+                "--select-latest-unnormalized-source-created",
+                "--selection-confirm",
+                SELECTION_CONFIRM_TOKEN,
+                "--approved-public-username",
+                "trendingrepo",
+            ],
+            "approved_public_username_not_explicit",
+        ),
+        (
+            [
+                "--mode",
+                "plan",
+                "--env-file",
+                "/tmp/runtime.env",
+                "--select-latest-unnormalized-source-created",
+                "--selection-confirm",
+                SELECTION_CONFIRM_TOKEN,
+                "--approved-public-username",
+                "@nimdaltg",
+            ],
+            "approved_public_username_not_f2_approved",
         ),
         (["--mode", "plan", "--env-file", "/tmp/runtime.env", "--lookback-hours", "0"], "lookback_hours_out_of_range"),
         (["--mode", "plan", "--env-file", "/tmp/runtime.env", "--sample-limit", "501"], "sample_limit_out_of_range"),
@@ -288,13 +360,14 @@ async def test_plan_inventory_read_only_blocks_with_counts_when_no_target() -> N
             lookback_hours=72,
             sample_limit=100,
             select_latest_unnormalized_source_created=True,
+            approved_public_usernames=APPROVED_ONE,
         ),
         router_config=_router_config(),
         components=components,
     )
 
     assert report.status == "blocked"
-    assert report.reason_code == "no_unnormalized_candidate_eligible_source_created_target"
+    assert report.reason_code == "approved_channel_selection_missing"
     assert report.source_created_event_count == 2
     assert report.source_created_without_normalization_count == 2
     assert report.normalization_signal_detected_count == 0
@@ -321,6 +394,7 @@ async def test_plan_selects_latest_unnormalized_eligible_source_created_target()
             lookback_hours=72,
             sample_limit=100,
             select_latest_unnormalized_source_created=True,
+            approved_public_usernames=APPROVED_ONE,
         ),
         router_config=_router_config(),
         components=components,
@@ -334,8 +408,50 @@ async def test_plan_selects_latest_unnormalized_eligible_source_created_target()
     assert report.selected_source_version_no == 1
     assert report.selected_current_rule_candidate_eligible is True
     assert report.selected_current_rule_reason_codes == ["developer_tool_signal"]
+    assert report.approved_channel_count == 1
+    assert report.selected_count == 1
+    assert report.per_channel[0]["bucket"] == "selected"
     assert selected.source_message_id.hex not in payload
     assert "new agent CLI for coding workflows" not in payload
+    assert service.calls == []
+    assert commit.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_plan_selects_one_latest_target_per_explicit_f2_approved_channel() -> None:
+    targets = [
+        _target(text="new agent CLI for coding workflows"),
+        _target(text="new agent CLI for coding workflows"),
+        _target(text="new agent CLI for coding workflows"),
+        _target(text="older broad target must not be selected"),
+    ]
+    repository = FakeRepository(counts=_counts(source_created_event_count=4), targets=targets)
+    components, service, commit = _components(repository)
+
+    report = await run_source_message_pipeline_inventory(
+        SourceMessagePipelineInventoryRequest(
+            mode="plan",
+            lookback_hours=72,
+            sample_limit=1,
+            select_latest_unnormalized_source_created=True,
+            approved_public_usernames=APPROVED_THREE,
+        ),
+        router_config=_router_config(),
+        components=components,
+    )
+
+    payload = json.dumps(asdict(report), sort_keys=True)
+    assert report.status == "pass"
+    assert report.reason_code == "normalization_target_plan_ready"
+    assert report.approved_channel_count == 3
+    assert report.selected_count == 3
+    assert [item["bucket"] for item in report.per_channel] == ["selected", "selected", "selected"]
+    assert [item["target_event_fingerprint"] for item in report.per_channel] == [
+        _fingerprint(target.event_id) for target in targets[:3]
+    ]
+    assert _fingerprint(targets[3].event_id) not in payload
+    for username in APPROVED_THREE:
+        assert username not in payload
     assert service.calls == []
     assert commit.calls == 0
 
@@ -366,13 +482,14 @@ async def test_plan_mismatch_current_eligible_requested_weak_is_not_selected() -
             lookback_hours=72,
             sample_limit=100,
             select_latest_unnormalized_source_created=True,
+            approved_public_usernames=APPROVED_ONE,
         ),
         router_config=_router_config(),
         components=components,
     )
 
     assert report.status == "blocked"
-    assert report.reason_code == "no_unnormalized_candidate_eligible_source_created_target"
+    assert report.reason_code == "approved_channel_selection_blocked"
     assert report.current_rule_candidate_eligible_count == 0
     assert report.current_rule_weak_suppressed_count == 1
     assert report.selected_target_event_fingerprint is None
@@ -404,6 +521,7 @@ async def test_plan_mismatch_current_weak_requested_eligible_is_selected() -> No
             lookback_hours=72,
             sample_limit=100,
             select_latest_unnormalized_source_created=True,
+            approved_public_usernames=APPROVED_ONE,
         ),
         router_config=_router_config(),
         components=components,
@@ -438,6 +556,7 @@ async def test_missing_requested_version_row_is_not_selected_or_executed() -> No
             lookback_hours=72,
             sample_limit=100,
             select_latest_unnormalized_source_created=True,
+            approved_public_usernames=APPROVED_ONE,
             expected_target_event_fingerprint=_fingerprint(missing_version_row["event_id"]),
         ),
         router_config=_router_config(),
@@ -445,7 +564,7 @@ async def test_missing_requested_version_row_is_not_selected_or_executed() -> No
     )
 
     assert report.status == "blocked"
-    assert report.reason_code == "no_unnormalized_candidate_eligible_source_created_target"
+    assert report.reason_code == "approved_channel_selection_missing"
     assert report.selected_target_event_fingerprint is None
     assert report.normalization_attempted is False
     assert service.calls == []
@@ -461,7 +580,10 @@ async def test_execute_normalize_succeeds_with_one_selected_event_and_readback()
         targets=[selected],
         readback=NormalizationReadback(
             normalization_run_count=1,
-            candidate_group_count=1,
+            artifact_registry_count=1,
+            artifact_observation_count=1,
+            candidate_group_proposal_count=1,
+            candidate_group_member_count=1,
             candidate_group_primary_member_count=1,
             artifact_enrichment_request_count=0,
         ),
@@ -474,6 +596,7 @@ async def test_execute_normalize_succeeds_with_one_selected_event_and_readback()
             lookback_hours=72,
             sample_limit=100,
             select_latest_unnormalized_source_created=True,
+            approved_public_usernames=APPROVED_ONE,
             expected_target_event_fingerprint=_fingerprint(selected.event_id),
         ),
         router_config=_router_config(),
@@ -486,6 +609,19 @@ async def test_execute_normalize_succeeds_with_one_selected_event_and_readback()
     assert report.normalization_created_or_updated is True
     assert report.candidate_group_created_or_present is True
     assert report.candidate_group_primary_member_count == 1
+    assert report.executed_target_count == 1
+    assert report.normalization_readbacks == [
+        {
+            "target_event_fingerprint": _fingerprint(selected.event_id),
+            "source_message_fingerprint": _fingerprint(selected.source_message_id),
+            "source_version_no": 1,
+            "normalization_runs": 1,
+            "artifact_registry": 1,
+            "artifact_observations": 1,
+            "candidate_group_proposals": 1,
+            "candidate_group_members": 1,
+        }
+    ]
     assert len(service.calls) == 1
     assert service.calls[0].trigger_event_id == str(selected.event_id)
     assert service.calls[0].root_object_id == str(selected.source_message_id)
@@ -509,7 +645,8 @@ async def test_execute_normalize_fingerprint_mismatch_blocks_before_writes() -> 
             lookback_hours=72,
             sample_limit=100,
             select_latest_unnormalized_source_created=True,
-            expected_target_event_fingerprint="mismatch",
+            approved_public_usernames=APPROVED_ONE,
+            expected_target_event_fingerprint="0000000000000000",
         ),
         router_config=_router_config(),
         components=components,
@@ -533,7 +670,7 @@ async def test_already_normalized_source_is_not_selected_or_reprocessed() -> Non
     )
     repository = FakeRepository(
         counts=_counts(source_created_without_normalization_count=0),
-        targets=[normalized],
+        targets=[normalized, _target(text="older broad target must not be selected")],
     )
     components, service, commit = _components(repository)
 
@@ -543,14 +680,17 @@ async def test_already_normalized_source_is_not_selected_or_reprocessed() -> Non
             lookback_hours=72,
             sample_limit=100,
             select_latest_unnormalized_source_created=True,
+            approved_public_usernames=APPROVED_ONE,
             expected_target_event_fingerprint=_fingerprint(normalized.event_id),
         ),
         router_config=_router_config(),
         components=components,
     )
 
-    assert report.status == "blocked"
-    assert report.reason_code == "source_pipeline_already_normalized_or_empty"
+    assert report.status == "pass"
+    assert report.reason_code == "source_normalization_already_materialized"
+    assert report.per_channel[0]["bucket"] == "already_normalized"
+    assert report.selected_count == 0
     assert service.calls == []
     assert commit.calls == 0
 
@@ -572,12 +712,14 @@ async def test_current_rule_recall_candidate_with_existing_old_normalization_is_
             lookback_hours=72,
             sample_limit=100,
             select_latest_unnormalized_source_created=True,
+            approved_public_usernames=APPROVED_ONE,
         ),
         router_config=_router_config(),
         components=components,
     )
 
-    assert report.status == "blocked"
+    assert report.status == "pass"
+    assert report.reason_code == "source_normalization_already_materialized"
     assert report.current_rule_candidate_eligible_count == 1
     assert report.current_rule_recall_candidate_with_existing_normalization_count == 1
     assert report.selected_target_event_fingerprint is None
@@ -605,6 +747,7 @@ async def test_redaction_omits_raw_text_ids_urls_db_url_and_error_sentinels() ->
             lookback_hours=72,
             sample_limit=100,
             select_latest_unnormalized_source_created=True,
+            approved_public_usernames=APPROVED_ONE,
         ),
         router_config=_router_config(),
         components=components,
@@ -623,6 +766,7 @@ async def test_redaction_omits_raw_text_ids_urls_db_url_and_error_sentinels() ->
         RAW_DB_LOCATOR,
         RAW_GITHUB_URL,
         RAW_ERROR_SENTINEL,
+        APPROVED_ONE[0],
     ]
     for value in forbidden:
         assert value not in payload
