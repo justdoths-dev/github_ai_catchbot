@@ -101,6 +101,53 @@ def test_runner_consumes_f9_proof_file_and_sanitizes_origin_vps_evidence(tmp_pat
         assert forbidden not in output
 
 
+def test_runner_requires_allow_flag_before_reading_collector_wrapper_evidence(tmp_path, capsys) -> None:
+    wrapper_path = tmp_path / "collector-wrapper.json"
+    wrapper_path.write_text(json.dumps(_collector_wrapper_report()), encoding="utf-8")
+
+    exit_code = runner.main(["--collector-wrapper-evidence-json", str(wrapper_path)])
+    parsed = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert parsed["status"] == "blocked"
+    assert parsed["reason_code"] == "collector_wrapper_evidence_file_read_not_allowed"
+
+
+def test_runner_consumes_collector_wrapper_evidence_without_raw_child_report(tmp_path, capsys) -> None:
+    wrapper_report = _collector_wrapper_report()
+    wrapper_report["child_report"] = {
+        "stdout_parsed_as_json": True,
+        "url": RAW_URL,
+        "stderr": RAW_SECRET,
+    }
+    wrapper_path = tmp_path / "collector-wrapper.json"
+    wrapper_path.write_text(json.dumps(wrapper_report), encoding="utf-8")
+
+    exit_code = runner.main(
+        [
+            "--collector-wrapper-evidence-json",
+            str(wrapper_path),
+            "--allow-collector-wrapper-evidence-file-read",
+        ]
+    )
+    output = capsys.readouterr().out
+    parsed = json.loads(output)
+
+    assert exit_code == 0
+    assert parsed["collector_wrapper_readback"]["consumed"] is True
+    assert parsed["collector_wrapper_readback"]["f1_duplicate_noop_readback_closure"]["closed"] is True
+    assert parsed["collector_wrapper_readback"]["operator_closure"][
+        "F1_EXACT_DUPLICATE_NOOP_REVIEWABILITY_CLOSED"
+    ] is True
+    assert parsed["completion_claims"]["F1_DUPLICATE_NOOP_READBACK_REVIEWABLE"] is True
+    assert parsed["completion_claims"]["F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY"] is False
+    assert parsed["completion_claims"]["LIVE_COLLECTOR_1_CHANNEL_CLOSED"] is False
+    assert parsed["completion_claims"]["PRODUCTION_ROLLOUT_CLOSED"] is False
+    assert "child_report" not in parsed["collector_wrapper_readback"]
+    for forbidden in (RAW_URL, RAW_SECRET):
+        assert forbidden not in output
+
+
 def test_static_runner_and_modules_have_no_forbidden_live_imports_or_calls() -> None:
     for path in (TOOL_PATH, F9_PROOF_PATH, F10_PACKET_PATH):
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -138,3 +185,85 @@ def test_static_runner_and_modules_have_no_forbidden_live_imports_or_calls() -> 
         )
         assert {"systemctl", "docker", "alembic", "run_forever"}.isdisjoint(call_names)
     assert "print(" not in TOOL_PATH.read_text(encoding="utf-8")
+
+
+def _collector_wrapper_report() -> dict[str, object]:
+    return {
+        "schema_version": "restricted_live_collector_one_channel_source_read_env_overlay_runner_v1",
+        "status": "pass",
+        "reason_code": "child_bounded_runner_passed",
+        "target_scope": {
+            "target_count": 1,
+            "target_fingerprints": ["sha256:1111111111111111"],
+            "raw_source_value_printed": False,
+            "direct_chat_id_allowed": False,
+            "direct_registry_id_allowed": False,
+            "broad_target_allowed": False,
+        },
+        "actual_attempted_operations": {
+            "child_runner_invoked": True,
+            "child_runner_returncode": 0,
+            "live_telegram_read_attempted_by_wrapper": False,
+            "telegram_send_or_edit_attempted": False,
+            "openai_attempted": False,
+            "github_attempted": False,
+            "x_attempted": False,
+            "web_attempted": False,
+            "redis_publish_attempted_by_wrapper": False,
+            "docker_or_systemd_called": False,
+            "alembic_called": False,
+        },
+        "source_truth_readback_closure": {
+            "child_report_available": True,
+            "wrapper_child_execution_passed": True,
+            "exact_child_runner_passed": True,
+            "live_telegram_read_attempted": True,
+            "telegram_read_called": True,
+            "messages_seen_present": True,
+            "source_current_readback_present": True,
+            "source_version_readback_present": True,
+            "source_created_events_readback_present": True,
+            "source_outbox_events_readback_present": True,
+            "source_outbox_publish_disabled": True,
+            "redis_publish_disabled": True,
+            "telegram_send_disabled": True,
+            "provider_calls_disabled": True,
+            "docker_systemd_alembic_disabled": True,
+            "raw_values_not_printed": True,
+            "runtime_values_not_printed": True,
+            "durable_readback_present": True,
+        },
+        "f1_duplicate_noop_readback_closure": {
+            "one_channel_or_legacy_child_report": True,
+            "source_truth_durable_readback_present": True,
+            "duplicate_noop_proof_present": True,
+            "duplicate_noop_without_second_telegram_read": True,
+            "closed": True,
+        },
+        "f1_fresh_write_readback_closure": {
+            "one_channel_or_legacy_child_report": True,
+            "source_truth_durable_readback_present": True,
+            "database_write_attempted": False,
+            "source_message_write_attempted": False,
+            "source_version_write_attempted": False,
+            "source_outbox_write_attempted": False,
+            "closed": False,
+        },
+        "f1_exact_live_readback_review_closure": {
+            "duplicate_noop_readback_closed": True,
+            "fresh_write_readback_closed": False,
+            "closed": True,
+        },
+        "f2_three_channel_readback_closure": {"closed": False},
+        "completion_claims": {
+            "F1_SOURCE_TRUTH_DURABLE_READBACK_REVIEWABLE": True,
+            "F1_DUPLICATE_NOOP_READBACK_REVIEWABLE": True,
+            "F1_EXACT_LIVE_READBACK_REVIEWABLE": True,
+            "F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY": False,
+            "F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY": False,
+            "LIVE_COLLECTOR_1_CHANNEL_CLOSED": False,
+            "LIVE_COLLECTOR_3_CHANNEL_CLOSED": False,
+            "PRODUCT_COMPLETE_CLOSED": False,
+            "PRODUCTION_ROLLOUT_CLOSED": False,
+        },
+    }

@@ -51,6 +51,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-origin-evidence-file-read", action="store_true")
     parser.add_argument("--vps-evidence-json")
     parser.add_argument("--allow-vps-evidence-file-read", action="store_true")
+    parser.add_argument("--collector-wrapper-evidence-json")
+    parser.add_argument("--allow-collector-wrapper-evidence-file-read", action="store_true")
     return parser
 
 
@@ -70,6 +72,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise BoundedFunctionCompletePacketError("origin_evidence_file_read_not_allowed")
         if args.vps_evidence_json and not args.allow_vps_evidence_file_read:
             raise BoundedFunctionCompletePacketError("vps_evidence_file_read_not_allowed")
+        if args.collector_wrapper_evidence_json and not args.allow_collector_wrapper_evidence_file_read:
+            raise BoundedFunctionCompletePacketError("collector_wrapper_evidence_file_read_not_allowed")
 
         f9_proof = (
             _read_json_object(args.f9_proof_json, file_kind="f9_proof")
@@ -84,10 +88,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         vps_evidence = (
             _read_json_object(args.vps_evidence_json, file_kind="vps_evidence") if args.vps_evidence_json else None
         )
+        collector_wrapper_evidence = (
+            _read_json_object(args.collector_wrapper_evidence_json, file_kind="collector_wrapper_evidence")
+            if args.collector_wrapper_evidence_json
+            else None
+        )
         packet = build_function_complete_packet(
             f9_proof=f9_proof,
             origin_evidence=origin_evidence,
             vps_evidence=vps_evidence,
+            collector_wrapper_evidence=collector_wrapper_evidence,
         )
         packet["mode"] = str(args.mode)
         packet["authority"] = {
@@ -95,6 +105,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "f9_proof_file_read_allowed": bool(args.allow_f9_proof_file_read),
             "origin_evidence_file_read_allowed": bool(args.allow_origin_evidence_file_read),
             "vps_evidence_file_read_allowed": bool(args.allow_vps_evidence_file_read),
+            "collector_wrapper_evidence_file_read_allowed": bool(
+                args.allow_collector_wrapper_evidence_file_read
+            ),
             "database_read_allowed": False,
             "database_write_allowed": False,
             "redis_allowed": False,
