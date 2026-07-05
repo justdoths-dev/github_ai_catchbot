@@ -140,10 +140,45 @@ def test_runner_consumes_collector_wrapper_evidence_without_raw_child_report(tmp
         "F1_EXACT_DUPLICATE_NOOP_REVIEWABILITY_CLOSED"
     ] is True
     assert parsed["completion_claims"]["F1_DUPLICATE_NOOP_READBACK_REVIEWABLE"] is True
+    assert parsed["completion_claims"]["F1_FRESH_WRITE_REVIEWABILITY_CLOSED"] is False
     assert parsed["completion_claims"]["F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY"] is False
     assert parsed["completion_claims"]["LIVE_COLLECTOR_1_CHANNEL_CLOSED"] is False
     assert parsed["completion_claims"]["PRODUCTION_ROLLOUT_CLOSED"] is False
     assert "child_report" not in parsed["collector_wrapper_readback"]
+    for forbidden in (RAW_URL, RAW_SECRET):
+        assert forbidden not in output
+
+
+def test_runner_consumes_repeated_collector_wrapper_evidence_files(tmp_path, capsys) -> None:
+    f1_path = tmp_path / "collector-wrapper-f1.json"
+    f1_path.write_text(json.dumps(_collector_wrapper_report()), encoding="utf-8")
+    f2_path = tmp_path / "collector-wrapper-f2.json"
+    f2_path.write_text(json.dumps(_three_channel_wrapper_report(live_source_read_closed=False)), encoding="utf-8")
+
+    exit_code = runner.main(
+        [
+            "--collector-wrapper-evidence-json",
+            str(f1_path),
+            "--collector-wrapper-evidence-json",
+            str(f2_path),
+            "--allow-collector-wrapper-evidence-file-read",
+        ]
+    )
+    output = capsys.readouterr().out
+    parsed = json.loads(output)
+
+    assert exit_code == 0
+    assert parsed["collector_wrapper_readback"]["consumed"] is True
+    assert parsed["collector_wrapper_readback"]["schema_version"] == "collector_wrapper_evidence_aggregate_v1"
+    assert parsed["collector_wrapper_readback"]["evidence_report_count"] == 2
+    assert parsed["completion_claims"]["F1_DUPLICATE_NOOP_READBACK_REVIEWABLE"] is True
+    assert parsed["completion_claims"]["F1_FRESH_WRITE_REVIEWABILITY_CLOSED"] is False
+    assert parsed["completion_claims"]["F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY"] is True
+    assert parsed["completion_claims"]["F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY"] is False
+    assert parsed["completion_claims"]["LIVE_COLLECTOR_1_CHANNEL_CLOSED"] is False
+    assert parsed["completion_claims"]["LIVE_COLLECTOR_3_CHANNEL_CLOSED"] is False
+    assert parsed["completion_claims"]["PRODUCT_COMPLETE_CLOSED"] is False
+    assert parsed["completion_claims"]["PRODUCTION_ROLLOUT_CLOSED"] is False
     for forbidden in (RAW_URL, RAW_SECRET):
         assert forbidden not in output
 
@@ -267,3 +302,55 @@ def _collector_wrapper_report() -> dict[str, object]:
             "PRODUCTION_ROLLOUT_CLOSED": False,
         },
     }
+
+
+def _three_channel_wrapper_report(*, live_source_read_closed: bool) -> dict[str, object]:
+    report = _collector_wrapper_report()
+    report["target_scope"] = {
+        "target_count": 3,
+        "target_fingerprints": [
+            "sha256:aaaaaaaaaaaaaaaa",
+            "sha256:bbbbbbbbbbbbbbbb",
+            "sha256:cccccccccccccccc",
+        ],
+        "raw_source_value_printed": False,
+        "direct_chat_id_allowed": False,
+        "direct_registry_id_allowed": False,
+        "broad_target_allowed": False,
+    }
+    report["f2_three_channel_readback_closure"] = {
+        "child_report_available": live_source_read_closed,
+        "wrapper_child_execution_passed": live_source_read_closed,
+        "exact_child_runner_passed": live_source_read_closed,
+        "target_count_is_three": True,
+        "target_fingerprint_count_is_three": True,
+        "per_channel_result_count_is_three": live_source_read_closed,
+        "per_channel_status_passed": live_source_read_closed,
+        "per_channel_messages_seen_present": live_source_read_closed,
+        "per_channel_readbacks_present": live_source_read_closed,
+        "aggregate_source_current_readback_present": live_source_read_closed,
+        "aggregate_source_version_readback_present": live_source_read_closed,
+        "aggregate_source_created_events_readback_present": live_source_read_closed,
+        "aggregate_source_outbox_events_readback_present": live_source_read_closed,
+        "aggregate_duplicate_noop_or_fresh_write_sufficient": live_source_read_closed,
+        "source_outbox_publish_disabled": live_source_read_closed,
+        "redis_publish_disabled": live_source_read_closed,
+        "telegram_send_disabled": live_source_read_closed,
+        "provider_calls_disabled": live_source_read_closed,
+        "docker_systemd_alembic_disabled": live_source_read_closed,
+        "raw_values_not_printed": live_source_read_closed,
+        "runtime_values_not_printed": live_source_read_closed,
+        "closed": live_source_read_closed,
+    }
+    report["completion_claims"] = {
+        "F1_SOURCE_TRUTH_DURABLE_READBACK_REVIEWABLE": True,
+        "F1_DUPLICATE_NOOP_READBACK_REVIEWABLE": True,
+        "F1_EXACT_LIVE_READBACK_REVIEWABLE": True,
+        "F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY": True,
+        "F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY": live_source_read_closed,
+        "LIVE_COLLECTOR_1_CHANNEL_CLOSED": False,
+        "LIVE_COLLECTOR_3_CHANNEL_CLOSED": False,
+        "PRODUCT_COMPLETE_CLOSED": False,
+        "PRODUCTION_ROLLOUT_CLOSED": False,
+    }
+    return report

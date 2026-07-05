@@ -38,6 +38,7 @@ def test_packet_ready_only_after_f1_f9_code_evidence_and_keeps_rollout_gates_ope
         "one_hundred_percent_complete": False,
         "F1_SOURCE_TRUTH_DURABLE_READBACK_REVIEWABLE": False,
         "F1_DUPLICATE_NOOP_READBACK_REVIEWABLE": False,
+        "F1_FRESH_WRITE_REVIEWABILITY_CLOSED": False,
         "F1_EXACT_LIVE_READBACK_REVIEWABLE": False,
         "F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY": False,
         "F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY": False,
@@ -115,6 +116,7 @@ def test_collector_wrapper_duplicate_noop_sections_are_consumed_without_product_
     assert wrapper["operator_closure"]["F1_FRESH_WRITE_REVIEWABILITY_CLOSED"] is False
     assert claims["F1_SOURCE_TRUTH_DURABLE_READBACK_REVIEWABLE"] is True
     assert claims["F1_DUPLICATE_NOOP_READBACK_REVIEWABLE"] is True
+    assert claims["F1_FRESH_WRITE_REVIEWABILITY_CLOSED"] is False
     assert claims["F1_EXACT_LIVE_READBACK_REVIEWABLE"] is True
     assert claims["F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY"] is False
     assert claims["LIVE_COLLECTOR_1_CHANNEL_CLOSED"] is False
@@ -135,11 +137,43 @@ def test_collector_wrapper_three_channel_preflight_and_live_proof_are_distinct()
 
     assert preflight_packet["completion_claims"]["F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY"] is True
     assert preflight_packet["completion_claims"]["F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY"] is False
+    assert preflight_packet["completion_claims"]["F1_DUPLICATE_NOOP_READBACK_REVIEWABLE"] is False
     assert live_packet["completion_claims"]["F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY"] is True
     assert live_packet["completion_claims"]["F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY"] is True
+    assert live_packet["completion_claims"]["F1_DUPLICATE_NOOP_READBACK_REVIEWABLE"] is False
     assert live_packet["completion_claims"]["LIVE_COLLECTOR_3_CHANNEL_CLOSED"] is False
     assert live_packet["completion_claims"]["PRODUCTION_ROLLOUT_CLOSED"] is False
     assert live_packet["completion_claims"]["PRODUCT_COMPLETE_CLOSED"] is False
+
+
+def test_multiple_collector_wrapper_reports_aggregate_without_synthetic_scope_merge() -> None:
+    packet = build_function_complete_packet(
+        f9_proof=build_noise_duplicate_suppression_proof(),
+        collector_wrapper_evidence=[
+            _duplicate_noop_wrapper_report(),
+            _three_channel_wrapper_report(live_source_read_closed=False),
+        ],
+    )
+    wrapper = packet["collector_wrapper_readback"]
+    claims = packet["completion_claims"]
+
+    assert wrapper["supplied"] is True
+    assert wrapper["consumed"] is True
+    assert wrapper["schema_version"] == "collector_wrapper_evidence_aggregate_v1"
+    assert wrapper["evidence_report_count"] == 2
+    assert len(wrapper["evidence_reports"]) == 2
+    assert claims["F1_SOURCE_TRUTH_DURABLE_READBACK_REVIEWABLE"] is True
+    assert claims["F1_DUPLICATE_NOOP_READBACK_REVIEWABLE"] is True
+    assert claims["F1_FRESH_WRITE_REVIEWABILITY_CLOSED"] is False
+    assert claims["F1_EXACT_LIVE_READBACK_REVIEWABLE"] is True
+    assert claims["F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY"] is True
+    assert claims["F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY"] is False
+    assert wrapper["evidence_reports"][0]["completion_claims"]["F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY"] is False
+    assert wrapper["evidence_reports"][1]["completion_claims"]["F1_DUPLICATE_NOOP_READBACK_REVIEWABLE"] is False
+    assert claims["LIVE_COLLECTOR_1_CHANNEL_CLOSED"] is False
+    assert claims["LIVE_COLLECTOR_3_CHANNEL_CLOSED"] is False
+    assert claims["PRODUCT_COMPLETE_CLOSED"] is False
+    assert claims["PRODUCTION_ROLLOUT_CLOSED"] is False
 
 
 def test_wrapper_claims_do_not_bypass_first_class_closure_or_child_returncode_gates() -> None:

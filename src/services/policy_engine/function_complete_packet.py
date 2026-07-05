@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Sequence
 
 from .noise_duplicate_suppression import F9_GATE, SCHEMA_VERSION as F9_SCHEMA_VERSION, build_noise_duplicate_suppression_proof
 
@@ -28,6 +28,7 @@ REQUIRED_CODE_GATES: tuple[str, ...] = (
 WRAPPER_COMPLETION_CLAIMS: tuple[str, ...] = (
     "F1_SOURCE_TRUTH_DURABLE_READBACK_REVIEWABLE",
     "F1_DUPLICATE_NOOP_READBACK_REVIEWABLE",
+    "F1_FRESH_WRITE_REVIEWABILITY_CLOSED",
     "F1_EXACT_LIVE_READBACK_REVIEWABLE",
     "F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY",
     "F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY",
@@ -114,7 +115,7 @@ def build_function_complete_packet(
     code_gate_evidence: Mapping[str, Any] | None = None,
     origin_evidence: Mapping[str, Any] | None = None,
     vps_evidence: Mapping[str, Any] | None = None,
-    collector_wrapper_evidence: Mapping[str, Any] | None = None,
+    collector_wrapper_evidence: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     proof = dict(f9_proof or build_noise_duplicate_suppression_proof())
     evidence = _default_code_gate_evidence(proof) if code_gate_evidence is None else dict(code_gate_evidence)
@@ -164,6 +165,7 @@ def build_function_complete_packet(
             "F1_DUPLICATE_NOOP_READBACK_REVIEWABLE": wrapper_claims[
                 "F1_DUPLICATE_NOOP_READBACK_REVIEWABLE"
             ],
+            "F1_FRESH_WRITE_REVIEWABILITY_CLOSED": wrapper_claims["F1_FRESH_WRITE_REVIEWABILITY_CLOSED"],
             "F1_EXACT_LIVE_READBACK_REVIEWABLE": wrapper_claims["F1_EXACT_LIVE_READBACK_REVIEWABLE"],
             "F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY": wrapper_claims[
                 "F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY"
@@ -199,7 +201,9 @@ def build_function_complete_packet(
     }
 
 
-def _collector_wrapper_evidence_summary(evidence: Mapping[str, Any] | None) -> dict[str, Any]:
+def _collector_wrapper_evidence_summary(
+    evidence: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
     if evidence is None:
         claims = {claim: False for claim in WRAPPER_COMPLETION_CLAIMS}
         return {
@@ -236,6 +240,66 @@ def _collector_wrapper_evidence_summary(evidence: Mapping[str, Any] | None) -> d
             "completion_claims": claims,
         }
 
+    evidence_reports = _collector_wrapper_evidence_reports(evidence)
+    if not evidence_reports:
+        claims = {claim: False for claim in WRAPPER_COMPLETION_CLAIMS}
+        return {
+            "supplied": True,
+            "consumed": False,
+            "status": "invalid",
+            "schema_version": None,
+            "reason_code": "collector_wrapper_evidence_invalid",
+            "evidence_fingerprint": None,
+            "target_scope": {
+                "target_count": None,
+                "target_fingerprints": [],
+                "raw_source_value_printed": False,
+            },
+            "actual_attempted_operations": {
+                "child_runner_invoked": False,
+                "child_runner_returncode_zero": False,
+                "live_telegram_read_attempted_by_wrapper": False,
+                "telegram_send_or_edit_attempted": False,
+                "openai_attempted": False,
+                "github_attempted": False,
+                "x_attempted": False,
+                "web_attempted": False,
+                "redis_publish_attempted_by_wrapper": False,
+                "docker_or_systemd_called": False,
+                "alembic_called": False,
+            },
+            "source_truth_readback_closure": _empty_bool_section(_SOURCE_TRUTH_CLOSURE_KEYS),
+            "f1_duplicate_noop_readback_closure": _empty_bool_section(_F1_DUPLICATE_NOOP_CLOSURE_KEYS),
+            "f1_fresh_write_readback_closure": _empty_bool_section(_F1_FRESH_WRITE_CLOSURE_KEYS),
+            "f1_exact_live_readback_review_closure": _empty_bool_section(_F1_EXACT_LIVE_CLOSURE_KEYS),
+            "f2_three_channel_readback_closure": _empty_bool_section(_F2_THREE_CHANNEL_CLOSURE_KEYS),
+            "operator_closure": _operator_closure_from_claims(claims),
+            "completion_claims": claims,
+        }
+
+    summaries = [_single_collector_wrapper_evidence_summary(report) for report in evidence_reports]
+    if len(summaries) == 1:
+        summary = dict(summaries[0])
+        summary["evidence_report_count"] = 1
+        return summary
+    return _aggregate_collector_wrapper_evidence_summaries(summaries)
+
+
+def _collector_wrapper_evidence_reports(
+    evidence: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    if isinstance(evidence, Mapping):
+        return [evidence]
+    if isinstance(evidence, (str, bytes, bytearray)):
+        return []
+    reports: list[Mapping[str, Any]] = []
+    for item in evidence:
+        if isinstance(item, Mapping):
+            reports.append(item)
+    return reports
+
+
+def _single_collector_wrapper_evidence_summary(evidence: Mapping[str, Any]) -> dict[str, Any]:
     source_truth = _project_bool_section(evidence.get("source_truth_readback_closure"), _SOURCE_TRUTH_CLOSURE_KEYS)
     duplicate_noop = _project_bool_section(
         evidence.get("f1_duplicate_noop_readback_closure"),
@@ -280,9 +344,84 @@ def _collector_wrapper_evidence_summary(evidence: Mapping[str, Any] | None) -> d
         "f2_three_channel_readback_closure": f2_three_channel,
         "operator_closure": _operator_closure_from_claims(
             wrapper_completion_claims,
-            fresh_write_closed=fresh_write.get("closed") is True,
+            fresh_write_closed=wrapper_completion_claims["F1_FRESH_WRITE_REVIEWABILITY_CLOSED"],
         ),
         "completion_claims": wrapper_completion_claims,
+    }
+    safe_summary["evidence_fingerprint"] = _fingerprint(safe_summary)
+    return safe_summary
+
+
+def _aggregate_collector_wrapper_evidence_summaries(summaries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    claims = {
+        claim: any(
+            isinstance(summary.get("completion_claims"), Mapping)
+            and summary["completion_claims"].get(claim) is True
+            for summary in summaries
+        )
+        for claim in WRAPPER_COMPLETION_CLAIMS
+    }
+    safe_summary: dict[str, Any] = {
+        "supplied": True,
+        "consumed": True,
+        "status": "pass" if all(summary.get("status") == "pass" for summary in summaries) else "mixed",
+        "schema_version": "collector_wrapper_evidence_aggregate_v1",
+        "reason_code": "collector_wrapper_evidence_reports_consumed",
+        "evidence_report_count": len(summaries),
+        "evidence_fingerprints": [
+            fingerprint
+            for summary in summaries
+            if isinstance((fingerprint := summary.get("evidence_fingerprint")), str)
+        ],
+        "target_scope": _aggregate_target_scopes(summaries),
+        "actual_attempted_operations": _aggregate_bool_sections(
+            summaries,
+            "actual_attempted_operations",
+            (
+                "child_runner_invoked",
+                "child_runner_returncode_zero",
+                "live_telegram_read_attempted_by_wrapper",
+                "telegram_send_or_edit_attempted",
+                "openai_attempted",
+                "github_attempted",
+                "x_attempted",
+                "web_attempted",
+                "redis_publish_attempted_by_wrapper",
+                "docker_or_systemd_called",
+                "alembic_called",
+            ),
+        ),
+        "source_truth_readback_closure": _aggregate_bool_sections(
+            summaries,
+            "source_truth_readback_closure",
+            _SOURCE_TRUTH_CLOSURE_KEYS,
+        ),
+        "f1_duplicate_noop_readback_closure": _aggregate_bool_sections(
+            summaries,
+            "f1_duplicate_noop_readback_closure",
+            _F1_DUPLICATE_NOOP_CLOSURE_KEYS,
+        ),
+        "f1_fresh_write_readback_closure": _aggregate_bool_sections(
+            summaries,
+            "f1_fresh_write_readback_closure",
+            _F1_FRESH_WRITE_CLOSURE_KEYS,
+        ),
+        "f1_exact_live_readback_review_closure": _aggregate_bool_sections(
+            summaries,
+            "f1_exact_live_readback_review_closure",
+            _F1_EXACT_LIVE_CLOSURE_KEYS,
+        ),
+        "f2_three_channel_readback_closure": _aggregate_bool_sections(
+            summaries,
+            "f2_three_channel_readback_closure",
+            _F2_THREE_CHANNEL_CLOSURE_KEYS,
+        ),
+        "operator_closure": _operator_closure_from_claims(
+            claims,
+            fresh_write_closed=claims["F1_FRESH_WRITE_REVIEWABILITY_CLOSED"],
+        ),
+        "completion_claims": claims,
+        "evidence_reports": list(summaries),
     }
     safe_summary["evidence_fingerprint"] = _fingerprint(safe_summary)
     return safe_summary
@@ -298,15 +437,19 @@ def _project_wrapper_completion_claims(
     f2_three_channel: Mapping[str, bool],
     target_scope: Mapping[str, Any],
 ) -> dict[str, bool]:
+    one_channel_or_legacy_scope = _one_channel_or_legacy_target_scope(target_scope)
+    three_channel_scope = _three_channel_target_scope(target_scope)
     source_truth_closed = (
-        claims.get("F1_SOURCE_TRUTH_DURABLE_READBACK_REVIEWABLE") is True
+        one_channel_or_legacy_scope
+        and claims.get("F1_SOURCE_TRUTH_DURABLE_READBACK_REVIEWABLE") is True
         and source_truth.get("durable_readback_present") is True
     )
     duplicate_noop_closed = (
-        claims.get("F1_DUPLICATE_NOOP_READBACK_REVIEWABLE") is True
+        one_channel_or_legacy_scope
+        and claims.get("F1_DUPLICATE_NOOP_READBACK_REVIEWABLE") is True
         and duplicate_noop.get("closed") is True
     )
-    fresh_write_closed = fresh_write.get("closed") is True
+    fresh_write_closed = one_channel_or_legacy_scope and fresh_write.get("closed") is True
     exact_live_closed = (
         claims.get("F1_EXACT_LIVE_READBACK_REVIEWABLE") is True
         and exact_live.get("closed") is True
@@ -314,10 +457,11 @@ def _project_wrapper_completion_claims(
     )
     f2_env_overlay_ready = (
         claims.get("F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY") is True
-        and target_scope.get("target_count") == 3
+        and three_channel_scope
     )
     f2_live_source_read_ready = (
         claims.get("F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY") is True
+        and three_channel_scope
         and f2_three_channel.get("closed") is True
         and f2_three_channel.get("wrapper_child_execution_passed") is True
         and f2_three_channel.get("exact_child_runner_passed") is True
@@ -325,6 +469,7 @@ def _project_wrapper_completion_claims(
     return {
         "F1_SOURCE_TRUTH_DURABLE_READBACK_REVIEWABLE": source_truth_closed,
         "F1_DUPLICATE_NOOP_READBACK_REVIEWABLE": duplicate_noop_closed,
+        "F1_FRESH_WRITE_REVIEWABILITY_CLOSED": fresh_write_closed,
         "F1_EXACT_LIVE_READBACK_REVIEWABLE": exact_live_closed,
         "F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY": f2_env_overlay_ready,
         "F2_THREE_CHANNEL_LIVE_SOURCE_READ_PROOF_READY": f2_live_source_read_ready,
@@ -344,7 +489,9 @@ def _operator_closure_from_claims(
         "F1_EXACT_DUPLICATE_NOOP_REVIEWABILITY_CLOSED": bool(
             claims.get("F1_DUPLICATE_NOOP_READBACK_REVIEWABLE") is True
         ),
-        "F1_FRESH_WRITE_REVIEWABILITY_CLOSED": bool(fresh_write_closed),
+        "F1_FRESH_WRITE_REVIEWABILITY_CLOSED": bool(
+            fresh_write_closed or claims.get("F1_FRESH_WRITE_REVIEWABILITY_CLOSED") is True
+        ),
         "F1_EXACT_LIVE_READBACK_REVIEWABLE": bool(claims.get("F1_EXACT_LIVE_READBACK_REVIEWABLE") is True),
         "F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY": bool(
             claims.get("F2_THREE_CHANNEL_ENV_OVERLAY_PREFLIGHT_READY") is True
@@ -394,6 +541,75 @@ def _attempted_operations_summary(value: Any) -> dict[str, bool]:
         "redis_publish_attempted_by_wrapper": source.get("redis_publish_attempted_by_wrapper") is True,
         "docker_or_systemd_called": source.get("docker_or_systemd_called") is True,
         "alembic_called": source.get("alembic_called") is True,
+    }
+
+
+def _one_channel_or_legacy_target_scope(target_scope: Mapping[str, Any]) -> bool:
+    target_count = target_scope.get("target_count")
+    return (
+        target_count in (None, 1)
+        and target_scope.get("raw_source_value_printed") is not True
+        and target_scope.get("direct_chat_id_allowed") is not True
+        and target_scope.get("direct_registry_id_allowed") is not True
+        and target_scope.get("broad_target_allowed") is not True
+    )
+
+
+def _three_channel_target_scope(target_scope: Mapping[str, Any]) -> bool:
+    return (
+        target_scope.get("target_count") == 3
+        and len(target_scope.get("target_fingerprints", [])) == 3
+        and target_scope.get("raw_source_value_printed") is not True
+        and target_scope.get("direct_chat_id_allowed") is not True
+        and target_scope.get("direct_registry_id_allowed") is not True
+        and target_scope.get("broad_target_allowed") is not True
+    )
+
+
+def _aggregate_bool_sections(
+    summaries: Sequence[Mapping[str, Any]],
+    section_key: str,
+    keys: tuple[str, ...],
+) -> dict[str, bool]:
+    return {
+        key: any(
+            isinstance(summary.get(section_key), Mapping) and summary[section_key].get(key) is True
+            for summary in summaries
+        )
+        for key in keys
+    }
+
+
+def _aggregate_target_scopes(summaries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    fingerprints: list[str] = []
+    target_counts: list[int] = []
+    raw_source_value_printed = False
+    direct_chat_id_allowed = False
+    direct_registry_id_allowed = False
+    broad_target_allowed = False
+    for summary in summaries:
+        target_scope = summary.get("target_scope")
+        if not isinstance(target_scope, Mapping):
+            continue
+        target_count = target_scope.get("target_count")
+        if isinstance(target_count, int):
+            target_counts.append(target_count)
+        for fingerprint in target_scope.get("target_fingerprints", []):
+            if isinstance(fingerprint, str) and fingerprint not in fingerprints:
+                fingerprints.append(fingerprint)
+        raw_source_value_printed = raw_source_value_printed or target_scope.get("raw_source_value_printed") is True
+        direct_chat_id_allowed = direct_chat_id_allowed or target_scope.get("direct_chat_id_allowed") is True
+        direct_registry_id_allowed = (
+            direct_registry_id_allowed or target_scope.get("direct_registry_id_allowed") is True
+        )
+        broad_target_allowed = broad_target_allowed or target_scope.get("broad_target_allowed") is True
+    return {
+        "target_count": target_counts[0] if len(set(target_counts)) == 1 else None,
+        "target_fingerprints": fingerprints[:6],
+        "raw_source_value_printed": raw_source_value_printed,
+        "direct_chat_id_allowed": direct_chat_id_allowed,
+        "direct_registry_id_allowed": direct_registry_id_allowed,
+        "broad_target_allowed": broad_target_allowed,
     }
 
 

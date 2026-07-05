@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-origin-evidence-file-read", action="store_true")
     parser.add_argument("--vps-evidence-json")
     parser.add_argument("--allow-vps-evidence-file-read", action="store_true")
-    parser.add_argument("--collector-wrapper-evidence-json")
+    parser.add_argument("--collector-wrapper-evidence-json", action="append")
     parser.add_argument("--allow-collector-wrapper-evidence-file-read", action="store_true")
     return parser
 
@@ -89,7 +89,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             _read_json_object(args.vps_evidence_json, file_kind="vps_evidence") if args.vps_evidence_json else None
         )
         collector_wrapper_evidence = (
-            _read_json_object(args.collector_wrapper_evidence_json, file_kind="collector_wrapper_evidence")
+            [
+                _read_json_object(path, file_kind="collector_wrapper_evidence")
+                for path in args.collector_wrapper_evidence_json
+            ]
             if args.collector_wrapper_evidence_json
             else None
         )
