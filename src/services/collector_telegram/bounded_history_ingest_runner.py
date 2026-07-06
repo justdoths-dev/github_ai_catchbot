@@ -46,6 +46,7 @@ DEFAULT_MAX_MESSAGES = DEFAULT_HISTORY_LIMIT
 MAX_MESSAGES_HARD_LIMIT = MAX_HISTORY_LIMIT
 EXACT_TARGET_HISTORY_WINDOW_LIMIT_HARD_CAP = 3
 EXACT_TARGET_HISTORY_WINDOW_OFFSETS = (0, -1, -2)
+EXACT_TARGET_ANCHORLESS_HISTORY_WINDOW_LIMIT_HARD_CAP = 3
 HISTORY_READ_TIMEOUT_SEC = 30.0
 HISTORY_RECEIVE_TIMEOUT_SEC = 1.0
 AUTH_READY_TIMEOUT_SEC = 30.0
@@ -759,6 +760,28 @@ def _exact_target_history_read_windows(*, target_message_id: int, history_limit:
     return tuple(windows)
 
 
+def _exact_target_anchorless_history_read_windows() -> tuple[_HistoryReadWindow, ...]:
+    return (
+        _HistoryReadWindow(
+            from_message_id=0,
+            offset=0,
+            limit=EXACT_TARGET_ANCHORLESS_HISTORY_WINDOW_LIMIT_HARD_CAP,
+        ),
+    )
+
+
+def _select_exact_target_messages(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    target_message_id: int,
+) -> tuple[Mapping[str, Any], ...]:
+    return tuple(
+        dict(message)
+        for message in messages
+        if isinstance(message, Mapping) and _message_id(message) == target_message_id
+    )
+
+
 async def _fetch_history_for_target(
     *,
     history_client: BoundedHistoryClient,
@@ -800,16 +823,37 @@ async def _fetch_history_for_target(
         saw_successful_window = True
         if len(messages) > window.limit:
             raise BoundedHistoryIngestError("history_result_exceeds_requested_limit")
-        selected_messages = [
-            dict(message)
-            for message in messages
-            if isinstance(message, Mapping) and _message_id(message) == target_message_id
-        ]
+        selected_messages = _select_exact_target_messages(messages, target_message_id=target_message_id)
         if selected_messages:
             return tuple(selected_messages)
 
     if bounded_window_failure is not None and not saw_successful_window:
-        raise bounded_window_failure
+        anchorless_bounded_window_failure: BoundedHistoryIngestError | None = None
+        for window in _exact_target_anchorless_history_read_windows():
+            state.history_window_attempts += 1
+            try:
+                messages = await history_client.fetch_newest_history_messages(
+                    chat_id=target.chat_id,
+                    limit=window.limit,
+                    from_message_id=window.from_message_id,
+                    offset=window.offset,
+                )
+            except BoundedHistoryIngestError as exc:
+                if (
+                    exc.error_code == "telegram_history_read_failed"
+                    and exc.history_read_failure_cause_bucket == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT
+                ):
+                    anchorless_bounded_window_failure = exc
+                    continue
+                raise
+
+            if len(messages) > window.limit:
+                raise BoundedHistoryIngestError("history_result_exceeds_requested_limit")
+            selected_messages = _select_exact_target_messages(messages, target_message_id=target_message_id)
+            if selected_messages:
+                return tuple(selected_messages)
+        if anchorless_bounded_window_failure is not None:
+            raise anchorless_bounded_window_failure
     return ()
 
 
