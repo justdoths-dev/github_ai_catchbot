@@ -77,16 +77,39 @@ _SOURCE_EVENT_TYPES = frozenset(
         "source_message.reconciled.v1",
     }
 )
+HISTORY_READ_CAUSE_REQUEST_CONSTRUCTION_REPAIR = "request_construction_repair"
+HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT = "bounded_window_adjustment"
+HISTORY_READ_CAUSE_RUNTIME_TDLIB_ACCESS_ISSUE = "runtime_tdlib_access_issue"
+HISTORY_READ_CAUSE_TARGET_UNAVAILABLE = "target_unavailable"
+_HISTORY_READ_FAILURE_CAUSE_BUCKETS = frozenset(
+    {
+        HISTORY_READ_CAUSE_REQUEST_CONSTRUCTION_REPAIR,
+        HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT,
+        HISTORY_READ_CAUSE_RUNTIME_TDLIB_ACCESS_ISSUE,
+        HISTORY_READ_CAUSE_TARGET_UNAVAILABLE,
+    }
+)
 
 JsonDict = dict[str, Any]
 RuntimeConfigLoader = Callable[[], CollectorTelegramConfig]
 
 
 class BoundedHistoryIngestError(RuntimeError):
-    def __init__(self, error_code: str, *, partial_publish: "PublishEventsResult | None" = None) -> None:
+    def __init__(
+        self,
+        error_code: str,
+        *,
+        partial_publish: "PublishEventsResult | None" = None,
+        history_read_failure_cause_bucket: str | None = None,
+    ) -> None:
         super().__init__(error_code)
         self.error_code = error_code
         self.partial_publish = partial_publish
+        self.history_read_failure_cause_bucket = (
+            history_read_failure_cause_bucket
+            if history_read_failure_cause_bucket in _HISTORY_READ_FAILURE_CAUSE_BUCKETS
+            else None
+        )
 
 
 class _RunResultReady(Exception):
@@ -330,6 +353,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
     per_channel_results: tuple[JsonDict, ...] = ()
     partial_committed_target_fingerprints: tuple[str, ...] = ()
     error_class: str | None = None
+    history_read_failure_cause_bucket: str | None = None
 
     def to_sanitized_dict(self) -> dict[str, Any]:
         gates = {
@@ -446,6 +470,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "rollout_scope": self.rollout_scope,
             "status": _report_status(self.status, self.ok),
             "reason_code": self.error_code or "ok",
+            "history_read_failure_cause_bucket": self.history_read_failure_cause_bucket,
             "target_count": self.target_count,
             "max_targets": self.max_targets,
             "target_fingerprints": list(self.target_fingerprints),
@@ -564,11 +589,17 @@ class _TargetSourceLastExecutionFailed(Exception):
         *,
         partial: _TargetSourceLastExecution,
         error_class: str | None = None,
+        history_read_failure_cause_bucket: str | None = None,
     ) -> None:
         super().__init__(error_code)
         self.error_code = error_code
         self.partial = partial
         self.error_class = error_class
+        self.history_read_failure_cause_bucket = (
+            history_read_failure_cause_bucket
+            if history_read_failure_cause_bucket in _HISTORY_READ_FAILURE_CAUSE_BUCKETS
+            else None
+        )
 
 
 class _TDLibBoundedHistoryClient:
@@ -618,7 +649,10 @@ class _TDLibBoundedHistoryClient:
             if response.get("@extra") != extra:
                 continue
             if response.get("@type") == "error":
-                raise BoundedHistoryIngestError("telegram_history_read_failed")
+                raise BoundedHistoryIngestError(
+                    "telegram_history_read_failed",
+                    history_read_failure_cause_bucket=_classify_tdlib_history_read_error_cause(response),
+                )
             messages = response.get("messages")
             if not isinstance(messages, list):
                 raise BoundedHistoryIngestError("telegram_history_response_invalid")
@@ -914,6 +948,7 @@ async def run_bounded_telegram_collector_history_ingest(
         targets: Sequence[_ResolvedTarget] = (),
         channel_results: Sequence[JsonDict] = (),
         partial_committed_target_fingerprints: Sequence[str] = (),
+        history_read_failure_cause_bucket: str | None = None,
     ) -> BoundedTelegramCollectorHistoryIngestResult:
         source_readback = readback or SourceLastReadbackResult()
         publish_event_fingerprints = () if publish is None else publish.event_fingerprints
@@ -983,6 +1018,9 @@ async def run_bounded_telegram_collector_history_ingest(
             per_channel_results=tuple(dict(item) for item in channel_results),
             partial_committed_target_fingerprints=tuple(partial_committed_target_fingerprints),
             error_class=error_class,
+            history_read_failure_cause_bucket=history_read_failure_cause_bucket
+            if history_read_failure_cause_bucket in _HISTORY_READ_FAILURE_CAUSE_BUCKETS
+            else None,
         )
 
     if not config.operator_approved:
@@ -1115,6 +1153,7 @@ async def run_bounded_telegram_collector_history_ingest(
                         status="failed",
                         reason_code=exc.error_code,
                         execution=exc.partial,
+                        history_read_failure_cause_bucket=exc.history_read_failure_cause_bucket,
                     ),
                 ]
                 if exc.partial.source_commit_durable:
@@ -1138,6 +1177,7 @@ async def run_bounded_telegram_collector_history_ingest(
                     readback=aggregate["readback"],
                     channel_results=partial_reports,
                     partial_committed_target_fingerprints=source_committed_target_fingerprints,
+                    history_read_failure_cause_bucket=exc.history_read_failure_cause_bucket,
                 )
                 raise _RunResultReady
 
@@ -1234,7 +1274,11 @@ async def run_bounded_telegram_collector_history_ingest(
     except _RunResultReady:
         pass
     except BoundedHistoryIngestError as exc:
-        result = make_result("blocked", exc.error_code)
+        result = make_result(
+            "blocked",
+            exc.error_code,
+            history_read_failure_cause_bucket=exc.history_read_failure_cause_bucket,
+        )
     except Exception as exc:
         result = make_result("failed", "unexpected_failure", error_class=_safe_exception_class(exc))
     finally:
@@ -1580,7 +1624,11 @@ async def _execute_target_source_last(
     except _TargetSourceLastExecutionFailed:
         raise
     except BoundedHistoryIngestError as exc:
-        raise _TargetSourceLastExecutionFailed(exc.error_code, partial=partial()) from exc
+        raise _TargetSourceLastExecutionFailed(
+            exc.error_code,
+            partial=partial(),
+            history_read_failure_cause_bucket=exc.history_read_failure_cause_bucket,
+        ) from exc
     except Exception as exc:
         raise _TargetSourceLastExecutionFailed(
             "unexpected_failure",
@@ -1701,6 +1749,7 @@ def _channel_report(
     status: str,
     reason_code: str,
     execution: _TargetSourceLastExecution | None = None,
+    history_read_failure_cause_bucket: str | None = None,
 ) -> JsonDict:
     readback = execution.readback if execution is not None else SourceLastReadbackResult()
     return {
@@ -1708,6 +1757,9 @@ def _channel_report(
         "registry_target_fingerprint": _target_fingerprint(target),
         "status": status,
         "reason_code": reason_code,
+        "history_read_failure_cause_bucket": history_read_failure_cause_bucket
+        if history_read_failure_cause_bucket in _HISTORY_READ_FAILURE_CAUSE_BUCKETS
+        else None,
         "messages_requested": history_limit,
         "messages_seen": 0 if execution is None else execution.messages_seen,
         "bounded_counts": {
@@ -2184,6 +2236,94 @@ def _report_status(status: str, ok: bool) -> str:
 
 def _runtime_close_error_code(commit: bool) -> str:
     return "runtime_commit_failed" if commit else "runtime_rollback_failed"
+
+
+def _classify_tdlib_history_read_error_cause(response: Mapping[str, Any]) -> str:
+    code = _tdlib_error_code(response.get("code"))
+    message = _tdlib_error_message(response.get("message"))
+    normalized = message.replace("_", " ").replace("-", " ")
+
+    runtime_or_access_markers = (
+        "authorization",
+        "authorized",
+        "forbidden",
+        "private",
+        "access",
+        "not enough rights",
+        "flood",
+        "too many requests",
+        "rate limit",
+        "timeout",
+        "temporarily",
+        "connection",
+        "network",
+        "database",
+        "tdlib",
+    )
+    if code in {401, 403, 429, 500, 502, 503, 504} or any(
+        marker in normalized for marker in runtime_or_access_markers
+    ):
+        return HISTORY_READ_CAUSE_RUNTIME_TDLIB_ACCESS_ISSUE
+
+    target_unavailable_markers = (
+        "message not found",
+        "chat not found",
+        "not found",
+        "deleted",
+        "unavailable",
+        "deactivated",
+        "migrated",
+    )
+    if code == 404 or any(marker in normalized for marker in target_unavailable_markers):
+        return HISTORY_READ_CAUSE_TARGET_UNAVAILABLE
+
+    bounded_window_markers = (
+        "from message",
+        "from message id",
+        "from_message_id",
+        "offset",
+        "limit",
+        "history",
+        "range",
+        "window",
+        "too old",
+        "too new",
+    )
+    if any(marker in normalized for marker in bounded_window_markers):
+        return HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT
+
+    request_repair_markers = (
+        "bad request",
+        "invalid",
+        "wrong",
+        "unsupported",
+        "parameter",
+        "parse",
+        "chat id",
+        "chat_id",
+        "message id",
+        "message_id",
+        "identifier",
+    )
+    if code == 400 or any(marker in normalized for marker in request_repair_markers):
+        return HISTORY_READ_CAUSE_REQUEST_CONSTRUCTION_REPAIR
+
+    return HISTORY_READ_CAUSE_RUNTIME_TDLIB_ACCESS_ISSUE
+
+
+def _tdlib_error_code(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tdlib_error_message(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.lower()
 
 
 def _safe_exception_class(exc: BaseException) -> str:

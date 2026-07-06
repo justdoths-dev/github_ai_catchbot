@@ -9,7 +9,9 @@ from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from src.services.collector_telegram.bounded_history_ingest_runner import (
+    BoundedHistoryIngestError,
     BoundedTelegramCollectorHistoryIngestRuntimeHandle,
+    HISTORY_READ_CAUSE_TARGET_UNAVAILABLE,
 )
 from src.services.collector_telegram.config import CollectorTelegramConfig
 from src.services.collector_telegram.models import CollectorEnvironment, CollectorMode, TrackedChat
@@ -199,7 +201,8 @@ class FakeRepository:
 
 
 class FakeHistoryClient:
-    def __init__(self) -> None:
+    def __init__(self, *, failure_by_chat: dict[int, Exception] | None = None) -> None:
+        self.failure_by_chat = failure_by_chat or {}
         self.calls: list[dict[str, int]] = []
 
     async def fetch_newest_history_messages(
@@ -216,6 +219,8 @@ class FakeHistoryClient:
         if offset:
             call["offset"] = offset
         self.calls.append(call)
+        if chat_id in self.failure_by_chat:
+            raise self.failure_by_chat[chat_id]
         return (
             {
                 "@type": "message",
@@ -534,6 +539,56 @@ def test_execute_target_message_id_delegates_without_raw_message_id(capsys) -> N
     ]
     assert "123456" not in output
     assert "trendingrepo" not in output
+
+
+def test_cli_exact_target_history_failure_exposes_safe_cause_bucket_without_raw_values(capsys) -> None:
+    failure = BoundedHistoryIngestError(
+        "telegram_history_read_failed",
+        history_read_failure_cause_bucket=HISTORY_READ_CAUSE_TARGET_UNAVAILABLE,
+    )
+    failure.__cause__ = RuntimeError(CLOSE_EXCEPTION_DETAIL)
+    runtime_builder = FakeRuntimeBuilder()
+    runtime_builder.history_client.failure_by_chat[RAW_CHAT_ID] = failure
+
+    exit_code = runner.main(
+        [
+            "--mode",
+            "execute",
+            "--operator-approved",
+            "--confirm-token",
+            runner.EXECUTE_CONFIRM_TOKEN,
+            "--allow-runtime-config",
+            "--allow-database-read",
+            "--allow-telegram-read",
+            "--allow-database-write",
+            "--allow-source-message-write",
+            "--allow-source-version-write",
+            "--allow-source-outbox-write",
+            "--source-kind",
+            "public_username",
+            "--source-value",
+            "trendingrepo",
+            "--target-message-id",
+            "123456",
+            "--history-limit",
+            "1",
+        ],
+        runtime_config_loader=_runtime_config,
+        runtime_builder=runtime_builder,
+    )
+    output = capsys.readouterr().out
+    parsed = json.loads(output)
+
+    assert exit_code == 1
+    assert parsed["error_code"] == "telegram_history_read_failed"
+    assert parsed["history_read_failure_cause_bucket"] == HISTORY_READ_CAUSE_TARGET_UNAVAILABLE
+    assert parsed["database_write_attempted"] is False
+    assert parsed["source_outbox_write_attempted"] is False
+    assert runtime_builder.history_client.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": 123456}
+    ]
+    for raw in ("123456", str(RAW_CHAT_ID), RAW_MESSAGE_TEXT, CLOSE_EXCEPTION_DETAIL, DB_URL, REDIS_URL, RAW_SECRET):
+        assert raw not in output
 
 
 def test_three_channel_plan_repeated_source_values_delegate_without_live_read_or_raw_output(capsys) -> None:

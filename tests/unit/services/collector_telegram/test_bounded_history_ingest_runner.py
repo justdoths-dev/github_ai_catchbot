@@ -19,6 +19,10 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
     BoundedTelegramCollectorHistoryIngestState,
     EXECUTE_CONFIRM_TOKEN,
     FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN,
+    HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT,
+    HISTORY_READ_CAUSE_REQUEST_CONSTRUCTION_REPAIR,
+    HISTORY_READ_CAUSE_RUNTIME_TDLIB_ACCESS_ISSUE,
+    HISTORY_READ_CAUSE_TARGET_UNAVAILABLE,
     THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
     _TDLibBoundedHistoryClient,
     run_bounded_telegram_collector_history_ingest,
@@ -380,11 +384,15 @@ class FakeTDLibTransport:
         *,
         auth_payloads: list[dict[str, Any]] | None = None,
         history_messages: list[dict[str, Any]] | None = None,
+        history_response: dict[str, Any] | None = None,
+        append_history_response: bool = True,
         log_suppression_attempted: bool = True,
         log_suppression_confirmed: bool = True,
     ) -> None:
         self.auth_payloads = list(auth_payloads or [])
         self.history_messages = list(history_messages or [_message()])
+        self.history_response = deepcopy(history_response) if history_response is not None else None
+        self.append_history_response = append_history_response
         self.log_suppression_attempted = log_suppression_attempted
         self.log_suppression_confirmed = log_suppression_confirmed
         self.initialized = False
@@ -397,14 +405,19 @@ class FakeTDLibTransport:
     async def send(self, request: dict[str, Any]) -> None:
         self.sent_requests.append(dict(request))
         if request.get("@type") == "getChatHistory":
+            if not self.append_history_response:
+                return
             extra = request.get("@extra")
-            self.auth_payloads.append(
-                {
+            response = (
+                deepcopy(self.history_response)
+                if self.history_response is not None
+                else {
                     "@type": "messages",
-                    "@extra": extra,
                     "messages": deepcopy(self.history_messages),
                 }
             )
+            response["@extra"] = extra
+            self.auth_payloads.append(response)
 
     async def receive(self, timeout: float) -> dict[str, Any] | None:
         del timeout
@@ -1436,6 +1449,7 @@ async def test_exact_target_message_id_missing_blocks_without_database_write() -
 
     assert result.ok is False
     assert report["error_code"] == "target_message_missing"
+    assert report["history_read_failure_cause_bucket"] is None
     assert report["telegram_read_attempted"] is True
     assert report["database_write_attempted"] is False
     assert report["source_outbox_write_attempted"] is False
@@ -1444,6 +1458,55 @@ async def test_exact_target_message_id_missing_blocks_without_database_write() -
     assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": target_message_id}]
     assert builder.close_commits == [False]
     assert str(target_message_id) not in rendered
+
+
+@pytest.mark.asyncio
+async def test_exact_target_tdlib_history_error_reports_safe_cause_bucket_without_writes() -> None:
+    target_message_id = RAW_MESSAGE_ID + 1
+    failure = BoundedHistoryIngestError(
+        "telegram_history_read_failed",
+        history_read_failure_cause_bucket=HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT,
+    )
+    failure.__cause__ = RuntimeError(EXCEPTION_DETAIL)
+
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(target_message_id=target_message_id),
+        history=FakeHistoryClient([], failure_by_chat={RAW_CHAT_ID: failure}),
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["error_code"] == "telegram_history_read_failed"
+    assert report["history_read_failure_cause_bucket"] == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT
+    assert report["per_channel_results"][0]["reason_code"] == "telegram_history_read_failed"
+    assert (
+        report["per_channel_results"][0]["history_read_failure_cause_bucket"]
+        == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT
+    )
+    assert report["telegram_read_attempted"] is True
+    assert report["database_write_attempted"] is False
+    assert report["source_message_write_attempted"] is False
+    assert report["source_version_write_attempted"] is False
+    assert report["source_outbox_write_attempted"] is False
+    assert report["event_outbox_status_write_attempted"] is False
+    assert repository.messages == {}
+    assert repository.versions == {}
+    assert repository.outbox == []
+    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": target_message_id}]
+    assert builder.close_commits == [False]
+    assert report["raw_values_printed"]["tdlib_payload"] is False
+    assert report["raw_values_printed"]["exception_body"] is False
+    for raw_value in (
+        str(RAW_CHAT_ID),
+        str(target_message_id),
+        RAW_MESSAGE_TEXT,
+        EXCEPTION_DETAIL,
+        DB_URL,
+        RAW_SECRET,
+        "runtime.env",
+    ):
+        assert raw_value not in rendered
 
 
 @pytest.mark.asyncio
@@ -2482,6 +2545,106 @@ async def test_tdlib_history_client_submits_parameters_before_history_request() 
     assert transport.sent_requests[1]["api_hash"] == RAW_SECRET
     assert transport.sent_requests[2]["encryption_key"]
     assert transport.sent_requests[3]["chat_id"] == RAW_CHAT_ID
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("history_error", "expected_bucket"),
+    [
+        (
+            {"@type": "error", "code": 400, "message": "Bad Request: CHAT_ID_INVALID"},
+            HISTORY_READ_CAUSE_REQUEST_CONSTRUCTION_REPAIR,
+        ),
+        (
+            {"@type": "error", "code": 400, "message": "Bad Request: history offset out of range"},
+            HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT,
+        ),
+        (
+            {"@type": "error", "code": 403, "message": "Forbidden: not authorized for this chat"},
+            HISTORY_READ_CAUSE_RUNTIME_TDLIB_ACCESS_ISSUE,
+        ),
+        (
+            {"@type": "error", "code": 404, "message": "MESSAGE_NOT_FOUND"},
+            HISTORY_READ_CAUSE_TARGET_UNAVAILABLE,
+        ),
+    ],
+)
+async def test_tdlib_history_error_classifies_safe_cause_bucket_without_payload(
+    history_error: dict[str, Any],
+    expected_bucket: str,
+) -> None:
+    state = BoundedTelegramCollectorHistoryIngestState()
+    raw_history_error = dict(history_error)
+    raw_history_error["message"] = f"{history_error['message']} {RAW_MESSAGE_ID}"
+    raw_history_error["source_text"] = RAW_MESSAGE_TEXT
+    raw_history_error["debug_detail"] = EXCEPTION_DETAIL
+    transport = FakeTDLibTransport(
+        auth_payloads=[{"@type": "authorizationStateReady"}],
+        history_response=raw_history_error,
+    )
+    tdlib = TDLibClient(_runtime_config(), transport=transport)
+    client = _TDLibBoundedHistoryClient(tdlib, state=state, auth_ready_timeout_sec=0.1)
+
+    with pytest.raises(BoundedHistoryIngestError) as exc_info:
+        await client.fetch_newest_history_messages(chat_id=RAW_CHAT_ID, limit=1)
+
+    rendered = json.dumps(
+        {
+            "error_code": exc_info.value.error_code,
+            "history_read_failure_cause_bucket": exc_info.value.history_read_failure_cause_bucket,
+        },
+        sort_keys=True,
+    )
+    assert exc_info.value.error_code == "telegram_history_read_failed"
+    assert exc_info.value.history_read_failure_cause_bucket == expected_bucket
+    assert state.telegram_read_called is True
+    assert [request["@type"] for request in transport.sent_requests] == [
+        "getAuthorizationState",
+        "getChatHistory",
+    ]
+    for raw_value in (str(RAW_MESSAGE_ID), RAW_MESSAGE_TEXT, EXCEPTION_DETAIL):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_tdlib_history_response_invalid_and_timeout_remain_distinct() -> None:
+    invalid_state = BoundedTelegramCollectorHistoryIngestState()
+    invalid_transport = FakeTDLibTransport(
+        auth_payloads=[{"@type": "authorizationStateReady"}],
+        history_response={"@type": "messages", "unexpected": "shape"},
+    )
+    invalid_tdlib = TDLibClient(_runtime_config(), transport=invalid_transport)
+    invalid_client = _TDLibBoundedHistoryClient(
+        invalid_tdlib,
+        state=invalid_state,
+        auth_ready_timeout_sec=0.1,
+    )
+
+    with pytest.raises(BoundedHistoryIngestError) as invalid_exc:
+        await invalid_client.fetch_newest_history_messages(chat_id=RAW_CHAT_ID, limit=1)
+
+    timeout_state = BoundedTelegramCollectorHistoryIngestState()
+    timeout_transport = FakeTDLibTransport(
+        auth_payloads=[{"@type": "authorizationStateReady"}],
+        append_history_response=False,
+    )
+    timeout_tdlib = TDLibClient(_runtime_config(), transport=timeout_transport)
+    timeout_client = _TDLibBoundedHistoryClient(
+        timeout_tdlib,
+        state=timeout_state,
+        timeout_sec=0.01,
+        auth_ready_timeout_sec=0.1,
+    )
+
+    with pytest.raises(BoundedHistoryIngestError) as timeout_exc:
+        await timeout_client.fetch_newest_history_messages(chat_id=RAW_CHAT_ID, limit=1)
+
+    assert invalid_exc.value.error_code == "telegram_history_response_invalid"
+    assert invalid_exc.value.history_read_failure_cause_bucket is None
+    assert invalid_state.telegram_read_called is True
+    assert timeout_exc.value.error_code == "telegram_history_read_timeout"
+    assert timeout_exc.value.history_read_failure_cause_bucket is None
+    assert timeout_state.telegram_read_called is True
 
 
 @pytest.mark.asyncio
