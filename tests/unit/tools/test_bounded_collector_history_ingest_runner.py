@@ -202,8 +202,20 @@ class FakeHistoryClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, int]] = []
 
-    async def fetch_newest_history_messages(self, *, chat_id: int, limit: int):
-        self.calls.append({"chat_id": chat_id, "limit": limit})
+    async def fetch_newest_history_messages(
+        self,
+        *,
+        chat_id: int,
+        limit: int,
+        from_message_id: int = 0,
+        offset: int = 0,
+    ):
+        call = {"chat_id": chat_id, "limit": limit}
+        if from_message_id:
+            call["from_message_id"] = from_message_id
+        if offset:
+            call["offset"] = offset
+        self.calls.append(call)
         return (
             {
                 "@type": "message",
@@ -348,6 +360,7 @@ def test_parser_exposes_only_approved_bounded_flags() -> None:
         "--rollout-scope",
         "--source-kind",
         "--source-value",
+        "--target-message-id",
         "--registry-id-suffix",
         "--max-targets",
         "--history-limit",
@@ -478,6 +491,49 @@ def test_execute_accepts_max_messages_alias_for_exact_one_channel_live_read(caps
         RAW_SECRET,
     ):
         assert raw not in output
+
+
+def test_execute_target_message_id_delegates_without_raw_message_id(capsys) -> None:
+    runtime_builder = FakeRuntimeBuilder()
+    exit_code = runner.main(
+        [
+            "--mode",
+            "execute",
+            "--operator-approved",
+            "--confirm-token",
+            runner.EXECUTE_CONFIRM_TOKEN,
+            "--allow-runtime-config",
+            "--allow-database-read",
+            "--allow-telegram-read",
+            "--allow-database-write",
+            "--allow-source-message-write",
+            "--allow-source-version-write",
+            "--allow-source-outbox-write",
+            "--source-kind",
+            "public_username",
+            "--source-value",
+            "trendingrepo",
+            "--target-message-id",
+            "123456",
+            "--history-limit",
+            "1",
+        ],
+        runtime_config_loader=_runtime_config,
+        runtime_builder=runtime_builder,
+    )
+    output = capsys.readouterr().out
+    parsed = json.loads(output)
+
+    assert exit_code == 0
+    assert parsed["ok"] is True
+    assert parsed["target_message_fingerprint"].startswith("sha256:")
+    assert parsed["gates"]["target_message_id_present"] is True
+    assert parsed["messages_seen"] == 1
+    assert runtime_builder.history_client.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": 123456}
+    ]
+    assert "123456" not in output
+    assert "trendingrepo" not in output
 
 
 def test_three_channel_plan_repeated_source_values_delegate_without_live_read_or_raw_output(capsys) -> None:

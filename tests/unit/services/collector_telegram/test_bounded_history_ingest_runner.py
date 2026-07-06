@@ -326,8 +326,20 @@ class FakeHistoryClient:
         self.calls: list[dict[str, int]] = []
         self.closed = False
 
-    async def fetch_newest_history_messages(self, *, chat_id: int, limit: int):
-        self.calls.append({"chat_id": chat_id, "limit": limit})
+    async def fetch_newest_history_messages(
+        self,
+        *,
+        chat_id: int,
+        limit: int,
+        from_message_id: int = 0,
+        offset: int = 0,
+    ):
+        call = {"chat_id": chat_id, "limit": limit}
+        if from_message_id:
+            call["from_message_id"] = from_message_id
+        if offset:
+            call["offset"] = offset
+        self.calls.append(call)
         if chat_id in self.failure_by_chat:
             raise self.failure_by_chat[chat_id]
         return tuple(deepcopy(self.messages_by_chat.get(chat_id, self.messages)))
@@ -1378,6 +1390,76 @@ async def test_exact_public_username_target_accepts_at_prefixed_source_value_and
     assert repository.registry_lookups == ["trendingrepo"]
     assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
     assert builder.close_commits == [True]
+
+
+@pytest.mark.asyncio
+async def test_exact_target_message_id_filters_history_to_one_source_message() -> None:
+    target_message_id = RAW_MESSAGE_ID + 1
+    history = FakeHistoryClient(
+        [
+            _message(message_id=RAW_MESSAGE_ID),
+            _message(message_id=target_message_id, text="target repo https://github.com/example/tool"),
+        ]
+    )
+
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(target_message_id=target_message_id, history_limit=2),
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is True
+    assert report["messages_requested"] == 2
+    assert report["messages_seen"] == 1
+    assert report["source_messages_created_count"] == 1
+    assert report["source_created_events_count"] == 1
+    assert report["target_message_fingerprint"].startswith("sha256:")
+    assert report["gates"]["target_message_id_present"] is True
+    assert list(repository.messages) == [(RAW_CHAT_ID, target_message_id)]
+    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 2, "from_message_id": target_message_id}]
+    assert builder.close_commits == [True]
+    assert str(target_message_id) not in rendered
+    assert "target repo https://github.com/example/tool" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_exact_target_message_id_missing_blocks_without_database_write() -> None:
+    target_message_id = RAW_MESSAGE_ID + 1
+
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(target_message_id=target_message_id),
+        history=FakeHistoryClient([_message(message_id=RAW_MESSAGE_ID)]),
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["error_code"] == "target_message_missing"
+    assert report["telegram_read_attempted"] is True
+    assert report["database_write_attempted"] is False
+    assert report["source_outbox_write_attempted"] is False
+    assert repository.messages == {}
+    assert repository.outbox == []
+    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": target_message_id}]
+    assert builder.close_commits == [False]
+    assert str(target_message_id) not in rendered
+
+
+@pytest.mark.asyncio
+async def test_target_message_id_requires_single_exact_public_username_before_runtime_config() -> None:
+    result, loader, builder, repository, history = await _run(
+        _approved_three_channel_config(target_message_id=RAW_MESSAGE_ID),
+        repository=_three_target_repository(),
+        history=_three_channel_history(),
+    )
+
+    assert result.ok is False
+    assert result.error_code == "target_message_requires_single_exact_target"
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
 
 
 @pytest.mark.asyncio

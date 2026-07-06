@@ -155,7 +155,15 @@ class BoundedHistoryRepository(Protocol):
 
 
 class BoundedHistoryClient(Protocol):
-    async def fetch_newest_history_messages(self, *, chat_id: int, limit: int) -> Sequence[Mapping[str, Any]]: ...
+    async def fetch_newest_history_messages(
+        self,
+        *,
+        chat_id: int,
+        limit: int,
+        from_message_id: int = 0,
+        offset: int = 0,
+    ) -> Sequence[Mapping[str, Any]]: ...
+
     async def close(self) -> None: ...
 
 
@@ -170,6 +178,7 @@ class BoundedTelegramCollectorHistoryIngestConfig:
     source_kind: str = SOURCE_KIND_PUBLIC_USERNAME
     source_value: str | None = None
     source_values: tuple[str, ...] = ()
+    target_message_id: int | None = None
     registry_id_suffix: str | None = None
     max_targets: int | None = None
     history_limit: int = DEFAULT_HISTORY_LIMIT
@@ -328,6 +337,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "confirm_token_present": bool((self.config.confirm_token or "").strip()),
             "confirm_token_valid": _confirm_token_valid(self.config),
             "runtime_config_allowed": self.config.allow_runtime_config,
+            "target_message_id_present": self.config.target_message_id is not None,
             "database_read_allowed": self.config.allow_database_read,
             "telegram_read_allowed": self.config.allow_telegram_read,
             "database_write_allowed": self.config.allow_database_write,
@@ -443,6 +453,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "duplicate_noop_proof": duplicate_noop_proof,
             "partial_committed_target_fingerprints": list(self.partial_committed_target_fingerprints),
             "exact_channel_target_fingerprint": self.exact_channel_target_fingerprint,
+            "target_message_fingerprint": _target_message_fingerprint(self.config.target_message_id),
             "registry_target_fingerprint": self.registry_target_fingerprint,
             "source_message_fingerprints": list(self.source_message_fingerprints),
             "source_outbox_event_fingerprints": list(self.source_outbox_event_fingerprints),
@@ -462,6 +473,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "gates": gates,
             "operator_approved": self.config.operator_approved,
             "runtime_config_allowed": self.config.allow_runtime_config,
+            "target_message_id_present": self.config.target_message_id is not None,
             "database_read_allowed": self.config.allow_database_read,
             "telegram_read_allowed": self.config.allow_telegram_read,
             "database_write_allowed": self.config.allow_database_write,
@@ -575,12 +587,19 @@ class _TDLibBoundedHistoryClient:
         self._auth_ready_timeout_sec = auth_ready_timeout_sec
         self._require_native_log_suppression = require_native_log_suppression
 
-    async def fetch_newest_history_messages(self, *, chat_id: int, limit: int) -> Sequence[Mapping[str, Any]]:
+    async def fetch_newest_history_messages(
+        self,
+        *,
+        chat_id: int,
+        limit: int,
+        from_message_id: int = 0,
+        offset: int = 0,
+    ) -> Sequence[Mapping[str, Any]]:
         await self._ensure_ready_for_history_read()
         request = self._tdlib.build_get_chat_history_request(
             chat_id=chat_id,
-            from_message_id=0,
-            offset=0,
+            from_message_id=from_message_id,
+            offset=offset,
             limit=limit,
             only_local=False,
         )
@@ -978,6 +997,13 @@ async def run_bounded_telegram_collector_history_ingest(
         return make_result("blocked", "direct_chat_or_registry_id_target_not_allowed")
     if target_error is not None:
         return make_result("blocked", target_error)
+    target_message_error = _target_message_id_error(
+        config,
+        rollout_scope=rollout_scope,
+        normalized_source_values=normalized_source_values,
+    )
+    if target_message_error is not None:
+        return make_result("blocked", target_message_error)
     if rollout_scope == ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY and config.registry_id_suffix:
         return make_result("blocked", "registry_id_suffix_not_allowed_for_full_registry_rollout")
     if _is_three_channel_rollout(config) and config.registry_id_suffix:
@@ -1450,10 +1476,13 @@ async def _execute_target_source_last(
 
     try:
         state.telegram_read_attempted = True
-        messages = await runtime.history_client.fetch_newest_history_messages(
-            chat_id=target.chat_id,
-            limit=history_limit,
-        )
+        history_request: dict[str, int] = {
+            "chat_id": target.chat_id,
+            "limit": history_limit,
+        }
+        if config.target_message_id is not None:
+            history_request["from_message_id"] = int(config.target_message_id)
+        messages = await runtime.history_client.fetch_newest_history_messages(**history_request)
         state.telegram_read_called = True
         if len(messages) > history_limit:
             raise _TargetSourceLastExecutionFailed(
@@ -1461,6 +1490,15 @@ async def _execute_target_source_last(
                 partial=partial(),
             )
         selected_messages = [dict(message) for message in messages if isinstance(message, Mapping)][:history_limit]
+        if config.target_message_id is not None:
+            selected_messages = [
+                message for message in selected_messages if _message_id(message) == config.target_message_id
+            ]
+            if not selected_messages:
+                raise _TargetSourceLastExecutionFailed(
+                    "target_message_missing",
+                    partial=partial(),
+                )
         _validate_selected_history_messages_for_target(selected_messages, target)
 
         processor = HistoryMessageIngestProcessor(
@@ -1906,6 +1944,25 @@ def _normalize_source_value(value: object | None) -> str | None:
     return normalized or None
 
 
+def _target_message_id_error(
+    config: BoundedTelegramCollectorHistoryIngestConfig,
+    *,
+    rollout_scope: str,
+    normalized_source_values: Sequence[str],
+) -> str | None:
+    if config.target_message_id is None:
+        return None
+    if (
+        isinstance(config.target_message_id, bool)
+        or not isinstance(config.target_message_id, int)
+        or config.target_message_id <= 0
+    ):
+        return "target_message_id_invalid"
+    if rollout_scope != ROLLOUT_SCOPE_EXACT_TARGETS or len(normalized_source_values) != 1:
+        return "target_message_requires_single_exact_target"
+    return None
+
+
 def _source_outbox_write_allowed(config: BoundedTelegramCollectorHistoryIngestConfig) -> bool:
     return bool(config.allow_source_outbox_write or config.allow_outbox_write)
 
@@ -2103,6 +2160,12 @@ def _input_target_fingerprint(normalized_source_value: str | None) -> str:
         "channel_target",
         f"{SOURCE_KIND_PUBLIC_USERNAME}:{normalized_source_value}",
     )
+
+
+def _target_message_fingerprint(target_message_id: int | None) -> str | None:
+    if target_message_id is None:
+        return None
+    return _fingerprint("target_message", target_message_id)
 
 
 def _target_fingerprint(target: _ResolvedTarget | None) -> str | None:

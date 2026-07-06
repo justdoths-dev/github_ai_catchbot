@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rollout-scope", default="exact-targets")
     parser.add_argument("--source-kind", default="public_username")
     parser.add_argument("--source-value", action="append", dest="source_values")
+    parser.add_argument("--target-message-id", type=int, default=None)
     parser.add_argument("--registry-id-suffix", default=None)
     parser.add_argument("--max-targets", type=int, default=None)
     parser.add_argument("--history-limit", type=int, default=10)
@@ -87,6 +88,7 @@ def run(
             source_kind=str(args.source_kind),
             source_value=source_values[0] if len(source_values) == 1 else None,
             source_values=source_values,
+            target_message_id=args.target_message_id,
             registry_id_suffix=args.registry_id_suffix,
             max_targets=args.max_targets,
             history_limit=int(args.history_limit),
