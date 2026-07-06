@@ -323,10 +323,12 @@ class FakeHistoryClient:
         *,
         messages_by_chat: dict[int, list[dict[str, Any]]] | None = None,
         failure_by_chat: dict[int, Exception] | None = None,
+        responses_by_call: list[list[dict[str, Any]] | Exception] | None = None,
     ) -> None:
         self.messages = messages
         self.messages_by_chat = messages_by_chat or {}
         self.failure_by_chat = failure_by_chat or {}
+        self.responses_by_call = list(responses_by_call or [])
         self.calls: list[dict[str, int]] = []
         self.closed = False
 
@@ -344,6 +346,11 @@ class FakeHistoryClient:
         if offset:
             call["offset"] = offset
         self.calls.append(call)
+        if self.responses_by_call:
+            response = self.responses_by_call.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return tuple(deepcopy(response))
         if chat_id in self.failure_by_chat:
             raise self.failure_by_chat[chat_id]
         return tuple(deepcopy(self.messages_by_chat.get(chat_id, self.messages)))
@@ -1427,6 +1434,8 @@ async def test_exact_target_message_id_filters_history_to_one_source_message() -
     assert report["messages_seen"] == 1
     assert report["source_messages_created_count"] == 1
     assert report["source_created_events_count"] == 1
+    assert report["history_window_attempts"] == 1
+    assert report["per_channel_results"][0]["history_window_attempts"] == 1
     assert report["target_message_fingerprint"].startswith("sha256:")
     assert report["gates"]["target_message_id_present"] is True
     assert list(repository.messages) == [(RAW_CHAT_ID, target_message_id)]
@@ -1451,13 +1460,59 @@ async def test_exact_target_message_id_missing_blocks_without_database_write() -
     assert report["error_code"] == "target_message_missing"
     assert report["history_read_failure_cause_bucket"] is None
     assert report["telegram_read_attempted"] is True
+    assert report["history_window_attempts"] == 3
+    assert report["per_channel_results"][0]["history_window_attempts"] == 3
     assert report["database_write_attempted"] is False
     assert report["source_outbox_write_attempted"] is False
     assert repository.messages == {}
     assert repository.outbox == []
-    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": target_message_id}]
+    assert history.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": target_message_id},
+        {"chat_id": RAW_CHAT_ID, "limit": 2, "from_message_id": target_message_id, "offset": -1},
+        {"chat_id": RAW_CHAT_ID, "limit": 3, "from_message_id": target_message_id, "offset": -2},
+    ]
     assert builder.close_commits == [False]
     assert str(target_message_id) not in rendered
+
+
+@pytest.mark.asyncio
+async def test_exact_target_bounded_window_error_retries_and_later_target_writes_once() -> None:
+    target_message_id = RAW_MESSAGE_ID + 1
+    failure = BoundedHistoryIngestError(
+        "telegram_history_read_failed",
+        history_read_failure_cause_bucket=HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT,
+    )
+    history = FakeHistoryClient(
+        [],
+        responses_by_call=[
+            failure,
+            [_message(message_id=target_message_id, text="target repo https://github.com/example/tool")],
+        ],
+    )
+
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(target_message_id=target_message_id),
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is True
+    assert report["messages_seen"] == 1
+    assert report["source_messages_created_count"] == 1
+    assert report["source_versions_appended_count"] == 1
+    assert report["source_created_events_count"] == 1
+    assert report["history_window_attempts"] == 2
+    assert report["per_channel_results"][0]["history_window_attempts"] == 2
+    assert list(repository.messages) == [(RAW_CHAT_ID, target_message_id)]
+    assert len(repository.outbox) == 1
+    assert history.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": target_message_id},
+        {"chat_id": RAW_CHAT_ID, "limit": 2, "from_message_id": target_message_id, "offset": -1},
+    ]
+    assert builder.close_commits == [True]
+    assert str(target_message_id) not in rendered
+    assert "target repo https://github.com/example/tool" not in rendered
 
 
 @pytest.mark.asyncio
@@ -1479,7 +1534,9 @@ async def test_exact_target_tdlib_history_error_reports_safe_cause_bucket_withou
     assert result.ok is False
     assert report["error_code"] == "telegram_history_read_failed"
     assert report["history_read_failure_cause_bucket"] == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT
+    assert report["history_window_attempts"] == 3
     assert report["per_channel_results"][0]["reason_code"] == "telegram_history_read_failed"
+    assert report["per_channel_results"][0]["history_window_attempts"] == 3
     assert (
         report["per_channel_results"][0]["history_read_failure_cause_bucket"]
         == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT
@@ -1493,7 +1550,11 @@ async def test_exact_target_tdlib_history_error_reports_safe_cause_bucket_withou
     assert repository.messages == {}
     assert repository.versions == {}
     assert repository.outbox == []
-    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": target_message_id}]
+    assert history.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": target_message_id},
+        {"chat_id": RAW_CHAT_ID, "limit": 2, "from_message_id": target_message_id, "offset": -1},
+        {"chat_id": RAW_CHAT_ID, "limit": 3, "from_message_id": target_message_id, "offset": -2},
+    ]
     assert builder.close_commits == [False]
     assert report["raw_values_printed"]["tdlib_payload"] is False
     assert report["raw_values_printed"]["exception_body"] is False

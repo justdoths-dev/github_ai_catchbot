@@ -44,6 +44,8 @@ DEFAULT_HISTORY_LIMIT = 10
 MAX_HISTORY_LIMIT = 30
 DEFAULT_MAX_MESSAGES = DEFAULT_HISTORY_LIMIT
 MAX_MESSAGES_HARD_LIMIT = MAX_HISTORY_LIMIT
+EXACT_TARGET_HISTORY_WINDOW_LIMIT_HARD_CAP = 3
+EXACT_TARGET_HISTORY_WINDOW_OFFSETS = (0, -1, -2)
 HISTORY_READ_TIMEOUT_SEC = 30.0
 HISTORY_RECEIVE_TIMEOUT_SEC = 1.0
 AUTH_READY_TIMEOUT_SEC = 30.0
@@ -230,6 +232,7 @@ class BoundedTelegramCollectorHistoryIngestState:
     database_read_attempted: bool = False
     registry_lookup_attempted: bool = False
     registry_targets_seen_count: int = 0
+    history_window_attempts: int = 0
     tdlib_auth_ready_checked: bool = False
     tdlib_auth_ready: bool = False
     tdlib_parameters_submitted: bool = False
@@ -513,6 +516,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "registry_lookup_attempted": self.state.registry_lookup_attempted,
             "registry_read_count": self.state.registry_targets_seen_count,
             "registry_targets_seen_count": self.state.registry_targets_seen_count,
+            "history_window_attempts": self.state.history_window_attempts,
             "tdlib_auth_ready_checked": self.state.tdlib_auth_ready_checked,
             "tdlib_auth_ready": self.state.tdlib_auth_ready,
             "tdlib_parameters_submitted": self.state.tdlib_parameters_submitted,
@@ -569,6 +573,7 @@ class _ResolvedTarget:
 class _TargetSourceLastExecution:
     target: _ResolvedTarget
     messages_seen: int = 0
+    history_window_attempts: int = 0
     source_messages_created_count: int = 0
     source_versions_appended_count: int = 0
     outbox_events_inserted_count: int = 0
@@ -600,6 +605,13 @@ class _TargetSourceLastExecutionFailed(Exception):
             if history_read_failure_cause_bucket in _HISTORY_READ_FAILURE_CAUSE_BUCKETS
             else None
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoryReadWindow:
+    limit: int
+    from_message_id: int = 0
+    offset: int = 0
 
 
 class _TDLibBoundedHistoryClient:
@@ -727,6 +739,78 @@ class _TDLibBoundedHistoryClient:
     def _copy_log_suppression_state(self) -> None:
         self._state.tdlib_log_suppression_attempted = self._tdlib.native_log_suppression_attempted()
         self._state.tdlib_log_suppression_confirmed = self._tdlib.native_log_suppression_confirmed()
+
+
+def _exact_target_history_read_windows(*, target_message_id: int, history_limit: int) -> tuple[_HistoryReadWindow, ...]:
+    base_limit = min(history_limit, EXACT_TARGET_HISTORY_WINDOW_LIMIT_HARD_CAP)
+    windows: list[_HistoryReadWindow] = []
+    for offset in EXACT_TARGET_HISTORY_WINDOW_OFFSETS:
+        minimum_limit = max(1, -offset + 1)
+        limit = min(EXACT_TARGET_HISTORY_WINDOW_LIMIT_HARD_CAP, max(base_limit, minimum_limit))
+        if offset < 0 and limit < -offset:
+            continue
+        windows.append(
+            _HistoryReadWindow(
+                from_message_id=target_message_id,
+                offset=offset,
+                limit=limit,
+            )
+        )
+    return tuple(windows)
+
+
+async def _fetch_history_for_target(
+    *,
+    history_client: BoundedHistoryClient,
+    target: _ResolvedTarget,
+    history_limit: int,
+    target_message_id: int | None,
+    state: BoundedTelegramCollectorHistoryIngestState,
+) -> Sequence[Mapping[str, Any]]:
+    if target_message_id is None:
+        state.history_window_attempts += 1
+        return await history_client.fetch_newest_history_messages(
+            chat_id=target.chat_id,
+            limit=history_limit,
+        )
+
+    bounded_window_failure: BoundedHistoryIngestError | None = None
+    saw_successful_window = False
+    for window in _exact_target_history_read_windows(
+        target_message_id=target_message_id,
+        history_limit=history_limit,
+    ):
+        state.history_window_attempts += 1
+        try:
+            messages = await history_client.fetch_newest_history_messages(
+                chat_id=target.chat_id,
+                limit=window.limit,
+                from_message_id=window.from_message_id,
+                offset=window.offset,
+            )
+        except BoundedHistoryIngestError as exc:
+            if (
+                exc.error_code == "telegram_history_read_failed"
+                and exc.history_read_failure_cause_bucket == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT
+            ):
+                bounded_window_failure = exc
+                continue
+            raise
+
+        saw_successful_window = True
+        if len(messages) > window.limit:
+            raise BoundedHistoryIngestError("history_result_exceeds_requested_limit")
+        selected_messages = [
+            dict(message)
+            for message in messages
+            if isinstance(message, Mapping) and _message_id(message) == target_message_id
+        ]
+        if selected_messages:
+            return tuple(selected_messages)
+
+    if bounded_window_failure is not None and not saw_successful_window:
+        raise bounded_window_failure
+    return ()
 
 
 class HistoryMessageIngestProcessor:
@@ -1500,11 +1584,13 @@ async def _execute_target_source_last(
     source_message_suffixes: list[str] = []
     readback = SourceLastReadbackResult()
     source_commit_durable = False
+    history_window_attempts = 0
 
     def partial() -> _TargetSourceLastExecution:
         return _TargetSourceLastExecution(
             target=target,
             messages_seen=len(selected_messages),
+            history_window_attempts=history_window_attempts,
             source_messages_created_count=created_count,
             source_versions_appended_count=version_count,
             outbox_events_inserted_count=outbox_count,
@@ -1520,13 +1606,17 @@ async def _execute_target_source_last(
 
     try:
         state.telegram_read_attempted = True
-        history_request: dict[str, int] = {
-            "chat_id": target.chat_id,
-            "limit": history_limit,
-        }
-        if config.target_message_id is not None:
-            history_request["from_message_id"] = int(config.target_message_id)
-        messages = await runtime.history_client.fetch_newest_history_messages(**history_request)
+        attempt_start = state.history_window_attempts
+        try:
+            messages = await _fetch_history_for_target(
+                history_client=runtime.history_client,
+                target=target,
+                history_limit=history_limit,
+                target_message_id=config.target_message_id,
+                state=state,
+            )
+        finally:
+            history_window_attempts = state.history_window_attempts - attempt_start
         state.telegram_read_called = True
         if len(messages) > history_limit:
             raise _TargetSourceLastExecutionFailed(
@@ -1762,6 +1852,7 @@ def _channel_report(
         else None,
         "messages_requested": history_limit,
         "messages_seen": 0 if execution is None else execution.messages_seen,
+        "history_window_attempts": 0 if execution is None else execution.history_window_attempts,
         "bounded_counts": {
             "source_messages_created": 0 if execution is None else execution.source_messages_created_count,
             "source_versions_created": 0 if execution is None else execution.source_versions_appended_count,
