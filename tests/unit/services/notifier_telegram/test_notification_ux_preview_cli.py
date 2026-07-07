@@ -17,6 +17,7 @@ from services.notifier_telegram.models import (
     CandidateRenderContext,
     JudgeOutputRenderContext,
     NotificationPlanDraft,
+    NotificationRenderDraft,
 )
 from tests.component.services.notifier_telegram._fakes import FakeRepository
 
@@ -117,25 +118,55 @@ async def test_preview_passes_for_later_normal_silent_github_button_without_raw_
     assert code == 0
     assert payload["status"] == "pass"
     assert payload["checks_failed"] == []
+    assert payload["source_type_visible"] is True
+    assert payload["severity_visible"] is True
+    assert payload["confidence_visible_or_not_applicable"] is True
+    assert payload["risk_marker_present"] is True
+    assert payload["recommended_action_marker_present"] is True
+    assert payload["link_buttons_present"] is True
+    assert payload["no_raw_values"] is True
+    assert payload["quality_checks"] == payload["checks"]
     assert payload["checks"]["verdict_visible_in_first_three_lines"] is True
     assert payload["checks"]["urgency_visible_in_first_three_lines"] is True
+    assert payload["checks"]["source_type_visible"] is True
+    assert payload["checks"]["severity_visible"] is True
+    assert payload["checks"]["title_visible_in_first_three_lines"] is True
+    assert payload["checks"]["confidence_visible_or_not_applicable"] is True
     assert payload["checks"]["korean_summary_marker_present"] is True
     assert payload["checks"]["skeptical_or_risk_marker_present"] is True
     assert payload["checks"]["why_it_matters_marker_present"] is True
+    assert payload["checks"]["risk_marker_present"] is True
     assert payload["checks"]["evidence_limitations_marker_present"] is True
     assert payload["checks"]["recommended_action_marker_present"] is True
     assert payload["checks"]["message_under_configured_limit"] is True
     assert payload["checks"]["link_preview_disabled"] is True
+    assert payload["checks"]["parse_strategy_entities"] is True
     assert payload["checks"]["protect_content_false"] is True
+    assert payload["checks"]["link_buttons_present"] is True
     assert payload["checks"]["primary_url_not_in_message_text_when_button_exists"] is True
+    assert payload["checks"]["no_raw_values"] is True
     assert payload["checks"]["no_db_or_redis_url_in_message_text"] is True
     assert payload["checks"]["no_sensitive_marker_or_error_body_in_message_text"] is True
     assert payload["checks"]["no_source_or_raw_json_in_message_text"] is True
+    assert payload["first_nonempty_lines"][:3] == [
+        "[MID] [GitHub]",
+        "판정: later | confidence 64",
+        "제목: Useful repo",
+    ]
     assert payload["render_summary"]["message_char_count"] <= payload["render_summary"]["configured_message_char_limit"]
     assert payload["render_summary"]["disable_notification"] is True
     assert payload["render_summary"]["protect_content"] is False
+    assert payload["render_summary"]["parse_strategy"] == "entities"
     assert payload["render_summary"]["link_preview_disabled"] is True
     assert "GitHub 열기" in payload["render_summary"]["button_labels"]
+    assert payload["delivery_quality_summary"] == {
+        "operator_actionability": "pass",
+        "missing_sections": [],
+        "visible_first_lines": payload["first_nonempty_lines"][:3],
+        "button_count": 1,
+        "message_char_count": payload["message_char_count"],
+        "notifier_reinterpreted_policy": False,
+    }
     assert primary_url not in serialized
     assert "raw source text" not in serialized
     assert payload["authority"]["redis_attempted"] is False
@@ -148,6 +179,37 @@ async def test_preview_passes_for_later_normal_silent_github_button_without_raw_
     assert payload["authority"]["alembic_or_ddl_ran"] is False
     assert payload["authority"]["db_write_attempted"] is False
     assert repository.operations == []
+
+
+@pytest.mark.asyncio
+async def test_preview_fails_with_precise_checks_when_render_surface_is_incomplete() -> None:
+    primary_url = "https://github.com/example/repo"
+    repository, plan_id = _preview_repository(primary_url=primary_url)
+    emitted: list[str] = []
+
+    code = await run_notification_ux_render_preview_with_repository(
+        plan_id,
+        repository,
+        renderer=BrokenPreviewRenderer(),
+        emit_json=emitted.append,
+    )
+    payload = json.loads(emitted[0])
+
+    assert code == 1
+    assert payload["status"] == "fail"
+    assert payload["reason_code"] == "render_preview_checks_failed"
+    for expected in (
+        "severity_visible",
+        "source_type_visible",
+        "title_visible_in_first_three_lines",
+        "risk_marker_present",
+        "recommended_action_marker_present",
+        "link_buttons_present",
+    ):
+        assert expected in payload["checks_failed"]
+    assert payload["delivery_quality_summary"]["operator_actionability"] == "fail"
+    assert "추천 행동" in payload["delivery_quality_summary"]["missing_sections"]
+    assert primary_url not in json.dumps(payload, ensure_ascii=False)
 
 
 @pytest.mark.asyncio
@@ -494,6 +556,8 @@ def _preview_repository(
     summary: str = "로컬 개발 워크플로우를 줄이는 GitHub 도구입니다.",
     skeptical: str = "유지보수와 실제 사용 흔적은 추가 확인이 필요합니다.",
     why: str = "반복적인 개발 도구 검토 시간을 줄일 수 있습니다.",
+    scores_json: dict[str, int] | None = None,
+    model_confidence_band: str | None = "medium",
 ) -> tuple[FakeRepository, UUID]:
     repository = repository or FakeRepository()
     plan_id = uuid4()
@@ -525,6 +589,7 @@ def _preview_repository(
         evidence_limitations_ko="공개 증거만 확인했습니다.",
         recommended_action_ko="README와 최근 커밋을 먼저 확인하세요.",
         freshness_note_ko="최근 공개 신호 기준입니다.",
+        scores_json=scores_json if scores_json is not None else {"confidence": 64},
     )
     repository.judge_outputs[judge_output_id] = JudgeOutputRenderContext(
         judge_output_id=judge_output_id,
@@ -533,8 +598,9 @@ def _preview_repository(
             "summary_one_line_ko": summary,
             "skeptical_take_ko": skeptical,
             "why_it_might_matter_ko": why,
+            "red_flags_ko": ["실사용 증거는 추가 확인이 필요합니다."],
         },
-        model_confidence_band="medium",
+        model_confidence_band=model_confidence_band,
     )
     repository.candidates[candidate_group_id] = CandidateRenderContext(
         candidate_group_id=candidate_group_id,
@@ -547,6 +613,26 @@ def _preview_repository(
         source_text_surface=source_text_surface,
     )
     return repository, plan_id
+
+
+class BrokenPreviewRenderer:
+    @property
+    def max_message_chars(self) -> int:
+        return 3800
+
+    def render(self, *, notification_plan_id: UUID, payload) -> NotificationRenderDraft:
+        del payload
+        return NotificationRenderDraft(
+            notification_plan_id=notification_plan_id,
+            message_text="판정: later\n한줄 요약: 불완전한 미리보기",
+            entities_json=[],
+            link_preview_options_json={"is_disabled": True},
+            reply_markup_json=None,
+            disable_notification=True,
+            protect_content=False,
+            parse_strategy="entities",
+            render_hash="broken-preview-render-hash",
+        )
 
 
 class LatestEligibleFakeRepository(FakeRepository):

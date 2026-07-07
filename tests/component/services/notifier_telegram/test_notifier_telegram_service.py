@@ -72,6 +72,23 @@ async def test_dry_run_creates_render_delivery_record_and_outbox_without_transpo
 
 
 @pytest.mark.asyncio
+async def test_service_renders_policy_verdict_without_reinterpreting_scores_or_urgency() -> None:
+    repository, intent = repo_with_valid_case()
+    repository.analyses[intent.analysis_id] = replace(
+        repository.analyses[intent.analysis_id],
+        verdict="later",
+        scores_json={"confidence": 15},
+    )
+    client = RaisingTelegramClient()
+
+    await service(repository, cfg=config(dry_run=True, enable_notification_send=True), client=client).handle_intent(intent)
+
+    assert client.calls == 0
+    first_lines = [line for line in repository.renders[0].message_text.splitlines() if line.strip()][:3]
+    assert first_lines == ["[MID] [GitHub]", "판정: later | confidence 15", "제목: Useful repo"]
+
+
+@pytest.mark.asyncio
 async def test_disabled_send_path_does_not_call_telegram() -> None:
     repository, intent = repo_with_valid_case()
     client = RaisingTelegramClient()

@@ -425,7 +425,7 @@ class NotifierTelegramRepository:
             sa.text(
                 """
                 SELECT analysis_id, candidate_group_id, judge_output_id, verdict, delivery_decision,
-                       reason_codes_json, evidence_limitations_ko, recommended_action_ko,
+                       scores_json, reason_codes_json, evidence_limitations_ko, recommended_action_ko,
                        freshness_note_ko, created_at
                 FROM analyses
                 WHERE analysis_id = CAST(:analysis_id AS uuid)
@@ -442,6 +442,7 @@ class NotifierTelegramRepository:
             judge_output_id=UUID(str(row["judge_output_id"])),
             verdict=str(row["verdict"]),
             delivery_decision=str(row["delivery_decision"]),
+            scores_json=_json_dict(row["scores_json"]),
             reason_codes_json=_string_list(_json_loads(row["reason_codes_json"])),
             evidence_limitations_ko=_string_or_none(row["evidence_limitations_ko"]),
             recommended_action_ko=_string_or_none(row["recommended_action_ko"]),
@@ -1401,6 +1402,11 @@ def _json_loads(value: Any) -> Any:
     if isinstance(value, str):
         return json.loads(value)
     return value
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    parsed = _json_loads(value)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _json_default(value: Any) -> str:

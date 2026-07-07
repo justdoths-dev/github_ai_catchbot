@@ -212,17 +212,23 @@ def _base_packet(
 def _notification_ux_surface(report: Mapping[str, Any]) -> dict[str, Any]:
     checks = _mapping(report.get("checks"))
     summary = _mapping(report.get("render_summary"))
+    delivery_quality = _mapping(report.get("delivery_quality_summary"))
     return {
         "status": _string(report.get("status")),
         "reason_code": _string(report.get("reason_code")),
         "schema_valid": report.get("schema_version") == UX_PREVIEW_SCHEMA_VERSION,
         "checks_failed_count": len(_list(report.get("checks_failed"))),
         "verdict_first_section": checks.get("verdict_visible_in_first_three_lines") is True,
+        "source_type_first_section": checks.get("source_type_visible") is True,
+        "severity_first_section": checks.get("severity_visible") is True,
         "urgency_first_section": checks.get("urgency_visible_in_first_three_lines") is True,
+        "confidence_visible_or_not_applicable": checks.get("confidence_visible_or_not_applicable") is True,
         "skeptical_or_risk_visible": checks.get("skeptical_or_risk_marker_present") is True,
+        "risk_visible": checks.get("risk_marker_present") is True,
         "recommended_action_visible": checks.get("recommended_action_marker_present") is True,
         "evidence_limitations_visible": checks.get("evidence_limitations_marker_present") is True,
         "primary_link_surface_visible": checks.get("url_button_present") is True,
+        "link_buttons_present": checks.get("link_buttons_present") is True,
         "github_primary_expectations_preserved": checks.get("github_primary_button_label") is True,
         "later_or_low_urgency_not_misleading": checks.get("silent_later_or_normal_profile") is True,
         "high_urgency_not_silent": checks.get("high_profile_not_silent") is True,
@@ -250,6 +256,14 @@ def _notification_ux_surface(report: Mapping[str, Any]) -> dict[str, Any]:
         "button_count": _int(summary.get("button_count")),
         "button_labels": [_safe_label(value) for value in _list(summary.get("button_labels"))],
         "disable_notification": _bool_or_none(summary.get("disable_notification")),
+        "delivery_quality_summary": {
+            "operator_actionability": _string(delivery_quality.get("operator_actionability")),
+            "missing_sections": [_safe_label(value) for value in _list(delivery_quality.get("missing_sections"))],
+            "visible_first_lines": [_safe_label(value) for value in _list(delivery_quality.get("visible_first_lines"))],
+            "button_count": _int(delivery_quality.get("button_count")),
+            "message_char_count": _int(delivery_quality.get("message_char_count")),
+            "notifier_reinterpreted_policy": _bool_or_none(delivery_quality.get("notifier_reinterpreted_policy")),
+        },
     }
 
 
@@ -346,11 +360,16 @@ def _surface_checks(surface: Mapping[str, Any]) -> dict[str, bool]:
             "status_pass": surface.get("status") == "pass",
             "checks_failed_zero": surface.get("checks_failed_count") == 0,
             "verdict_first_section": surface.get("verdict_first_section") is True,
+            "source_type_first_section": surface.get("source_type_first_section") is True,
+            "severity_first_section": surface.get("severity_first_section") is True,
             "urgency_first_section": surface.get("urgency_first_section") is True,
+            "confidence_visible_or_not_applicable": surface.get("confidence_visible_or_not_applicable") is True,
             "skeptical_or_risk_visible": surface.get("skeptical_or_risk_visible") is True,
+            "risk_visible": surface.get("risk_visible") is True,
             "recommended_action_visible": surface.get("recommended_action_visible") is True,
             "evidence_limitations_visible": surface.get("evidence_limitations_visible") is True,
             "primary_link_surface_visible": surface.get("primary_link_surface_visible") is True,
+            "link_buttons_present": surface.get("link_buttons_present") is True,
             "github_primary_expectations_preserved": surface.get("github_primary_expectations_preserved") is True,
             "later_or_low_urgency_not_misleading": surface.get("later_or_low_urgency_not_misleading") is True,
             "high_urgency_not_silent": surface.get("high_urgency_not_silent") is True,
@@ -358,6 +377,18 @@ def _surface_checks(surface: Mapping[str, Any]) -> dict[str, bool]:
             "link_preview_disabled": surface.get("link_preview_disabled") is True,
             "protect_content_false": surface.get("protect_content_false") is True,
             "raw_leak_checks_passed": surface.get("raw_leak_checks_passed") is True,
+            "delivery_quality_actionable": _mapping(surface.get("delivery_quality_summary")).get(
+                "operator_actionability"
+            )
+            == "pass",
+            "delivery_quality_no_missing_sections": _mapping(surface.get("delivery_quality_summary")).get(
+                "missing_sections"
+            )
+            == [],
+            "notifier_did_not_reinterpret_policy": _mapping(surface.get("delivery_quality_summary")).get(
+                "notifier_reinterpreted_policy"
+            )
+            is False,
         }
     if "transport_reason_code" in surface:
         return {

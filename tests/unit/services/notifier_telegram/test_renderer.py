@@ -41,10 +41,14 @@ def test_renderer_includes_final_verdict_and_explicit_omissions() -> None:
         ),
     )
 
+    first_lines = [line for line in render.message_text.splitlines() if line.strip()][:3]
+    assert first_lines == ["[HIGH] [Link]", "판정: inspect_now", "제목: Untitled candidate"]
     assert "판정: inspect_now" in render.message_text
-    assert "전달: send_now / high" in render.message_text
     assert "누락: 요약 없음." in render.message_text
     assert "누락: 추천 행동 없음." in render.message_text
+    assert "리스크:" in render.message_text
+    assert "기존 도구 대비:" not in render.message_text
+    assert "confidence " not in render.message_text
 
 
 def test_render_hash_is_stable() -> None:
@@ -78,6 +82,7 @@ def test_renderer_normal_silent_uses_korean_labels_and_button_only_primary_url()
         evidence_limitations_ko="저장소 활동 증거가 제한적입니다.",
         recommended_action_ko="저장소 README와 최근 커밋을 확인하세요.",
         freshness_note_ko="최근 공개 신호 기준입니다.",
+        scores_json={"confidence": 72},
     )
     primary_url = "https://github.com/example/repo"
     raw_uuid = str(uuid4())
@@ -88,9 +93,12 @@ def test_renderer_normal_silent_uses_korean_labels_and_button_only_primary_url()
             judge_output=JudgeOutputRenderContext(
                 judge_output_id=analysis.judge_output_id,
                 payload_json={
+                    "headline": "example/repo",
                     "summary_one_line_ko": "Claude CLI로 HTML 디자인을 만드는 로컬 MCP 래퍼입니다.",
                     "skeptical_take_ko": f"실사용 유지보수 신호는 아직 더 확인해야 합니다. {raw_uuid}",
                     "why_it_might_matter_ko": "디자인 초안 반복 작업을 줄일 수 있습니다.",
+                    "comparables": ["v0", "Lovable"],
+                    "red_flags_ko": ["검증된 운영 사례는 아직 제한적입니다."],
                 },
             ),
             candidate=CandidateRenderContext(
@@ -108,11 +116,12 @@ def test_renderer_normal_silent_uses_korean_labels_and_button_only_primary_url()
     )
 
     nonempty_lines = [line for line in render.message_text.splitlines() if line.strip()]
-    assert any(line.startswith("판정: later") for line in nonempty_lines[:3])
-    assert any("normal_silent" in line for line in nonempty_lines[:3])
+    assert nonempty_lines[:3] == ["[MID] [GitHub]", "판정: later | confidence 72", "제목: example/repo"]
     assert "한줄 요약:" in render.message_text
     assert "냉정 평가:" in render.message_text
     assert "왜 볼만한가:" in render.message_text
+    assert "기존 도구 대비: v0; Lovable" in render.message_text
+    assert "리스크: 검증된 운영 사례는 아직 제한적입니다." in render.message_text
     assert "증거 한계:" in render.message_text
     assert "추천 행동:" in render.message_text
     assert render.disable_notification is True
@@ -174,9 +183,10 @@ def test_renderer_send_worthy_message_redacts_raw_payload_runtime_secret_and_exc
     )
 
     assert "판정: inspect_now" in render.message_text
-    assert "전달: send_now / high" in render.message_text
+    assert "[HIGH] [GitHub]" in render.message_text
     assert "냉정 평가:" in render.message_text
     assert "왜 볼만한가:" in render.message_text
+    assert "리스크:" in render.message_text
     assert "증거 한계:" in render.message_text
     assert "추천 행동:" in render.message_text
     assert len(render.message_text) <= 900
@@ -196,3 +206,49 @@ def test_renderer_send_worthy_message_redacts_raw_payload_runtime_secret_and_exc
         "tok" + "en",
     ):
         assert raw not in render.message_text
+
+
+def test_renderer_omits_github_comparables_when_no_comparable_data_exists() -> None:
+    analysis = AnalysisRenderContext(
+        analysis_id=uuid4(),
+        candidate_group_id=uuid4(),
+        judge_output_id=uuid4(),
+        verdict="later",
+        delivery_decision="send_now",
+        reason_codes_json=["comparison_gap"],
+        evidence_limitations_ko="비교 가능한 기존 도구 증거가 없습니다.",
+        recommended_action_ko="동일 문제를 푸는 도구가 있는지 수동 확인하세요.",
+        freshness_note_ko=None,
+    )
+
+    render = NotificationRenderer().render(
+        notification_plan_id=uuid4(),
+        payload=RenderInput(
+            analysis=analysis,
+            judge_output=JudgeOutputRenderContext(
+                judge_output_id=analysis.judge_output_id,
+                payload_json={
+                    "headline": "Useful repo",
+                    "summary_one_line_ko": "요약입니다.",
+                    "skeptical_take_ko": "냉정 평가입니다.",
+                    "why_it_might_matter_ko": "근거입니다.",
+                    "comparables": [],
+                },
+            ),
+            candidate=CandidateRenderContext(
+                candidate_group_id=analysis.candidate_group_id,
+                source_message_id=uuid4(),
+                current_primary_artifact_id=uuid4(),
+                primary_artifact_type="github_repo",
+                primary_canonical_url="https://github.com/example/repo",
+                primary_canonical_id="github.com/example/repo",
+                source_message_link=None,
+                source_text_surface=None,
+            ),
+            urgency_profile="normal_silent",
+        ),
+    )
+
+    assert "기존 도구 대비:" not in render.message_text
+    assert "comparison_gap" in render.message_text
+    assert "비교 가능한 기존 도구 증거가 없습니다." in render.message_text

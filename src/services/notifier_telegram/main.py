@@ -21,7 +21,7 @@ from .models import NotificationPlanDraft
 from .redis_streams import RedisStreamConsumer
 from .repositories import NotifierTelegramRepository
 from .restricted_transport_canary import run_restricted_transport_canary
-from .renderer import NotificationRenderer, RenderInput
+from .renderer import NotificationRenderer, RenderInput, confidence_display, severity_band, source_type_label
 from .service import NotifierTelegramService
 from .telegram_client import TelegramBotClient
 from .worker import NotifierTelegramWorker
@@ -66,6 +66,7 @@ NOTIFICATION_UX_TOKENLIKE_RE = re.compile(
     r"\b(?:secret|token|password|credential|api[_-]?key)\b",
     flags=re.IGNORECASE,
 )
+NOTIFICATION_UX_SEVERITY_RE = re.compile(r"^\[(HIGH|MID|LOW)\]\s+\[(GitHub|X|Idea|Web|Link)\]$")
 SEND_DISABLED_PROOF_SETUP_REJECTION_REASONS = {
     "source_notification_plan_missing",
     "source_plan_not_send_now",
@@ -734,19 +735,36 @@ async def build_notification_ux_render_preview_payload(
     checks = _notification_ux_render_checks(
         message_text=render.message_text,
         render=render,
-        verdict=analysis.verdict,
+        analysis=analysis,
+        judge_output=judge_output,
         urgency_profile=urgency_profile,
         candidate=candidate,
         message_char_limit=renderer.max_message_chars,
     )
     failed = [name for name, passed in checks.items() if not passed]
+    render_summary = _notification_ux_render_summary(render, message_char_limit=renderer.max_message_chars)
+    delivery_quality_summary = _delivery_quality_summary(render_summary=render_summary, checks=checks)
     payload = {
         "schema_version": NOTIFICATION_UX_RENDER_PREVIEW_SCHEMA_VERSION,
         "status": "pass" if not failed else "fail",
         "reason_code": "ok" if not failed else "render_preview_checks_failed",
         "checks_failed": failed,
         "checks": checks,
-        "render_summary": _notification_ux_render_summary(render, message_char_limit=renderer.max_message_chars),
+        "quality_checks": checks,
+        "first_nonempty_lines": render_summary["first_nonempty_lines"],
+        "message_char_count": render_summary["message_char_count"],
+        "configured_message_char_limit": render_summary["configured_message_char_limit"],
+        "button_labels": render_summary["button_labels"],
+        "button_count": render_summary["button_count"],
+        "source_type_visible": checks["source_type_visible"],
+        "severity_visible": checks["severity_visible"],
+        "confidence_visible_or_not_applicable": checks["confidence_visible_or_not_applicable"],
+        "risk_marker_present": checks["risk_marker_present"],
+        "recommended_action_marker_present": checks["recommended_action_marker_present"],
+        "link_buttons_present": checks["link_buttons_present"],
+        "no_raw_values": checks["no_raw_values"],
+        "render_summary": render_summary,
+        "delivery_quality_summary": delivery_quality_summary,
         "authority": _notification_ux_preview_authority(),
     }
     if selection is not None:
@@ -2794,18 +2812,25 @@ def _notification_ux_preview_base_checks(
         "message_nonempty": False,
         "message_under_telegram_limit": False,
         "message_under_configured_limit": False,
+        "source_type_visible": False,
+        "severity_visible": False,
+        "title_visible_in_first_three_lines": False,
+        "confidence_visible_or_not_applicable": False,
         "verdict_visible_in_first_three_lines": False,
         "urgency_visible_in_first_three_lines": False,
         "korean_summary_marker_present": False,
         "skeptical_or_risk_marker_present": False,
         "why_it_matters_marker_present": False,
+        "risk_marker_present": False,
         "evidence_limitations_marker_present": False,
         "recommended_action_marker_present": False,
         "link_preview_disabled": False,
+        "parse_strategy_entities": False,
         "protect_content_false": False,
         "silent_later_or_normal_profile": False,
         "high_profile_not_silent": False,
         "url_button_present": False,
+        "link_buttons_present": False,
         "github_primary_button_label": False,
         "primary_url_not_in_message_text_when_button_exists": False,
         "source_url_not_in_message_text_when_button_exists": False,
@@ -2815,6 +2840,7 @@ def _notification_ux_preview_base_checks(
         "no_sensitive_markers_in_message_text": False,
         "no_sensitive_marker_or_error_body_in_message_text": False,
         "no_source_or_raw_json_in_message_text": False,
+        "no_raw_values": False,
     }
 
 
@@ -2822,7 +2848,8 @@ def _notification_ux_render_checks(
     *,
     message_text: str,
     render,
-    verdict: str,
+    analysis,
+    judge_output,
     urgency_profile: str,
     candidate,
     message_char_limit: int,
@@ -2837,35 +2864,15 @@ def _notification_ux_render_checks(
     github_primary = bool(primary_url and _is_github_url(primary_url)) or candidate.primary_artifact_type == "github_repo"
     sensitive_text = message_text.lower()
     source_text = _string_from_row(getattr(candidate, "source_text_surface", None))
-    return {
-        "plan_found": True,
-        "analysis_found": True,
-        "judge_output_found": True,
-        "candidate_found": True,
-        "message_nonempty": bool(message_text.strip()),
-        "message_under_telegram_limit": len(message_text) <= 4096,
-        "message_under_configured_limit": len(message_text) <= message_char_limit,
-        "verdict_visible_in_first_three_lines": any(verdict and verdict in line for line in first_lines[:3]),
-        "urgency_visible_in_first_three_lines": any(urgency_profile and urgency_profile in line for line in first_lines[:3]),
-        "korean_summary_marker_present": "한줄 요약:" in message_text or "요약:" in message_text,
-        "skeptical_or_risk_marker_present": "냉정 평가:" in message_text or "리스크:" in message_text,
-        "why_it_matters_marker_present": "왜 볼만한가:" in message_text or "근거:" in message_text,
-        "evidence_limitations_marker_present": "증거 한계:" in message_text,
-        "recommended_action_marker_present": "추천 행동:" in message_text,
-        "link_preview_disabled": render.link_preview_options_json == {"is_disabled": True},
-        "protect_content_false": render.protect_content is False,
-        "silent_later_or_normal_profile": (
-            render.disable_notification is True
-            if urgency_profile == "normal_silent" or verdict == "later"
-            else True
-        ),
-        "high_profile_not_silent": render.disable_notification is False if urgency_profile == "high" else True,
-        "url_button_present": bool(buttons) if primary_url or source_url else True,
-        "github_primary_button_label": (
-            any(button["text"] == "GitHub 열기" and button["url"] == primary_url for button in buttons)
-            if github_primary and primary_url
-            else True
-        ),
+    expected_severity = severity_band(
+        verdict=analysis.verdict,
+        urgency_profile=urgency_profile,
+        delivery_decision=analysis.delivery_decision,
+    )
+    expected_source_type = source_type_label(candidate)
+    confidence = confidence_display(analysis, judge_output)
+    first_line = first_lines[0] if first_lines else ""
+    raw_checks = {
         "primary_url_not_in_message_text_when_button_exists": (
             primary_url not in message_text if primary_button_exists and primary_url else True
         ),
@@ -2885,9 +2892,55 @@ def _notification_ux_render_checks(
         "no_source_or_raw_json_in_message_text": (
             "payload_json" not in sensitive_text
             and "source_text_surface" not in sensitive_text
+            and "telegram_response_json" not in sensitive_text
             and (source_text is None or source_text not in message_text)
         ),
     }
+    checks = {
+        "plan_found": True,
+        "analysis_found": True,
+        "judge_output_found": True,
+        "candidate_found": True,
+        "message_nonempty": bool(message_text.strip()),
+        "message_under_telegram_limit": len(message_text) <= 4096,
+        "message_under_configured_limit": len(message_text) <= message_char_limit,
+        "source_type_visible": f"[{expected_source_type}]" in first_line,
+        "severity_visible": first_line == f"[{expected_severity}] [{expected_source_type}]"
+        and NOTIFICATION_UX_SEVERITY_RE.match(first_line) is not None,
+        "title_visible_in_first_three_lines": any(line.startswith("제목:") for line in first_lines[:3]),
+        "confidence_visible_or_not_applicable": (
+            any(f"confidence {confidence}" in line for line in first_lines[:3]) if confidence is not None else True
+        ),
+        "verdict_visible_in_first_three_lines": any(
+            analysis.verdict and analysis.verdict in line for line in first_lines[:3]
+        ),
+        "urgency_visible_in_first_three_lines": any(expected_severity in line for line in first_lines[:3]),
+        "korean_summary_marker_present": "한줄 요약:" in message_text or "요약:" in message_text,
+        "skeptical_or_risk_marker_present": "냉정 평가:" in message_text or "리스크:" in message_text,
+        "why_it_matters_marker_present": "왜 볼만한가:" in message_text or "근거:" in message_text,
+        "risk_marker_present": "리스크:" in message_text,
+        "evidence_limitations_marker_present": "증거 한계:" in message_text,
+        "recommended_action_marker_present": "추천 행동:" in message_text,
+        "link_preview_disabled": render.link_preview_options_json == {"is_disabled": True},
+        "parse_strategy_entities": render.parse_strategy == "entities",
+        "protect_content_false": render.protect_content is False,
+        "silent_later_or_normal_profile": (
+            render.disable_notification is True
+            if urgency_profile == "normal_silent" or analysis.verdict == "later"
+            else True
+        ),
+        "high_profile_not_silent": render.disable_notification is False if urgency_profile == "high" else True,
+        "url_button_present": bool(buttons) if primary_url or source_url else True,
+        "link_buttons_present": bool(buttons) if primary_url or source_url else True,
+        "github_primary_button_label": (
+            any(button["text"] == "GitHub 열기" and button["url"] == primary_url for button in buttons)
+            if github_primary and primary_url
+            else True
+        ),
+    }
+    checks.update(raw_checks)
+    checks["no_raw_values"] = all(raw_checks.values())
+    return checks
 
 
 def _notification_ux_render_summary(render, *, message_char_limit: int) -> dict[str, Any]:
@@ -2901,7 +2954,41 @@ def _notification_ux_render_summary(render, *, message_char_limit: int) -> dict[
         "button_labels": [button["text"] for button in buttons],
         "disable_notification": render.disable_notification,
         "protect_content": render.protect_content,
+        "parse_strategy": render.parse_strategy,
         "link_preview_disabled": render.link_preview_options_json == {"is_disabled": True},
+    }
+
+
+def _delivery_quality_summary(
+    *,
+    render_summary: Mapping[str, Any],
+    checks: Mapping[str, bool],
+) -> dict[str, Any]:
+    missing_sections = [
+        section
+        for section, check_name in (
+            ("first_line_severity_source", "severity_visible"),
+            ("source_type", "source_type_visible"),
+            ("verdict", "verdict_visible_in_first_three_lines"),
+            ("title", "title_visible_in_first_three_lines"),
+            ("한줄 요약", "korean_summary_marker_present"),
+            ("냉정 평가", "skeptical_or_risk_marker_present"),
+            ("왜 볼만한가", "why_it_matters_marker_present"),
+            ("리스크", "risk_marker_present"),
+            ("증거 한계", "evidence_limitations_marker_present"),
+            ("추천 행동", "recommended_action_marker_present"),
+            ("link_buttons", "link_buttons_present"),
+            ("no_raw_values", "no_raw_values"),
+        )
+        if checks.get(check_name) is not True
+    ]
+    return {
+        "operator_actionability": "pass" if not missing_sections else "fail",
+        "missing_sections": missing_sections,
+        "visible_first_lines": list(render_summary.get("first_nonempty_lines") or [])[:3],
+        "button_count": _int_from_row(render_summary.get("button_count")) or 0,
+        "message_char_count": _int_from_row(render_summary.get("message_char_count")) or 0,
+        "notifier_reinterpreted_policy": False,
     }
 
 

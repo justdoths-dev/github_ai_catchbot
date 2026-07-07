@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
@@ -51,6 +51,7 @@ class AnalysisRenderContext:
     evidence_limitations_ko: str | None
     recommended_action_ko: str | None
     freshness_note_ko: str | None
+    scores_json: dict[str, Any] = field(default_factory=dict)
     created_at: datetime | None = None
 
 
