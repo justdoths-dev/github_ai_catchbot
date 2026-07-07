@@ -26,6 +26,7 @@ from services.notifier_telegram.main import (
 )
 from src.services.maintenance.exact_target_source_to_analysis_materializer import (
     build_mvp_closure_packet,
+    load_m1_notification_ux_readback_acceptance,
     run_cli,
 )
 from tools import notification_operator_acceptance_packet_runner
@@ -247,14 +248,17 @@ async def test_notification_operator_acceptance_consolidates_closed_readbacks_wi
 
 
 @pytest.mark.asyncio
-async def test_mvp_closure_packet_consumes_m1_and_source_channel_proofs_without_final_claims() -> None:
+async def test_mvp_closure_packet_consumes_m1_and_source_channel_proofs_without_final_claims(
+    tmp_path: Path,
+) -> None:
     m1_readback = await _notification_acceptance_consolidation()
+    m1_readback_path = write_json(tmp_path / "m1-readback.json", m1_readback)
+    m1_acceptance = load_m1_notification_ux_readback_acceptance(str(m1_readback_path))
     source_report = await run_source_materializer(Ledger(), mode="execute")
 
     packet = build_mvp_closure_packet(
         source_report,
-        m1_notification_ux_acceptance_closed=m1_readback["status"] == "pass",
-        m1_notification_ux_readback_schema_version=str(m1_readback["schema_version"]),
+        m1_notification_ux_readback=m1_acceptance,
         restricted_source_channel_proof=source_report.restricted_source_channel_proof,
     )
 
@@ -263,8 +267,16 @@ async def test_mvp_closure_packet_consumes_m1_and_source_channel_proofs_without_
     assert packet["status"] == "pass"
     assert packet["reason_code"] == "mvp_code_proof_ux_packet_ready"
     assert packet["m1_notification_ux_acceptance_closed"] is True
+    assert packet["m1_notification_ux_readback_schema_version"] == (
+        "notification_operator_acceptance_readback_consolidation_v1"
+    )
     assert packet["m2_restricted_source_channel_proof_closed"] is True
     assert packet["mvp_closure_packet_ready"] is True
+    assert packet["m1_delivery_quality_operator_actionability"] == "pass"
+    assert packet["m1_delivery_quality_missing_sections_count"] == 0
+    assert packet["m1_delivery_quality_button_count"] == 1
+    assert packet["m1_delivery_quality_message_char_count"] > 0
+    assert packet["m1_notifier_reinterpreted_policy"] is False
     assert packet["closed_capabilities"] == [
         "M1 notification UX acceptance packet closed",
         "M2 restricted source/channel proof closed",
@@ -300,6 +312,8 @@ async def test_mvp_closure_packet_consumes_m1_and_source_channel_proofs_without_
         "one_hundred_percent_complete": False,
     }
     rendered = json.dumps(packet, ensure_ascii=False, sort_keys=True)
+    assert "visible_first_lines" not in rendered
+    assert "판정: later | confidence 64" not in rendered
     for forbidden in (
         "postgresql+psycopg" + "://",
         "redis" + "://",
@@ -371,6 +385,11 @@ async def test_materializer_cli_consumes_m1_readback_and_emits_operator_pass_pac
     )
     assert closure["m2_restricted_source_channel_proof_closed"] is True
     assert closure["mvp_closure_packet_ready"] is True
+    assert closure["m1_delivery_quality_operator_actionability"] == "pass"
+    assert closure["m1_delivery_quality_missing_sections_count"] == 0
+    assert closure["m1_delivery_quality_button_count"] == 1
+    assert closure["m1_delivery_quality_message_char_count"] > 0
+    assert closure["m1_notifier_reinterpreted_policy"] is False
     assert "AUTHORITY_OPEN" in closure["open_gates"]
     assert "ROLLOUT_OPEN" in closure["open_gates"]
     assert "FUNCTION_COMPLETE_OPEN" in closure["open_gates"]
@@ -382,6 +401,8 @@ async def test_materializer_cli_consumes_m1_readback_and_emits_operator_pass_pac
     assert claims["one_hundred_percent_complete"] is False
 
     rendered = emitted[0]
+    assert "visible_first_lines" not in rendered
+    assert "판정: later | confidence 64" not in rendered
     for forbidden in (
         str(packet_path),
         str(readback_path),

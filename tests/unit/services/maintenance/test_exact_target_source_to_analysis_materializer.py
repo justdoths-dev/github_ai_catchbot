@@ -25,6 +25,7 @@ from src.services.gh_enricher.github_client import (
 from src.services.gh_enricher.models import CurrentSnapshotRef, EnrichmentRunRef
 from src.services.maintenance.exact_target_source_to_analysis_materializer import (
     ExistingSourceProviderResumeAuthority,
+    ExactTargetSourceToAnalysisConfigError,
     ExactTargetSourceToAnalysisRequest,
     FinalReadback,
     M1NotificationUxReadbackAcceptance,
@@ -36,6 +37,7 @@ from src.services.maintenance.exact_target_source_to_analysis_materializer impor
     RuntimeConfigBundle,
     SqlProviderEnrichmentService,
     SqlStageComponents,
+    load_m1_notification_ux_readback_acceptance,
     run_cli,
     run_exact_target_source_to_analysis_materializer,
 )
@@ -698,6 +700,10 @@ def m1_notification_ux_readback_payload(
     *,
     status: str = "pass",
     authority_overrides: dict[str, bool] | None = None,
+    surface_overrides: dict[str, Any] | None = None,
+    quality_overrides: dict[str, Any] | None = None,
+    omit_delivery_quality: bool = False,
+    stale_schema_status_only: bool = False,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     authority = {
@@ -714,15 +720,62 @@ def m1_notification_ux_readback_payload(
     }
     if authority_overrides:
         authority.update(authority_overrides)
+    delivery_quality: dict[str, Any] = {
+        "operator_actionability": "pass",
+        "missing_sections": [],
+        "visible_first_lines": [
+            "[MID] [GitHub]",
+            "판정: later | confidence 64",
+            "제목: Useful repo",
+        ],
+        "button_count": 1,
+        "message_char_count": 256,
+        "notifier_reinterpreted_policy": False,
+    }
+    if quality_overrides:
+        delivery_quality.update(quality_overrides)
+    ux_surface: dict[str, Any] = {
+        "status": "pass",
+        "reason_code": "ok",
+        "schema_valid": True,
+        "checks_failed_count": 0,
+        "verdict_first_section": True,
+        "source_type_first_section": True,
+        "severity_first_section": True,
+        "urgency_first_section": True,
+        "confidence_visible_or_not_applicable": True,
+        "skeptical_or_risk_visible": True,
+        "risk_visible": True,
+        "recommended_action_visible": True,
+        "evidence_limitations_visible": True,
+        "primary_link_surface_visible": True,
+        "link_buttons_present": True,
+        "github_primary_expectations_preserved": True,
+        "later_or_low_urgency_not_misleading": True,
+        "high_urgency_not_silent": True,
+        "message_under_limit": True,
+        "link_preview_disabled": True,
+        "protect_content_false": True,
+        "raw_leak_checks_passed": True,
+        "message_char_count": 256,
+        "configured_message_char_limit": 3800,
+        "button_count": 1,
+        "button_labels": ["GitHub 열기"],
+        "disable_notification": True,
+    }
+    if not omit_delivery_quality:
+        ux_surface["delivery_quality_summary"] = delivery_quality
+    if surface_overrides:
+        ux_surface.update(surface_overrides)
+    surfaces = (
+        {"fake_backed_notification_operator_acceptance": {"status": "pass"}}
+        if stale_schema_status_only
+        else {"notification_ux_render_preview": ux_surface}
+    )
     payload: dict[str, Any] = {
         "schema_version": "notification_operator_acceptance_readback_consolidation_v1",
         "status": status,
-        "surfaces": {
-            "fake_backed_notification_operator_acceptance": {
-                "status": "pass",
-                "reason_code": "fake_backed_acceptance_closed",
-            }
-        },
+        "surfaces": surfaces,
         "authority": authority,
     }
     if extra:
@@ -733,6 +786,101 @@ def m1_notification_ux_readback_payload(
 def write_json(path: Path, payload: Any) -> Path:
     path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     return path
+
+
+def load_m1_acceptance(tmp_path: Path, payload: dict[str, Any]) -> M1NotificationUxReadbackAcceptance:
+    return load_m1_notification_ux_readback_acceptance(
+        str(write_json(tmp_path / "m1-readback.json", payload))
+    )
+
+
+def test_load_m1_notification_ux_readback_acceptance_accepts_delivery_quality_pass(
+    tmp_path: Path,
+) -> None:
+    acceptance = load_m1_acceptance(tmp_path, m1_notification_ux_readback_payload())
+
+    assert acceptance.schema_version == "notification_operator_acceptance_readback_consolidation_v1"
+    assert acceptance.delivery_quality_operator_actionability == "pass"
+    assert acceptance.delivery_quality_missing_sections_count == 0
+    assert acceptance.delivery_quality_button_count == 1
+    assert acceptance.delivery_quality_message_char_count == 256
+    assert acceptance.notifier_reinterpreted_policy is False
+
+
+def test_load_m1_notification_ux_readback_acceptance_rejects_stale_readback(
+    tmp_path: Path,
+) -> None:
+    path = write_json(
+        tmp_path / "m1-readback.json",
+        m1_notification_ux_readback_payload(omit_delivery_quality=True),
+    )
+
+    with pytest.raises(ExactTargetSourceToAnalysisConfigError) as excinfo:
+        load_m1_notification_ux_readback_acceptance(str(path))
+
+    assert str(excinfo.value) == "m1_notification_ux_readback_delivery_quality_missing"
+
+
+def test_load_m1_notification_ux_readback_acceptance_rejects_schema_status_only_readback(
+    tmp_path: Path,
+) -> None:
+    path = write_json(
+        tmp_path / "m1-readback.json",
+        m1_notification_ux_readback_payload(stale_schema_status_only=True),
+    )
+
+    with pytest.raises(ExactTargetSourceToAnalysisConfigError) as excinfo:
+        load_m1_notification_ux_readback_acceptance(str(path))
+
+    assert str(excinfo.value) == "m1_notification_ux_surface_missing"
+
+
+def test_load_m1_notification_ux_readback_acceptance_rejects_missing_sections(
+    tmp_path: Path,
+) -> None:
+    path = write_json(
+        tmp_path / "m1-readback.json",
+        m1_notification_ux_readback_payload(
+            quality_overrides={"missing_sections": ["risk_marker"]}
+        ),
+    )
+
+    with pytest.raises(ExactTargetSourceToAnalysisConfigError) as excinfo:
+        load_m1_notification_ux_readback_acceptance(str(path))
+
+    assert str(excinfo.value) == "m1_notification_ux_readback_delivery_quality_failed"
+
+
+def test_load_m1_notification_ux_readback_acceptance_rejects_notifier_reinterpretation(
+    tmp_path: Path,
+) -> None:
+    path = write_json(
+        tmp_path / "m1-readback.json",
+        m1_notification_ux_readback_payload(
+            quality_overrides={"notifier_reinterpreted_policy": True}
+        ),
+    )
+
+    with pytest.raises(ExactTargetSourceToAnalysisConfigError) as excinfo:
+        load_m1_notification_ux_readback_acceptance(str(path))
+
+    assert str(excinfo.value) == "m1_notification_ux_readback_notifier_reinterpreted_policy"
+
+
+def test_load_m1_notification_ux_readback_acceptance_rejects_missing_required_check(
+    tmp_path: Path,
+) -> None:
+    path = write_json(
+        tmp_path / "m1-readback.json",
+        m1_notification_ux_readback_payload(
+            surface_overrides={"recommended_action_visible": False}
+        ),
+    )
+
+    with pytest.raises(ExactTargetSourceToAnalysisConfigError) as excinfo:
+        load_m1_notification_ux_readback_acceptance(str(path))
+
+    assert str(excinfo.value) == "m1_notification_ux_readback_missing_required_check"
 
 
 def runtime_bundle() -> RuntimeConfigBundle:
@@ -1395,6 +1543,70 @@ async def test_execute_report_includes_restricted_source_channel_proof_without_r
 
 
 @pytest.mark.asyncio
+async def test_execute_report_closes_mvp_packet_with_sanitized_m1_quality_summary(
+    tmp_path: Path,
+) -> None:
+    ledger = Ledger()
+    m1_acceptance = load_m1_acceptance(tmp_path, m1_notification_ux_readback_payload())
+
+    report = await run(
+        ledger,
+        mode="execute",
+        m1_notification_ux_readback=m1_acceptance,
+    )
+
+    closure = report.mvp_closure_packet
+    rendered_report = json.dumps(asdict(report), ensure_ascii=False, sort_keys=True)
+    rendered_closure = json.dumps(closure, ensure_ascii=False, sort_keys=True)
+
+    assert report.status == "pass"
+    assert report.restricted_source_channel_proof["status"] == "pass"
+    assert closure["status"] == "pass"
+    assert closure["reason_code"] == "mvp_code_proof_ux_packet_ready"
+    assert closure["m1_notification_ux_acceptance_closed"] is True
+    assert closure["m1_notification_ux_readback_schema_version"] == (
+        "notification_operator_acceptance_readback_consolidation_v1"
+    )
+    assert closure["m2_restricted_source_channel_proof_closed"] is True
+    assert closure["mvp_closure_packet_ready"] is True
+    assert closure["completion_claims"]["mvp_code_proof_ux_packet_ready"] is True
+    assert closure["completion_claims"]["final_function_complete"] is False
+    assert closure["completion_claims"]["production_complete"] is False
+    assert closure["completion_claims"]["bot_complete"] is False
+    assert closure["completion_claims"]["one_hundred_percent_complete"] is False
+    assert closure["m1_delivery_quality_operator_actionability"] == "pass"
+    assert closure["m1_delivery_quality_missing_sections_count"] == 0
+    assert closure["m1_delivery_quality_button_count"] == 1
+    assert closure["m1_delivery_quality_message_char_count"] == 256
+    assert closure["m1_notifier_reinterpreted_policy"] is False
+    assert "visible_first_lines" not in closure
+    assert "visible_first_lines" not in rendered_closure
+    for forbidden in (
+        "[MID] [GitHub]",
+        "판정: later | confidence 64",
+        "제목: Useful repo",
+        "https://t.me/SynthChannel/12345",
+        "SynthChannel/12345",
+        KOREAN_LLM_WORKFLOW_TEXT,
+        "db_locator_not_used",
+        "redis_locator_not_used",
+        "postgresql+psycopg" + "://",
+        "redis" + "://",
+        "TELEGRAM_BOT_TOKEN",
+        "OPENAI_API_KEY",
+        "tok" + "en=",
+        "pass" + "word=",
+        RAW_SECRET,
+        "runtime.env",
+        "payload_json",
+        "telegram_response_json",
+        "Traceback",
+        "11111111-1111-1111-1111-111111111111",
+    ):
+        assert forbidden not in rendered_report
+
+
+@pytest.mark.asyncio
 async def test_execute_url_path_materializes_provider_snapshot_and_analysis_request() -> None:
     ledger = Ledger()
 
@@ -1842,8 +2054,28 @@ async def test_cli_provider_live_flags_are_blocked_in_plan_mode(tmp_path: Path) 
     ("readback_payload", "reason_code"),
     [
         (
+            m1_notification_ux_readback_payload(omit_delivery_quality=True),
+            "m1_notification_ux_readback_delivery_quality_missing",
+        ),
+        (
+            m1_notification_ux_readback_payload(stale_schema_status_only=True),
+            "m1_notification_ux_surface_missing",
+        ),
+        (
             m1_notification_ux_readback_payload(status="blocked"),
             "m1_notification_ux_readback_not_pass",
+        ),
+        (
+            m1_notification_ux_readback_payload(
+                quality_overrides={"missing_sections": ["risk_marker"]}
+            ),
+            "m1_notification_ux_readback_delivery_quality_failed",
+        ),
+        (
+            m1_notification_ux_readback_payload(
+                quality_overrides={"notifier_reinterpreted_policy": True}
+            ),
+            "m1_notification_ux_readback_notifier_reinterpreted_policy",
         ),
         (
             m1_notification_ux_readback_payload(

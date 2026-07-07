@@ -113,6 +113,17 @@ M1_READBACK_UNSAFE_CASEFOLD_MARKERS = (
     "credential",
     "api_key",
 )
+M1_NOTIFICATION_UX_REQUIRED_SURFACE_CHECKS = (
+    "verdict_first_section",
+    "source_type_first_section",
+    "severity_first_section",
+    "confidence_visible_or_not_applicable",
+    "risk_visible",
+    "recommended_action_visible",
+    "primary_link_surface_visible",
+    "link_buttons_present",
+    "raw_leak_checks_passed",
+)
 
 RUNTIME_VALUE_KEYS = {
     "APP_ENV",
@@ -200,6 +211,11 @@ class ExistingSourceProviderResumeAuthority:
 @dataclass(slots=True, frozen=True)
 class M1NotificationUxReadbackAcceptance:
     schema_version: str
+    delivery_quality_operator_actionability: str
+    delivery_quality_missing_sections_count: int
+    delivery_quality_button_count: int
+    delivery_quality_message_char_count: int
+    notifier_reinterpreted_policy: bool
 
 
 @dataclass(slots=True, frozen=True)
@@ -2722,7 +2738,59 @@ def load_m1_notification_ux_readback_acceptance(
             "m1_notification_ux_readback_authority_open"
         )
 
-    return M1NotificationUxReadbackAcceptance(schema_version=str(schema_version))
+    surfaces = payload.get("surfaces")
+    if not isinstance(surfaces, Mapping):
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_surface_missing"
+        )
+    ux_surface = surfaces.get("notification_ux_render_preview")
+    if not isinstance(ux_surface, Mapping) or ux_surface.get("status") != "pass":
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_surface_missing"
+        )
+    for check_name in M1_NOTIFICATION_UX_REQUIRED_SURFACE_CHECKS:
+        if ux_surface.get(check_name) is not True:
+            raise ExactTargetSourceToAnalysisConfigError(
+                "m1_notification_ux_readback_missing_required_check"
+            )
+
+    quality = ux_surface.get("delivery_quality_summary")
+    if not isinstance(quality, Mapping):
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_readback_delivery_quality_missing"
+        )
+    operator_actionability = quality.get("operator_actionability")
+    missing_sections = quality.get("missing_sections")
+    notifier_reinterpreted_policy = quality.get("notifier_reinterpreted_policy")
+    button_count = _m1_quality_count(quality.get("button_count"))
+    message_char_count = _m1_quality_count(quality.get("message_char_count"))
+    if (
+        not isinstance(operator_actionability, str)
+        or not isinstance(missing_sections, list)
+        or not isinstance(notifier_reinterpreted_policy, bool)
+        or button_count is None
+        or message_char_count is None
+    ):
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_readback_delivery_quality_missing"
+        )
+    if notifier_reinterpreted_policy is True:
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_readback_notifier_reinterpreted_policy"
+        )
+    if operator_actionability != "pass" or missing_sections != []:
+        raise ExactTargetSourceToAnalysisConfigError(
+            "m1_notification_ux_readback_delivery_quality_failed"
+        )
+
+    return M1NotificationUxReadbackAcceptance(
+        schema_version=str(schema_version),
+        delivery_quality_operator_actionability=operator_actionability,
+        delivery_quality_missing_sections_count=0,
+        delivery_quality_button_count=button_count,
+        delivery_quality_message_char_count=message_char_count,
+        notifier_reinterpreted_policy=notifier_reinterpreted_policy,
+    )
 
 
 def _m1_notification_ux_readback_is_sanitized(payload: Mapping[str, Any]) -> bool:
@@ -2733,6 +2801,14 @@ def _m1_notification_ux_readback_is_sanitized(payload: Mapping[str, Any]) -> boo
     if any(marker in rendered_casefold for marker in M1_READBACK_UNSAFE_CASEFOLD_MARKERS):
         return False
     return re.search(r"postgresql\+[^\"'\s:]+://", rendered, flags=re.IGNORECASE) is None
+
+
+def _m1_quality_count(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
 
 
 def build_restricted_source_channel_proof(
@@ -2855,8 +2931,7 @@ def build_restricted_source_channel_proof(
 def build_mvp_closure_packet(
     report: ExactTargetSourceToAnalysisReport,
     *,
-    m1_notification_ux_acceptance_closed: bool = False,
-    m1_notification_ux_readback_schema_version: str | None = None,
+    m1_notification_ux_readback: M1NotificationUxReadbackAcceptance | None = None,
     restricted_source_channel_proof: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     source_proof = dict(
@@ -2865,6 +2940,7 @@ def build_mvp_closure_packet(
         else build_restricted_source_channel_proof(report)
     )
     m2_closed = source_proof.get("status") == "pass"
+    m1_notification_ux_acceptance_closed = m1_notification_ux_readback is not None
     ready = bool(m1_notification_ux_acceptance_closed and m2_closed)
     closed_capabilities: list[str] = []
     if m1_notification_ux_acceptance_closed:
@@ -2873,7 +2949,7 @@ def build_mvp_closure_packet(
         closed_capabilities.append("M2 restricted source/channel proof closed")
     if ready:
         closed_capabilities.append("MVP code/proof/UX packet ready")
-    return {
+    packet: dict[str, Any] = {
         "schema_version": MVP_CLOSURE_PACKET_SCHEMA_VERSION,
         "status": "pass" if ready else "blocked",
         "reason_code": (
@@ -2882,7 +2958,11 @@ def build_mvp_closure_packet(
             else "mvp_closure_inputs_incomplete"
         ),
         "m1_notification_ux_acceptance_closed": bool(m1_notification_ux_acceptance_closed),
-        "m1_notification_ux_readback_schema_version": m1_notification_ux_readback_schema_version,
+        "m1_notification_ux_readback_schema_version": (
+            None
+            if m1_notification_ux_readback is None
+            else m1_notification_ux_readback.schema_version
+        ),
         "m2_restricted_source_channel_proof_closed": bool(m2_closed),
         "mvp_closure_packet_ready": ready,
         "closed_capabilities": closed_capabilities,
@@ -2903,6 +2983,27 @@ def build_mvp_closure_packet(
         ).get("analysis_requested_visible")
         is True,
     }
+    if m1_notification_ux_readback is not None:
+        packet.update(
+            {
+                "m1_delivery_quality_operator_actionability": (
+                    m1_notification_ux_readback.delivery_quality_operator_actionability
+                ),
+                "m1_delivery_quality_missing_sections_count": (
+                    m1_notification_ux_readback.delivery_quality_missing_sections_count
+                ),
+                "m1_delivery_quality_button_count": (
+                    m1_notification_ux_readback.delivery_quality_button_count
+                ),
+                "m1_delivery_quality_message_char_count": (
+                    m1_notification_ux_readback.delivery_quality_message_char_count
+                ),
+                "m1_notifier_reinterpreted_policy": (
+                    m1_notification_ux_readback.notifier_reinterpreted_policy
+                ),
+            }
+        )
+    return packet
 
 
 def _finalize_report(
@@ -2916,12 +3017,7 @@ def _finalize_report(
         restricted_source_channel_proof=source_proof,
         mvp_closure_packet=build_mvp_closure_packet(
             report,
-            m1_notification_ux_acceptance_closed=m1_notification_ux_readback is not None,
-            m1_notification_ux_readback_schema_version=(
-                None
-                if m1_notification_ux_readback is None
-                else m1_notification_ux_readback.schema_version
-            ),
+            m1_notification_ux_readback=m1_notification_ux_readback,
             restricted_source_channel_proof=source_proof,
         ),
     )
