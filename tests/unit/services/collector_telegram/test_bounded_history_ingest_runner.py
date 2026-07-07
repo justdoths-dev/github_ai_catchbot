@@ -46,6 +46,7 @@ EXCEPTION_DETAIL = "private exception detail with sentinel bounded history inges
 CLOSE_EXCEPTION_DETAIL = "private close failure detail with sentinel bounded history ingest raw message text"
 _DEFAULT_SOURCE_MESSAGE_ID = object()
 _DEFAULT_TRACKED_CHAT = object()
+_DEFAULT_EXACT_MESSAGE_RESPONSE = object()
 
 
 class FakeTransaction:
@@ -324,12 +325,17 @@ class FakeHistoryClient:
         messages_by_chat: dict[int, list[dict[str, Any]]] | None = None,
         failure_by_chat: dict[int, Exception] | None = None,
         responses_by_call: list[list[dict[str, Any]] | Exception] | None = None,
+        exact_message_response: dict[str, Any] | None | object = _DEFAULT_EXACT_MESSAGE_RESPONSE,
+        exact_responses_by_call: list[dict[str, Any] | None | Exception] | None = None,
     ) -> None:
         self.messages = messages
         self.messages_by_chat = messages_by_chat or {}
         self.failure_by_chat = failure_by_chat or {}
         self.responses_by_call = list(responses_by_call or [])
+        self.exact_message_response = exact_message_response
+        self.exact_responses_by_call = list(exact_responses_by_call or [])
         self.calls: list[dict[str, int]] = []
+        self.exact_calls: list[dict[str, int]] = []
         self.closed = False
 
     async def fetch_newest_history_messages(
@@ -354,6 +360,17 @@ class FakeHistoryClient:
         if chat_id in self.failure_by_chat:
             raise self.failure_by_chat[chat_id]
         return tuple(deepcopy(self.messages_by_chat.get(chat_id, self.messages)))
+
+    async def read_exact_message(self, *, chat_id: int, message_id: int):
+        self.exact_calls.append({"chat_id": chat_id, "message_id": message_id})
+        if self.exact_responses_by_call:
+            response = self.exact_responses_by_call.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return deepcopy(response)
+        if self.exact_message_response is _DEFAULT_EXACT_MESSAGE_RESPONSE:
+            return None
+        return deepcopy(self.exact_message_response)
 
     async def close(self) -> None:
         self.closed = True
@@ -392,14 +409,18 @@ class FakeTDLibTransport:
         auth_payloads: list[dict[str, Any]] | None = None,
         history_messages: list[dict[str, Any]] | None = None,
         history_response: dict[str, Any] | None = None,
+        exact_message_response: dict[str, Any] | None = None,
         append_history_response: bool = True,
+        append_exact_message_response: bool = True,
         log_suppression_attempted: bool = True,
         log_suppression_confirmed: bool = True,
     ) -> None:
         self.auth_payloads = list(auth_payloads or [])
         self.history_messages = list(history_messages or [_message()])
         self.history_response = deepcopy(history_response) if history_response is not None else None
+        self.exact_message_response = deepcopy(exact_message_response) if exact_message_response is not None else None
         self.append_history_response = append_history_response
+        self.append_exact_message_response = append_exact_message_response
         self.log_suppression_attempted = log_suppression_attempted
         self.log_suppression_confirmed = log_suppression_confirmed
         self.initialized = False
@@ -422,6 +443,17 @@ class FakeTDLibTransport:
                     "@type": "messages",
                     "messages": deepcopy(self.history_messages),
                 }
+            )
+            response["@extra"] = extra
+            self.auth_payloads.append(response)
+        if request.get("@type") == "getMessage":
+            if not self.append_exact_message_response:
+                return
+            extra = request.get("@extra")
+            response = (
+                deepcopy(self.exact_message_response)
+                if self.exact_message_response is not None
+                else deepcopy(_message())
             )
             response["@extra"] = extra
             self.auth_payloads.append(response)
@@ -528,6 +560,10 @@ class FakeDefaultHistoryClient:
     async def fetch_newest_history_messages(self, *, chat_id: int, limit: int):
         del chat_id, limit
         raise AssertionError("default runtime close tests do not fetch history")
+
+    async def read_exact_message(self, *, chat_id: int, message_id: int):
+        del chat_id, message_id
+        raise AssertionError("default runtime close tests do not read exact messages")
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -1662,6 +1698,168 @@ async def test_exact_target_anchorless_non_target_only_reports_missing_without_w
 
 
 @pytest.mark.asyncio
+async def test_direct_exact_message_fallback_after_history_miss_writes_target_once() -> None:
+    target_message_id = RAW_MESSAGE_ID + 1
+    raw_url = "http" + "s://example.invalid/direct-target"
+    failures = [
+        BoundedHistoryIngestError(
+            "telegram_history_read_failed",
+            history_read_failure_cause_bucket=HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT,
+        )
+        for _ in range(3)
+    ]
+    history = FakeHistoryClient(
+        [],
+        responses_by_call=[
+            *failures,
+            [_message(message_id=RAW_MESSAGE_ID)],
+        ],
+        exact_message_response=_message(message_id=target_message_id, text=f"target repo {raw_url}"),
+    )
+
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(target_message_id=target_message_id),
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is True
+    assert report["messages_seen"] == 1
+    assert report["history_window_attempts"] == 4
+    assert report["exact_message_read_attempted"] is True
+    assert report["exact_message_read_succeeded"] is True
+    assert report["exact_message_read_failure_cause_bucket"] is None
+    assert report["per_channel_results"][0]["history_window_attempts"] == 4
+    assert report["per_channel_results"][0]["exact_message_read_attempted"] is True
+    assert report["per_channel_results"][0]["exact_message_read_succeeded"] is True
+    assert report["source_message_write_attempted"] is True
+    assert report["source_version_write_attempted"] is True
+    assert report["source_outbox_write_attempted"] is True
+    assert report["redis_publish_attempted"] is False
+    assert report["source_messages_created_count"] == 1
+    assert report["source_versions_appended_count"] == 1
+    assert report["source_created_events_count"] == 1
+    assert report["readback"]["source_current_found_count"] == 1
+    assert report["readback"]["source_version_rows_count"] == 1
+    assert report["readback"]["source_created_events_count"] == 1
+    assert report["readback"]["source_outbox_events_count"] == 1
+    assert list(repository.messages) == [(RAW_CHAT_ID, target_message_id)]
+    assert len(repository.outbox) == 1
+    assert history.calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": target_message_id},
+        {"chat_id": RAW_CHAT_ID, "limit": 2, "from_message_id": target_message_id, "offset": -1},
+        {"chat_id": RAW_CHAT_ID, "limit": 3, "from_message_id": target_message_id, "offset": -2},
+        {"chat_id": RAW_CHAT_ID, "limit": 3},
+    ]
+    assert history.exact_calls == [{"chat_id": RAW_CHAT_ID, "message_id": target_message_id}]
+    assert builder.close_commits == [True]
+    assert report["raw_values_printed"]["raw_id"] is False
+    assert report["raw_values_printed"]["url"] is False
+    assert str(target_message_id) not in rendered
+    assert str(RAW_CHAT_ID) not in rendered
+    assert raw_url not in rendered
+
+
+@pytest.mark.asyncio
+async def test_direct_exact_message_fallback_not_found_fails_closed_without_writes() -> None:
+    target_message_id = RAW_MESSAGE_ID + 1
+    failures = [
+        BoundedHistoryIngestError(
+            "telegram_history_read_failed",
+            history_read_failure_cause_bucket=HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT,
+        )
+        for _ in range(3)
+    ]
+    history = FakeHistoryClient(
+        [],
+        responses_by_call=[
+            *failures,
+            [_message(message_id=RAW_MESSAGE_ID)],
+        ],
+        exact_responses_by_call=[None],
+    )
+
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(target_message_id=target_message_id),
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["error_code"] == "target_message_missing"
+    assert report["exact_message_read_attempted"] is True
+    assert report["exact_message_read_succeeded"] is False
+    assert report["exact_message_read_failure_cause_bucket"] == "not_found"
+    assert report["per_channel_results"][0]["reason_code"] == "target_message_missing"
+    assert report["per_channel_results"][0]["exact_message_read_failure_cause_bucket"] == "not_found"
+    assert report["database_write_attempted"] is False
+    assert report["source_message_write_attempted"] is False
+    assert report["source_version_write_attempted"] is False
+    assert report["source_outbox_write_attempted"] is False
+    assert report["readback"]["source_current_found_count"] == 0
+    assert report["readback"]["source_version_rows_count"] == 0
+    assert report["readback"]["source_created_events_count"] == 0
+    assert report["readback"]["source_outbox_events_count"] == 0
+    assert repository.messages == {}
+    assert repository.versions == {}
+    assert repository.outbox == []
+    assert history.exact_calls == [{"chat_id": RAW_CHAT_ID, "message_id": target_message_id}]
+    assert builder.close_commits == [False]
+    assert report["raw_values_printed"]["raw_id"] is False
+    assert str(target_message_id) not in rendered
+    assert str(RAW_CHAT_ID) not in rendered
+
+
+@pytest.mark.asyncio
+async def test_direct_exact_message_fallback_wrong_message_id_fails_closed_without_writes() -> None:
+    target_message_id = RAW_MESSAGE_ID + 1
+    wrong_message_id = RAW_MESSAGE_ID + 99
+    failures = [
+        BoundedHistoryIngestError(
+            "telegram_history_read_failed",
+            history_read_failure_cause_bucket=HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT,
+        )
+        for _ in range(3)
+    ]
+    history = FakeHistoryClient(
+        [],
+        responses_by_call=[
+            *failures,
+            [_message(message_id=RAW_MESSAGE_ID)],
+        ],
+        exact_message_response=_message(message_id=wrong_message_id),
+    )
+
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(target_message_id=target_message_id),
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["error_code"] == "target_message_missing"
+    assert report["exact_message_read_attempted"] is True
+    assert report["exact_message_read_succeeded"] is False
+    assert report["exact_message_read_failure_cause_bucket"] == "unsupported_response"
+    assert report["database_write_attempted"] is False
+    assert report["source_message_write_attempted"] is False
+    assert report["source_version_write_attempted"] is False
+    assert report["source_outbox_write_attempted"] is False
+    assert (RAW_CHAT_ID, wrong_message_id) not in repository.messages
+    assert repository.messages == {}
+    assert repository.versions == {}
+    assert repository.outbox == []
+    assert history.exact_calls == [{"chat_id": RAW_CHAT_ID, "message_id": target_message_id}]
+    assert builder.close_commits == [False]
+    assert str(target_message_id) not in rendered
+    assert str(wrong_message_id) not in rendered
+    assert str(RAW_CHAT_ID) not in rendered
+
+
+@pytest.mark.asyncio
 async def test_exact_target_non_bounded_history_error_skips_anchorless_fallback_without_writes() -> None:
     target_message_id = RAW_MESSAGE_ID + 1
     failure = BoundedHistoryIngestError(
@@ -1679,8 +1877,11 @@ async def test_exact_target_non_bounded_history_error_skips_anchorless_fallback_
     assert result.ok is False
     assert report["error_code"] == "telegram_history_read_failed"
     assert report["history_read_failure_cause_bucket"] == HISTORY_READ_CAUSE_TARGET_UNAVAILABLE
+    assert report["exact_message_read_attempted"] is False
+    assert report["exact_message_read_succeeded"] is False
     assert report["history_window_attempts"] == 1
     assert report["per_channel_results"][0]["history_window_attempts"] == 1
+    assert report["per_channel_results"][0]["exact_message_read_attempted"] is False
     assert report["database_write_attempted"] is False
     assert report["source_message_write_attempted"] is False
     assert report["source_version_write_attempted"] is False
@@ -1689,6 +1890,7 @@ async def test_exact_target_non_bounded_history_error_skips_anchorless_fallback_
     assert repository.versions == {}
     assert repository.outbox == []
     assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": target_message_id}]
+    assert history.exact_calls == []
     assert builder.close_commits == [False]
     assert str(target_message_id) not in rendered
     assert str(RAW_CHAT_ID) not in rendered
@@ -1719,9 +1921,12 @@ async def test_exact_target_anchorless_bounded_error_reports_safe_cause_bucket_w
     assert result.ok is False
     assert report["error_code"] == "telegram_history_read_failed"
     assert report["history_read_failure_cause_bucket"] == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT
+    assert report["exact_message_read_attempted"] is False
+    assert report["exact_message_read_succeeded"] is False
     assert report["history_window_attempts"] == 4
     assert report["per_channel_results"][0]["reason_code"] == "telegram_history_read_failed"
     assert report["per_channel_results"][0]["history_window_attempts"] == 4
+    assert report["per_channel_results"][0]["exact_message_read_attempted"] is False
     assert (
         report["per_channel_results"][0]["history_read_failure_cause_bucket"]
         == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT
@@ -1741,6 +1946,7 @@ async def test_exact_target_anchorless_bounded_error_reports_safe_cause_bucket_w
         {"chat_id": RAW_CHAT_ID, "limit": 3, "from_message_id": target_message_id, "offset": -2},
         {"chat_id": RAW_CHAT_ID, "limit": 3},
     ]
+    assert history.exact_calls == []
     assert builder.close_commits == [False]
     assert report["raw_values_printed"]["tdlib_payload"] is False
     assert report["raw_values_printed"]["exception_body"] is False
@@ -1763,6 +1969,26 @@ async def test_exact_target_anchorless_bounded_error_reports_safe_cause_bucket_w
         '"offset"',
     ):
         assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_missing_target_message_id_uses_existing_history_without_direct_read() -> None:
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(),
+        history=FakeHistoryClient([_message()]),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is True
+    assert report["target_message_id_present"] is False
+    assert report["exact_message_read_attempted"] is False
+    assert report["exact_message_read_succeeded"] is False
+    assert report["messages_seen"] == 1
+    assert report["source_messages_created_count"] == 1
+    assert list(repository.messages) == [(RAW_CHAT_ID, RAW_MESSAGE_ID)]
+    assert history.calls == [{"chat_id": RAW_CHAT_ID, "limit": 1}]
+    assert history.exact_calls == []
+    assert builder.close_commits == [True]
 
 
 @pytest.mark.asyncio
@@ -2817,6 +3043,67 @@ async def test_tdlib_history_client_submits_parameters_before_history_request() 
     assert transport.sent_requests[1]["api_hash"] == RAW_SECRET
     assert transport.sent_requests[2]["encryption_key"]
     assert transport.sent_requests[3]["chat_id"] == RAW_CHAT_ID
+
+
+@pytest.mark.asyncio
+async def test_tdlib_history_client_reads_exact_message_with_get_message() -> None:
+    target_message_id = RAW_MESSAGE_ID + 1
+    state = BoundedTelegramCollectorHistoryIngestState()
+    transport = FakeTDLibTransport(
+        auth_payloads=[{"@type": "authorizationStateReady"}],
+        exact_message_response=_message(message_id=target_message_id),
+    )
+    tdlib = TDLibClient(_runtime_config(), transport=transport)
+    client = _TDLibBoundedHistoryClient(tdlib, state=state, auth_ready_timeout_sec=0.1)
+
+    message = await client.read_exact_message(chat_id=RAW_CHAT_ID, message_id=target_message_id)
+
+    assert message is not None
+    assert message["id"] == target_message_id
+    assert state.telegram_read_called is True
+    assert state.exact_message_read_failure_cause_bucket is None
+    assert [request["@type"] for request in transport.sent_requests] == [
+        "getAuthorizationState",
+        "getMessage",
+    ]
+    assert transport.sent_requests[1]["chat_id"] == RAW_CHAT_ID
+    assert transport.sent_requests[1]["message_id"] == target_message_id
+
+
+@pytest.mark.asyncio
+async def test_tdlib_exact_message_error_sets_safe_bucket_without_payload() -> None:
+    target_message_id = RAW_MESSAGE_ID + 1
+    state = BoundedTelegramCollectorHistoryIngestState()
+    transport = FakeTDLibTransport(
+        auth_payloads=[{"@type": "authorizationStateReady"}],
+        exact_message_response={
+            "@type": "error",
+            "code": 404,
+            "message": f"MESSAGE_NOT_FOUND {target_message_id}",
+            "source_text": RAW_MESSAGE_TEXT,
+            "debug_detail": EXCEPTION_DETAIL,
+        },
+    )
+    tdlib = TDLibClient(_runtime_config(), transport=transport)
+    client = _TDLibBoundedHistoryClient(tdlib, state=state, auth_ready_timeout_sec=0.1)
+
+    message = await client.read_exact_message(chat_id=RAW_CHAT_ID, message_id=target_message_id)
+    rendered = json.dumps(
+        {
+            "exact_message_read_failure_cause_bucket": state.exact_message_read_failure_cause_bucket,
+        },
+        sort_keys=True,
+    )
+
+    assert message is None
+    assert state.telegram_read_called is True
+    assert state.exact_message_read_failure_cause_bucket == "not_found"
+    assert [request["@type"] for request in transport.sent_requests] == [
+        "getAuthorizationState",
+        "getMessage",
+    ]
+    for raw_value in (str(RAW_CHAT_ID), str(target_message_id), RAW_MESSAGE_TEXT, EXCEPTION_DETAIL):
+        assert raw_value not in rendered
 
 
 @pytest.mark.asyncio

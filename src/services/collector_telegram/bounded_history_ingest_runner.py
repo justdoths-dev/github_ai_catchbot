@@ -92,6 +92,18 @@ _HISTORY_READ_FAILURE_CAUSE_BUCKETS = frozenset(
         HISTORY_READ_CAUSE_TARGET_UNAVAILABLE,
     }
 )
+EXACT_MESSAGE_READ_CAUSE_NOT_FOUND = "not_found"
+EXACT_MESSAGE_READ_CAUSE_TDLIB_ERROR = "tdlib_error"
+EXACT_MESSAGE_READ_CAUSE_UNSUPPORTED_RESPONSE = "unsupported_response"
+EXACT_MESSAGE_READ_CAUSE_TIMEOUT = "timeout"
+_EXACT_MESSAGE_READ_FAILURE_CAUSE_BUCKETS = frozenset(
+    {
+        EXACT_MESSAGE_READ_CAUSE_NOT_FOUND,
+        EXACT_MESSAGE_READ_CAUSE_TDLIB_ERROR,
+        EXACT_MESSAGE_READ_CAUSE_UNSUPPORTED_RESPONSE,
+        EXACT_MESSAGE_READ_CAUSE_TIMEOUT,
+    }
+)
 
 JsonDict = dict[str, Any]
 RuntimeConfigLoader = Callable[[], CollectorTelegramConfig]
@@ -190,6 +202,8 @@ class BoundedHistoryClient(Protocol):
         offset: int = 0,
     ) -> Sequence[Mapping[str, Any]]: ...
 
+    async def read_exact_message(self, *, chat_id: int, message_id: int) -> Mapping[str, Any] | None: ...
+
     async def close(self) -> None: ...
 
 
@@ -241,6 +255,9 @@ class BoundedTelegramCollectorHistoryIngestState:
     tdlib_log_suppression_confirmed: bool = False
     telegram_read_attempted: bool = False
     telegram_read_called: bool = False
+    exact_message_read_attempted: bool = False
+    exact_message_read_succeeded: bool = False
+    exact_message_read_failure_cause_bucket: str | None = None
     source_message_write_attempted: bool = False
     source_version_write_attempted: bool = False
     source_outbox_write_attempted: bool = False
@@ -475,6 +492,12 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "status": _report_status(self.status, self.ok),
             "reason_code": self.error_code or "ok",
             "history_read_failure_cause_bucket": self.history_read_failure_cause_bucket,
+            "exact_message_read_attempted": self.state.exact_message_read_attempted,
+            "exact_message_read_succeeded": self.state.exact_message_read_succeeded,
+            "exact_message_read_failure_cause_bucket": self.state.exact_message_read_failure_cause_bucket
+            if self.state.exact_message_read_failure_cause_bucket
+            in _EXACT_MESSAGE_READ_FAILURE_CAUSE_BUCKETS
+            else None,
             "target_count": self.target_count,
             "max_targets": self.max_targets,
             "target_fingerprints": list(self.target_fingerprints),
@@ -575,6 +598,9 @@ class _TargetSourceLastExecution:
     target: _ResolvedTarget
     messages_seen: int = 0
     history_window_attempts: int = 0
+    exact_message_read_attempted: bool = False
+    exact_message_read_succeeded: bool = False
+    exact_message_read_failure_cause_bucket: str | None = None
     source_messages_created_count: int = 0
     source_versions_appended_count: int = 0
     outbox_events_inserted_count: int = 0
@@ -671,6 +697,40 @@ class _TDLibBoundedHistoryClient:
                 raise BoundedHistoryIngestError("telegram_history_response_invalid")
             return tuple(message for message in messages if isinstance(message, Mapping))
         raise BoundedHistoryIngestError("telegram_history_read_timeout")
+
+    async def read_exact_message(self, *, chat_id: int, message_id: int) -> Mapping[str, Any] | None:
+        await self._ensure_ready_for_history_read()
+        payload = {
+            "@type": "getMessage",
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }
+        extra = f"{RUNNER_NAME}:exact_message:{uuid4()}"
+        payload["@extra"] = extra
+        self._state.telegram_read_called = True
+        await self._tdlib.send(payload)
+
+        deadline = time.monotonic() + self._timeout_sec
+        while time.monotonic() < deadline:
+            receive_timeout = min(HISTORY_RECEIVE_TIMEOUT_SEC, max(0.0, deadline - time.monotonic()))
+            response = await self._tdlib.receive(receive_timeout)
+            if response is None:
+                continue
+            if response.get("@extra") != extra:
+                continue
+            if response.get("@type") == "error":
+                self._state.exact_message_read_failure_cause_bucket = (
+                    _classify_tdlib_exact_message_read_error_cause(response)
+                )
+                return None
+            if response.get("@type") != "message":
+                self._state.exact_message_read_failure_cause_bucket = (
+                    EXACT_MESSAGE_READ_CAUSE_UNSUPPORTED_RESPONSE
+                )
+                return None
+            return dict(response)
+        self._state.exact_message_read_failure_cause_bucket = EXACT_MESSAGE_READ_CAUSE_TIMEOUT
+        return None
 
     async def close(self) -> None:
         await self._tdlib.close()
@@ -782,6 +842,40 @@ def _select_exact_target_messages(
     )
 
 
+async def _read_direct_exact_target_message(
+    *,
+    history_client: BoundedHistoryClient,
+    target: _ResolvedTarget,
+    target_message_id: int,
+    state: BoundedTelegramCollectorHistoryIngestState,
+) -> tuple[Mapping[str, Any], ...]:
+    state.exact_message_read_attempted = True
+    state.exact_message_read_succeeded = False
+    state.exact_message_read_failure_cause_bucket = None
+
+    message = await history_client.read_exact_message(
+        chat_id=target.chat_id,
+        message_id=target_message_id,
+    )
+    if message is None or not isinstance(message, Mapping):
+        if state.exact_message_read_failure_cause_bucket not in _EXACT_MESSAGE_READ_FAILURE_CAUSE_BUCKETS:
+            state.exact_message_read_failure_cause_bucket = EXACT_MESSAGE_READ_CAUSE_NOT_FOUND
+        return ()
+
+    if _message_id(message) != target_message_id:
+        state.exact_message_read_failure_cause_bucket = EXACT_MESSAGE_READ_CAUSE_UNSUPPORTED_RESPONSE
+        return ()
+
+    message_chat_id = _message_chat_id(message)
+    if message_chat_id is None or message_chat_id != target.chat_id:
+        state.exact_message_read_failure_cause_bucket = EXACT_MESSAGE_READ_CAUSE_UNSUPPORTED_RESPONSE
+        return ()
+
+    state.exact_message_read_succeeded = True
+    state.exact_message_read_failure_cause_bucket = None
+    return (dict(message),)
+
+
 async def _fetch_history_for_target(
     *,
     history_client: BoundedHistoryClient,
@@ -854,6 +948,15 @@ async def _fetch_history_for_target(
                 return tuple(selected_messages)
         if anchorless_bounded_window_failure is not None:
             raise anchorless_bounded_window_failure
+
+    direct_message = await _read_direct_exact_target_message(
+        history_client=history_client,
+        target=target,
+        target_message_id=target_message_id,
+        state=state,
+    )
+    if direct_message:
+        return direct_message
     return ()
 
 
@@ -1629,12 +1732,20 @@ async def _execute_target_source_last(
     readback = SourceLastReadbackResult()
     source_commit_durable = False
     history_window_attempts = 0
+    exact_message_read_attempted = False
+    exact_message_read_succeeded = False
+    exact_message_read_failure_cause_bucket: str | None = None
 
     def partial() -> _TargetSourceLastExecution:
         return _TargetSourceLastExecution(
             target=target,
             messages_seen=len(selected_messages),
             history_window_attempts=history_window_attempts,
+            exact_message_read_attempted=exact_message_read_attempted,
+            exact_message_read_succeeded=exact_message_read_succeeded,
+            exact_message_read_failure_cause_bucket=exact_message_read_failure_cause_bucket
+            if exact_message_read_failure_cause_bucket in _EXACT_MESSAGE_READ_FAILURE_CAUSE_BUCKETS
+            else None,
             source_messages_created_count=created_count,
             source_versions_appended_count=version_count,
             outbox_events_inserted_count=outbox_count,
@@ -1651,6 +1762,7 @@ async def _execute_target_source_last(
     try:
         state.telegram_read_attempted = True
         attempt_start = state.history_window_attempts
+        exact_attempted_before = state.exact_message_read_attempted
         try:
             messages = await _fetch_history_for_target(
                 history_client=runtime.history_client,
@@ -1661,6 +1773,13 @@ async def _execute_target_source_last(
             )
         finally:
             history_window_attempts = state.history_window_attempts - attempt_start
+            exact_message_read_attempted = state.exact_message_read_attempted and not exact_attempted_before
+            exact_message_read_succeeded = (
+                state.exact_message_read_succeeded if exact_message_read_attempted else False
+            )
+            exact_message_read_failure_cause_bucket = (
+                state.exact_message_read_failure_cause_bucket if exact_message_read_attempted else None
+            )
         state.telegram_read_called = True
         if len(messages) > history_limit:
             raise _TargetSourceLastExecutionFailed(
@@ -1897,6 +2016,13 @@ def _channel_report(
         "messages_requested": history_limit,
         "messages_seen": 0 if execution is None else execution.messages_seen,
         "history_window_attempts": 0 if execution is None else execution.history_window_attempts,
+        "exact_message_read_attempted": False if execution is None else execution.exact_message_read_attempted,
+        "exact_message_read_succeeded": False if execution is None else execution.exact_message_read_succeeded,
+        "exact_message_read_failure_cause_bucket": None
+        if execution is None
+        else execution.exact_message_read_failure_cause_bucket
+        if execution.exact_message_read_failure_cause_bucket in _EXACT_MESSAGE_READ_FAILURE_CAUSE_BUCKETS
+        else None,
         "bounded_counts": {
             "source_messages_created": 0 if execution is None else execution.source_messages_created_count,
             "source_versions_created": 0 if execution is None else execution.source_versions_appended_count,
@@ -2444,6 +2570,15 @@ def _classify_tdlib_history_read_error_cause(response: Mapping[str, Any]) -> str
         return HISTORY_READ_CAUSE_REQUEST_CONSTRUCTION_REPAIR
 
     return HISTORY_READ_CAUSE_RUNTIME_TDLIB_ACCESS_ISSUE
+
+
+def _classify_tdlib_exact_message_read_error_cause(response: Mapping[str, Any]) -> str:
+    code = _tdlib_error_code(response.get("code"))
+    message = _tdlib_error_message(response.get("message"))
+    normalized = message.replace("_", " ").replace("-", " ")
+    if code == 404 or "message not found" in normalized or "not found" in normalized:
+        return EXACT_MESSAGE_READ_CAUSE_NOT_FOUND
+    return EXACT_MESSAGE_READ_CAUSE_TDLIB_ERROR
 
 
 def _tdlib_error_code(value: Any) -> int | None:
