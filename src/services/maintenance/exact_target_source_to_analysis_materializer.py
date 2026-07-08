@@ -256,6 +256,7 @@ class ExactTargetSourceToAnalysisReport:
     source_event_fingerprint: str | None
     artifact_fingerprint: str | None
     candidate_group_fingerprint: str | None
+    selected_candidate_group_fingerprint: str | None
     refresh_event_fingerprint: str | None
     artifact_enrichment_request_fingerprint: str | None
     provider_snapshot_update_fingerprint: str | None
@@ -348,6 +349,9 @@ class NormalizationReadback:
     depth_budget: int | None = None
     provider_route_counts: dict[str, int] = field(default_factory=dict)
     provider_requests: tuple[ProviderEnrichmentRequestRow, ...] = ()
+    source_candidate_groups: int = 0
+    source_enrichment_requests: int = 0
+    source_provider_route_counts: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)
@@ -545,16 +549,24 @@ class SqlExactTargetSourceToAnalysisRepository:
         )
         primary_rows = await self._rows(
             """
-            SELECT cgp.candidate_group_id, ar.artifact_id, ar.artifact_type
+            SELECT
+                cgp.candidate_group_id,
+                cgm.candidate_group_member_id,
+                ar.artifact_id,
+                ar.artifact_type
             FROM candidate_group_proposals cgp
-            JOIN candidate_group_members cgm
+            LEFT JOIN candidate_group_members cgm
               ON cgm.candidate_group_id = cgp.candidate_group_id
              AND cgm.member_role = 'primary'
-            JOIN artifact_registry ar ON ar.artifact_id = cgm.artifact_id
+            LEFT JOIN artifact_registry ar ON ar.artifact_id = cgm.artifact_id
             WHERE cgp.source_message_id = CAST(:source_message_id AS uuid)
               AND cgp.source_version_no = :source_version_no
-            ORDER BY cgp.created_at ASC, cgp.candidate_group_id ASC
-            LIMIT 2
+            ORDER BY
+                cgp.created_at ASC,
+                cgp.candidate_group_id ASC,
+                cgm.member_order ASC NULLS LAST,
+                cgm.created_at ASC NULLS LAST,
+                cgm.candidate_group_member_id ASC NULLS LAST
             """,
             {
                 "source_message_id": str(source_message_id),
@@ -576,51 +588,72 @@ class SqlExactTargetSourceToAnalysisRepository:
               AND payload_json->>'source_message_id' = :source_message_id
               AND payload_json->>'source_version_no' = :source_version_no_text
             ORDER BY created_at ASC, event_id ASC
-            LIMIT 10
             """,
             {
                 "source_message_id": str(source_message_id),
                 "source_version_no_text": str(source_version_no),
             },
         )
-        provider_route_counts: dict[str, int] = {}
+        source_provider_route_counts: dict[str, int] = {}
         for row in enrichment_rows:
             route = str(row.get("provider_route") or "")
             if route in {"github", "x", "web"}:
-                provider_route_counts[route] = provider_route_counts.get(route, 0) + 1
-        provider_requests = tuple(
-            ProviderEnrichmentRequestRow(
-                trigger_event_id=UUID(str(row["event_id"])),
-                candidate_group_id=UUID(str(row["candidate_group_id"])),
-                artifact_id=UUID(str(row["artifact_id"])),
-                artifact_type=str(row["artifact_type"] or ""),
-                provider_route=str(row["provider_route"] or ""),
-                refresh_mode=str(row["refresh_mode"] or ""),
-                depth_budget=int(row["depth_budget"]),
-            )
-            for row in enrichment_rows
-            if row.get("candidate_group_id")
-            and row.get("artifact_id")
-            and row.get("depth_budget") is not None
+                source_provider_route_counts[route] = source_provider_route_counts.get(route, 0) + 1
+        selected_candidate_group_id = (
+            None if not primary_rows else UUID(str(primary_rows[0]["candidate_group_id"]))
         )
-        first = primary_rows[0] if primary_rows else None
-        enrichment = enrichment_rows[0] if enrichment_rows else None
+        selected_primary_rows = [
+            row
+            for row in primary_rows
+            if selected_candidate_group_id is not None
+            and str(row.get("candidate_group_id")) == str(selected_candidate_group_id)
+            and row.get("artifact_id") is not None
+        ]
+        selected_primary = selected_primary_rows[0] if selected_primary_rows else None
+        all_provider_requests = tuple(
+            row
+            for row in (
+                _provider_request_row_from_mapping(enrichment_row)
+                for enrichment_row in enrichment_rows
+            )
+            if row is not None
+        )
+        selected_provider_requests = tuple(
+            row
+            for row in all_provider_requests
+            if selected_candidate_group_id is not None
+            and row.candidate_group_id == selected_candidate_group_id
+        )
+        selected_provider_route_counts: dict[str, int] = {}
+        for row in selected_provider_requests:
+            if row.provider_route in {"github", "x", "web"}:
+                selected_provider_route_counts[row.provider_route] = (
+                    selected_provider_route_counts.get(row.provider_route, 0) + 1
+                )
+        enrichment = selected_provider_requests[0] if selected_provider_requests else None
         return NormalizationReadback(
             normalization_runs=normalization_runs,
-            candidate_groups=candidate_groups,
-            primary_members=len(primary_rows),
-            primary_artifact_type=None if first is None else str(first["artifact_type"]),
-            primary_artifact_id=None if first is None else UUID(str(first["artifact_id"])),
-            candidate_group_id=None if first is None else UUID(str(first["candidate_group_id"])),
-            enrichment_requests=len(enrichment_rows),
-            enrichment_request_event_id=(
-                None if not enrichment_rows else UUID(str(enrichment_rows[0]["event_id"]))
+            candidate_groups=1 if selected_candidate_group_id is not None else 0,
+            primary_members=len(selected_primary_rows),
+            primary_artifact_type=(
+                None if selected_primary is None else str(selected_primary["artifact_type"])
             ),
-            provider_route=None if enrichment is None else str(enrichment.get("provider_route") or ""),
-            refresh_mode=None if enrichment is None else str(enrichment.get("refresh_mode") or ""),
-            depth_budget=_int_or_none(None if enrichment is None else enrichment.get("depth_budget")),
-            provider_route_counts=provider_route_counts,
-            provider_requests=provider_requests,
+            primary_artifact_id=(
+                None if selected_primary is None else UUID(str(selected_primary["artifact_id"]))
+            ),
+            candidate_group_id=selected_candidate_group_id,
+            enrichment_requests=len(selected_provider_requests),
+            enrichment_request_event_id=(
+                None if enrichment is None else enrichment.trigger_event_id
+            ),
+            provider_route=None if enrichment is None else enrichment.provider_route,
+            refresh_mode=None if enrichment is None else enrichment.refresh_mode,
+            depth_budget=None if enrichment is None else enrichment.depth_budget,
+            provider_route_counts=selected_provider_route_counts,
+            provider_requests=all_provider_requests,
+            source_candidate_groups=candidate_groups,
+            source_enrichment_requests=len(enrichment_rows),
+            source_provider_route_counts=source_provider_route_counts,
         )
 
     async def insert_candidate_bundle_refresh_event(
@@ -835,10 +868,12 @@ class SqlExactTargetSourceToAnalysisRepository:
                 WHERE event_type = 'artifact.enrich.requested.v1'
                   AND payload_json->>'source_message_id' = :source_message_id
                   AND payload_json->>'source_version_no' = :source_version_no_text
+                  AND payload_json->>'candidate_group_id' = :candidate_group_id
                 """,
                 {
                     "source_message_id": str(source_message_id),
                     "source_version_no_text": str(source_version_no),
+                    "candidate_group_id": str(candidate_group_id),
                 },
             ),
             provider_snapshots=await self._count(
@@ -2766,21 +2801,37 @@ def _apply_normalization_readback(
     report: ExactTargetSourceToAnalysisReport,
     readback: NormalizationReadback,
 ) -> ExactTargetSourceToAnalysisReport:
+    source_candidate_groups = _source_candidate_groups(readback)
     return replace(
         _with_counts(
             report,
             {
                 "normalization_runs": readback.normalization_runs,
                 "candidate_groups": readback.candidate_groups,
+                "source_candidate_groups_count": source_candidate_groups,
+                "unselected_candidate_groups_count": max(
+                    0,
+                    source_candidate_groups - readback.candidate_groups,
+                ),
                 "primary_members": readback.primary_members,
                 "external_enrichment_requests": readback.enrichment_requests,
+                "selected_external_enrichment_requests": readback.enrichment_requests,
                 **{
                     f"provider_route_{route}": count
                     for route, count in readback.provider_route_counts.items()
                 },
+                **{
+                    f"selected_provider_route_{route}": count
+                    for route, count in readback.provider_route_counts.items()
+                },
+                **{
+                    f"source_provider_route_{route}": count
+                    for route, count in _source_provider_route_counts(readback).items()
+                },
             },
         ),
         candidate_group_fingerprint=_fingerprint(readback.candidate_group_id),
+        selected_candidate_group_fingerprint=_fingerprint(readback.candidate_group_id),
         artifact_fingerprint=_fingerprint(readback.primary_artifact_id),
         candidate_created=readback.candidate_groups == 1,
         artifact_enrichment_request_created=readback.enrichment_requests >= 1,
@@ -2848,6 +2899,9 @@ def _normalization_error(readback: NormalizationReadback) -> str | None:
             return "primary_artifact_type_invalid_for_enrichment"
         if not readback.provider_route_counts:
             return "provider_route_missing"
+        source_route_error = _source_route_error(readback)
+        if source_route_error is not None:
+            return source_route_error
         routes = _provider_routes(readback)
         if len(routes) > 1:
             return "mixed_provider_routes_not_supported_by_exact_materializer"
@@ -2862,6 +2916,8 @@ def _normalization_error(readback: NormalizationReadback) -> str | None:
                 if row_error is not None:
                     return row_error
             return None
+        if _source_candidate_groups(readback) != 1:
+            return "candidate_group_cardinality_invalid"
         if route != "github":
             return "provider_route_not_supported_by_live_exact_materializer"
         if readback.enrichment_requests != 1:
@@ -2875,6 +2931,8 @@ def _normalization_error(readback: NormalizationReadback) -> str | None:
         if readback.depth_budget is None:
             return "depth_budget_missing"
         return None
+    if _source_candidate_groups(readback) != 1:
+        return "candidate_group_cardinality_invalid"
     if readback.primary_artifact_type != "text_idea":
         return "primary_artifact_type_not_text_idea"
     return None
@@ -2882,6 +2940,7 @@ def _normalization_error(readback: NormalizationReadback) -> str | None:
 
 def _normalization_error_status(reason_code: str) -> str:
     if reason_code in {
+        "candidate_group_cardinality_invalid",
         "provider_route_not_supported_by_live_exact_materializer",
         "mixed_provider_routes_not_supported_by_exact_materializer",
         "web_provider_request_count_exceeds_exact_materializer_cap",
@@ -2897,6 +2956,9 @@ def _provider_request_error(readback: NormalizationReadback) -> str | None:
         return "primary_artifact_missing"
     if not readback.primary_artifact_type:
         return "primary_artifact_type_missing"
+    source_route_error = _source_route_error(readback)
+    if source_route_error is not None:
+        return source_route_error
     routes = _provider_routes(readback)
     if not routes:
         return "provider_route_missing"
@@ -2917,6 +2979,8 @@ def _provider_request_error(readback: NormalizationReadback) -> str | None:
                 return row_error
         return None
     if route == "github":
+        if _source_candidate_groups(readback) != 1:
+            return "candidate_group_cardinality_invalid"
         if readback.enrichment_requests != 1:
             return "artifact_enrichment_request_cardinality_invalid"
         if readback.enrichment_request_event_id is None:
@@ -2933,6 +2997,47 @@ def _provider_request_error(readback: NormalizationReadback) -> str | None:
     return "provider_route_not_allowed"
 
 
+def _source_candidate_groups(readback: NormalizationReadback) -> int:
+    return readback.source_candidate_groups or readback.candidate_groups
+
+
+def _source_provider_route_counts(readback: NormalizationReadback) -> dict[str, int]:
+    return (
+        dict(readback.source_provider_route_counts)
+        if readback.source_provider_route_counts
+        else dict(readback.provider_route_counts)
+    )
+
+
+def _source_provider_routes(readback: NormalizationReadback) -> set[str]:
+    return {
+        route
+        for route, count in _source_provider_route_counts(readback).items()
+        if count > 0
+    }
+
+
+def _source_route_error(readback: NormalizationReadback) -> str | None:
+    if _source_candidate_groups(readback) == 1:
+        return None
+    source_enrichment_requests = (
+        readback.source_enrichment_requests or readback.enrichment_requests
+    )
+    if (
+        source_enrichment_requests > 0
+        and sum(_source_provider_route_counts(readback).values()) != source_enrichment_requests
+    ):
+        return "provider_route_missing"
+    source_routes = _source_provider_routes(readback)
+    if not source_routes:
+        return "provider_route_missing"
+    if source_routes == {"web"}:
+        return None
+    if source_routes == {"x"}:
+        return "provider_route_not_supported_by_live_exact_materializer"
+    return "mixed_provider_routes_not_supported_by_exact_materializer"
+
+
 def _provider_routes(readback: NormalizationReadback) -> set[str]:
     routes = {route for route, count in readback.provider_route_counts.items() if count > 0}
     if not routes and readback.provider_route:
@@ -2942,7 +3047,13 @@ def _provider_routes(readback: NormalizationReadback) -> set[str]:
 
 def _provider_request_rows(readback: NormalizationReadback) -> tuple[ProviderEnrichmentRequestRow, ...]:
     if readback.provider_requests:
-        return readback.provider_requests
+        if readback.candidate_group_id is None:
+            return ()
+        return tuple(
+            row
+            for row in readback.provider_requests
+            if row.candidate_group_id == readback.candidate_group_id
+        )
     if (
         readback.enrichment_request_event_id is not None
         and readback.candidate_group_id is not None
@@ -3260,6 +3371,7 @@ def _report(
         source_event_fingerprint=None,
         artifact_fingerprint=None,
         candidate_group_fingerprint=None,
+        selected_candidate_group_fingerprint=None,
         refresh_event_fingerprint=None,
         artifact_enrichment_request_fingerprint=None,
         provider_snapshot_update_fingerprint=None,
@@ -3472,6 +3584,7 @@ def build_restricted_source_channel_proof(
             "source_outbox_event": report.source_event_fingerprint,
             "artifact": report.artifact_fingerprint,
             "candidate_group": report.candidate_group_fingerprint,
+            "selected_candidate_group": report.selected_candidate_group_fingerprint,
             "bundle": report.bundle_fingerprint,
             "analysis_request": report.analysis_request_fingerprint,
         },
@@ -3484,8 +3597,12 @@ def build_restricted_source_channel_proof(
                 "source_created_events",
                 "telegram_raw_updates",
                 "normalization_runs",
+                "source_candidate_groups_count",
                 "candidate_groups",
+                "unselected_candidate_groups_count",
                 "external_enrichment_requests",
+                "selected_external_enrichment_requests",
+                "selected_provider_route_web",
                 "provider_snapshots",
                 "artifact_snapshot_updated_events",
                 "github_request_count",
@@ -3787,6 +3904,30 @@ def _int_or_none(value: Any) -> int | None:
         return None
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _provider_request_row_from_mapping(
+    row: Mapping[str, Any],
+) -> ProviderEnrichmentRequestRow | None:
+    if (
+        row.get("event_id") is None
+        or row.get("candidate_group_id") is None
+        or row.get("artifact_id") is None
+        or row.get("depth_budget") is None
+    ):
+        return None
+    try:
+        return ProviderEnrichmentRequestRow(
+            trigger_event_id=UUID(str(row["event_id"])),
+            candidate_group_id=UUID(str(row["candidate_group_id"])),
+            artifact_id=UUID(str(row["artifact_id"])),
+            artifact_type=str(row.get("artifact_type") or ""),
+            provider_route=str(row.get("provider_route") or ""),
+            refresh_mode=str(row.get("refresh_mode") or ""),
+            depth_budget=int(row["depth_budget"]),
+        )
     except (TypeError, ValueError):
         return None
 

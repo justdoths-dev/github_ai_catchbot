@@ -77,6 +77,10 @@ TWO_WEB_URL_TEXT = (
     "AI 개발 workflow 자동화 제약을 우회하는 방법 "
     "https://example.com/alpha https://example.org/beta"
 )
+THREE_WEB_URL_TEXT = (
+    "AI 개발 workflow 자동화 제약을 우회하는 방법 "
+    "https://example.com/alpha https://example.org/beta https://example.net/gamma"
+)
 FOUR_WEB_URL_TEXT = (
     "AI 개발 workflow 자동화 제약을 우회하는 방법 "
     "https://example.com/a https://example.org/b https://example.net/c https://example.dev/d"
@@ -447,11 +451,16 @@ class Ledger:
         self.outbox: list[dict[str, Any]] = []
         self.normalization_runs: list[dict[str, Any]] = []
         self.candidate_group_id: UUID | None = None
+        self.candidate_group_ids: list[UUID] = []
         self.primary_artifact_id: UUID | None = None
         self.primary_artifact_type: str | None = None
         self.enrichment_requests = 0
+        self.source_candidate_groups_count = 0
+        self.source_enrichment_requests = 0
+        self.source_provider_route_counts: dict[str, int] = {}
         self.enrichment_request_event_id: UUID | None = None
         self.provider_request_rows: list[ProviderEnrichmentRequestRow] = []
+        self.provider_request_attempts: list[ProviderEnrichmentRequest] = []
         self.provider_route_counts: dict[str, int] = {}
         self.provider_route: str | None = None
         self.refresh_mode: str | None = None
@@ -477,6 +486,7 @@ class Ledger:
         self.normalizer_failure = False
         self.assembler_failure = False
         self.provider_authority: ProviderLiveAuthority | None = None
+        self.multi_candidate_groups: list[list[tuple[str, str]]] | None = None
 
 
 class FakeCollectorRepository:
@@ -567,6 +577,22 @@ class FakeMaterializerRepository:
     async def load_normalization_readback(self, *, source_message_id: UUID, source_version_no: int):
         self.ledger.call_order.append("materializer.load_normalization_readback")
         del source_message_id, source_version_no
+        selected_provider_rows = [
+            row
+            for row in self.ledger.provider_request_rows
+            if row.candidate_group_id == self.ledger.candidate_group_id
+        ]
+        selected_route_counts: dict[str, int] = {}
+        for row in selected_provider_rows:
+            selected_route_counts[row.provider_route] = (
+                selected_route_counts.get(row.provider_route, 0) + 1
+            )
+        selected_first = selected_provider_rows[0] if selected_provider_rows else None
+        selected_enrichment_requests = (
+            self.ledger.enrichment_requests
+            if self.ledger.enrichment_requests != len(selected_provider_rows)
+            else len(selected_provider_rows)
+        )
         return NormalizationReadback(
             normalization_runs=len(self.ledger.normalization_runs),
             candidate_groups=1 if self.ledger.candidate_group_id else 0,
@@ -574,13 +600,47 @@ class FakeMaterializerRepository:
             primary_artifact_type=self.ledger.primary_artifact_type,
             primary_artifact_id=self.ledger.primary_artifact_id,
             candidate_group_id=self.ledger.candidate_group_id,
-            enrichment_requests=self.ledger.enrichment_requests,
-            enrichment_request_event_id=self.ledger.enrichment_request_event_id,
-            provider_route=self.ledger.provider_route,
-            refresh_mode=self.ledger.refresh_mode,
-            depth_budget=self.ledger.depth_budget,
-            provider_route_counts=self.ledger.provider_route_counts,
+            enrichment_requests=selected_enrichment_requests,
+            enrichment_request_event_id=(
+                selected_first.trigger_event_id
+                if selected_first is not None
+                else self.ledger.enrichment_request_event_id
+            ),
+            provider_route=(
+                self.ledger.provider_route
+                or (selected_first.provider_route if selected_first is not None else None)
+            ),
+            refresh_mode=(
+                self.ledger.refresh_mode
+                or (selected_first.refresh_mode if selected_first is not None else None)
+            ),
+            depth_budget=(
+                self.ledger.depth_budget
+                if self.ledger.depth_budget is not None
+                else (selected_first.depth_budget if selected_first is not None else None)
+            ),
+            provider_route_counts=(
+                self.ledger.provider_route_counts
+                if self.ledger.provider_route_counts
+                else selected_route_counts
+            ),
             provider_requests=tuple(self.ledger.provider_request_rows),
+            source_candidate_groups=(
+                self.ledger.source_candidate_groups_count
+                or (1 if self.ledger.candidate_group_id else 0)
+            ),
+            source_enrichment_requests=(
+                self.ledger.source_enrichment_requests
+                or (
+                    len(self.ledger.provider_request_rows)
+                    if self.ledger.provider_request_rows
+                    else self.ledger.enrichment_requests
+                )
+            ),
+            source_provider_route_counts=(
+                self.ledger.source_provider_route_counts
+                or self.ledger.provider_route_counts
+            ),
         )
 
     async def insert_candidate_bundle_refresh_event(
@@ -617,6 +677,15 @@ class FakeMaterializerRepository:
         self.ledger.call_order.append("materializer.load_final_readback")
         source_id = str(source_message_id)
         del source_version_no, source_content_hash, chat_id, message_id, candidate_group_id
+        selected_enrichment_requests = (
+            sum(
+                1
+                for row in self.ledger.provider_request_rows
+                if row.candidate_group_id == self.ledger.candidate_group_id
+            )
+            if self.ledger.provider_request_rows
+            else self.ledger.enrichment_requests
+        )
         return FinalReadback(
             source_messages=sum(
                 1 for row in self.ledger.current.values() if row["source_message_id"] == source_id
@@ -633,7 +702,7 @@ class FakeMaterializerRepository:
                 if self.ledger.primary_artifact_id and self.ledger.primary_artifact_type == "text_idea"
                 else 0
             ),
-            external_enrichment_requests=self.ledger.enrichment_requests,
+            external_enrichment_requests=selected_enrichment_requests,
             provider_snapshots=(
                 len(self.ledger.provider_snapshot_ids)
                 if self.ledger.provider_snapshot_ids
@@ -675,11 +744,16 @@ class FakeNormalizerService:
         if not self.ledger.normalization_runs:
             self.ledger.normalization_runs.append({"trigger_event_id": message.trigger_event_id})
             self.ledger.candidate_group_id = uuid4()
+            self.ledger.candidate_group_ids = [self.ledger.candidate_group_id]
             self.ledger.primary_artifact_id = uuid4()
             current = next(iter(self.ledger.current.values()))
             if current.get("url_surface_json"):
                 text = str(current.get("text_body") or "")
-                if "github.com" in text and "example." in text:
+                if self.ledger.multi_candidate_groups is not None:
+                    self._emit_multi_candidate_provider_requests(
+                        self.ledger.multi_candidate_groups
+                    )
+                elif "github.com" in text and "example." in text:
                     self._emit_provider_requests(
                         [("github", "github_repo"), ("web", "web_article")]
                     )
@@ -693,8 +767,11 @@ class FakeNormalizerService:
 
     def _emit_provider_requests(self, routes: list[tuple[str, str]]) -> None:
         self.ledger.enrichment_requests = len(routes)
+        self.ledger.source_candidate_groups_count = 1 if self.ledger.candidate_group_id else 0
+        self.ledger.source_enrichment_requests = len(routes)
         self.ledger.provider_request_rows = []
         self.ledger.provider_route_counts = {}
+        self.ledger.source_provider_route_counts = {}
         for idx, (route, artifact_type) in enumerate(routes):
             artifact_id = self.ledger.primary_artifact_id if idx == 0 else uuid4()
             assert artifact_id is not None
@@ -707,6 +784,9 @@ class FakeNormalizerService:
                 self.ledger.depth_budget = 1
             self.ledger.provider_route_counts[route] = (
                 self.ledger.provider_route_counts.get(route, 0) + 1
+            )
+            self.ledger.source_provider_route_counts[route] = (
+                self.ledger.source_provider_route_counts.get(route, 0) + 1
             )
             self.ledger.provider_request_rows.append(
                 ProviderEnrichmentRequestRow(
@@ -726,6 +806,61 @@ class FakeNormalizerService:
                 }
             )
 
+    def _emit_multi_candidate_provider_requests(
+        self,
+        candidate_routes: list[list[tuple[str, str]]],
+    ) -> None:
+        assert candidate_routes
+        self.ledger.provider_request_rows = []
+        self.ledger.provider_route_counts = {}
+        self.ledger.source_provider_route_counts = {}
+        self.ledger.source_candidate_groups_count = len(candidate_routes)
+        self.ledger.candidate_group_ids = [uuid4() for _ in candidate_routes]
+        self.ledger.candidate_group_id = self.ledger.candidate_group_ids[0]
+        self.ledger.primary_artifact_id = uuid4()
+        self.ledger.primary_artifact_type = candidate_routes[0][0][1]
+        self.ledger.source_enrichment_requests = sum(len(routes) for routes in candidate_routes)
+        self.ledger.enrichment_requests = len(candidate_routes[0])
+        for group_idx, routes in enumerate(candidate_routes):
+            candidate_group_id = self.ledger.candidate_group_ids[group_idx]
+            for request_idx, (route, artifact_type) in enumerate(routes):
+                artifact_id = (
+                    self.ledger.primary_artifact_id
+                    if group_idx == 0 and request_idx == 0
+                    else uuid4()
+                )
+                assert artifact_id is not None
+                event_id = uuid4()
+                if group_idx == 0 and request_idx == 0:
+                    self.ledger.enrichment_request_event_id = event_id
+                    self.ledger.provider_route = route
+                    self.ledger.refresh_mode = "standard"
+                    self.ledger.depth_budget = 1
+                if group_idx == 0:
+                    self.ledger.provider_route_counts[route] = (
+                        self.ledger.provider_route_counts.get(route, 0) + 1
+                    )
+                self.ledger.source_provider_route_counts[route] = (
+                    self.ledger.source_provider_route_counts.get(route, 0) + 1
+                )
+                self.ledger.provider_request_rows.append(
+                    ProviderEnrichmentRequestRow(
+                        trigger_event_id=event_id,
+                        candidate_group_id=candidate_group_id,
+                        artifact_id=artifact_id,
+                        artifact_type=artifact_type,
+                        provider_route=route,
+                        refresh_mode="standard",
+                        depth_budget=1,
+                    )
+                )
+                self.ledger.outbox.append(
+                    {
+                        "event_id": event_id,
+                        "event_type": "artifact.enrich.requested.v1",
+                    }
+                )
+
 
 class FakeProviderEnrichmentService:
     def __init__(self, ledger: Ledger) -> None:
@@ -733,12 +868,17 @@ class FakeProviderEnrichmentService:
 
     async def materialize_provider_request(self, request) -> ProviderEnrichmentResult:
         self.ledger.call_order.append("provider.materialize_provider_request")
+        self.ledger.provider_request_attempts.append(request)
         self.ledger.provider_authority = request.provider_authority
         expected_event_ids = {
-            row.trigger_event_id for row in self.ledger.provider_request_rows
+            row.trigger_event_id
+            for row in self.ledger.provider_request_rows
+            if row.candidate_group_id == self.ledger.candidate_group_id
         } or {self.ledger.enrichment_request_event_id}
         expected_artifact_ids = {
-            row.artifact_id for row in self.ledger.provider_request_rows
+            row.artifact_id
+            for row in self.ledger.provider_request_rows
+            if row.candidate_group_id == self.ledger.candidate_group_id
         } or {self.ledger.primary_artifact_id}
         assert request.trigger_event_id in expected_event_ids
         assert request.artifact_id in expected_artifact_ids
@@ -2237,6 +2377,115 @@ async def test_execute_two_web_provider_requests_processes_both_before_single_an
 
 
 @pytest.mark.asyncio
+async def test_execute_web_only_multi_candidate_runtime_shape_selects_one_group() -> None:
+    ledger = Ledger()
+    ledger.multi_candidate_groups = [
+        [("web", "web_article")],
+        [("web", "web_article")],
+        [("web", "web_article")],
+    ]
+
+    report = await run(
+        ledger,
+        mode="execute",
+        text=THREE_WEB_URL_TEXT,
+        provider_authority=web_authority(),
+    )
+
+    assert report.status == "pass"
+    assert report.reason_code == "source_url_provider_evidence_analysis_requested"
+    assert report.provider_enrichment_attempted is True
+    assert report.assembler_attempted is True
+    assert report.provider_snapshot_created is True
+    assert report.bundle_created is True
+    assert report.analysis_request_created is True
+    assert report.selected_candidate_group_fingerprint is not None
+    assert report.selected_candidate_group_fingerprint == report.candidate_group_fingerprint
+    assert report.bounded_counts["source_candidate_groups_count"] == 3
+    assert report.bounded_counts["unselected_candidate_groups_count"] == 2
+    assert report.bounded_counts["selected_external_enrichment_requests"] == 1
+    assert report.bounded_counts["selected_provider_route_web"] == 1
+    assert report.bounded_counts["source_provider_route_web"] == 3
+    assert report.bounded_counts["external_enrichment_requests"] == 1
+    assert report.bounded_counts["provider_route_web"] == 1
+    assert report.bounded_counts["provider_snapshot_results"] == 1
+    assert report.bounded_counts["provider_snapshot_updated_events"] == 1
+    assert report.bounded_counts["provider_snapshots"] == 1
+    assert report.bounded_counts["artifact_snapshot_updated_events"] == 1
+    assert report.bounded_counts["web_request_count"] == 1
+    assert report.bounded_counts["analysis_requested_events"] == 1
+    assert report.bounded_counts["judge_runs"] == 0
+    assert report.bounded_counts["judge_call_requested_events"] == 0
+    assert len(ledger.provider_request_attempts) == 1
+    assert ledger.provider_request_attempts[0].candidate_group_id == ledger.candidate_group_id
+    assert {
+        attempt.candidate_group_id for attempt in ledger.provider_request_attempts
+    }.isdisjoint(set(ledger.candidate_group_ids[1:]))
+    assert len(ledger.provider_snapshot_ids) == 1
+    assert len(ledger.provider_snapshot_updated_event_ids) == 1
+    assert ledger.analysis_request_event_id is not None
+    provider_index = ledger.call_order.index("provider.materialize_provider_request")
+    assembler_index = ledger.call_order.index("assembler.handle_trigger_event")
+    assert provider_index < assembler_index
+
+
+@pytest.mark.asyncio
+async def test_execute_multi_candidate_mixed_provider_shape_blocks_before_fetch() -> None:
+    ledger = Ledger()
+    ledger.multi_candidate_groups = [
+        [("web", "web_article")],
+        [("github", "github_repo")],
+    ]
+
+    report = await run(
+        ledger,
+        mode="execute",
+        text=THREE_WEB_URL_TEXT,
+        provider_authority=web_authority(),
+    )
+
+    assert report.status == "blocked"
+    assert report.reason_code == "mixed_provider_routes_not_supported_by_exact_materializer"
+    assert report.provider_enrichment_attempted is False
+    assert report.assembler_attempted is False
+    assert report.analysis_request_created is False
+    assert report.bounded_counts["source_candidate_groups_count"] == 2
+    assert report.bounded_counts["selected_provider_route_web"] == 1
+    assert report.bounded_counts["source_provider_route_web"] == 1
+    assert report.bounded_counts["source_provider_route_github"] == 1
+    assert ledger.provider_request_attempts == []
+    assert ledger.provider_snapshot_ids == []
+    assert ledger.provider_snapshot_updated_event_ids == []
+    assert ledger.analysis_request_event_id is None
+    assert "provider.materialize_provider_request" not in ledger.call_order
+    assert "assembler.handle_trigger_event" not in ledger.call_order
+
+
+@pytest.mark.asyncio
+async def test_execute_x_route_blocks_before_provider_fetch() -> None:
+    ledger = Ledger()
+    ledger.multi_candidate_groups = [[("x", "x_post")]]
+
+    report = await run(
+        ledger,
+        mode="execute",
+        text=WEB_URL_TEXT,
+        provider_authority=web_authority(),
+    )
+
+    assert report.status == "blocked"
+    assert report.reason_code == "provider_route_not_supported_by_live_exact_materializer"
+    assert report.provider_enrichment_attempted is False
+    assert report.assembler_attempted is False
+    assert report.analysis_request_created is False
+    assert report.bounded_counts["source_provider_route_x"] == 1
+    assert ledger.provider_request_attempts == []
+    assert ledger.provider_snapshot_ids == []
+    assert "provider.materialize_provider_request" not in ledger.call_order
+    assert "assembler.handle_trigger_event" not in ledger.call_order
+
+
+@pytest.mark.asyncio
 async def test_execute_web_provider_request_count_over_cap_blocks_before_fetch() -> None:
     ledger = Ledger()
 
@@ -2251,6 +2500,8 @@ async def test_execute_web_provider_request_count_over_cap_blocks_before_fetch()
     assert report.reason_code == "web_provider_request_count_exceeds_exact_materializer_cap"
     assert report.provider_enrichment_attempted is False
     assert report.assembler_attempted is False
+    assert report.bounded_counts["selected_external_enrichment_requests"] == 3
+    assert report.bounded_counts["selected_provider_route_web"] == 3
     assert ledger.provider_snapshot_ids == []
     assert "provider.materialize_provider_request" not in ledger.call_order
     assert "assembler.handle_trigger_event" not in ledger.call_order
@@ -2310,6 +2561,54 @@ async def test_web_final_report_redacts_raw_source_urls_ids_and_runtime_values()
         "runtime.env",
         "payload_json",
         "telegram_response_json",
+        "Traceback",
+        RAW_SECRET,
+    ):
+        assert forbidden not in rendered_report
+    assert re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        rendered_report,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_web_multi_candidate_reporting_uses_only_counts_and_fingerprints() -> None:
+    ledger = Ledger()
+    ledger.multi_candidate_groups = [
+        [("web", "web_article")],
+        [("web", "web_article")],
+        [("web", "web_article")],
+    ]
+
+    report = await run(
+        ledger,
+        mode="execute",
+        text=THREE_WEB_URL_TEXT,
+        provider_authority=web_authority(),
+    )
+    rendered_report = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "pass"
+    assert report.bounded_counts["source_candidate_groups_count"] == 3
+    assert report.bounded_counts["unselected_candidate_groups_count"] == 2
+    assert report.bounded_counts["selected_external_enrichment_requests"] == 1
+    assert report.selected_candidate_group_fingerprint is not None
+    for candidate_group_id in ledger.candidate_group_ids:
+        assert str(candidate_group_id) not in rendered_report
+    for forbidden in (
+        "https://example.com/alpha",
+        "https://example.org/beta",
+        "https://example.net/gamma",
+        "example.com",
+        "example.org",
+        "example.net",
+        "AI 개발 workflow",
+        "https://t.me/SynthChannel/12345",
+        "SynthChannel/12345",
+        "db_locator_not_used",
+        "redis_locator_not_used",
+        "runtime.env",
+        "payload_json",
         "Traceback",
         RAW_SECRET,
     ):
