@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -31,6 +32,7 @@ from src.services.maintenance.exact_target_source_to_analysis_materializer impor
     M1NotificationUxReadbackAcceptance,
     NormalizationReadback,
     ProviderEnrichmentRequest,
+    ProviderEnrichmentRequestRow,
     ProviderEnrichmentResult,
     ProviderLiveAuthority,
     RefreshEventRecord,
@@ -42,6 +44,18 @@ from src.services.maintenance.exact_target_source_to_analysis_materializer impor
     run_exact_target_source_to_analysis_materializer,
 )
 from src.services.router_normalizer.config import RouterNormalizerConfig
+from src.services.web_enricher.models import (
+    ArtifactRecord as WebArtifactRecord,
+    FetchedDocument,
+)
+from src.services.web_enricher.web_fetch_client import (
+    UnsupportedContentTypeError,
+    WebAccessDeniedError,
+    WebFetchClientError,
+    WebPermanentFetchError,
+    WebRateLimitedError,
+    WebTransientFetchError,
+)
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -54,6 +68,22 @@ KOREAN_LLM_WORKFLOW_TEXT = (
 GITHUB_URL_TEXT = (
     "https://github.com/DietrichGebert/ponytail\n\n"
     "AI가 코드를 작성하기 전에 다음 6단계의 사다리를 거치도록 통제합니다..."
+)
+WEB_URL_TEXT = (
+    "AI 개발 workflow 자동화 제약을 우회하는 방법 "
+    "https://example.com/alpha"
+)
+TWO_WEB_URL_TEXT = (
+    "AI 개발 workflow 자동화 제약을 우회하는 방법 "
+    "https://example.com/alpha https://example.org/beta"
+)
+FOUR_WEB_URL_TEXT = (
+    "AI 개발 workflow 자동화 제약을 우회하는 방법 "
+    "https://example.com/a https://example.org/b https://example.net/c https://example.dev/d"
+)
+MIXED_URL_TEXT = (
+    "AI 개발 workflow 자동화 제약을 우회하는 방법 "
+    "https://github.com/example/project https://example.com/alpha"
 )
 
 
@@ -321,6 +351,94 @@ class SqlProviderFakeGitHubClient:
         return []
 
 
+class SqlProviderFakeWebFetchClient:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.calls: list[str] = []
+
+    async def fetch(self, url: str) -> FetchedDocument:
+        self.calls.append(url)
+        if self.error is not None:
+            raise self.error
+        body = (
+            "<html><head><title>Fixture</title><meta name=\"description\" "
+            "content=\"offline web evidence\"></head><body><main>"
+            "<p>AI developer workflow automation evidence.</p>"
+            "<a href=\"https://example.test/docs\">Docs</a>"
+            "</main></body></html>"
+        ).encode("utf-8")
+        return FetchedDocument(
+            requested_url=url,
+            final_url="https://example.test/final",
+            status_code=200,
+            content_type="text/html",
+            body_bytes=body,
+            body_text=body.decode("utf-8"),
+            response_headers_subset={"content-type": "text/html"},
+            content_hash="a" * 64,
+            fetch_anomalies=[],
+        )
+
+
+class SqlProviderFakeWebRepository:
+    def __init__(self, *, artifact_id: UUID) -> None:
+        self.artifact = WebArtifactRecord(
+            artifact_id=artifact_id,
+            artifact_type="web_article",
+            canonical_id="web_article:fixture",
+            canonical_url="https://example.test/article",
+            normalized_host="example.test",
+            artifact_key_json={"url": "https://example.test/article"},
+            current_snapshot_id=None,
+            current_status=None,
+        )
+        self.runs: list[dict[str, Any]] = []
+        self.snapshots: list[dict[str, Any]] = []
+        self.web_article_children: list[dict[str, Any]] = []
+        self.discovered_urls: list[dict[str, Any]] = []
+        self.current_updates: list[dict[str, Any]] = []
+        self.outbox_event_id = uuid4()
+        self.outbox: list[dict[str, Any]] = []
+
+    def transaction(self):
+        return SqlProviderTx()
+
+    async def load_artifact(self, artifact_id):
+        assert artifact_id == self.artifact.artifact_id
+        return self.artifact
+
+    async def load_current_snapshot(self, snapshot_id):
+        assert snapshot_id is None
+        return None
+
+    async def insert_enrichment_run_if_absent(self, **kwargs):
+        self.runs.append(kwargs)
+        return uuid4()
+
+    async def mark_enrichment_run_started(self, run_id):
+        del run_id
+
+    async def mark_enrichment_run_finished(self, **kwargs):
+        del kwargs
+
+    async def insert_snapshot(self, **kwargs):
+        self.snapshots.append(kwargs)
+        return uuid4()
+
+    async def upsert_web_article_child(self, **kwargs):
+        self.web_article_children.append(kwargs)
+
+    async def insert_discovered_url(self, **kwargs):
+        self.discovered_urls.append(kwargs)
+
+    async def update_artifact_current_snapshot(self, **kwargs):
+        self.current_updates.append(kwargs)
+
+    async def insert_snapshot_updated_outbox(self, **kwargs):
+        self.outbox.append(kwargs)
+        return self.outbox_event_id
+
+
 class Ledger:
     def __init__(self) -> None:
         self.registry_rows = [{"registry_id": str(uuid4()), "chat_id": 9001}]
@@ -333,13 +451,17 @@ class Ledger:
         self.primary_artifact_type: str | None = None
         self.enrichment_requests = 0
         self.enrichment_request_event_id: UUID | None = None
+        self.provider_request_rows: list[ProviderEnrichmentRequestRow] = []
         self.provider_route_counts: dict[str, int] = {}
         self.provider_route: str | None = None
         self.refresh_mode: str | None = None
         self.depth_budget: int | None = None
         self.provider_snapshot_id: UUID | None = None
+        self.provider_snapshot_ids: list[UUID] = []
         self.provider_snapshot_status = "ready"
+        self.provider_snapshot_statuses: list[str] = []
         self.provider_snapshot_updated_event_id: UUID | None = None
+        self.provider_snapshot_updated_event_ids: list[UUID] = []
         self.provider_error_code: str | None = None
         self.provider_orphan_snapshot_recovered = False
         self.provider_requires_live_authority = False
@@ -458,6 +580,7 @@ class FakeMaterializerRepository:
             refresh_mode=self.ledger.refresh_mode,
             depth_budget=self.ledger.depth_budget,
             provider_route_counts=self.ledger.provider_route_counts,
+            provider_requests=tuple(self.ledger.provider_request_rows),
         )
 
     async def insert_candidate_bundle_refresh_event(
@@ -511,15 +634,31 @@ class FakeMaterializerRepository:
                 else 0
             ),
             external_enrichment_requests=self.ledger.enrichment_requests,
-            provider_snapshots=1 if self.ledger.provider_snapshot_id else 0,
-            artifact_snapshot_updated_events=1 if self.ledger.provider_snapshot_updated_event_id else 0,
+            provider_snapshots=(
+                len(self.ledger.provider_snapshot_ids)
+                if self.ledger.provider_snapshot_ids
+                else (1 if self.ledger.provider_snapshot_id else 0)
+            ),
+            artifact_snapshot_updated_events=(
+                len(self.ledger.provider_snapshot_updated_event_ids)
+                if self.ledger.provider_snapshot_updated_event_ids
+                else (1 if self.ledger.provider_snapshot_updated_event_id else 0)
+            ),
             text_idea_snapshots=self.ledger.text_idea_snapshot_count,
             ready_current_bundles=1 if self.ledger.bundle_id else 0,
             candidate_evidence_members=self.ledger.evidence_member_count,
             analysis_requested_events=1 if self.ledger.analysis_request_event_id else 0,
             judge_runs=self.ledger.judge_runs,
             judge_call_requested_events=self.ledger.judge_call_events,
-            provider_snapshot_updated_event_id=self.ledger.provider_snapshot_updated_event_id,
+            provider_snapshot_updated_event_id=(
+                self.ledger.provider_snapshot_updated_event_id
+                if self.ledger.provider_snapshot_updated_event_id is not None
+                else (
+                    self.ledger.provider_snapshot_updated_event_ids[0]
+                    if len(self.ledger.provider_snapshot_updated_event_ids) == 1
+                    else None
+                )
+            ),
             bundle_id=self.ledger.bundle_id,
             analysis_request_event_id=self.ledger.analysis_request_event_id,
         )
@@ -539,21 +678,53 @@ class FakeNormalizerService:
             self.ledger.primary_artifact_id = uuid4()
             current = next(iter(self.ledger.current.values()))
             if current.get("url_surface_json"):
-                self.ledger.primary_artifact_type = "github_repo"
-                self.ledger.enrichment_requests = 1
-                self.ledger.enrichment_request_event_id = uuid4()
-                self.ledger.provider_route = "github"
-                self.ledger.refresh_mode = "standard"
-                self.ledger.depth_budget = 1
-                self.ledger.provider_route_counts = {"github": 1}
-                self.ledger.outbox.append(
-                    {
-                        "event_id": self.ledger.enrichment_request_event_id,
-                        "event_type": "artifact.enrich.requested.v1",
-                    }
-                )
+                text = str(current.get("text_body") or "")
+                if "github.com" in text and "example." in text:
+                    self._emit_provider_requests(
+                        [("github", "github_repo"), ("web", "web_article")]
+                    )
+                elif "github.com" in text:
+                    self._emit_provider_requests([("github", "github_repo")])
+                else:
+                    web_count = text.count("https://")
+                    self._emit_provider_requests([("web", "web_article")] * web_count)
             else:
                 self.ledger.primary_artifact_type = "text_idea"
+
+    def _emit_provider_requests(self, routes: list[tuple[str, str]]) -> None:
+        self.ledger.enrichment_requests = len(routes)
+        self.ledger.provider_request_rows = []
+        self.ledger.provider_route_counts = {}
+        for idx, (route, artifact_type) in enumerate(routes):
+            artifact_id = self.ledger.primary_artifact_id if idx == 0 else uuid4()
+            assert artifact_id is not None
+            event_id = uuid4()
+            if idx == 0:
+                self.ledger.enrichment_request_event_id = event_id
+                self.ledger.primary_artifact_type = artifact_type
+                self.ledger.provider_route = route
+                self.ledger.refresh_mode = "standard"
+                self.ledger.depth_budget = 1
+            self.ledger.provider_route_counts[route] = (
+                self.ledger.provider_route_counts.get(route, 0) + 1
+            )
+            self.ledger.provider_request_rows.append(
+                ProviderEnrichmentRequestRow(
+                    trigger_event_id=event_id,
+                    candidate_group_id=self.ledger.candidate_group_id,
+                    artifact_id=artifact_id,
+                    artifact_type=artifact_type,
+                    provider_route=route,
+                    refresh_mode="standard",
+                    depth_budget=1,
+                )
+            )
+            self.ledger.outbox.append(
+                {
+                    "event_id": event_id,
+                    "event_type": "artifact.enrich.requested.v1",
+                }
+            )
 
 
 class FakeProviderEnrichmentService:
@@ -563,11 +734,28 @@ class FakeProviderEnrichmentService:
     async def materialize_provider_request(self, request) -> ProviderEnrichmentResult:
         self.ledger.call_order.append("provider.materialize_provider_request")
         self.ledger.provider_authority = request.provider_authority
-        assert request.trigger_event_id == self.ledger.enrichment_request_event_id
-        assert request.artifact_id == self.ledger.primary_artifact_id
+        expected_event_ids = {
+            row.trigger_event_id for row in self.ledger.provider_request_rows
+        } or {self.ledger.enrichment_request_event_id}
+        expected_artifact_ids = {
+            row.artifact_id for row in self.ledger.provider_request_rows
+        } or {self.ledger.primary_artifact_id}
+        assert request.trigger_event_id in expected_event_ids
+        assert request.artifact_id in expected_artifact_ids
         assert request.candidate_group_id == self.ledger.candidate_group_id
-        assert request.provider_route == "github"
-        if self.ledger.provider_requires_live_authority and not request.provider_authority.github_live_opened:
+        assert request.provider_route in {"github", "web"}
+        if request.provider_route == "web" and not request.provider_authority.web_live_opened:
+            return ProviderEnrichmentResult(
+                provider_route="web",
+                status="blocked",
+                emitted_snapshot_updated=False,
+                error_code="web_provider_live_authority_required",
+            )
+        if (
+            request.provider_route == "github"
+            and self.ledger.provider_requires_live_authority
+            and not request.provider_authority.github_live_opened
+        ):
             return ProviderEnrichmentResult(
                 provider_route="github",
                 status="blocked",
@@ -581,13 +769,19 @@ class FakeProviderEnrichmentService:
                 emitted_snapshot_updated=False,
                 error_code=self.ledger.provider_error_code,
             )
-        if self.ledger.provider_snapshot_status == "pending":
+        request_index = len(self.ledger.provider_snapshot_ids)
+        status = (
+            self.ledger.provider_snapshot_statuses[request_index]
+            if request_index < len(self.ledger.provider_snapshot_statuses)
+            else self.ledger.provider_snapshot_status
+        )
+        if status == "pending":
             return ProviderEnrichmentResult(
-                provider_route="github",
+                provider_route=request.provider_route,
                 status="pending",
                 emitted_snapshot_updated=False,
             )
-        if self.ledger.provider_orphan_snapshot_recovered:
+        if request.provider_route == "github" and self.ledger.provider_orphan_snapshot_recovered:
             self.ledger.provider_snapshot_id = self.ledger.provider_snapshot_id or uuid4()
             self.ledger.provider_snapshot_updated_event_id = (
                 self.ledger.provider_snapshot_updated_event_id or uuid4()
@@ -605,13 +799,16 @@ class FakeProviderEnrichmentService:
         self.ledger.provider_snapshot_updated_event_id = (
             self.ledger.provider_snapshot_updated_event_id or uuid4()
         )
+        self.ledger.provider_snapshot_ids.append(uuid4())
+        self.ledger.provider_snapshot_updated_event_ids.append(uuid4())
         return ProviderEnrichmentResult(
-            provider_route="github",
-            status=self.ledger.provider_snapshot_status,
+            provider_route=request.provider_route,
+            status=status,
             emitted_snapshot_updated=True,
-            snapshot_id=self.ledger.provider_snapshot_id,
-            snapshot_updated_event_id=self.ledger.provider_snapshot_updated_event_id,
+            snapshot_id=self.ledger.provider_snapshot_ids[-1],
+            snapshot_updated_event_id=self.ledger.provider_snapshot_updated_event_ids[-1],
             snapshot_created=True,
+            web_request_count=1 if request.provider_route == "web" else 0,
         )
 
 
@@ -627,6 +824,7 @@ class FakeAssemblerService:
         assert parsed_trigger_event_id in {
             self.ledger.refresh_event_id,
             self.ledger.provider_snapshot_updated_event_id,
+            *self.ledger.provider_snapshot_updated_event_ids,
         }
         if not self.ledger.bundle_id:
             if parsed_trigger_event_id == self.ledger.refresh_event_id:
@@ -919,6 +1117,14 @@ def runtime_bundle() -> RuntimeConfigBundle:
     )
 
 
+def web_authority() -> ProviderLiveAuthority:
+    return ProviderLiveAuthority(
+        allow_live_web_provider_read=True,
+        allow_web_provider_snapshot_write=True,
+        web_provider_live_confirm="live-web-provider-evidence",
+    )
+
+
 async def run(
     ledger: Ledger,
     *,
@@ -1030,7 +1236,7 @@ async def test_sql_provider_partial_live_authority_blocks_before_network_or_snap
 
 
 @pytest.mark.asyncio
-async def test_sql_provider_live_authority_rejects_non_github_route_without_network() -> None:
+async def test_sql_provider_github_authority_does_not_open_web_route_without_network() -> None:
     fake_client = SqlProviderFakeGitHubClient()
     service = SqlProviderEnrichmentService(
         object(),
@@ -1058,10 +1264,269 @@ async def test_sql_provider_live_authority_rejects_non_github_route_without_netw
     )
 
     assert result.status == "blocked"
-    assert result.error_code == "provider_route_not_supported_by_live_exact_materializer"
+    assert result.error_code == "web_provider_live_authority_required"
     assert result.github_request_count == 0
+    assert result.web_request_count == 0
     assert result.external_network_attempted is False
     assert fake_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_sql_web_provider_route_without_web_authority_blocks_before_fetch_or_snapshot_write() -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderFakeWebRepository(artifact_id=artifact_id)
+    fake_fetch = SqlProviderFakeWebFetchClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        web_repository_factory=lambda session: fake_repository,
+        web_fetch_client_factory=lambda config: fake_fetch,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="web_article",
+            provider_route="web",
+            refresh_mode="standard",
+            depth_budget=1,
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.error_code == "web_provider_live_authority_required"
+    assert result.external_network_attempted is False
+    assert result.web_request_count == 0
+    assert fake_fetch.calls == []
+    assert fake_repository.snapshots == []
+    assert fake_repository.outbox == []
+
+
+@pytest.mark.asyncio
+async def test_sql_web_provider_partial_authority_blocks_before_fetch_or_snapshot_write() -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderFakeWebRepository(artifact_id=artifact_id)
+    fake_fetch = SqlProviderFakeWebFetchClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        web_repository_factory=lambda session: fake_repository,
+        web_fetch_client_factory=lambda config: fake_fetch,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="web_article",
+            provider_route="web",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=ProviderLiveAuthority(
+                allow_live_web_provider_read=True,
+                allow_web_provider_snapshot_write=False,
+                web_provider_live_confirm="live-web-provider-evidence",
+            ),
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.error_code == "web_provider_live_authority_required"
+    assert result.external_network_attempted is False
+    assert result.web_request_count == 0
+    assert fake_fetch.calls == []
+    assert fake_repository.snapshots == []
+    assert fake_repository.outbox == []
+
+
+@pytest.mark.asyncio
+async def test_web_authority_does_not_open_github_authority() -> None:
+    fake_client = SqlProviderFakeGitHubClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        github_client_factory=lambda config: fake_client,
+        repository_factory=lambda session: SqlProviderFakeRepository(artifact_id=uuid4()),
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=uuid4(),
+            artifact_type="github_repo",
+            provider_route="github",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=web_authority(),
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.error_code == "provider_live_authority_required"
+    assert fake_client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_github_authority_does_not_open_web_authority() -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderFakeWebRepository(artifact_id=artifact_id)
+    fake_fetch = SqlProviderFakeWebFetchClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        web_repository_factory=lambda session: fake_repository,
+        web_fetch_client_factory=lambda config: fake_fetch,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="web_article",
+            provider_route="web",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=ProviderLiveAuthority(
+                allow_live_github_provider_read=True,
+                allow_provider_snapshot_write=True,
+                provider_live_confirm="live-github-provider-evidence",
+            ),
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.error_code == "web_provider_live_authority_required"
+    assert result.web_request_count == 0
+    assert fake_fetch.calls == []
+    assert fake_repository.snapshots == []
+
+
+@pytest.mark.asyncio
+async def test_non_web_route_with_web_authority_is_blocked_before_fetch() -> None:
+    fake_fetch = SqlProviderFakeWebFetchClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        web_fetch_client_factory=lambda config: fake_fetch,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=uuid4(),
+            artifact_type="x_post",
+            provider_route="x",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=web_authority(),
+        )
+    )
+
+    assert result.status == "blocked"
+    assert result.error_code == "provider_route_not_supported_by_live_exact_materializer"
+    assert result.external_network_attempted is False
+    assert result.web_request_count == 0
+    assert fake_fetch.calls == []
+
+
+@pytest.mark.asyncio
+async def test_sql_web_provider_uses_web_enricher_service_with_injected_fetch_and_repository() -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderFakeWebRepository(artifact_id=artifact_id)
+    fake_fetch = SqlProviderFakeWebFetchClient()
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        web_repository_factory=lambda session: fake_repository,
+        web_fetch_client_factory=lambda config: fake_fetch,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="web_article",
+            provider_route="web",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=web_authority(),
+        )
+    )
+
+    assert result.error_code is None
+    assert result.status == "ready"
+    assert result.emitted_snapshot_updated is True
+    assert result.snapshot_id is not None
+    assert result.snapshot_updated_event_id == fake_repository.outbox_event_id
+    assert result.snapshot_created is True
+    assert result.web_request_count == 1
+    assert result.github_request_count == 0
+    assert result.external_network_attempted is False
+    assert fake_fetch.calls == ["https://example.test/article"]
+    assert fake_repository.snapshots
+    assert fake_repository.web_article_children
+    assert fake_repository.outbox
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        WebRateLimitedError(f"rate limited {RAW_SECRET}"),
+        WebAccessDeniedError(f"access denied {RAW_SECRET}"),
+        UnsupportedContentTypeError(f"unsupported {RAW_SECRET}"),
+        WebPermanentFetchError(f"permanent {RAW_SECRET}"),
+        WebTransientFetchError(f"transient {RAW_SECRET}"),
+        WebFetchClientError(f"client {RAW_SECRET}"),
+        RuntimeError(f"raw body {RAW_SECRET}"),
+    ],
+)
+async def test_sql_web_provider_fetch_errors_are_sanitized(error: Exception) -> None:
+    artifact_id = uuid4()
+    fake_repository = SqlProviderFakeWebRepository(artifact_id=artifact_id)
+    fake_fetch = SqlProviderFakeWebFetchClient(error=error)
+    service = SqlProviderEnrichmentService(
+        object(),
+        runtime_bundle(),
+        web_repository_factory=lambda session: fake_repository,
+        web_fetch_client_factory=lambda config: fake_fetch,
+        track_external_network=False,
+    )
+
+    result = await service.materialize_provider_request(
+        ProviderEnrichmentRequest(
+            trigger_event_id=uuid4(),
+            candidate_group_id=uuid4(),
+            artifact_id=artifact_id,
+            artifact_type="web_article",
+            provider_route="web",
+            refresh_mode="standard",
+            depth_budget=1,
+            provider_authority=web_authority(),
+        )
+    )
+    rendered = json.dumps(asdict(result), sort_keys=True)
+
+    assert result.error_code == "web_provider_fetch_unusable"
+    assert result.web_request_count == 1
+    assert result.external_network_attempted is False
+    assert result.snapshot_created is False
+    assert RAW_SECRET not in rendered
+    assert "Traceback" not in rendered
+    assert "example.test" not in rendered
 
 
 @pytest.mark.asyncio
@@ -1655,6 +2120,207 @@ async def test_execute_url_path_materializes_provider_snapshot_and_analysis_requ
 
 
 @pytest.mark.asyncio
+async def test_execute_web_path_without_web_authority_blocks_before_snapshot_write() -> None:
+    ledger = Ledger()
+
+    report = await run(ledger, mode="execute", text=WEB_URL_TEXT)
+
+    assert report.status == "blocked"
+    assert report.reason_code == "web_provider_live_authority_required"
+    assert report.provider_enrichment_attempted is True
+    assert report.assembler_attempted is False
+    assert report.provider_snapshot_created is False
+    assert report.analysis_request_created is False
+    assert report.bounded_counts["web_request_count"] == 0
+    assert ledger.provider_snapshot_ids == []
+    assert ledger.provider_snapshot_updated_event_ids == []
+    assert "assembler.handle_trigger_event" not in ledger.call_order
+
+
+@pytest.mark.asyncio
+async def test_execute_web_path_partial_web_authority_blocks_before_snapshot_write() -> None:
+    ledger = Ledger()
+
+    report = await run(
+        ledger,
+        mode="execute",
+        text=WEB_URL_TEXT,
+        provider_authority=ProviderLiveAuthority(
+            allow_live_web_provider_read=True,
+            allow_web_provider_snapshot_write=False,
+            web_provider_live_confirm="live-web-provider-evidence",
+        ),
+    )
+
+    assert report.status == "blocked"
+    assert report.reason_code == "web_provider_live_authority_required"
+    assert report.provider_enrichment_attempted is True
+    assert report.assembler_attempted is False
+    assert report.provider_snapshot_created is False
+    assert report.bounded_counts["web_request_count"] == 0
+    assert ledger.provider_snapshot_ids == []
+    assert ledger.provider_snapshot_updated_event_ids == []
+
+
+@pytest.mark.asyncio
+async def test_execute_single_web_provider_request_materializes_analysis_request() -> None:
+    ledger = Ledger()
+
+    report = await run(
+        ledger,
+        mode="execute",
+        text=WEB_URL_TEXT,
+        provider_authority=web_authority(),
+    )
+
+    assert report.status == "pass"
+    assert report.reason_code == "source_url_provider_evidence_analysis_requested"
+    assert report.provider_enrichment_attempted is True
+    assert report.assembler_attempted is True
+    assert report.provider_snapshot_created is True
+    assert report.bundle_created is True
+    assert report.analysis_request_created is True
+    assert report.openai_attempted is False
+    assert report.redis_attempted is False
+    assert report.telegram_live_read_attempted is False
+    assert report.telegram_send_attempted is False
+    assert report.external_network_attempted is False
+    assert report.bounded_counts["external_enrichment_requests"] == 1
+    assert report.bounded_counts["provider_route_web"] == 1
+    assert report.bounded_counts["provider_snapshots"] == 1
+    assert report.bounded_counts["artifact_snapshot_updated_events"] == 1
+    assert report.bounded_counts["web_request_count"] == 1
+    assert report.bounded_counts["analysis_requested_events"] == 1
+    assert len(ledger.provider_snapshot_ids) == 1
+    assert len(ledger.provider_snapshot_updated_event_ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_two_web_provider_requests_processes_both_before_single_analysis_request() -> None:
+    ledger = Ledger()
+
+    report = await run(
+        ledger,
+        mode="execute",
+        text=TWO_WEB_URL_TEXT,
+        provider_authority=web_authority(),
+    )
+
+    assert report.status == "pass"
+    assert report.reason_code == "source_url_provider_evidence_analysis_requested"
+    assert report.provider_enrichment_attempted is True
+    assert report.assembler_attempted is True
+    assert report.provider_snapshot_created is True
+    assert report.analysis_request_created is True
+    assert report.bounded_counts["external_enrichment_requests"] == 2
+    assert report.bounded_counts["provider_route_web"] == 2
+    assert report.bounded_counts["provider_snapshot_results"] == 2
+    assert report.bounded_counts["provider_snapshot_updated_events"] == 2
+    assert report.bounded_counts["provider_snapshots"] == 2
+    assert report.bounded_counts["artifact_snapshot_updated_events"] == 2
+    assert report.bounded_counts["web_request_count"] == 2
+    assert report.bounded_counts["analysis_requested_events"] == 1
+    assert len(ledger.provider_snapshot_ids) == 2
+    assert len(ledger.provider_snapshot_updated_event_ids) == 2
+    assert ledger.analysis_request_event_id is not None
+    provider_indices = [
+        idx for idx, value in enumerate(ledger.call_order)
+        if value == "provider.materialize_provider_request"
+    ]
+    assembler_indices = [
+        idx for idx, value in enumerate(ledger.call_order)
+        if value == "assembler.handle_trigger_event"
+    ]
+    assert len(provider_indices) == 2
+    assert len(assembler_indices) == 2
+    assert provider_indices[-1] < assembler_indices[0]
+
+
+@pytest.mark.asyncio
+async def test_execute_web_provider_request_count_over_cap_blocks_before_fetch() -> None:
+    ledger = Ledger()
+
+    report = await run(
+        ledger,
+        mode="execute",
+        text=FOUR_WEB_URL_TEXT,
+        provider_authority=web_authority(),
+    )
+
+    assert report.status == "blocked"
+    assert report.reason_code == "web_provider_request_count_exceeds_exact_materializer_cap"
+    assert report.provider_enrichment_attempted is False
+    assert report.assembler_attempted is False
+    assert ledger.provider_snapshot_ids == []
+    assert "provider.materialize_provider_request" not in ledger.call_order
+    assert "assembler.handle_trigger_event" not in ledger.call_order
+
+
+@pytest.mark.asyncio
+async def test_execute_mixed_provider_routes_block_before_fetch() -> None:
+    ledger = Ledger()
+
+    report = await run(
+        ledger,
+        mode="execute",
+        text=MIXED_URL_TEXT,
+        provider_authority=web_authority(),
+    )
+
+    assert report.status == "blocked"
+    assert report.reason_code == "mixed_provider_routes_not_supported_by_exact_materializer"
+    assert report.provider_enrichment_attempted is False
+    assert report.assembler_attempted is False
+    assert ledger.provider_snapshot_ids == []
+    assert "provider.materialize_provider_request" not in ledger.call_order
+    assert "assembler.handle_trigger_event" not in ledger.call_order
+
+
+@pytest.mark.asyncio
+async def test_web_final_report_redacts_raw_source_urls_ids_and_runtime_values() -> None:
+    ledger = Ledger()
+
+    report = await run(
+        ledger,
+        mode="execute",
+        text=TWO_WEB_URL_TEXT,
+        provider_authority=web_authority(),
+    )
+    rendered_report = json.dumps(asdict(report), sort_keys=True)
+
+    assert report.status == "pass"
+    for forbidden in (
+        "https://example.com/alpha",
+        "https://example.org/beta",
+        "example.com",
+        "example.org",
+        "AI 개발 workflow",
+        "https://t.me/SynthChannel/12345",
+        "SynthChannel/12345",
+        "db_locator_not_used",
+        "redis_locator_not_used",
+        "postgresql+psycopg" + "://",
+        "redis" + "://",
+        "TELEGRAM_BOT_TOKEN",
+        "OPENAI_API_KEY",
+        "tok" + "en=",
+        "pass" + "word=",
+        "credential=",
+        "api_key=",
+        "runtime.env",
+        "payload_json",
+        "telegram_response_json",
+        "Traceback",
+        RAW_SECRET,
+    ):
+        assert forbidden not in rendered_report
+    assert re.search(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        rendered_report,
+    ) is None
+
+
+@pytest.mark.asyncio
 async def test_execute_url_path_provider_pending_does_not_emit_analysis_request() -> None:
     ledger = Ledger()
     ledger.provider_snapshot_status = "pending"
@@ -2020,6 +2686,43 @@ async def test_cli_live_provider_flags_reach_provider_request_authority(tmp_path
     payload = json.loads(emitted[0])
     assert payload["status"] == "pass"
     assert payload["reason_code"] == "source_url_provider_evidence_analysis_requested"
+
+
+@pytest.mark.asyncio
+async def test_cli_live_web_provider_flags_reach_web_provider_request_authority(tmp_path: Path) -> None:
+    ledger = Ledger()
+    emitted: list[str] = []
+    packet_path = tmp_path / "source-packet.json"
+    packet_path.write_text(packet_json(WEB_URL_TEXT), encoding="utf-8")
+
+    exit_code = await run_cli(
+        [
+            "--mode",
+            "execute",
+            "--source-packet-json",
+            str(packet_path),
+            "--env-file",
+            "/tmp/not-read-by-test.env",
+            "--confirm",
+            "materialize-source-analysis",
+            "--allow-live-web-provider-read",
+            "--allow-web-provider-snapshot-write",
+            "--web-provider-live-confirm",
+            "live-web-provider-evidence",
+        ],
+        emit_json=emitted.append,
+        runtime_config_loader=lambda env_file: runtime_bundle(),
+        stage_factory_builder=lambda runtime_config: FakeStageFactoryContext(ledger),
+    )
+
+    assert exit_code == 0
+    assert ledger.provider_authority is not None
+    assert ledger.provider_authority.web_live_opened is True
+    assert ledger.provider_authority.github_live_opened is False
+    payload = json.loads(emitted[0])
+    assert payload["status"] == "pass"
+    assert payload["reason_code"] == "source_url_provider_evidence_analysis_requested"
+    assert payload["bounded_counts"]["web_request_count"] == 1
 
 
 @pytest.mark.asyncio

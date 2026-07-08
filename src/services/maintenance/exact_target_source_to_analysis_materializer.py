@@ -8,6 +8,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Protocol
 from urllib.parse import urlparse
@@ -44,9 +45,11 @@ M1_NOTIFICATION_UX_READBACK_SCHEMA_VERSION = (
 )
 CONFIRM_TOKEN = "materialize-source-analysis"
 PROVIDER_LIVE_CONFIRM_TOKEN = "live-github-provider-evidence"
+WEB_PROVIDER_LIVE_CONFIRM_TOKEN = "live-web-provider-evidence"
 PROVIDER_RESUME_CONFIRM_TOKEN = "resume-live-github-provider-evidence"
 PLACEHOLDER_REDIS_URL = "redis_locator_not_attempted"
 REPO_ROOT = Path(__file__).resolve().parents[3]
+WEB_PROVIDER_REQUEST_CAP = 3
 MVP_OPEN_GATES = (
     "AUTHORITY_OPEN",
     "ROLLOUT_OPEN",
@@ -157,6 +160,18 @@ RUNTIME_VALUE_KEYS = {
     "GH_ENRICHER_SAMPLE_EXCERPT_CHARS",
     "GH_ENRICHER_MAX_FILE_BYTES",
     "GH_ENRICHER_STALE_AFTER_SEC",
+    "WEB_ENRICHER_QUEUE_NAME",
+    "WEB_ENRICHER_CONSUMER_GROUP",
+    "WEB_ENRICHER_CONSUMER_NAME",
+    "WEB_ENRICHER_BATCH_SIZE",
+    "WEB_ENRICHER_BLOCK_MS",
+    "WEB_FETCH_TIMEOUT_SEC",
+    "WEB_FETCH_MAX_REDIRECTS",
+    "WEB_FETCH_MAX_BYTES",
+    "WEB_FETCH_EXCERPT_CHARS",
+    "WEB_FETCH_MAX_OUTBOUND_LINKS",
+    "WEB_FETCH_USER_AGENT",
+    "WEB_FETCH_CONTENT_TYPE_ALLOWLIST",
     "LOG_LEVEL",
 }
 RUNTIME_FILE_KEYS = {"DATABASE_URL_FILE"}
@@ -178,6 +193,9 @@ class ProviderLiveAuthority:
     allow_live_github_provider_read: bool = False
     allow_provider_snapshot_write: bool = False
     provider_live_confirm: str | None = None
+    allow_live_web_provider_read: bool = False
+    allow_web_provider_snapshot_write: bool = False
+    web_provider_live_confirm: str | None = None
 
     @property
     def github_live_opened(self) -> bool:
@@ -185,6 +203,14 @@ class ProviderLiveAuthority:
             self.allow_live_github_provider_read
             and self.allow_provider_snapshot_write
             and self.provider_live_confirm == PROVIDER_LIVE_CONFIRM_TOKEN
+        )
+
+    @property
+    def web_live_opened(self) -> bool:
+        return (
+            self.allow_live_web_provider_read
+            and self.allow_web_provider_snapshot_write
+            and self.web_provider_live_confirm == WEB_PROVIDER_LIVE_CONFIRM_TOKEN
         )
 
 
@@ -297,6 +323,17 @@ class LocalSourceRoutingPlan:
 
 
 @dataclass(slots=True, frozen=True)
+class ProviderEnrichmentRequestRow:
+    trigger_event_id: UUID
+    candidate_group_id: UUID
+    artifact_id: UUID
+    artifact_type: str
+    provider_route: str
+    refresh_mode: str
+    depth_budget: int
+
+
+@dataclass(slots=True, frozen=True)
 class NormalizationReadback:
     normalization_runs: int
     candidate_groups: int
@@ -310,6 +347,7 @@ class NormalizationReadback:
     refresh_mode: str | None = None
     depth_budget: int | None = None
     provider_route_counts: dict[str, int] = field(default_factory=dict)
+    provider_requests: tuple[ProviderEnrichmentRequestRow, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)
@@ -340,6 +378,7 @@ class ProviderEnrichmentResult:
     snapshot_created: bool = False
     external_network_attempted: bool = False
     github_request_count: int = 0
+    web_request_count: int = 0
     error_code: str | None = None
 
 
@@ -526,6 +565,9 @@ class SqlExactTargetSourceToAnalysisRepository:
             """
             SELECT
                 event_id,
+                payload_json->>'candidate_group_id' AS candidate_group_id,
+                payload_json->>'artifact_id' AS artifact_id,
+                payload_json->>'artifact_type' AS artifact_type,
                 payload_json->>'provider_route' AS provider_route,
                 payload_json->>'refresh_mode' AS refresh_mode,
                 payload_json->>'depth_budget' AS depth_budget
@@ -546,6 +588,21 @@ class SqlExactTargetSourceToAnalysisRepository:
             route = str(row.get("provider_route") or "")
             if route in {"github", "x", "web"}:
                 provider_route_counts[route] = provider_route_counts.get(route, 0) + 1
+        provider_requests = tuple(
+            ProviderEnrichmentRequestRow(
+                trigger_event_id=UUID(str(row["event_id"])),
+                candidate_group_id=UUID(str(row["candidate_group_id"])),
+                artifact_id=UUID(str(row["artifact_id"])),
+                artifact_type=str(row["artifact_type"] or ""),
+                provider_route=str(row["provider_route"] or ""),
+                refresh_mode=str(row["refresh_mode"] or ""),
+                depth_budget=int(row["depth_budget"]),
+            )
+            for row in enrichment_rows
+            if row.get("candidate_group_id")
+            and row.get("artifact_id")
+            and row.get("depth_budget") is not None
+        )
         first = primary_rows[0] if primary_rows else None
         enrichment = enrichment_rows[0] if enrichment_rows else None
         return NormalizationReadback(
@@ -563,6 +620,7 @@ class SqlExactTargetSourceToAnalysisRepository:
             refresh_mode=None if enrichment is None else str(enrichment.get("refresh_mode") or ""),
             depth_budget=_int_or_none(None if enrichment is None else enrichment.get("depth_budget")),
             provider_route_counts=provider_route_counts,
+            provider_requests=provider_requests,
         )
 
     async def insert_candidate_bundle_refresh_event(
@@ -959,15 +1017,34 @@ class SqlProviderEnrichmentService:
         *,
         github_client_factory: Callable[[Any], Any] | None = None,
         repository_factory: Callable[[Any], Any] | None = None,
+        web_repository_factory: Callable[[Any], Any] | None = None,
+        web_fetch_client_factory: Callable[[Any], Any] | None = None,
         track_external_network: bool = True,
     ) -> None:
         self._session = session
         self._runtime = runtime
         self._github_client_factory = github_client_factory
         self._repository_factory = repository_factory
+        self._web_repository_factory = web_repository_factory
+        self._web_fetch_client_factory = web_fetch_client_factory
         self._track_external_network = track_external_network
 
     async def materialize_provider_request(
+        self,
+        request: ProviderEnrichmentRequest,
+    ) -> ProviderEnrichmentResult:
+        if request.provider_route == "github":
+            return await self._materialize_github_provider_request(request)
+        if request.provider_route == "web":
+            return await self._materialize_web_provider_request(request)
+        return ProviderEnrichmentResult(
+            provider_route=request.provider_route,
+            status="blocked",
+            emitted_snapshot_updated=False,
+            error_code="provider_route_not_supported_by_live_exact_materializer",
+        )
+
+    async def _materialize_github_provider_request(
         self,
         request: ProviderEnrichmentRequest,
     ) -> ProviderEnrichmentResult:
@@ -1126,6 +1203,124 @@ class SqlProviderEnrichmentService:
             snapshot_created=repository.snapshot_created,
             external_network_attempted=state.external_network_attempted,
             github_request_count=state.github_request_count,
+        )
+
+    async def _materialize_web_provider_request(
+        self,
+        request: ProviderEnrichmentRequest,
+    ) -> ProviderEnrichmentResult:
+        if not request.provider_authority.web_live_opened:
+            return ProviderEnrichmentResult(
+                provider_route=request.provider_route,
+                status="blocked",
+                emitted_snapshot_updated=False,
+                error_code="web_provider_live_authority_required",
+            )
+        try:
+            web_config = _build_web_enricher_config(self._runtime)
+            _validate_web_enricher_caps(web_config)
+        except ExactTargetSourceToAnalysisConfigError:
+            return ProviderEnrichmentResult(
+                provider_route=request.provider_route,
+                status="blocked",
+                emitted_snapshot_updated=False,
+                error_code="web_provider_runtime_config_invalid",
+            )
+
+        from ..web_enricher.article_parser import ArticleParser
+        from ..web_enricher.models import ArtifactEnrichmentJob
+        from ..web_enricher.repositories import WebEnricherRepository
+        from ..web_enricher.service import WebEnricherService
+        from ..web_enricher.url_discovery import WebUrlDiscovery
+        from ..web_enricher.web_fetch_client import WebFetchClient
+
+        state = _WebProviderAttemptState()
+        repository_factory = self._web_repository_factory or (lambda session: WebEnricherRepository(session))
+        fetch_client_factory = self._web_fetch_client_factory or (
+            lambda config: WebFetchClient(
+                timeout_sec=config.request_timeout_sec,
+                max_redirects=config.max_redirects,
+                max_bytes=config.max_bytes,
+                user_agent=config.user_agent,
+                content_type_allowlist=config.content_type_allowlist,
+            )
+        )
+        repository = _SnapshotUpdatedEventCapturingWebRepository(
+            repository_factory(self._session),
+            session=self._session,
+            state=state,
+        )
+        fetch_client = _TrackedWebFetchClient(
+            fetch_client_factory(web_config),
+            state,
+            request_limit=1,
+            track_external_network=self._track_external_network,
+        )
+        service = WebEnricherService(
+            web_config,
+            repository=repository,  # type: ignore[arg-type]
+            fetch_client=fetch_client,  # type: ignore[arg-type]
+            article_parser=ArticleParser(
+                excerpt_chars=web_config.excerpt_chars,
+                max_outbound_links=web_config.max_outbound_links,
+            ),
+            url_discovery=WebUrlDiscovery(),
+        )
+        try:
+            result = await service.handle_job(
+                ArtifactEnrichmentJob(
+                    trigger_event_id=request.trigger_event_id,
+                    event_type="artifact.enrich.requested.v1",
+                    candidate_group_id=request.candidate_group_id,
+                    artifact_id=request.artifact_id,
+                    artifact_type=request.artifact_type,  # type: ignore[arg-type]
+                    provider_route=request.provider_route,
+                    refresh_mode=request.refresh_mode,
+                    depth_budget=request.depth_budget,
+                    requested_at=datetime.now(timezone.utc),
+                )
+            )
+        except _WebFetchRequestCapExceeded:
+            return ProviderEnrichmentResult(
+                provider_route=request.provider_route,
+                status="blocked",
+                emitted_snapshot_updated=False,
+                snapshot_created=repository.snapshot_created,
+                external_network_attempted=state.external_network_attempted,
+                web_request_count=state.web_request_count,
+                error_code="web_provider_fetch_unusable",
+            )
+        except Exception:
+            return ProviderEnrichmentResult(
+                provider_route=request.provider_route,
+                status="failed_transient",
+                emitted_snapshot_updated=False,
+                snapshot_created=repository.snapshot_created,
+                external_network_attempted=state.external_network_attempted,
+                web_request_count=state.web_request_count,
+                error_code=(
+                    state.repository_error_code
+                    or state.web_error_code
+                    or "web_provider_fetch_unusable"
+                ),
+            )
+
+        error_code = _web_provider_result_error(
+            result_status=result.status,
+            emitted_snapshot_updated=result.emitted_snapshot_updated,
+            snapshot_updated_event_id=repository.snapshot_updated_event_id,
+            state=state,
+        )
+        return ProviderEnrichmentResult(
+            provider_route=request.provider_route,
+            status=result.status,
+            emitted_snapshot_updated=result.emitted_snapshot_updated,
+            snapshot_id=result.snapshot_id,
+            snapshot_updated_event_id=repository.snapshot_updated_event_id,
+            snapshot_created=repository.snapshot_created,
+            external_network_attempted=state.external_network_attempted,
+            web_request_count=state.web_request_count,
+            error_code=error_code,
         )
 
 
@@ -1353,6 +1548,143 @@ class _SnapshotUpdatedEventCapturingGhRepository:
         return UUID(str(row)) if row else None
 
 
+@dataclass(slots=True)
+class _WebProviderAttemptState:
+    external_network_attempted: bool = False
+    web_request_count: int = 0
+    web_error_code: str | None = None
+    repository_error_code: str | None = None
+
+
+class _WebFetchRequestCapExceeded(Exception):
+    pass
+
+
+class _TrackedWebFetchClient:
+    def __init__(
+        self,
+        fetch_client: Any,
+        state: _WebProviderAttemptState,
+        *,
+        request_limit: int,
+        track_external_network: bool,
+    ) -> None:
+        self._fetch_client = fetch_client
+        self._state = state
+        self._request_limit = request_limit
+        self._track_external_network = track_external_network
+
+    async def fetch(self, url: str) -> Any:
+        self._state.web_request_count += 1
+        if self._state.web_request_count > self._request_limit:
+            raise _WebFetchRequestCapExceeded
+        if self._track_external_network:
+            self._state.external_network_attempted = True
+        try:
+            return await self._fetch_client.fetch(url)
+        except Exception as exc:
+            self._record_web_error(exc)
+            raise
+
+    async def close(self) -> None:
+        close = getattr(self._fetch_client, "close", None)
+        if close is not None:
+            await close()
+
+    def _record_web_error(self, exc: Exception) -> None:
+        reason_code = _web_fetch_exception_reason(exc)
+        if reason_code is not None:
+            self._state.web_error_code = reason_code
+
+
+class _SnapshotUpdatedEventCapturingWebRepository:
+    def __init__(self, repository: Any, *, session: Any, state: _WebProviderAttemptState) -> None:
+        self._repository = repository
+        self._session = session
+        self._state = state
+        self.snapshot_updated_event_id: UUID | None = None
+        self.snapshot_created = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._repository, name)
+
+    async def insert_enrichment_run_if_absent(self, **kwargs: Any) -> UUID | None:
+        return await self._repository_write("web_provider_snapshot_not_updated", "insert_enrichment_run_if_absent", **kwargs)
+
+    async def mark_enrichment_run_started(self, run_id: UUID) -> None:
+        await self._repository_write("web_provider_snapshot_not_updated", "mark_enrichment_run_started", run_id)
+
+    async def mark_enrichment_run_finished(self, **kwargs: Any) -> None:
+        await self._repository_write("web_provider_snapshot_not_updated", "mark_enrichment_run_finished", **kwargs)
+
+    async def insert_snapshot(self, **kwargs: Any) -> UUID:
+        snapshot_id = await self._repository_write(
+            "web_provider_snapshot_not_updated",
+            "insert_snapshot",
+            **kwargs,
+        )
+        self.snapshot_created = True
+        return snapshot_id
+
+    async def upsert_web_article_child(self, **kwargs: Any) -> None:
+        await self._repository_write("web_provider_snapshot_not_updated", "upsert_web_article_child", **kwargs)
+
+    async def insert_discovered_url(self, **kwargs: Any) -> None:
+        await self._repository_write("web_provider_snapshot_not_updated", "insert_discovered_url", **kwargs)
+
+    async def update_artifact_current_snapshot(self, **kwargs: Any) -> None:
+        await self._repository_write("web_provider_snapshot_not_updated", "update_artifact_current_snapshot", **kwargs)
+
+    async def insert_snapshot_updated_outbox(self, **kwargs: Any) -> Any:
+        try:
+            result = await self._repository.insert_snapshot_updated_outbox(**kwargs)
+            self.snapshot_updated_event_id = _uuid_from_value(result)
+            if self.snapshot_updated_event_id is None:
+                self.snapshot_updated_event_id = await self._load_existing_snapshot_updated_event_id(
+                    artifact_id=kwargs["artifact_id"],
+                    snapshot_id=kwargs["snapshot_id"],
+                )
+            return result
+        except Exception:
+            self._state.repository_error_code = "web_provider_snapshot_not_updated"
+            raise
+
+    async def _repository_write(self, reason_code: str, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await getattr(self._repository, method_name)(*args, **kwargs)
+        except Exception:
+            self._state.repository_error_code = reason_code
+            raise
+
+    async def _load_existing_snapshot_updated_event_id(
+        self,
+        *,
+        artifact_id: UUID,
+        snapshot_id: UUID,
+    ) -> UUID | None:
+        execute = getattr(self._session, "execute", None)
+        if execute is None:
+            return None
+        result = await execute(
+            sa.text(
+                """
+                SELECT event_id
+                FROM event_outbox
+                WHERE event_type = 'artifact.snapshot.updated.v1'
+                  AND dedupe_key = :dedupe_key
+                ORDER BY created_at ASC, event_id ASC
+                LIMIT 1
+                """
+            ),
+            {"dedupe_key": f"artifact:snapshot_updated:{artifact_id}:{snapshot_id}"},
+        )
+        scalar = getattr(result, "scalar_one_or_none", None)
+        if scalar is None:
+            return None
+        row = scalar()
+        return UUID(str(row)) if row else None
+
+
 def _build_gh_enricher_config(runtime: RuntimeConfigBundle) -> Any:
     from ..gh_enricher.config import GhEnricherConfig
 
@@ -1408,6 +1740,67 @@ def _validate_gh_enricher_caps(config: Any) -> None:
         raise ExactTargetSourceToAnalysisConfigError("github_max_file_bytes_cap_out_of_range")
 
 
+def _build_web_enricher_config(runtime: RuntimeConfigBundle) -> Any:
+    from ..web_enricher.config import WebEnricherConfig
+
+    values = runtime.values
+    try:
+        config = WebEnricherConfig(
+            app_env=_read(values, "APP_ENV", runtime.router_config.app_env).lower(),
+            database_url=runtime.database_url,
+            redis_url=runtime.router_config.redis_url or PLACEHOLDER_REDIS_URL,
+            queue_name=_read(values, "WEB_ENRICHER_QUEUE_NAME", "q.artifact.enrich.web"),
+            consumer_group=_read(values, "WEB_ENRICHER_CONSUMER_GROUP", "web-enricher"),
+            consumer_name=_read(values, "WEB_ENRICHER_CONSUMER_NAME", "web-enricher-1"),
+            batch_size=int(_read(values, "WEB_ENRICHER_BATCH_SIZE", "10")),
+            block_ms=int(_read(values, "WEB_ENRICHER_BLOCK_MS", "5000")),
+            request_timeout_sec=float(_read(values, "WEB_FETCH_TIMEOUT_SEC", "6")),
+            max_redirects=int(_read(values, "WEB_FETCH_MAX_REDIRECTS", "4")),
+            max_bytes=int(_read(values, "WEB_FETCH_MAX_BYTES", "262144")),
+            excerpt_chars=int(_read(values, "WEB_FETCH_EXCERPT_CHARS", "1600")),
+            max_outbound_links=int(_read(values, "WEB_FETCH_MAX_OUTBOUND_LINKS", "50")),
+            user_agent=_read(values, "WEB_FETCH_USER_AGENT", "catchbot-web-enricher/0.1"),
+            content_type_allowlist=tuple(
+                part.strip().lower()
+                for part in _read(
+                    values,
+                    "WEB_FETCH_CONTENT_TYPE_ALLOWLIST",
+                    "text/html,application/xhtml+xml,text/plain,text/markdown",
+                ).split(",")
+                if part.strip()
+            ),
+            log_level=_read(values, "LOG_LEVEL", "INFO").upper(),
+        )
+        config.validate()
+        return config
+    except Exception:
+        raise ExactTargetSourceToAnalysisConfigError("web_provider_runtime_config_invalid") from None
+
+
+def _validate_web_enricher_caps(config: Any) -> None:
+    from ..web_enricher.bounded_web_enrich_runner import (
+        ALLOWED_CONTENT_TYPES,
+        HARD_MAX_OUTBOUND_LINKS,
+        HARD_MAX_REDIRECTS,
+        HARD_MAX_RESPONSE_BYTES,
+        HARD_MAX_TIMEOUT_SEC,
+        QUEUE_NAME,
+    )
+
+    if config.queue_name != QUEUE_NAME:
+        raise ExactTargetSourceToAnalysisConfigError("web_provider_runtime_config_invalid")
+    if config.max_redirects < 0 or config.max_redirects > HARD_MAX_REDIRECTS:
+        raise ExactTargetSourceToAnalysisConfigError("web_provider_runtime_config_invalid")
+    if config.max_bytes <= 0 or config.max_bytes > HARD_MAX_RESPONSE_BYTES:
+        raise ExactTargetSourceToAnalysisConfigError("web_provider_runtime_config_invalid")
+    if config.request_timeout_sec <= 0 or config.request_timeout_sec > HARD_MAX_TIMEOUT_SEC:
+        raise ExactTargetSourceToAnalysisConfigError("web_provider_runtime_config_invalid")
+    if config.max_outbound_links <= 0 or config.max_outbound_links > HARD_MAX_OUTBOUND_LINKS:
+        raise ExactTargetSourceToAnalysisConfigError("web_provider_runtime_config_invalid")
+    if not set(config.content_type_allowlist).issubset(ALLOWED_CONTENT_TYPES):
+        raise ExactTargetSourceToAnalysisConfigError("web_provider_runtime_config_invalid")
+
+
 def _github_request_limit() -> int:
     from ..gh_enricher.bounded_github_enrich_runner import HARD_GITHUB_REQUEST_LIMIT
 
@@ -1423,6 +1816,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-live-github-provider-read", action="store_true")
     parser.add_argument("--allow-provider-snapshot-write", action="store_true")
     parser.add_argument("--provider-live-confirm", default=None)
+    parser.add_argument("--allow-live-web-provider-read", action="store_true")
+    parser.add_argument("--allow-web-provider-snapshot-write", action="store_true")
+    parser.add_argument("--web-provider-live-confirm", default=None)
     parser.add_argument("--allow-existing-source-provider-resume", action="store_true")
     parser.add_argument("--provider-resume-confirm", default=None)
     parser.add_argument("--m1-notification-ux-readback-json", default=None)
@@ -1679,7 +2075,11 @@ async def run_exact_target_source_to_analysis_materializer(
         normalization_error = _normalization_error(normalization)
         if normalization_error is not None:
             return finalize(
-                replace(report, status="failed", reason_code=normalization_error)
+                replace(
+                    report,
+                    status=_normalization_error_status(normalization_error),
+                    reason_code=normalization_error,
+                )
             )
         assert normalization.candidate_group_id is not None
 
@@ -1904,80 +2304,105 @@ async def _run_provider_enrichment_to_analysis(
 ) -> ExactTargetSourceToAnalysisReport:
     provider_request_error = _provider_request_error(normalization)
     if provider_request_error is not None:
-        return replace(report, status="failed", reason_code=provider_request_error)
-    assert preflight.registry_target is not None
-    assert preflight.source_content_hash is not None
-    assert normalization.enrichment_request_event_id is not None
-    assert normalization.candidate_group_id is not None
-    assert normalization.primary_artifact_id is not None
-    assert normalization.primary_artifact_type is not None
-    assert normalization.provider_route is not None
-    assert normalization.refresh_mode is not None
-    assert normalization.depth_budget is not None
-
-    provider_request = ProviderEnrichmentRequest(
-        trigger_event_id=normalization.enrichment_request_event_id,
-        candidate_group_id=normalization.candidate_group_id,
-        artifact_id=normalization.primary_artifact_id,
-        artifact_type=normalization.primary_artifact_type,
-        provider_route=normalization.provider_route,
-        refresh_mode=normalization.refresh_mode,
-        depth_budget=normalization.depth_budget,
-        provider_authority=request.provider_authority,
-    )
-    report = replace(report, provider_enrichment_attempted=True)
-    async with stage_factory.stage("provider_enrichment") as components:
-        provider = await components.provider_enrichment_service.materialize_provider_request(
-            provider_request
-        )
-        await components.commit()
-    report = _apply_provider_enrichment_result(report, provider)
-
-    async with stage_factory.stage("final_readback") as components:
-        final = await components.materializer_repository.load_final_readback(
-            source_message_id=source_message_id,
-            source_version_no=source_version_no,
-            source_content_hash=preflight.source_content_hash,
-            chat_id=preflight.registry_target.chat_id,
-            message_id=request.packet.parsed_ref.message_id,
-            candidate_group_id=normalization.candidate_group_id,
-        )
-    report = _apply_final_readback(report, final)
-    if provider.error_code is not None:
-        provider_error = _provider_not_ready_readback_error(final)
-        if provider_error is not None:
-            return replace(report, status="failed", reason_code=provider_error)
         return replace(
             report,
             status="blocked",
-            reason_code=provider.error_code,
+            reason_code=provider_request_error,
             preflight_passed=True,
-            analysis_request_created=False,
         )
-    if not _provider_result_ready_for_assembly(provider):
-        provider_error = _provider_not_ready_readback_error(final)
-        if provider_error is not None:
-            return replace(report, status="failed", reason_code=provider_error)
-        return replace(
-            report,
-            status="pass",
-            reason_code=_provider_not_ready_reason(provider),
-            preflight_passed=True,
-            analysis_request_created=False,
+    assert preflight.registry_target is not None
+    assert preflight.source_content_hash is not None
+    assert normalization.candidate_group_id is not None
+
+    provider_requests = [
+        ProviderEnrichmentRequest(
+            trigger_event_id=row.trigger_event_id,
+            candidate_group_id=row.candidate_group_id,
+            artifact_id=row.artifact_id,
+            artifact_type=row.artifact_type,
+            provider_route=row.provider_route,
+            refresh_mode=row.refresh_mode,
+            depth_budget=row.depth_budget,
+            provider_authority=request.provider_authority,
         )
-    if provider.snapshot_updated_event_id is None:
-        return replace(
-            report,
-            status="failed",
-            reason_code="provider_snapshot_updated_event_missing",
-        )
+        for row in _provider_request_rows(normalization)
+    ]
+    expected_provider_count = len(provider_requests)
+    web_provider_flow = any(item.provider_route == "web" for item in provider_requests)
+    report = replace(report, provider_enrichment_attempted=True)
+    provider_results: list[ProviderEnrichmentResult] = []
+    for provider_request in provider_requests:
+        async with stage_factory.stage("provider_enrichment") as components:
+            provider = await components.provider_enrichment_service.materialize_provider_request(
+                provider_request
+            )
+            await components.commit()
+        provider_results.append(provider)
+        report = _apply_provider_enrichment_result(report, provider)
+
+        if provider.error_code is not None:
+            async with stage_factory.stage("final_readback") as components:
+                final = await components.materializer_repository.load_final_readback(
+                    source_message_id=source_message_id,
+                    source_version_no=source_version_no,
+                    source_content_hash=preflight.source_content_hash,
+                    chat_id=preflight.registry_target.chat_id,
+                    message_id=request.packet.parsed_ref.message_id,
+                    candidate_group_id=normalization.candidate_group_id,
+                )
+            report = _apply_final_readback(report, final)
+            provider_error = _provider_not_ready_readback_error(
+                final,
+                expected_provider_count=expected_provider_count,
+            )
+            if provider_error is not None:
+                return replace(report, status="failed", reason_code=provider_error)
+            return replace(
+                report,
+                status="blocked",
+                reason_code=provider.error_code,
+                preflight_passed=True,
+                analysis_request_created=False,
+            )
+        if not _provider_result_ready_for_assembly(provider):
+            async with stage_factory.stage("final_readback") as components:
+                final = await components.materializer_repository.load_final_readback(
+                    source_message_id=source_message_id,
+                    source_version_no=source_version_no,
+                    source_content_hash=preflight.source_content_hash,
+                    chat_id=preflight.registry_target.chat_id,
+                    message_id=request.packet.parsed_ref.message_id,
+                    candidate_group_id=normalization.candidate_group_id,
+                )
+            report = _apply_final_readback(report, final)
+            provider_error = _provider_not_ready_readback_error(
+                final,
+                expected_provider_count=expected_provider_count,
+            )
+            if provider_error is not None:
+                return replace(report, status="failed", reason_code=provider_error)
+            return replace(
+                report,
+                status="pass",
+                reason_code=_provider_not_ready_reason(provider),
+                preflight_passed=True,
+                analysis_request_created=False,
+            )
+        if provider.snapshot_updated_event_id is None:
+            return replace(
+                report,
+                status="failed",
+                reason_code="provider_snapshot_updated_event_missing",
+            )
 
     report = replace(report, assembler_attempted=True)
-    async with stage_factory.stage("assembler") as components:
-        await components.assembler_service.handle_trigger_event(
-            provider.snapshot_updated_event_id
-        )
-        await components.commit()
+    for provider in provider_results:
+        assert provider.snapshot_updated_event_id is not None
+        async with stage_factory.stage("assembler") as components:
+            await components.assembler_service.handle_trigger_event(
+                provider.snapshot_updated_event_id
+            )
+            await components.commit()
 
     async with stage_factory.stage("final_readback") as components:
         final = await components.materializer_repository.load_final_readback(
@@ -1989,9 +2414,20 @@ async def _run_provider_enrichment_to_analysis(
             candidate_group_id=normalization.candidate_group_id,
         )
     report = _apply_final_readback(report, final)
-    provider_final_error = _provider_final_readback_error(final)
+    provider_final_error = _provider_final_readback_error(
+        final,
+        expected_provider_count=expected_provider_count,
+    )
     if provider_final_error is not None:
-        return replace(report, status="failed", reason_code=provider_final_error)
+        return replace(
+            report,
+            status="failed",
+            reason_code=(
+                "web_provider_final_readback_invalid"
+                if web_provider_flow
+                else provider_final_error
+            ),
+        )
     return replace(
         report,
         status="pass",
@@ -2360,15 +2796,23 @@ def _apply_provider_enrichment_result(
         _with_counts(
             report,
             {
-                "provider_snapshot_results": 1 if result.snapshot_id is not None else 0,
+                "provider_snapshot_results": _count(report, "provider_snapshot_results")
+                + (1 if result.snapshot_id is not None else 0),
                 "provider_snapshot_updated_events": (
-                    1 if result.snapshot_updated_event_id is not None else 0
+                    _count(report, "provider_snapshot_updated_events")
+                    + (1 if result.snapshot_updated_event_id is not None else 0)
                 ),
-                "github_request_count": result.github_request_count,
+                "github_request_count": _count(report, "github_request_count")
+                + result.github_request_count,
+                "web_request_count": _count(report, "web_request_count")
+                + result.web_request_count,
             },
         ),
-        provider_snapshot_update_fingerprint=_fingerprint(result.snapshot_updated_event_id),
-        provider_snapshot_created=result.snapshot_created,
+        provider_snapshot_update_fingerprint=(
+            report.provider_snapshot_update_fingerprint
+            or _fingerprint(result.snapshot_updated_event_id)
+        ),
+        provider_snapshot_created=report.provider_snapshot_created or result.snapshot_created,
         external_network_attempted=report.external_network_attempted
         or result.external_network_attempted,
     )
@@ -2400,12 +2844,28 @@ def _normalization_error(readback: NormalizationReadback) -> str | None:
     if readback.primary_members != 1:
         return "primary_member_cardinality_invalid"
     if readback.enrichment_requests >= 1:
-        if readback.enrichment_requests != 1:
-            return "artifact_enrichment_request_cardinality_invalid"
         if readback.primary_artifact_type == "text_idea":
             return "primary_artifact_type_invalid_for_enrichment"
         if not readback.provider_route_counts:
             return "provider_route_missing"
+        routes = _provider_routes(readback)
+        if len(routes) > 1:
+            return "mixed_provider_routes_not_supported_by_exact_materializer"
+        route = next(iter(routes), None)
+        if route == "web":
+            if readback.enrichment_requests > WEB_PROVIDER_REQUEST_CAP:
+                return "web_provider_request_count_exceeds_exact_materializer_cap"
+            if len(_provider_request_rows(readback)) != readback.enrichment_requests:
+                return "artifact_enrichment_request_missing"
+            for row in _provider_request_rows(readback):
+                row_error = _provider_request_row_error(row)
+                if row_error is not None:
+                    return row_error
+            return None
+        if route != "github":
+            return "provider_route_not_supported_by_live_exact_materializer"
+        if readback.enrichment_requests != 1:
+            return "artifact_enrichment_request_cardinality_invalid"
         if readback.enrichment_request_event_id is None:
             return "artifact_enrichment_request_missing"
         if not readback.provider_route:
@@ -2420,24 +2880,100 @@ def _normalization_error(readback: NormalizationReadback) -> str | None:
     return None
 
 
+def _normalization_error_status(reason_code: str) -> str:
+    if reason_code in {
+        "provider_route_not_supported_by_live_exact_materializer",
+        "mixed_provider_routes_not_supported_by_exact_materializer",
+        "web_provider_request_count_exceeds_exact_materializer_cap",
+    }:
+        return "blocked"
+    return "failed"
+
+
 def _provider_request_error(readback: NormalizationReadback) -> str | None:
-    if readback.enrichment_requests != 1:
-        return "artifact_enrichment_request_cardinality_invalid"
-    if readback.enrichment_request_event_id is None:
-        return "artifact_enrichment_request_missing"
     if readback.candidate_group_id is None:
         return "candidate_group_missing"
     if readback.primary_artifact_id is None:
         return "primary_artifact_missing"
     if not readback.primary_artifact_type:
         return "primary_artifact_type_missing"
-    if not readback.provider_route:
+    routes = _provider_routes(readback)
+    if not routes:
         return "provider_route_missing"
-    if readback.provider_route not in {"github", "x", "web"}:
+    if len(routes) > 1:
+        return "mixed_provider_routes_not_supported_by_exact_materializer"
+    route = next(iter(routes))
+    if route == "web":
+        if readback.enrichment_requests < 1:
+            return "artifact_enrichment_request_missing"
+        if readback.enrichment_requests > WEB_PROVIDER_REQUEST_CAP:
+            return "web_provider_request_count_exceeds_exact_materializer_cap"
+        rows = _provider_request_rows(readback)
+        if len(rows) != readback.enrichment_requests:
+            return "artifact_enrichment_request_missing"
+        for row in rows:
+            row_error = _provider_request_row_error(row)
+            if row_error is not None:
+                return row_error
+        return None
+    if route == "github":
+        if readback.enrichment_requests != 1:
+            return "artifact_enrichment_request_cardinality_invalid"
+        if readback.enrichment_request_event_id is None:
+            return "artifact_enrichment_request_missing"
+        if not readback.provider_route:
+            return "provider_route_missing"
+        if not readback.refresh_mode:
+            return "refresh_mode_missing"
+        if readback.depth_budget is None:
+            return "depth_budget_missing"
+        return None
+    if route in {"x"}:
+        return "provider_route_not_supported_by_live_exact_materializer"
+    return "provider_route_not_allowed"
+
+
+def _provider_routes(readback: NormalizationReadback) -> set[str]:
+    routes = {route for route, count in readback.provider_route_counts.items() if count > 0}
+    if not routes and readback.provider_route:
+        routes.add(readback.provider_route)
+    return routes
+
+
+def _provider_request_rows(readback: NormalizationReadback) -> tuple[ProviderEnrichmentRequestRow, ...]:
+    if readback.provider_requests:
+        return readback.provider_requests
+    if (
+        readback.enrichment_request_event_id is not None
+        and readback.candidate_group_id is not None
+        and readback.primary_artifact_id is not None
+        and readback.primary_artifact_type is not None
+        and readback.provider_route is not None
+        and readback.refresh_mode is not None
+        and readback.depth_budget is not None
+    ):
+        return (
+            ProviderEnrichmentRequestRow(
+                trigger_event_id=readback.enrichment_request_event_id,
+                candidate_group_id=readback.candidate_group_id,
+                artifact_id=readback.primary_artifact_id,
+                artifact_type=readback.primary_artifact_type,
+                provider_route=readback.provider_route,
+                refresh_mode=readback.refresh_mode,
+                depth_budget=readback.depth_budget,
+            ),
+        )
+    return ()
+
+
+def _provider_request_row_error(row: ProviderEnrichmentRequestRow) -> str | None:
+    if row.provider_route not in {"github", "x", "web"}:
         return "provider_route_not_allowed"
-    if not readback.refresh_mode:
+    if not row.artifact_type:
+        return "primary_artifact_type_missing"
+    if not row.refresh_mode:
         return "refresh_mode_missing"
-    if readback.depth_budget is None:
+    if row.depth_budget is None:
         return "depth_budget_missing"
     return None
 
@@ -2510,18 +3046,23 @@ def _provider_resume_snapshot_ready_for_assembly(readback: FinalReadback) -> boo
     )
 
 
-def _provider_not_ready_readback_error(readback: FinalReadback) -> str | None:
+def _provider_not_ready_readback_error(
+    readback: FinalReadback,
+    *,
+    expected_provider_count: int = 1,
+) -> str | None:
     expected_one = {
         "source_messages": readback.source_messages,
         "source_message_versions": readback.source_message_versions,
         "source_created_events": readback.source_created_events,
         "normalization_runs": readback.normalization_runs,
         "candidate_groups": readback.candidate_groups,
-        "external_enrichment_requests": readback.external_enrichment_requests,
     }
     for name, count in expected_one.items():
         if count != 1:
             return f"{name}_cardinality_invalid"
+    if readback.external_enrichment_requests != expected_provider_count:
+        return "external_enrichment_requests_cardinality_invalid"
     expected_zero = {
         "telegram_raw_updates": readback.telegram_raw_updates,
         "primary_text_idea_members": readback.primary_text_idea_members,
@@ -2538,21 +3079,30 @@ def _provider_not_ready_readback_error(readback: FinalReadback) -> str | None:
     return None
 
 
-def _provider_final_readback_error(readback: FinalReadback) -> str | None:
+def _provider_final_readback_error(
+    readback: FinalReadback,
+    *,
+    expected_provider_count: int = 1,
+) -> str | None:
     expected_one = {
         "source_messages": readback.source_messages,
         "source_message_versions": readback.source_message_versions,
         "source_created_events": readback.source_created_events,
         "normalization_runs": readback.normalization_runs,
         "candidate_groups": readback.candidate_groups,
-        "external_enrichment_requests": readback.external_enrichment_requests,
-        "provider_snapshots": readback.provider_snapshots,
-        "artifact_snapshot_updated_events": readback.artifact_snapshot_updated_events,
         "ready_current_bundles": readback.ready_current_bundles,
         "analysis_requested_events": readback.analysis_requested_events,
     }
     for key, value in expected_one.items():
         if value != 1:
+            return f"{key}_cardinality_invalid"
+    expected_provider = {
+        "external_enrichment_requests": readback.external_enrichment_requests,
+        "provider_snapshots": readback.provider_snapshots,
+        "artifact_snapshot_updated_events": readback.artifact_snapshot_updated_events,
+    }
+    for key, value in expected_provider.items():
+        if value != expected_provider_count:
             return f"{key}_cardinality_invalid"
     expected_zero = {
         "telegram_raw_updates": readback.telegram_raw_updates,
@@ -2647,6 +3197,49 @@ def _github_client_exception_reason(exc: Exception) -> str | None:
     if isinstance(exc, GitHubClientError):
         return "provider_github_client_error"
     return None
+
+
+def _web_fetch_exception_reason(exc: Exception) -> str | None:
+    from ..web_enricher.web_fetch_client import (
+        UnsupportedContentTypeError,
+        WebAccessDeniedError,
+        WebFetchClientError,
+        WebNotFoundError,
+        WebPermanentFetchError,
+        WebRateLimitedError,
+        WebTransientFetchError,
+    )
+
+    if isinstance(
+        exc,
+        (
+            UnsupportedContentTypeError,
+            WebAccessDeniedError,
+            WebFetchClientError,
+            WebNotFoundError,
+            WebPermanentFetchError,
+            WebRateLimitedError,
+            WebTransientFetchError,
+        ),
+    ):
+        return "web_provider_fetch_unusable"
+    return None
+
+
+def _web_provider_result_error(
+    *,
+    result_status: str,
+    emitted_snapshot_updated: bool,
+    snapshot_updated_event_id: UUID | None,
+    state: _WebProviderAttemptState,
+) -> str | None:
+    if result_status in {"ready", "partial_ready"}:
+        if emitted_snapshot_updated and snapshot_updated_event_id is not None:
+            return None
+        return "web_provider_snapshot_not_updated"
+    if result_status in {"failed_transient", "failed_permanent", "rate_limited", "access_denied", "unsupported"}:
+        return state.web_error_code or "web_provider_fetch_unusable"
+    return "web_provider_evidence_not_ready"
 
 
 def _report(
@@ -2815,6 +3408,12 @@ def build_restricted_source_channel_proof(
     report: ExactTargetSourceToAnalysisReport,
 ) -> dict[str, Any]:
     source_to_analysis_visible = _source_to_analysis_boundary_visible(report)
+    github_network_attempted = (
+        report.external_network_attempted and _count(report, "github_request_count") > 0
+    )
+    web_network_attempted = (
+        report.external_network_attempted and _count(report, "web_request_count") > 0
+    )
     authority_closed = (
         not report.openai_attempted
         and not report.redis_attempted
@@ -2889,6 +3488,8 @@ def build_restricted_source_channel_proof(
                 "external_enrichment_requests",
                 "provider_snapshots",
                 "artifact_snapshot_updated_events",
+                "github_request_count",
+                "web_request_count",
                 "text_idea_snapshots",
                 "ready_current_bundles",
                 "candidate_evidence_members",
@@ -2904,9 +3505,9 @@ def build_restricted_source_channel_proof(
             "telegram_raw_updates_write_required": False,
             "telegram_send_opened": report.telegram_send_attempted,
             "openai_called": report.openai_attempted,
-            "github_called": report.external_network_attempted,
+            "github_called": github_network_attempted,
             "x_called": False,
-            "web_called": False,
+            "web_called": web_network_attempted,
             "redis_consume_or_ack": report.redis_attempted,
             "docker_or_systemd_called": False,
             "alembic_or_ddl_ran": False,
@@ -3063,6 +3664,9 @@ def _provider_authority_args_present(args: argparse.Namespace) -> bool:
         bool(args.allow_live_github_provider_read)
         or bool(args.allow_provider_snapshot_write)
         or args.provider_live_confirm is not None
+        or bool(args.allow_live_web_provider_read)
+        or bool(args.allow_web_provider_snapshot_write)
+        or args.web_provider_live_confirm is not None
     )
 
 
@@ -3078,6 +3682,9 @@ def _provider_authority_from_args(args: argparse.Namespace) -> ProviderLiveAutho
         allow_live_github_provider_read=bool(args.allow_live_github_provider_read),
         allow_provider_snapshot_write=bool(args.allow_provider_snapshot_write),
         provider_live_confirm=args.provider_live_confirm,
+        allow_live_web_provider_read=bool(args.allow_live_web_provider_read),
+        allow_web_provider_snapshot_write=bool(args.allow_web_provider_snapshot_write),
+        web_provider_live_confirm=args.web_provider_live_confirm,
     )
 
 
@@ -3172,9 +3779,7 @@ def _with_counts(
 def _bounded_count(value: int | None) -> int:
     if value is None or value <= 0:
         return 0
-    if value == 1:
-        return 1
-    return 2
+    return min(value, WEB_PROVIDER_REQUEST_CAP)
 
 
 def _int_or_none(value: Any) -> int | None:
@@ -3190,6 +3795,19 @@ def _fingerprint(value: Any) -> str | None:
     if value is None:
         return None
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:16]
+
+
+def _uuid_from_value(value: Any) -> UUID | None:
+    if isinstance(value, UUID):
+        return value
+    if isinstance(value, int):
+        return None
+    if isinstance(value, str):
+        try:
+            return UUID(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _json_default(value: Any) -> str:
