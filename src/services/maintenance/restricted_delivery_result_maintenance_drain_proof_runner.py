@@ -162,7 +162,7 @@ async def run_restricted_delivery_result_maintenance_drain_proof(
             publisher_result=publisher_result,
             preview_result=preview_result,
         )
-    if pending != 0:
+    if pending != 0 and not _preview_selected_pending_target(preview_result):
         return _report(
             status="blocked",
             reason_code="redis_pending_not_zero",
@@ -419,10 +419,23 @@ def _worker_config(
         allow_redis_read=True,
         allow_redis_consume=mode == "execute" and config.allow_redis_consume,
         allow_redis_ack=mode == "execute" and config.allow_redis_ack,
+        allow_pending_target_resume=True,
         mode=mode,
         trigger_event_suffix=publisher_result.selected_event_id_suffix,
         root_object_id_suffix=publisher_result.selected_aggregate_id_suffix,
         redis_message_id_suffix=publisher_result.redis_message_id_suffix,
+    )
+
+
+def _preview_selected_pending_target(result: BoundedMaintenanceResult) -> bool:
+    selection = result.redis_selection
+    return (
+        result.queue_config is not None
+        and result.queue_config.allow_pending_target_resume
+        and selection is not None
+        and selection.message is not None
+        and selection.group_pending is not None
+        and selection.group_pending > 0
     )
 
 
@@ -475,6 +488,7 @@ def _report(
             "outbox_status_update_allowed": config.allow_outbox_status_update,
             "redis_consume_allowed": config.allow_redis_consume,
             "redis_ack_allowed": config.allow_redis_ack,
+            "pending_target_resume_allowed": _pending_target_resume_authorized(config),
             "max_lag": config.max_lag,
             "telegram_transport_attempted": False,
             "openai_called": False,
@@ -579,6 +593,17 @@ def _readback_report(readback: DeliveryResultMaintenanceDrainReadback | None) ->
 
 def _status_from_child(status: str) -> str:
     return "blocked" if status == "blocked" else "failed"
+
+
+def _pending_target_resume_authorized(config: RestrictedDeliveryResultMaintenanceDrainProofConfig) -> bool:
+    return (
+        config.operator_confirmed
+        and config.allow_database_read
+        and config.allow_redis_write
+        and config.allow_outbox_status_update
+        and config.allow_redis_consume
+        and config.allow_redis_ack
+    )
 
 
 def _publisher_event_suffix(result: BoundedDeliveryResultOutboxPublishResult | None) -> str | None:

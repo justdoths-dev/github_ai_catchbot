@@ -7,11 +7,12 @@ import pytest
 
 from services.maintenance.bounded_runtime import (
     MAINTENANCE_RESULT_COMMAND,
+    BoundedMaintenanceQueueOnceConfig,
     BoundedMaintenanceResult,
     BoundedMaintenanceRuntimeState,
     RedisTargetSelection,
 )
-from services.maintenance.models import DeliveryResultWorkerResult
+from services.maintenance.models import DeliveryResultWorkerResult, StreamMessage
 from services.maintenance.restricted_delivery_result_maintenance_drain_proof_runner import (
     DeliveryResultMaintenanceDrainReadback,
     RestrictedDeliveryResultMaintenanceDrainProofConfig,
@@ -30,6 +31,7 @@ TARGET_EVENT_ID = UUID("11111111-1111-4111-8111-111111111111")
 PLAN_SUFFIX = "22222222"
 DELIVERY_RECORD_SUFFIX = "33333333"
 REDIS_MESSAGE_SUFFIX = "0000-42"
+REDIS_MESSAGE_ID = "1740000000000-42"
 RAW_SECRET = "sentinel_private_runtime_detail"
 
 
@@ -149,6 +151,8 @@ def _maintenance_result(
     acked: bool = False,
     handler_called: bool = False,
     error_code: str | None = None,
+    selected_message: StreamMessage | None = None,
+    queue_config: BoundedMaintenanceQueueOnceConfig | None = None,
 ) -> BoundedMaintenanceResult:
     state = BoundedMaintenanceRuntimeState(
         runtime_config_loaded=True,
@@ -163,6 +167,7 @@ def _maintenance_result(
     selection = RedisTargetSelection(
         status="matched" if ok else "blocked",
         error_code=error_code,
+        message=selected_message,
         group_lag=lag,
         group_pending=pending,
         redis_message_count=1,
@@ -191,6 +196,7 @@ def _maintenance_result(
         status="pass" if ok else "blocked",
         ok=ok,
         error_code=error_code,
+        queue_config=queue_config,
         state=state,
         queue_name="q.maintenance",
         consumer_group="maintenance",
@@ -214,6 +220,19 @@ def _readback(**overrides) -> DeliveryResultMaintenanceDrainReadback:
     }
     values.update(overrides)
     return DeliveryResultMaintenanceDrainReadback(**values)
+
+
+def _stream_message() -> StreamMessage:
+    return StreamMessage(
+        stream="q.maintenance",
+        message_id=REDIS_MESSAGE_ID,
+        fields={
+            "stage_name": "maintenance",
+            "root_object_type": "notification_plan",
+            "root_object_id": f"00000000-0000-4000-8000-0000{PLAN_SUFFIX}",
+            "trigger_event_id": f"00000000-0000-4000-8000-000011111111",
+        },
+    )
 
 
 def test_redis_group_readback_preserves_zero_lag_and_pending_with_string_keys() -> None:
@@ -301,14 +320,68 @@ async def test_pass_path_publishes_previews_executes_one_message_and_reads_back_
     assert [call.mode for call in maintenance.calls] == ["preview", "execute"]
     assert maintenance.calls[0].allow_redis_consume is False
     assert maintenance.calls[0].allow_redis_ack is False
+    assert maintenance.calls[0].allow_pending_target_resume is True
     assert maintenance.calls[0].allow_database_read is False
     assert maintenance.calls[1].allow_redis_consume is True
     assert maintenance.calls[1].allow_redis_ack is True
+    assert maintenance.calls[1].allow_pending_target_resume is True
     assert maintenance.calls[1].allow_database_read is True
     assert maintenance.calls[1].allow_database_write is True
     assert maintenance.calls[1].trigger_event_suffix == "11111111"
     assert maintenance.calls[1].root_object_id_suffix == PLAN_SUFFIX
     assert maintenance.calls[1].redis_message_id_suffix == REDIS_MESSAGE_SUFFIX
+    assert readback.calls == [TARGET_EVENT_ID]
+
+
+@pytest.mark.asyncio
+async def test_pass_path_resumes_exact_pending_target_under_same_consumer() -> None:
+    class PendingResumeMaintenanceRunner:
+        def __init__(self) -> None:
+            self.calls: list[BoundedMaintenanceQueueOnceConfig] = []
+
+        async def __call__(self, config, **kwargs):
+            del kwargs
+            self.calls.append(config)
+            return _maintenance_result(
+                mode=config.mode,
+                lag=1,
+                pending=1,
+                acked=config.mode == "execute",
+                handler_called=config.mode == "execute",
+                selected_message=_stream_message(),
+                queue_config=config,
+            )
+
+    maintenance = PendingResumeMaintenanceRunner()
+    readback = FakeReadbackLoader(_readback(redis_lag=0, redis_pending=0, maintenance_receipt_present=True))
+
+    report = await run_restricted_delivery_result_maintenance_drain_proof(
+        _config(),
+        publisher_runner=FakePublisherRunner(_publisher_result()),
+        maintenance_runner=maintenance,
+        readback_loader=readback,
+    )
+
+    assert report["status"] == "pass"
+    assert report["reason_code"] == "delivery_result_maintenance_drain_proof_closed"
+    assert report["publisher"]["redis_xadd_count"] == 1
+    assert report["redis_precheck"]["pending"] == 1
+    assert report["worker_once"]["acked"] is True
+    assert report["worker_once"]["processed"] is True
+    assert report["worker_once"]["reason_code"] == "delivery_result_terminal_success"
+    assert report["readback"]["redis_pending"] == 0
+    assert report["readback"]["redis_lag"] == 0
+    assert report["readback"]["maintenance_receipt_present"] is True
+    assert report["authority"]["q_notification_send_consumed"] is False
+    assert report["authority"]["telegram_transport_attempted"] is False
+    assert report["authority"]["raw_payload_printed"] is False
+    assert report["authority"]["raw_ids_printed"] is False
+    assert report["authority"]["pending_target_resume_allowed"] is True
+    assert [call.mode for call in maintenance.calls] == ["preview", "execute"]
+    assert all(call.allow_pending_target_resume is True for call in maintenance.calls)
+    assert maintenance.calls[0].allow_redis_consume is False
+    assert maintenance.calls[1].allow_redis_consume is True
+    assert maintenance.calls[1].allow_redis_ack is True
     assert readback.calls == [TARGET_EVENT_ID]
 
 

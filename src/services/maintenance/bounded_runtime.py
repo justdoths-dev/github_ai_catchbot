@@ -48,6 +48,7 @@ class BoundedMaintenanceQueueOnceConfig:
     allow_redis_read: bool = False
     allow_redis_consume: bool = False
     allow_redis_ack: bool = False
+    allow_pending_target_resume: bool = False
     mode: str = "preview"
     trigger_event_suffix: str | None = None
     root_object_id_suffix: str | None = None
@@ -195,6 +196,7 @@ class BoundedMaintenanceResult:
             "redis_read_allowed": queue_config.allow_redis_read if queue_config else False,
             "redis_consume_allowed": queue_config.allow_redis_consume if queue_config else False,
             "redis_ack_allowed": queue_config.allow_redis_ack if queue_config else False,
+            "pending_target_resume_allowed": queue_config.allow_pending_target_resume if queue_config else False,
             "target_event_suffix": _uuid_suffix_projection(queue_config.trigger_event_suffix) if queue_config else None,
             "target_root_object_id_suffix": _uuid_suffix_projection(queue_config.root_object_id_suffix)
             if queue_config
@@ -315,6 +317,10 @@ class RedisExactNextMaintenanceConsumer:
         config: BoundedMaintenanceQueueOnceConfig,
     ) -> RedisTargetSelection:
         self._state.redis_consume_called = True
+        if config.allow_pending_target_resume:
+            pending_selection = await self._select_expected_pending_message(expected, config)
+            if pending_selection is not None:
+                return pending_selection
         try:
             raw = await self._client.xreadgroup(
                 self._consumer_group,
@@ -360,16 +366,15 @@ class RedisExactNextMaintenanceConsumer:
         group_pending: int,
         group_lag: int | None,
     ) -> RedisTargetSelection:
-        entries: list[Any] = []
-        pending_range = getattr(self._client, "xpending_range", None)
-        if pending_range is not None:
-            try:
-                entries = await pending_range(self._queue_name, self._consumer_group, "-", "+", 10)
-            except Exception:
-                entries = []
+        entries = await self._load_pending_entries(count=10)
+        target_message_id: str | None = None
+        unrelated_pending_seen = False
         for entry in entries:
             message_id = _pending_message_id(entry)
-            if message_id and config.redis_message_id_suffix and message_id.endswith(config.redis_message_id_suffix):
+            if not message_id:
+                unrelated_pending_seen = True
+                continue
+            if config.redis_message_id_suffix and message_id.endswith(config.redis_message_id_suffix):
                 consumer = _pending_consumer_name(entry)
                 if consumer and consumer != self._consumer_name:
                     return _selection_error(
@@ -377,12 +382,110 @@ class RedisExactNextMaintenanceConsumer:
                         group_pending=group_pending,
                         group_lag=group_lag,
                     )
+                if not config.allow_pending_target_resume:
+                    return _selection_error(
+                        "target_pending_not_unconsumed",
+                        group_pending=group_pending,
+                        group_lag=group_lag,
+                    )
+                if consumer != self._consumer_name:
+                    return _selection_error(
+                        "target_pending_not_unconsumed",
+                        group_pending=group_pending,
+                        group_lag=group_lag,
+                    )
+                if target_message_id is not None:
+                    return _selection_error(
+                        "redis_pending_messages_present",
+                        group_pending=group_pending,
+                        group_lag=group_lag,
+                    )
+                target_message_id = message_id
+            else:
+                unrelated_pending_seen = True
+
+        if target_message_id is not None:
+            if group_pending != 1 or unrelated_pending_seen or len(entries) != 1:
+                return _selection_error(
+                    "redis_pending_messages_present",
+                    group_pending=group_pending,
+                    group_lag=group_lag,
+                )
+            return await self._select_pending_target_message(
+                config,
+                target_message_id,
+                group_pending=group_pending,
+                group_lag=group_lag,
+            )
+        return _selection_error("redis_pending_messages_present", group_pending=group_pending, group_lag=group_lag)
+
+    async def _select_expected_pending_message(
+        self,
+        expected: StreamMessage,
+        config: BoundedMaintenanceQueueOnceConfig,
+    ) -> RedisTargetSelection | None:
+        group = await self._load_group()
+        if group is None:
+            return None
+        group_pending = _safe_int(_dict_get(group, "pending"))
+        group_lag = _safe_int(_dict_get(group, "lag"))
+        if not group_pending or group_pending < 1:
+            return None
+        entries = await self._load_pending_entries(count=10)
+        target_seen = False
+        unrelated_pending_seen = False
+        for entry in entries:
+            message_id = _pending_message_id(entry)
+            if message_id != expected.message_id:
+                unrelated_pending_seen = True
+                continue
+            consumer = _pending_consumer_name(entry)
+            if consumer and consumer != self._consumer_name:
+                return _selection_error(
+                    "target_pending_under_another_consumer",
+                    group_pending=group_pending,
+                    group_lag=group_lag,
+                )
+            if consumer != self._consumer_name:
                 return _selection_error(
                     "target_pending_not_unconsumed",
                     group_pending=group_pending,
                     group_lag=group_lag,
                 )
-        return _selection_error("redis_pending_messages_present", group_pending=group_pending, group_lag=group_lag)
+            target_seen = True
+
+        if not target_seen:
+            return _selection_error("redis_pending_messages_present", group_pending=group_pending, group_lag=group_lag)
+        if group_pending != 1 or unrelated_pending_seen or len(entries) != 1:
+            return _selection_error("redis_pending_messages_present", group_pending=group_pending, group_lag=group_lag)
+        return _select_exact_message(config, expected, group_pending=group_pending, group_lag=group_lag)
+
+    async def _select_pending_target_message(
+        self,
+        config: BoundedMaintenanceQueueOnceConfig,
+        message_id: str,
+        *,
+        group_pending: int,
+        group_lag: int | None,
+    ) -> RedisTargetSelection:
+        try:
+            entries = await self._client.xrange(self._queue_name, min=message_id, max=message_id, count=1)
+        except Exception:
+            return _selection_error("redis_xrange_failed", group_pending=group_pending, group_lag=group_lag)
+        messages = [_stream_message_from_xrange(self._queue_name, entry) for entry in entries or []]
+        if len(messages) != 1:
+            return _selection_error("redis_pending_target_missing", group_pending=group_pending, group_lag=group_lag)
+        return _select_exact_message(config, messages[0], group_pending=group_pending, group_lag=group_lag)
+
+    async def _load_pending_entries(self, *, count: int) -> list[Any]:
+        pending_range = getattr(self._client, "xpending_range", None)
+        if pending_range is None:
+            return []
+        try:
+            entries = await pending_range(self._queue_name, self._consumer_group, "-", "+", count)
+        except Exception:
+            return []
+        return list(entries or [])
 
 
 class DefaultBoundedMaintenanceQueueRuntime:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import UUID
 
 import pytest
@@ -35,6 +36,7 @@ class FakeRedis:
         self.lag = lag
         self.pending_entries = pending_entries or []
         self.ack_raises = ack_raises
+        self.xrange_calls = []
         self.xreadgroup_calls = []
         self.acked = []
 
@@ -51,7 +53,10 @@ class FakeRedis:
         ]
 
     async def xrange(self, name, min="-", max="+", count=None):
-        del name, min, max
+        self.xrange_calls.append({"name": name, "min": min, "max": max, "count": count})
+        if min == max:
+            exact = [entry for entry in self.entries if entry[0] == min]
+            return exact[: count or len(exact)]
         return self.entries[: count or len(self.entries)]
 
     async def xpending_range(self, name, groupname, min, max, count):
@@ -379,7 +384,10 @@ async def test_pending_target_under_another_consumer_fails_without_claim_takeove
         return FakeQueueRuntime(redis=redis, repository=repository, state=state)
 
     result = await run_bounded_maintenance_queue_once(
-        _queue_config(event.event_id, notification_plan.notification_plan_id),
+        replace(
+            _queue_config(event.event_id, notification_plan.notification_plan_id),
+            allow_pending_target_resume=True,
+        ),
         runtime_config_loader=_runtime_loader,
         runtime_builder=builder,
     )
@@ -388,3 +396,138 @@ async def test_pending_target_under_another_consumer_fails_without_claim_takeove
     assert result.error_code == "target_pending_under_another_consumer"
     assert redis.xreadgroup_calls == []
     assert redis.acked == []
+
+
+@pytest.mark.asyncio
+async def test_default_blocks_exact_pending_target_under_same_consumer() -> None:
+    repository, notification_plan, event = _fixture()
+    redis = FakeRedis(
+        entries=[_message(event.event_id, notification_plan.notification_plan_id)],
+        pending=1,
+        pending_entries=[{"message_id": MESSAGE_ID, "consumer": "test"}],
+    )
+
+    async def builder(runtime_config, state, logger):
+        del runtime_config, logger
+        return FakeQueueRuntime(redis=redis, repository=repository, state=state)
+
+    result = await run_bounded_maintenance_queue_once(
+        _queue_config(event.event_id, notification_plan.notification_plan_id),
+        runtime_config_loader=_runtime_loader,
+        runtime_builder=builder,
+    )
+
+    assert result.ok is False
+    assert result.error_code == "target_pending_not_unconsumed"
+    assert result.to_sanitized_dict()["pending_target_resume_allowed"] is False
+    assert redis.xreadgroup_calls == []
+    assert redis.acked == []
+
+
+@pytest.mark.asyncio
+async def test_execute_resumes_exact_pending_target_under_same_consumer_when_authorized() -> None:
+    repository, notification_plan, event = _fixture()
+    redis = FakeRedis(
+        entries=[_message(event.event_id, notification_plan.notification_plan_id)],
+        pending=1,
+        pending_entries=[{"message_id": MESSAGE_ID, "consumer": "test"}],
+    )
+    runtime_holder = {}
+
+    async def builder(runtime_config, state, logger):
+        del runtime_config, logger
+        runtime = FakeQueueRuntime(redis=redis, repository=repository, state=state)
+        runtime_holder["runtime"] = runtime
+        return runtime
+
+    result = await run_bounded_maintenance_queue_once(
+        replace(
+            _queue_config(event.event_id, notification_plan.notification_plan_id, mode="execute"),
+            allow_pending_target_resume=True,
+        ),
+        runtime_config_loader=_runtime_loader,
+        runtime_builder=builder,
+    )
+
+    assert result.ok is True
+    report = result.to_sanitized_dict()
+    assert report["pending_target_resume_allowed"] is True
+    assert report["redis_group_pending"] == 1
+    assert report["database_committed"] is True
+    runtime = runtime_holder["runtime"]
+    assert runtime.invoked_trigger_event_ids == [event.event_id]
+    assert runtime.order == ["invoke_maintenance", "commit", "ack"]
+    assert redis.xreadgroup_calls == []
+    assert {"name": "q.maintenance", "min": MESSAGE_ID, "max": MESSAGE_ID, "count": 1} in redis.xrange_calls
+    assert redis.acked == [MESSAGE_ID]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_pending_messages_remain_blocked_with_resume_authority() -> None:
+    repository, notification_plan, event = _fixture()
+    redis = FakeRedis(
+        entries=[_message(event.event_id, notification_plan.notification_plan_id)],
+        pending=1,
+        pending_entries=[{"message_id": "1740000000000-99", "consumer": "test"}],
+    )
+
+    async def builder(runtime_config, state, logger):
+        del runtime_config, logger
+        return FakeQueueRuntime(redis=redis, repository=repository, state=state)
+
+    result = await run_bounded_maintenance_queue_once(
+        replace(
+            _queue_config(event.event_id, notification_plan.notification_plan_id),
+            allow_pending_target_resume=True,
+        ),
+        runtime_config_loader=_runtime_loader,
+        runtime_builder=builder,
+    )
+
+    assert result.ok is False
+    assert result.error_code == "redis_pending_messages_present"
+    assert redis.xreadgroup_calls == []
+    assert redis.acked == []
+
+
+@pytest.mark.asyncio
+async def test_pending_target_resume_revalidates_loaded_message_trigger_and_root() -> None:
+    repository, notification_plan, event = _fixture()
+    other_plan = plan()
+    other_event = outbox_event(
+        "notification.delivery.result.v1",
+        aggregate_id=other_plan.notification_plan_id,
+        payload_json={"notification_plan_id": str(other_plan.notification_plan_id)},
+    )
+
+    cases = (
+        ("trigger_event_id", str(other_event.event_id), "trigger_event_id_mismatch"),
+        ("root_object_id", str(other_plan.notification_plan_id), "root_object_id_mismatch"),
+    )
+    for field_name, bad_value, expected_error in cases:
+        message_id, fields = _message(event.event_id, notification_plan.notification_plan_id)
+        bad_fields = dict(fields)
+        bad_fields[field_name] = bad_value
+        redis = FakeRedis(
+            entries=[(message_id, bad_fields)],
+            pending=1,
+            pending_entries=[{"message_id": MESSAGE_ID, "consumer": "test"}],
+        )
+
+        async def builder(runtime_config, state, logger):
+            del runtime_config, logger
+            return FakeQueueRuntime(redis=redis, repository=repository, state=state)
+
+        result = await run_bounded_maintenance_queue_once(
+            replace(
+                _queue_config(event.event_id, notification_plan.notification_plan_id),
+                allow_pending_target_resume=True,
+            ),
+            runtime_config_loader=_runtime_loader,
+            runtime_builder=builder,
+        )
+
+        assert result.ok is False
+        assert result.error_code == expected_error
+        assert redis.xreadgroup_calls == []
+        assert redis.acked == []
