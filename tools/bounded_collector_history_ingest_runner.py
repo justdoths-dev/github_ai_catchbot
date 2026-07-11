@@ -20,6 +20,7 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
     EXECUTE_CONFIRM_TOKEN,
     FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN,
     SEARCH_CONFIRM_TOKEN,
+    TARGET_LOCATOR_SCHEMA_VERSION,
     THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
     argument_error_report,
     render_sanitized_json,
@@ -54,6 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--source-kind", default="public_username")
     parser.add_argument("--source-value", action="append", dest="source_values")
     parser.add_argument("--target-message-id", type=int, default=None)
+    parser.add_argument("--target-locator-path", default=None)
+    parser.add_argument("--target-locator-output-path", default=None)
+    parser.add_argument("--allow-target-locator-write", action="store_true")
     parser.add_argument("--registry-id-suffix", default=None)
     parser.add_argument("--max-targets", type=int, default=None)
     parser.add_argument("--history-limit", type=int, default=10)
@@ -92,6 +96,9 @@ def run(
             source_value=source_values[0] if len(source_values) == 1 else None,
             source_values=source_values,
             target_message_id=args.target_message_id,
+            target_locator_path=args.target_locator_path,
+            target_locator_output_path=args.target_locator_output_path,
+            allow_target_locator_write=bool(args.allow_target_locator_write),
             registry_id_suffix=args.registry_id_suffix,
             max_targets=args.max_targets,
             history_limit=int(args.history_limit),
@@ -160,6 +167,7 @@ __all__ = [
     "FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN",
     "RunnerResult",
     "SEARCH_CONFIRM_TOKEN",
+    "TARGET_LOCATOR_SCHEMA_VERSION",
     "THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN",
     "build_parser",
     "main",

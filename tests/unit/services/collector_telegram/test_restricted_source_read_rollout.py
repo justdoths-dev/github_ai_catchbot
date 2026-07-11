@@ -20,6 +20,7 @@ from src.services.collector_telegram.restricted_source_read_rollout import (
     SEARCH_PREFLIGHT_PASS_REASON_CODE,
     SEARCH_PREFLIGHT_SCHEMA_VERSION,
     SOURCE_VALUE_PLACEHOLDER,
+    TARGET_LOCATOR_PATH_PLACEHOLDER,
     RestrictedLiveCollectorOneChannelSourceReadProofRequest,
     build_restricted_live_collector_github_url_search_preflight_packet,
     build_restricted_live_collector_one_channel_source_read_preflight_packet,
@@ -325,6 +326,36 @@ def test_live_preflight_command_packet_reuses_bounded_runner_without_live_author
         assert raw not in rendered
 
 
+def test_live_preflight_accepts_private_locator_presence_without_reading_or_exposing_path() -> None:
+    private_path = "/tmp/sentinel-private-preflight-locator-name.json"
+    report = _preflight_packet(source_value=None, target_locator_path=private_path)
+    rendered = json.dumps(report, sort_keys=True)
+    command = report["future_execution_command"]
+
+    assert report["status"] == "pass"
+    assert report["target_locator_present"] is True
+    assert report["target_locator_consumption_supported"] is True
+    assert report["target_scope"]["target_count"] == 1
+    assert report["target_scope"]["target_fingerprint"] is None
+    assert "--target-locator-path" in command["operator_command_tokens"]
+    assert "--target-locator-path" in command["child_command_tokens"]
+    assert TARGET_LOCATOR_PATH_PLACEHOLDER in command["operator_command_tokens"]
+    assert TARGET_LOCATOR_PATH_PLACEHOLDER in command["child_command_tokens"]
+    assert SOURCE_VALUE_PLACEHOLDER not in command["operator_command_tokens"]
+    assert private_path not in rendered
+    assert "sentinel-private-preflight-locator-name.json" not in rendered
+    assert report["actual_attempted_operations"]["collector_bounded_runner_invoked"] is False
+
+
+def test_live_preflight_rejects_locator_direct_target_ambiguity_without_command() -> None:
+    report = _preflight_packet(target_locator_path="/tmp/private-locator.json")
+
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == "target_locator_direct_target_ambiguity"
+    assert report["future_execution_command"]["command_tokens"] == []
+    assert report["actual_attempted_operations"]["collector_bounded_runner_invoked"] is False
+
+
 @pytest.mark.parametrize(
     ("overrides", "reason_code", "target_count"),
     [
@@ -511,6 +542,57 @@ def test_search_preflight_reuses_wrapper_with_placeholder_only_read_authority() 
     assert SEARCH_CONFIRM_TOKEN not in rendered
     assert "trendingrepo" not in rendered
     assert "runtime.env" not in rendered
+
+
+def test_search_preflight_passes_private_locator_write_request_with_placeholder_only() -> None:
+    private_path = "/tmp/sentinel-private-search-locator-name.json"
+    report = _search_preflight_packet(
+        target_locator_output_path=private_path,
+        allow_target_locator_write=True,
+    )
+    rendered = json.dumps(report, sort_keys=True)
+    command = report["future_execution_command"]
+
+    assert report["status"] == "pass"
+    assert report["target_locator_requested"] is True
+    assert report["target_locator_consumption_supported"] is True
+    for tokens in (command["operator_command_tokens"], command["child_command_tokens"]):
+        assert "--target-locator-output-path" in tokens
+        assert "--allow-target-locator-write" in tokens
+        assert TARGET_LOCATOR_PATH_PLACEHOLDER in tokens
+    assert private_path not in rendered
+    assert "sentinel-private-search-locator-name.json" not in rendered
+    assert report["redaction_audit"]["target_locator_path_printed"] is False
+    assert report["actual_attempted_operations"]["child_runner_invoked"] is False
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason_code"),
+    [
+        (
+            {"target_locator_output_path": "/tmp/private-locator.json"},
+            "target_locator_write_authority_missing",
+        ),
+        (
+            {"allow_target_locator_write": True},
+            "target_locator_output_path_required",
+        ),
+        (
+            {"target_locator_path": "/tmp/private-locator.json"},
+            "target_locator_input_not_allowed_in_search",
+        ),
+    ],
+)
+def test_search_preflight_locator_gates_fail_closed_without_command(
+    overrides: dict[str, object],
+    reason_code: str,
+) -> None:
+    report = _search_preflight_packet(**overrides)
+
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == reason_code
+    assert report["future_execution_command"]["operator_command_tokens"] == []
+    assert report["future_execution_command"]["child_command_tokens"] == []
 
 
 @pytest.mark.parametrize(

@@ -22,6 +22,7 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
     SEARCH_CONFIRM_TOKEN,
     SEARCH_SCHEMA_VERSION,
     SOURCE_KIND_PUBLIC_USERNAME,
+    TARGET_LOCATOR_SCHEMA_VERSION,
     THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
     THREE_CHANNEL_TARGET_COUNT,
     render_sanitized_json,
@@ -39,6 +40,7 @@ RUNTIME_ENV_FILE_PLACEHOLDER = "<RUNTIME_ENV_FILE>"
 SCHEMA_VERSION = "restricted_live_collector_one_channel_source_read_env_overlay_runner_v1"
 SEARCH_WRAPPER_SCHEMA_VERSION = "restricted_live_collector_github_url_search_env_overlay_runner_v1"
 SEARCH_CONFIRM_TOKEN_PLACEHOLDER = "<SEARCH_CONFIRM_TOKEN>"
+TARGET_LOCATOR_PATH_PLACEHOLDER = "<PRIVATE_TARGET_LOCATOR_PATH>"
 
 SubprocessRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -67,6 +69,8 @@ _GATE_PROJECTION_KEYS = (
     "source_outbox_write_allowed",
     "source_outbox_publish_allowed",
     "redis_publish_allowed",
+    "target_locator_present",
+    "target_locator_consumption_supported",
 )
 _ATTEMPT_PROJECTION_KEYS = (
     "telegram_read_attempted",
@@ -98,6 +102,9 @@ _RAW_VALUES_PRINTED_KEYS = (
     "source_ref",
     "url",
     "raw_id",
+    "target_locator_path",
+    "target_locator_basename",
+    "target_locator_content",
     "tdlib_payload",
     "database_url",
     "redis_url",
@@ -122,6 +129,10 @@ _REDACTIONS_APPLIED_KEYS = (
     "redis_url_omitted",
     "telegram_credentials_omitted",
     "tdlib_session_paths_omitted",
+    "target_locator_path_omitted",
+    "target_locator_basename_omitted",
+    "target_locator_content_omitted",
+    "target_locator_raw_target_values_omitted",
     "exception_detail_omitted",
     "traceback_omitted",
     "stderr_omitted",
@@ -149,6 +160,9 @@ _SEARCH_GATE_KEYS = (
     "max_messages_explicit",
     "write_authority_absent",
     "publish_authority_absent",
+    "target_locator_write_allowed",
+    "target_locator_output_path_present",
+    "target_locator_consumption_supported",
 )
 _SEARCH_AUTHORITY_KEYS = (
     "database_read_allowed",
@@ -174,6 +188,7 @@ _SEARCH_SIDE_EFFECT_KEYS = (
     "provider_or_openai_called",
     "telegram_send_or_edit_called",
     "notifier_called",
+    "target_locator_write_attempted",
 )
 _SEARCH_REDACTION_KEYS = (
     "public_username_omitted",
@@ -197,6 +212,10 @@ _SEARCH_REDACTION_KEYS = (
     "redis_url_omitted",
     "telegram_credentials_omitted",
     "confirm_token_omitted",
+    "target_locator_path_omitted",
+    "target_locator_basename_omitted",
+    "target_locator_content_omitted",
+    "target_locator_raw_target_values_omitted",
     "exception_detail_omitted",
     "traceback_omitted",
     "stderr_omitted",
@@ -221,6 +240,11 @@ _SEARCH_RAW_VALUE_KEYS = (
     "redis_url",
     "credential",
     "confirm_token",
+    "target_locator_path",
+    "target_locator_basename",
+    "target_locator_content",
+    "target_locator_source_value",
+    "target_locator_message_id",
     "exception_body",
     "traceback",
     "stderr",
@@ -269,6 +293,28 @@ _SEARCH_REASON_CODES = frozenset(
         "runtime_config_failed",
         "search_redis_runtime_not_allowed",
         "search_runtime_commit_not_allowed",
+        "target_locator_input_not_allowed_in_search",
+        "target_locator_write_authority_missing",
+        "target_locator_output_path_required",
+        "target_locator_output_path_relative",
+        "target_locator_output_path_outside_allowed_roots",
+        "target_locator_output_path_traversal_not_allowed",
+        "target_locator_output_root_not_real",
+        "target_locator_output_parent_missing",
+        "target_locator_output_parent_symlink_not_allowed",
+        "target_locator_output_parent_not_directory",
+        "target_locator_output_parent_invalid",
+        "target_locator_output_target_symlink_not_allowed",
+        "target_locator_output_target_exists",
+        "target_locator_output_create_failed",
+        "target_locator_output_write_failed",
+        "target_locator_output_readback_failed",
+        "target_locator_output_close_failed",
+        "target_locator_output_cleanup_failed",
+        "target_locator_output_cleanup_unconfirmed",
+        "target_locator_output_private_mode_unconfirmed",
+        "target_locator_payload_too_large",
+        "target_locator_payload_invalid",
         "search_history_request_count_exceeded",
         "tdlib_log_suppression_unconfirmed",
         "tdlib_initialize_failed",
@@ -284,6 +330,7 @@ _SEARCH_REASON_CODES = frozenset(
         "github_url_live_target_found",
         "history_result_exceeds_requested_limit",
         "github_url_live_search_projection_failed",
+        "github_url_live_search_selected_message_id_invalid",
         "github_url_live_search_failed",
         "runtime_rollback_failed",
         "source_value_missing",
@@ -332,6 +379,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("plan", "execute", "search"), default="plan")
     parser.add_argument("--runtime-env-file", default=None)
     parser.add_argument("--source-value", action="append", dest="source_values")
+    parser.add_argument("--target-locator-path", default=None)
+    parser.add_argument("--target-locator-output-path", default=None)
+    parser.add_argument("--allow-target-locator-write", action="store_true")
     parser.add_argument("--max-messages", type=int, default=None)
     parser.add_argument("--operator-approved", action="store_true")
     parser.add_argument("--confirm-token", default=None)
@@ -347,7 +397,33 @@ def run(
     if mode == "search":
         return _run_search(args, subprocess_runner=subprocess_runner)
 
-    normalized_sources, target_error = _normalize_public_username_targets(tuple(args.source_values or ()))
+    source_values = tuple(args.source_values or ())
+    target_locator_present = args.target_locator_path is not None
+    if args.allow_target_locator_write or args.target_locator_output_path is not None:
+        report = _base_report(
+            status="blocked",
+            reason_code="target_locator_write_search_mode_required",
+            mode=mode,
+            requested_max_messages=args.max_messages,
+            target_fingerprint=None,
+            target_locator_present=target_locator_present,
+        )
+        return RunnerResult(exit_code=1, report=report)
+    if target_locator_present and source_values:
+        report = _base_report(
+            status="blocked",
+            reason_code="target_locator_direct_target_ambiguity",
+            mode=mode,
+            requested_max_messages=args.max_messages,
+            target_fingerprint=None,
+            target_locator_present=True,
+        )
+        return RunnerResult(exit_code=1, report=report)
+    normalized_sources, target_error = (
+        ((), None)
+        if target_locator_present
+        else _normalize_public_username_targets(source_values)
+    )
     max_messages = args.max_messages
     max_messages_error = _max_messages_error(max_messages)
     target_fingerprints = tuple(
@@ -365,6 +441,7 @@ def run(
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
             target_fingerprints=target_fingerprints,
+            target_locator_present=target_locator_present,
         )
         return RunnerResult(exit_code=1, report=report)
     if max_messages_error is not None:
@@ -375,6 +452,7 @@ def run(
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
             target_fingerprints=target_fingerprints,
+            target_locator_present=target_locator_present,
         )
         return RunnerResult(exit_code=1, report=report)
     if mode == "execute" and not bool(args.operator_approved):
@@ -385,6 +463,7 @@ def run(
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
             target_fingerprints=target_fingerprints,
+            target_locator_present=target_locator_present,
         )
         return RunnerResult(exit_code=1, report=report)
     expected_confirm_token = (
@@ -400,6 +479,7 @@ def run(
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
             target_fingerprints=target_fingerprints,
+            target_locator_present=target_locator_present,
         )
         return RunnerResult(exit_code=1, report=report)
     if not args.runtime_env_file:
@@ -410,10 +490,11 @@ def run(
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
             target_fingerprints=target_fingerprints,
+            target_locator_present=target_locator_present,
         )
         return RunnerResult(exit_code=1, report=report)
 
-    assert normalized_sources
+    assert normalized_sources or target_locator_present
     assert isinstance(max_messages, int)
     overlay_result = build_collector_runtime_env_overlay(str(args.runtime_env_file))
     if not overlay_result.ok:
@@ -424,12 +505,17 @@ def run(
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
             target_fingerprints=target_fingerprints,
+            target_locator_present=target_locator_present,
             runtime_env_read_attempted=True,
             overlay_report=overlay_result.to_sanitized_dict(),
         )
         return RunnerResult(exit_code=1, report=report)
 
-    child_command = _child_command_tokens(source_values=normalized_sources, max_messages=max_messages)
+    child_command = _child_command_tokens(
+        source_values=normalized_sources,
+        target_locator_path=args.target_locator_path,
+        max_messages=max_messages,
+    )
     if mode == "plan":
         report = _base_report(
             status="pass",
@@ -438,11 +524,13 @@ def run(
             requested_max_messages=max_messages,
             target_fingerprint=target_fingerprint,
             target_fingerprints=target_fingerprints,
+            target_locator_present=target_locator_present,
             runtime_env_read_attempted=True,
             overlay_report=overlay_result.to_sanitized_dict(),
             redacted_child_command_tokens=_redacted_child_plan_command_tokens(
                 target_count=len(normalized_sources),
                 max_messages=max_messages,
+                target_locator_present=target_locator_present,
             ),
         )
         return RunnerResult(exit_code=0, report=report)
@@ -467,11 +555,13 @@ def run(
         requested_max_messages=max_messages,
         target_fingerprint=target_fingerprint,
         target_fingerprints=target_fingerprints,
+        target_locator_present=target_locator_present,
         runtime_env_read_attempted=True,
         overlay_report=overlay_result.to_sanitized_dict(),
         redacted_child_command_tokens=_redacted_child_execute_command_tokens(
             target_count=len(normalized_sources),
             max_messages=max_messages,
+            target_locator_present=target_locator_present,
         ),
         child_runner_invoked=True,
         child_runner_returncode=child_returncode,
@@ -487,6 +577,11 @@ def _run_search(
 ) -> RunnerResult:
     source_values = tuple(args.source_values or ())
     max_messages = args.max_messages
+    target_locator_output_path_present = args.target_locator_output_path is not None
+    target_locator_write_allowed = bool(args.allow_target_locator_write)
+    target_locator_requested = bool(
+        target_locator_write_allowed or target_locator_output_path_present
+    )
     normalized_source, target_error = _normalize_search_public_username_target(source_values)
     target_fingerprint = _fingerprint("source_value", normalized_source)
 
@@ -499,11 +594,16 @@ def _run_search(
                 requested_max_messages=max_messages,
                 target_count=len(source_values),
                 target_fingerprint=target_fingerprint,
+                target_locator_requested=target_locator_requested,
+                target_locator_output_path_present=target_locator_output_path_present,
+                target_locator_write_allowed=target_locator_write_allowed,
             ),
         )
 
     if not bool(args.operator_approved):
         return blocked("operator_approval_missing")
+    if args.target_locator_path is not None:
+        return blocked("target_locator_input_not_allowed_in_search")
     if target_error is not None:
         return blocked(target_error)
     max_messages_error = _search_max_messages_error(max_messages)
@@ -529,6 +629,9 @@ def _run_search(
                 requested_max_messages=max_messages,
                 target_count=1,
                 target_fingerprint=target_fingerprint,
+                target_locator_requested=target_locator_requested,
+                target_locator_output_path_present=target_locator_output_path_present,
+                target_locator_write_allowed=target_locator_write_allowed,
                 runtime_env_read_attempted=True,
                 overlay_report=overlay_result.to_sanitized_dict(),
             ),
@@ -537,6 +640,8 @@ def _run_search(
     child_command = _search_child_command_tokens(
         source_value=normalized_source,
         max_messages=max_messages,
+        target_locator_output_path=args.target_locator_output_path,
+        allow_target_locator_write=bool(args.allow_target_locator_write),
     )
     runner = subprocess_runner or subprocess.run
     try:
@@ -555,10 +660,15 @@ def _run_search(
             requested_max_messages=max_messages,
             target_count=1,
             target_fingerprint=target_fingerprint,
+            target_locator_requested=target_locator_requested,
+            target_locator_output_path_present=target_locator_output_path_present,
+            target_locator_write_allowed=target_locator_write_allowed,
             runtime_env_read_attempted=True,
             overlay_report=overlay_result.to_sanitized_dict(),
             redacted_child_command_tokens=_redacted_search_child_command_tokens(
-                max_messages=max_messages
+                max_messages=max_messages,
+                target_locator_output_path_present=args.target_locator_output_path is not None,
+                allow_target_locator_write=bool(args.allow_target_locator_write),
             ),
         )
         return RunnerResult(exit_code=1, report=report)
@@ -580,9 +690,16 @@ def _run_search(
         requested_max_messages=max_messages,
         target_count=1,
         target_fingerprint=target_fingerprint,
+        target_locator_requested=target_locator_requested,
+        target_locator_output_path_present=target_locator_output_path_present,
+        target_locator_write_allowed=target_locator_write_allowed,
         runtime_env_read_attempted=True,
         overlay_report=overlay_result.to_sanitized_dict(),
-        redacted_child_command_tokens=_redacted_search_child_command_tokens(max_messages=max_messages),
+        redacted_child_command_tokens=_redacted_search_child_command_tokens(
+            max_messages=max_messages,
+            target_locator_output_path_present=args.target_locator_output_path is not None,
+            allow_target_locator_write=bool(args.allow_target_locator_write),
+        ),
         child_runner_invoked=True,
         child_runner_returncode=child_returncode,
         child_runner_report=child_report,
@@ -652,6 +769,7 @@ def _base_report(
     requested_max_messages: int | None,
     target_fingerprint: str | None,
     target_fingerprints: Sequence[str] = (),
+    target_locator_present: bool = False,
     runtime_env_read_attempted: bool = False,
     overlay_report: Mapping[str, Any] | None = None,
     redacted_child_command_tokens: Sequence[str] = (),
@@ -667,6 +785,10 @@ def _base_report(
         "runtime_env_file_contents_printed": False,
         "runtime_env_file_path_printed": False,
         "raw_source_value_printed": False,
+        "target_locator_path_printed": False,
+        "target_locator_basename_printed": False,
+        "target_locator_content_printed": False,
+        "target_locator_raw_target_values_printed": False,
         "child_stdout_printed": False,
         "child_stderr_printed": False,
         "token_or_secret_printed": False,
@@ -726,9 +848,10 @@ def _base_report(
         "target_scope": {
             "exact_single_public_username_supported": True,
             "exact_three_public_usernames_supported": True,
-            "exact_single_public_username_required": len(report_target_fingerprints) <= 1,
+            "exact_single_public_username_required": target_locator_present
+            or len(report_target_fingerprints) <= 1,
             "exact_three_public_usernames_required": three_channel_target_requested,
-            "target_count": len(report_target_fingerprints),
+            "target_count": 1 if target_locator_present else len(report_target_fingerprints),
             "target_fingerprint": target_fingerprint,
             "target_fingerprints": list(report_target_fingerprints),
             "raw_source_value_printed": False,
@@ -741,6 +864,12 @@ def _base_report(
             "hard_max_messages": MAX_MESSAGES_HARD_LIMIT,
             "unbounded_history_allowed": False,
         },
+        "target_locator_present": target_locator_present,
+        "target_locator_consumption_supported": True,
+        "target_locator_path_omitted": True,
+        "target_locator_basename_omitted": True,
+        "target_locator_content_omitted": True,
+        "target_locator_raw_target_values_omitted": True,
         "runtime_env_overlay": overlay_report
         or {
             "schema_version": "collector_runtime_env_overlay_v1",
@@ -765,6 +894,7 @@ def _base_report(
             "command_tokens": list(redacted_child_command_tokens),
             "redacted_command_tokens": True,
             "source_value_placeholder": SOURCE_VALUE_PLACEHOLDER,
+            "target_locator_path_placeholder": TARGET_LOCATOR_PATH_PLACEHOLDER,
             "runtime_env_file_placeholder": RUNTIME_ENV_FILE_PLACEHOLDER,
             "forbidden_flags_absent": [
                 "--allow-source-outbox-publish",
@@ -833,6 +963,9 @@ def _base_search_report(
     requested_max_messages: int | None,
     target_count: int,
     target_fingerprint: str | None,
+    target_locator_requested: bool = False,
+    target_locator_output_path_present: bool = False,
+    target_locator_write_allowed: bool = False,
     runtime_env_read_attempted: bool = False,
     overlay_report: Mapping[str, Any] | None = None,
     redacted_child_command_tokens: Sequence[str] = (),
@@ -874,7 +1007,11 @@ def _base_search_report(
             and projected_rollback_close.get("commit_called") is False
         )
     )
-    gate_contract_satisfied = all(projected_gates.get(key) is True for key in _SEARCH_GATE_KEYS)
+    gate_contract_satisfied = all(
+        projected_gates.get(key) is True
+        for key in _SEARCH_GATE_KEYS
+        if key not in {"target_locator_write_allowed", "target_locator_output_path_present"}
+    )
     authority_contract_satisfied = (
         projected_authority.get("database_read_allowed") is True
         and projected_authority.get("telegram_read_allowed") is True
@@ -882,6 +1019,38 @@ def _base_search_report(
             projected_authority.get(key) is False
             for key in _SEARCH_AUTHORITY_KEYS
             if key not in {"database_read_allowed", "telegram_read_allowed"}
+        )
+    )
+    projected_locator_requested = projection.get("target_locator_requested")
+    projected_locator_written = projection.get("target_locator_written")
+    projected_locator_private_mode_confirmed = projection.get(
+        "target_locator_private_mode_confirmed"
+    )
+    projected_locator_write_attempted = projected_side_effects.get(
+        "target_locator_write_attempted"
+    )
+    locator_contract_satisfied = (
+        projected_locator_requested is target_locator_requested
+        and projected_gates.get("target_locator_output_path_present")
+        is target_locator_output_path_present
+        and projected_gates.get("target_locator_write_allowed")
+        is target_locator_write_allowed
+        and isinstance(projected_locator_written, bool)
+        and isinstance(projected_locator_private_mode_confirmed, bool)
+        and isinstance(projected_locator_write_attempted, bool)
+        and projection.get("target_locator_schema_version") == TARGET_LOCATOR_SCHEMA_VERSION
+        and projection.get("target_locator_consumption_supported") is True
+        and projected_locator_private_mode_confirmed is projected_locator_written
+        and (not projected_locator_written or projected_locator_requested is True)
+        and (not projected_locator_written or projected_locator_write_attempted is True)
+        and (target_locator_requested or projected_locator_write_attempted is False)
+        and (
+            projection.get("reason_code") != "github_url_live_target_found"
+            or projected_locator_requested is not True
+            or (
+                projected_locator_written is True
+                and projected_locator_write_attempted is True
+            )
         )
     )
     search_contract_projection = {
@@ -900,8 +1069,11 @@ def _base_search_report(
         "terminal_read_contract_satisfied": terminal_read_contract_satisfied,
         "gate_contract_satisfied": gate_contract_satisfied,
         "authority_contract_satisfied": authority_contract_satisfied,
+        "target_locator_contract_satisfied": locator_contract_satisfied,
         "write_publish_side_effects_absent": all(
-            projected_side_effects.get(key) is False for key in _SEARCH_SIDE_EFFECT_KEYS
+            projected_side_effects.get(key) is False
+            for key in _SEARCH_SIDE_EFFECT_KEYS
+            if key != "target_locator_write_attempted"
         ),
         "redactions_complete": all(projected_redactions.get(key) is True for key in _SEARCH_REDACTION_KEYS),
         "raw_values_not_printed": all(projected_raw_values.get(key) is False for key in _SEARCH_RAW_VALUE_KEYS),
@@ -915,6 +1087,10 @@ def _base_search_report(
         "confirm_token_value_printed": False,
         "child_stdout_printed": False,
         "child_stderr_printed": False,
+        "target_locator_path_printed": False,
+        "target_locator_basename_printed": False,
+        "target_locator_content_printed": False,
+        "target_locator_raw_target_values_printed": False,
     }
     return {
         "schema_version": SEARCH_WRAPPER_SCHEMA_VERSION,
@@ -936,6 +1112,15 @@ def _base_search_report(
             "history_request_maximum": 1,
             "unbounded_history_allowed": False,
         },
+        "target_locator_requested": target_locator_requested,
+        "target_locator_written": projected_locator_written is True,
+        "target_locator_schema_version": TARGET_LOCATOR_SCHEMA_VERSION,
+        "target_locator_private_mode_confirmed": projected_locator_private_mode_confirmed is True,
+        "target_locator_consumption_supported": True,
+        "target_locator_path_omitted": True,
+        "target_locator_basename_omitted": True,
+        "target_locator_content_omitted": True,
+        "target_locator_raw_target_values_omitted": True,
         "runtime_env_overlay": overlay_report
         or {
             "schema_version": "collector_runtime_env_overlay_v1",
@@ -961,6 +1146,7 @@ def _base_search_report(
             "redacted_command_tokens": True,
             "source_value_placeholder": SOURCE_VALUE_PLACEHOLDER,
             "confirm_token_placeholder": SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
+            "target_locator_path_placeholder": TARGET_LOCATOR_PATH_PLACEHOLDER,
             "confirm_token_value_printed": False,
             "forbidden_flags_absent": [
                 "--allow-database-write",
@@ -1017,6 +1203,19 @@ def _project_search_child_report(child_report: Mapping[str, Any] | None) -> dict
         "target_fingerprint": _safe_fingerprint(report.get("target_fingerprint")),
         "registry_target_fingerprint": _safe_fingerprint(report.get("registry_target_fingerprint")),
         "selected_message_fingerprint": _safe_fingerprint(report.get("selected_message_fingerprint")),
+        "target_locator_requested": _safe_bool(report.get("target_locator_requested")),
+        "target_locator_written": _safe_bool(report.get("target_locator_written")),
+        "target_locator_schema_version": (
+            TARGET_LOCATOR_SCHEMA_VERSION
+            if report.get("target_locator_schema_version") == TARGET_LOCATOR_SCHEMA_VERSION
+            else None
+        ),
+        "target_locator_private_mode_confirmed": _safe_bool(
+            report.get("target_locator_private_mode_confirmed")
+        ),
+        "target_locator_consumption_supported": _safe_bool(
+            report.get("target_locator_consumption_supported")
+        ),
         "github_url_present": _safe_bool(report.get("github_url_present")),
         "selected_match_source_buckets": _project_bool_mapping(
             _mapping_child(report, "selected_match_source_buckets"),
@@ -1072,6 +1271,10 @@ def _project_child_report(child_report: Mapping[str, Any] | None) -> dict[str, A
         "rollout_scope": _safe_report_string(report.get("rollout_scope")),
         "target_count": _safe_nonnegative_int(report.get("target_count")),
         "max_targets": _safe_nonnegative_int(report.get("max_targets")),
+        "target_locator_present": _safe_bool(report.get("target_locator_present")),
+        "target_locator_consumption_supported": _safe_bool(
+            report.get("target_locator_consumption_supported")
+        ),
         "authority": _project_bool_mapping(_mapping_child(report, "authority"), _AUTHORITY_PROJECTION_KEYS),
         "gates": _project_bool_mapping(_mapping_child(report, "gates"), _GATE_PROJECTION_KEYS),
         "bounded_counts": _project_count_mapping(_mapping_child(report, "bounded_counts"), _BOUNDED_COUNT_PROJECTION_KEYS),
@@ -1418,15 +1621,23 @@ def _build_readback_closure_evidence(
     }
 
 
-def _child_command_tokens(*, source_values: Sequence[str], max_messages: int) -> tuple[str, ...]:
+def _child_command_tokens(
+    *,
+    source_values: Sequence[str],
+    target_locator_path: object | None,
+    max_messages: int,
+) -> tuple[str, ...]:
     confirm_token = (
         THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN
         if len(source_values) == THREE_CHANNEL_TARGET_COUNT
         else EXECUTE_CONFIRM_TOKEN
     )
     source_tokens: list[str] = []
-    for source_value in source_values:
-        source_tokens.extend(("--source-value", source_value))
+    if target_locator_path is not None:
+        source_tokens.extend(("--target-locator-path", str(target_locator_path)))
+    else:
+        for source_value in source_values:
+            source_tokens.extend(("--source-value", source_value))
     return (
         sys.executable,
         CHILD_RUNNER_PATH,
@@ -1450,7 +1661,18 @@ def _child_command_tokens(*, source_values: Sequence[str], max_messages: int) ->
     )
 
 
-def _search_child_command_tokens(*, source_value: str, max_messages: int) -> tuple[str, ...]:
+def _search_child_command_tokens(
+    *,
+    source_value: str,
+    max_messages: int,
+    target_locator_output_path: object | None,
+    allow_target_locator_write: bool,
+) -> tuple[str, ...]:
+    locator_tokens: list[str] = []
+    if target_locator_output_path is not None:
+        locator_tokens.extend(("--target-locator-output-path", str(target_locator_output_path)))
+    if allow_target_locator_write:
+        locator_tokens.append("--allow-target-locator-write")
     return (
         sys.executable,
         CHILD_RUNNER_PATH,
@@ -1464,6 +1686,7 @@ def _search_child_command_tokens(*, source_value: str, max_messages: int) -> tup
         SOURCE_KIND_PUBLIC_USERNAME,
         "--source-value",
         source_value,
+        *locator_tokens,
         "--max-messages",
         str(max_messages),
         "--confirm-token",
@@ -1471,10 +1694,18 @@ def _search_child_command_tokens(*, source_value: str, max_messages: int) -> tup
     )
 
 
-def _redacted_child_plan_command_tokens(*, target_count: int, max_messages: int) -> tuple[str, ...]:
+def _redacted_child_plan_command_tokens(
+    *,
+    target_count: int,
+    max_messages: int,
+    target_locator_present: bool,
+) -> tuple[str, ...]:
     source_tokens: list[str] = []
-    for _ in range(target_count):
-        source_tokens.extend(("--source-value", SOURCE_VALUE_PLACEHOLDER))
+    if target_locator_present:
+        source_tokens.extend(("--target-locator-path", TARGET_LOCATOR_PATH_PLACEHOLDER))
+    else:
+        for _ in range(target_count):
+            source_tokens.extend(("--source-value", SOURCE_VALUE_PLACEHOLDER))
     return (
         "sys.executable",
         CHILD_RUNNER_PATH,
@@ -1490,15 +1721,23 @@ def _redacted_child_plan_command_tokens(*, target_count: int, max_messages: int)
     )
 
 
-def _redacted_child_execute_command_tokens(*, target_count: int, max_messages: int) -> tuple[str, ...]:
+def _redacted_child_execute_command_tokens(
+    *,
+    target_count: int,
+    max_messages: int,
+    target_locator_present: bool,
+) -> tuple[str, ...]:
     confirm_token_placeholder = (
         "THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN"
         if target_count == THREE_CHANNEL_TARGET_COUNT
         else "EXECUTE_CONFIRM_TOKEN"
     )
     source_tokens: list[str] = []
-    for _ in range(target_count):
-        source_tokens.extend(("--source-value", SOURCE_VALUE_PLACEHOLDER))
+    if target_locator_present:
+        source_tokens.extend(("--target-locator-path", TARGET_LOCATOR_PATH_PLACEHOLDER))
+    else:
+        for _ in range(target_count):
+            source_tokens.extend(("--source-value", SOURCE_VALUE_PLACEHOLDER))
     return (
         "sys.executable",
         CHILD_RUNNER_PATH,
@@ -1522,7 +1761,19 @@ def _redacted_child_execute_command_tokens(*, target_count: int, max_messages: i
     )
 
 
-def _redacted_search_child_command_tokens(*, max_messages: int) -> tuple[str, ...]:
+def _redacted_search_child_command_tokens(
+    *,
+    max_messages: int,
+    target_locator_output_path_present: bool,
+    allow_target_locator_write: bool,
+) -> tuple[str, ...]:
+    locator_tokens: list[str] = []
+    if target_locator_output_path_present:
+        locator_tokens.extend(
+            ("--target-locator-output-path", TARGET_LOCATOR_PATH_PLACEHOLDER)
+        )
+    if allow_target_locator_write:
+        locator_tokens.append("--allow-target-locator-write")
     return (
         "sys.executable",
         CHILD_RUNNER_PATH,
@@ -1536,6 +1787,7 @@ def _redacted_search_child_command_tokens(*, max_messages: int) -> tuple[str, ..
         SOURCE_KIND_PUBLIC_USERNAME,
         "--source-value",
         SOURCE_VALUE_PLACEHOLDER,
+        *locator_tokens,
         "--max-messages",
         str(max_messages),
         "--confirm-token",
@@ -1801,6 +2053,8 @@ __all__ = [
     "SEARCH_CONFIRM_TOKEN_PLACEHOLDER",
     "SEARCH_WRAPPER_SCHEMA_VERSION",
     "SOURCE_VALUE_PLACEHOLDER",
+    "TARGET_LOCATOR_PATH_PLACEHOLDER",
+    "TARGET_LOCATOR_SCHEMA_VERSION",
     "WRAPPER_RUNNER_PATH",
     "build_parser",
     "main",

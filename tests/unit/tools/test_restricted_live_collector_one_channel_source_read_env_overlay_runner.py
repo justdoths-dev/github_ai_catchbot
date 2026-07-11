@@ -69,7 +69,12 @@ def _fixture_env(tmp_path: Path) -> Path:
     return path
 
 
-def _rich_child_report(*, duplicate_noop_count: int = 1, write_attempts: bool = True) -> dict[str, Any]:
+def _rich_child_report(
+    *,
+    duplicate_noop_count: int = 1,
+    write_attempts: bool = True,
+    target_locator_present: bool = False,
+) -> dict[str, Any]:
     return {
         "schema_version": "live_collector_one_channel_source_last_rollout_v1",
         "runner_name": "bounded_collector_history_ingest_runner",
@@ -80,6 +85,8 @@ def _rich_child_report(*, duplicate_noop_count: int = 1, write_attempts: bool = 
         "target_count": 1,
         "max_targets": None,
         "target_fingerprints": ["sha256:1111111111111111"],
+        "target_locator_present": target_locator_present,
+        "target_locator_consumption_supported": True,
         "per_channel_results": [],
         "source_message_fingerprints": ["sha256:2222222222222222"],
         "source_outbox_event_fingerprints": ["sha256:3333333333333333"],
@@ -109,6 +116,8 @@ def _rich_child_report(*, duplicate_noop_count: int = 1, write_attempts: bool = 
             "source_outbox_write_allowed": True,
             "source_outbox_publish_allowed": False,
             "redis_publish_allowed": False,
+            "target_locator_present": target_locator_present,
+            "target_locator_consumption_supported": True,
         },
         "telegram_read_attempted": True,
         "telegram_read_called": True,
@@ -145,6 +154,9 @@ def _rich_child_report(*, duplicate_noop_count: int = 1, write_attempts: bool = 
             "source_ref": False,
             "url": False,
             "raw_id": False,
+            "target_locator_path": False,
+            "target_locator_basename": False,
+            "target_locator_content": False,
             "tdlib_payload": False,
             "database_url": False,
             "redis_url": False,
@@ -169,6 +181,10 @@ def _rich_child_report(*, duplicate_noop_count: int = 1, write_attempts: bool = 
             "redis_url_omitted": True,
             "telegram_credentials_omitted": True,
             "tdlib_session_paths_omitted": True,
+            "target_locator_path_omitted": True,
+            "target_locator_basename_omitted": True,
+            "target_locator_content_omitted": True,
+            "target_locator_raw_target_values_omitted": True,
             "exception_detail_omitted": True,
             "traceback_omitted": True,
             "stderr_omitted": True,
@@ -249,6 +265,8 @@ def _three_channel_child_report() -> dict[str, Any]:
             "sha256:bbbbbbbbbbbbbbbb",
             "sha256:cccccccccccccccc",
         ],
+        "target_locator_present": False,
+        "target_locator_consumption_supported": True,
         "per_channel_results": per_channel_results,
         "source_message_fingerprints": [
             "sha256:0000000000000011",
@@ -286,6 +304,8 @@ def _three_channel_child_report() -> dict[str, Any]:
             "source_outbox_write_allowed": True,
             "source_outbox_publish_allowed": False,
             "redis_publish_allowed": False,
+            "target_locator_present": False,
+            "target_locator_consumption_supported": True,
         },
         "telegram_read_attempted": True,
         "telegram_read_called": True,
@@ -326,6 +346,9 @@ def _three_channel_child_report() -> dict[str, Any]:
             "source_ref": False,
             "url": False,
             "raw_id": False,
+            "target_locator_path": False,
+            "target_locator_basename": False,
+            "target_locator_content": False,
             "tdlib_payload": False,
             "database_url": False,
             "redis_url": False,
@@ -350,6 +373,10 @@ def _three_channel_child_report() -> dict[str, Any]:
             "redis_url_omitted": True,
             "telegram_credentials_omitted": True,
             "tdlib_session_paths_omitted": True,
+            "target_locator_path_omitted": True,
+            "target_locator_basename_omitted": True,
+            "target_locator_content_omitted": True,
+            "target_locator_raw_target_values_omitted": True,
             "exception_detail_omitted": True,
             "traceback_omitted": True,
             "stderr_omitted": True,
@@ -374,6 +401,8 @@ def _search_child_report(
     status: str = "pass",
     reason_code: str = "github_url_live_target_found",
     github_url_present: bool = True,
+    target_locator_requested: bool = False,
+    target_locator_written: bool = False,
 ) -> dict[str, Any]:
     return {
         "schema_version": "github_url_live_target_bounded_search_v1",
@@ -383,6 +412,11 @@ def _search_child_report(
         "target_fingerprint": "sha256:1111111111111111",
         "registry_target_fingerprint": "sha256:2222222222222222",
         "selected_message_fingerprint": "sha256:3333333333333333" if github_url_present else None,
+        "target_locator_requested": target_locator_requested,
+        "target_locator_written": target_locator_written,
+        "target_locator_schema_version": runner.TARGET_LOCATOR_SCHEMA_VERSION,
+        "target_locator_private_mode_confirmed": target_locator_written,
+        "target_locator_consumption_supported": True,
         "requested_max_messages": 30,
         "messages_returned": 3,
         "messages_examined": 3,
@@ -422,6 +456,9 @@ def _search_child_report(
             "max_messages_explicit": True,
             "write_authority_absent": True,
             "publish_authority_absent": True,
+            "target_locator_write_allowed": target_locator_requested,
+            "target_locator_output_path_present": target_locator_requested,
+            "target_locator_consumption_supported": True,
         },
         "authority": {
             "database_read_allowed": True,
@@ -447,6 +484,7 @@ def _search_child_report(
             "provider_or_openai_called": False,
             "telegram_send_or_edit_called": False,
             "notifier_called": False,
+            "target_locator_write_attempted": target_locator_written,
         },
         "redactions_applied": {key: True for key in runner._SEARCH_REDACTION_KEYS},
         "raw_values_printed": {key: False for key in runner._SEARCH_RAW_VALUE_KEYS},
@@ -477,6 +515,9 @@ def test_parser_exposes_only_env_overlay_preflight_flags() -> None:
         "--mode",
         "--runtime-env-file",
         "--source-value",
+        "--target-locator-path",
+        "--target-locator-output-path",
+        "--allow-target-locator-write",
         "--max-messages",
         "--operator-approved",
         "--confirm-token",
@@ -524,6 +565,126 @@ def test_plan_mode_emits_sanitized_json_and_does_not_invoke_child_runner(tmp_pat
     assert "trendingrepo" not in captured.out
     for value in SENTINEL_VALUES:
         assert value not in captured.out
+
+
+def test_plan_with_private_locator_emits_placeholder_only_without_reading_locator_or_invoking_child(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    env_file = _fixture_env(tmp_path)
+    locator_path = tmp_path / "sentinel-wrapper-private-locator.json"
+
+    def forbidden_runner(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("plan mode must not invoke child runner")
+
+    exit_code = runner.main(
+        [
+            "--runtime-env-file",
+            str(env_file),
+            "--target-locator-path",
+            str(locator_path),
+            "--max-messages",
+            "1",
+        ],
+        subprocess_runner=forbidden_runner,
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert not locator_path.exists()
+    assert report["target_locator_present"] is True
+    assert report["target_locator_consumption_supported"] is True
+    assert report["target_scope"]["target_count"] == 1
+    assert report["actual_attempted_operations"]["child_runner_invoked"] is False
+    assert "--target-locator-path" in report["child_command"]["command_tokens"]
+    assert runner.TARGET_LOCATOR_PATH_PLACEHOLDER in report["child_command"]["command_tokens"]
+    assert str(locator_path) not in captured.out
+    assert locator_path.name not in captured.out
+    assert report["redaction_audit"]["target_locator_path_printed"] is False
+    assert report["redaction_audit"]["target_locator_content_printed"] is False
+
+
+def test_execute_with_private_locator_passes_path_only_to_existing_child_and_redacts_report(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    env_file = _fixture_env(tmp_path)
+    locator_path = tmp_path / "sentinel-wrapper-execute-private-locator.json"
+    child_report = _rich_child_report(target_locator_present=True)
+    calls: list[list[str]] = []
+
+    def fake_runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps(child_report, sort_keys=True) + "\n",
+            stderr="SENTINEL_PRIVATE_LOCATOR_STDERR",
+        )
+
+    exit_code = runner.main(
+        [
+            "--mode",
+            "execute",
+            "--runtime-env-file",
+            str(env_file),
+            "--target-locator-path",
+            str(locator_path),
+            "--max-messages",
+            "1",
+            "--operator-approved",
+            "--confirm-token",
+            runner.EXECUTE_CONFIRM_TOKEN,
+        ],
+        subprocess_runner=fake_runner,
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert calls and "--target-locator-path" in calls[0]
+    assert str(locator_path) in calls[0]
+    assert "--source-value" not in calls[0]
+    assert report["target_locator_present"] is True
+    assert report["target_locator_consumption_supported"] is True
+    assert report["child_report_projection"]["target_locator_present"] is True
+    assert str(locator_path) not in captured.out
+    assert locator_path.name not in captured.out
+    assert "SENTINEL_PRIVATE_LOCATOR_STDERR" not in captured.out
+
+
+def test_locator_and_direct_source_ambiguity_blocks_before_env_read_or_child(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    locator_path = tmp_path / "sentinel-wrapper-ambiguous-private-locator.json"
+
+    def forbidden_runner(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("ambiguous locator target must not invoke child")
+
+    exit_code = runner.main(
+        [
+            "--runtime-env-file",
+            str(tmp_path / "missing.env"),
+            "--source-value",
+            "trendingrepo",
+            "--target-locator-path",
+            str(locator_path),
+            "--max-messages",
+            "1",
+        ],
+        subprocess_runner=forbidden_runner,
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert report["reason_code"] == "target_locator_direct_target_ambiguity"
+    assert report["actual_attempted_operations"]["runtime_env_read_attempted"] is False
+    assert report["actual_attempted_operations"]["child_runner_invoked"] is False
+    assert str(locator_path) not in captured.out
+    assert locator_path.name not in captured.out
 
 
 def test_execute_without_approval_blocks_before_runtime_env_read_or_child_invoke(tmp_path: Path, capsys) -> None:
@@ -1477,6 +1638,120 @@ def test_search_invokes_exact_read_only_child_and_projects_sanitized_result(tmp_
         "SENTINEL_PRIVATE_SEARCH_STDERR_SHOULD_NOT_PRINT",
     ) + SENTINEL_VALUES:
         assert raw not in captured.out
+
+
+def test_search_private_locator_authority_passes_to_child_and_projects_only_safe_locator_state(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    env_file = _fixture_env(tmp_path)
+    locator_path = tmp_path / "sentinel-wrapper-search-private-locator.json"
+    child_report = _search_child_report(
+        target_locator_requested=True,
+        target_locator_written=True,
+    )
+    calls: list[list[str]] = []
+
+    def fake_runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps(child_report, sort_keys=True) + "\n",
+            stderr="SENTINEL_PRIVATE_LOCATOR_SEARCH_STDERR",
+        )
+
+    exit_code = runner.main(
+        [
+            "--mode",
+            "search",
+            "--runtime-env-file",
+            str(env_file),
+            "--source-value",
+            "@trendingrepo",
+            "--max-messages",
+            "30",
+            "--operator-approved",
+            "--confirm-token",
+            runner.SEARCH_CONFIRM_TOKEN,
+            "--target-locator-output-path",
+            str(locator_path),
+            "--allow-target-locator-write",
+        ],
+        subprocess_runner=fake_runner,
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert calls and "--target-locator-output-path" in calls[0]
+    assert str(locator_path) in calls[0]
+    assert "--allow-target-locator-write" in calls[0]
+    assert report["target_locator_requested"] is True
+    assert report["target_locator_written"] is True
+    assert report["target_locator_private_mode_confirmed"] is True
+    assert report["target_locator_consumption_supported"] is True
+    assert report["search_contract_projection"]["target_locator_contract_satisfied"] is True
+    assert report["search_contract_projection"]["reviewable"] is True
+    assert runner.TARGET_LOCATOR_PATH_PLACEHOLDER in report["child_command"]["command_tokens"]
+    assert str(locator_path) not in captured.out
+    assert locator_path.name not in captured.out
+    assert "SENTINEL_PRIVATE_LOCATOR_SEARCH_STDERR" not in captured.out
+    assert not locator_path.exists()
+
+
+def test_search_locator_projection_rejects_tampered_child_authority_readback(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    env_file = _fixture_env(tmp_path)
+    locator_path = tmp_path / "sentinel-wrapper-tampered-locator.json"
+    child_report = _search_child_report(
+        target_locator_requested=True,
+        target_locator_written=True,
+    )
+    child_report["gates"]["target_locator_write_allowed"] = False
+    child_report["gates"]["target_locator_output_path_present"] = False
+
+    def fake_runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps(child_report, sort_keys=True) + "\n",
+            stderr="SENTINEL_TAMPERED_LOCATOR_STDERR",
+        )
+
+    exit_code = runner.main(
+        [
+            "--mode",
+            "search",
+            "--runtime-env-file",
+            str(env_file),
+            "--source-value",
+            "@trendingrepo",
+            "--max-messages",
+            "30",
+            "--operator-approved",
+            "--confirm-token",
+            runner.SEARCH_CONFIRM_TOKEN,
+            "--target-locator-output-path",
+            str(locator_path),
+            "--allow-target-locator-write",
+        ],
+        subprocess_runner=fake_runner,
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert report["status"] == "failed"
+    assert report["reason_code"] == "child_bounded_search_contract_invalid"
+    assert report["search_contract_projection"]["target_locator_contract_satisfied"] is False
+    assert report["search_contract_projection"]["reviewable"] is False
+    assert str(locator_path) not in captured.out
+    assert locator_path.name not in captured.out
+    assert "SENTINEL_TAMPERED_LOCATOR_STDERR" not in captured.out
+    assert not locator_path.exists()
 
 
 def test_search_projects_bounded_not_found_without_raw_child_output(tmp_path: Path, capsys) -> None:

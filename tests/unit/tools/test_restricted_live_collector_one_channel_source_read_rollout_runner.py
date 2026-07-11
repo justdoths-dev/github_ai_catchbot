@@ -17,6 +17,7 @@ from src.services.collector_telegram.restricted_source_read_rollout import (
     SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
     SEARCH_PREFLIGHT_SCHEMA_VERSION,
     SOURCE_VALUE_PLACEHOLDER,
+    TARGET_LOCATOR_PATH_PLACEHOLDER,
 )
 from tools import restricted_live_collector_one_channel_source_read_rollout_runner as runner
 
@@ -37,6 +38,9 @@ def test_parser_exposes_only_fake_backed_source_read_proof_flags() -> None:
 
     assert parser_flags == {
         "--source-value",
+        "--target-locator-path",
+        "--target-locator-output-path",
+        "--allow-target-locator-write",
         "--max-messages",
         "--emit-live-preflight-command",
         "--emit-live-search-preflight-command",
@@ -171,6 +175,31 @@ def test_runner_prints_preflight_command_packet_without_live_authority_or_raw_va
         assert raw not in captured.out
 
 
+def test_runner_prints_locator_preflight_with_placeholder_only(capsys) -> None:
+    private_path = "/tmp/sentinel-runner-private-locator-name.json"
+    exit_code = runner.main(
+        [
+            "--target-locator-path",
+            private_path,
+            "--max-messages",
+            "1",
+            "--emit-live-preflight-command",
+        ]
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    command = report["future_execution_command"]
+
+    assert exit_code == 0
+    assert report["target_locator_present"] is True
+    assert report["target_locator_consumption_supported"] is True
+    assert "--target-locator-path" in command["operator_command_tokens"]
+    assert TARGET_LOCATOR_PATH_PLACEHOLDER in command["operator_command_tokens"]
+    assert private_path not in captured.out
+    assert "sentinel-runner-private-locator-name.json" not in captured.out
+    assert report["actual_attempted_operations"]["collector_bounded_runner_invoked"] is False
+
+
 def test_runner_prints_placeholder_only_search_preflight_without_live_authority(capsys) -> None:
     exit_code = runner.main(
         [
@@ -204,6 +233,35 @@ def test_runner_prints_placeholder_only_search_preflight_without_live_authority(
     assert SEARCH_CONFIRM_TOKEN not in captured.out
     assert "trendingrepo" not in captured.out
     assert "runtime.env" not in captured.out
+
+
+def test_runner_prints_locator_search_preflight_with_placeholder_only(capsys) -> None:
+    private_path = "/tmp/sentinel-runner-search-private-locator-name.json"
+    exit_code = runner.main(
+        [
+            "--source-value",
+            "@trendingrepo",
+            "--max-messages",
+            "30",
+            "--emit-live-search-preflight-command",
+            "--target-locator-output-path",
+            private_path,
+            "--allow-target-locator-write",
+        ]
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    command = report["future_execution_command"]
+
+    assert exit_code == 0
+    assert report["target_locator_requested"] is True
+    assert report["target_locator_consumption_supported"] is True
+    assert "--target-locator-output-path" in command["operator_command_tokens"]
+    assert "--allow-target-locator-write" in command["operator_command_tokens"]
+    assert TARGET_LOCATOR_PATH_PLACEHOLDER in command["operator_command_tokens"]
+    assert private_path not in captured.out
+    assert "sentinel-runner-search-private-locator-name.json" not in captured.out
+    assert report["actual_attempted_operations"]["child_runner_invoked"] is False
 
 
 def test_runner_rejects_both_preflight_selectors_as_json(capsys) -> None:

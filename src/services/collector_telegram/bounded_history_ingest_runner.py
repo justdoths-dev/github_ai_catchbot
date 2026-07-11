@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import copy
 import contextlib
+import errno
 import hashlib
 import json
 import logging
+import os
+import stat
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Protocol
 from urllib.parse import urlsplit
@@ -33,6 +36,9 @@ SCHEMA_VERSION = "live_collector_one_channel_source_last_rollout_v1"
 THREE_CHANNEL_SCHEMA_VERSION = "live_collector_three_channel_source_last_rollout_v1"
 FULL_REGISTRY_SCHEMA_VERSION = "live_collector_full_registry_source_last_rollout_v1"
 SEARCH_SCHEMA_VERSION = "github_url_live_target_bounded_search_v1"
+TARGET_LOCATOR_SCHEMA_VERSION = "github_url_live_target_locator_v1"
+TARGET_LOCATOR_MAX_BYTES = 2048
+TARGET_LOCATOR_PRIVATE_MODE = 0o600
 RUNNER_NAME = "bounded_collector_history_ingest_runner"
 MODE_PLAN = "plan"
 MODE_EXECUTE = "execute"
@@ -115,6 +121,7 @@ _SEARCH_REASON_CODES = frozenset(
         "github_url_live_target_not_found_in_approved_window",
         "github_url_live_search_history_empty",
         "github_url_live_search_projection_failed",
+        "github_url_live_search_selected_message_id_invalid",
         "github_url_live_search_failed",
         "unsupported_cli_argument",
         "operator_approval_missing",
@@ -132,6 +139,28 @@ _SEARCH_REASON_CODES = frozenset(
         "search_history_request_count_exceeded",
         "search_redis_runtime_not_allowed",
         "search_runtime_commit_not_allowed",
+        "target_locator_input_not_allowed_in_search",
+        "target_locator_write_authority_missing",
+        "target_locator_output_path_required",
+        "target_locator_output_path_relative",
+        "target_locator_output_path_outside_allowed_roots",
+        "target_locator_output_path_traversal_not_allowed",
+        "target_locator_output_root_not_real",
+        "target_locator_output_parent_missing",
+        "target_locator_output_parent_symlink_not_allowed",
+        "target_locator_output_parent_not_directory",
+        "target_locator_output_parent_invalid",
+        "target_locator_output_target_symlink_not_allowed",
+        "target_locator_output_target_exists",
+        "target_locator_output_create_failed",
+        "target_locator_output_write_failed",
+        "target_locator_output_private_mode_unconfirmed",
+        "target_locator_output_readback_failed",
+        "target_locator_output_close_failed",
+        "target_locator_output_cleanup_failed",
+        "target_locator_output_cleanup_unconfirmed",
+        "target_locator_payload_too_large",
+        "target_locator_payload_invalid",
         "source_kind_unsupported",
         "direct_chat_id_target_not_allowed",
         "direct_registry_id_target_not_allowed",
@@ -164,6 +193,17 @@ _SEARCH_REASON_CODES = frozenset(
 
 JsonDict = dict[str, Any]
 RuntimeConfigLoader = Callable[[], CollectorTelegramConfig]
+
+_TARGET_LOCATOR_FIELDS = frozenset(
+    {
+        "schema_version",
+        "source_kind",
+        "source_value",
+        "target_message_id",
+        "target_fingerprint",
+        "selected_message_fingerprint",
+    }
+)
 
 
 class BoundedHistoryIngestError(RuntimeError):
@@ -276,6 +316,9 @@ class BoundedTelegramCollectorHistoryIngestConfig:
     source_value: str | None = None
     source_values: tuple[str, ...] = ()
     target_message_id: int | None = None
+    target_locator_path: str | None = None
+    target_locator_output_path: str | None = None
+    allow_target_locator_write: bool = False
     registry_id_suffix: str | None = None
     max_targets: int | None = None
     history_limit: int = DEFAULT_HISTORY_LIMIT
@@ -445,6 +488,8 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "confirm_token_valid": _confirm_token_valid(self.config),
             "runtime_config_allowed": self.config.allow_runtime_config,
             "target_message_id_present": self.config.target_message_id is not None,
+            "target_locator_present": self.config.target_locator_path is not None,
+            "target_locator_consumption_supported": True,
             "database_read_allowed": self.config.allow_database_read,
             "telegram_read_allowed": self.config.allow_telegram_read,
             "database_write_allowed": self.config.allow_database_write,
@@ -512,6 +557,10 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "redis_url_omitted": True,
             "telegram_credentials_omitted": True,
             "tdlib_session_paths_omitted": True,
+            "target_locator_path_omitted": True,
+            "target_locator_basename_omitted": True,
+            "target_locator_content_omitted": True,
+            "target_locator_raw_target_values_omitted": True,
             "exception_detail_omitted": True,
             "traceback_omitted": True,
             "stderr_omitted": True,
@@ -521,6 +570,9 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "source_ref": False,
             "url": False,
             "raw_id": False,
+            "target_locator_path": False,
+            "target_locator_basename": False,
+            "target_locator_content": False,
             "tdlib_payload": False,
             "database_url": False,
             "redis_url": False,
@@ -568,6 +620,12 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "partial_committed_target_fingerprints": list(self.partial_committed_target_fingerprints),
             "exact_channel_target_fingerprint": self.exact_channel_target_fingerprint,
             "target_message_fingerprint": _target_message_fingerprint(self.config.target_message_id),
+            "target_locator_present": self.config.target_locator_path is not None,
+            "target_locator_schema_version": TARGET_LOCATOR_SCHEMA_VERSION,
+            "target_locator_consumption_supported": True,
+            "target_locator_path_omitted": True,
+            "target_locator_content_omitted": True,
+            "target_locator_raw_target_values_omitted": True,
             "registry_target_fingerprint": self.registry_target_fingerprint,
             "source_message_fingerprints": list(self.source_message_fingerprints),
             "source_outbox_event_fingerprints": list(self.source_outbox_event_fingerprints),
@@ -667,6 +725,9 @@ class BoundedTelegramCollectorGitHubSearchResult:
     selected_preview_match: bool = False
     selected_regex_match: bool = False
     safe_failure_bucket: str | None = None
+    target_locator_write_attempted: bool = False
+    target_locator_written: bool = False
+    target_locator_private_mode_confirmed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -705,7 +766,16 @@ class BoundedTelegramCollectorGitHubSearchResult:
             "exception_body": False,
             "traceback": False,
             "stderr": False,
+            "target_locator_path": False,
+            "target_locator_basename": False,
+            "target_locator_content": False,
+            "target_locator_source_value": False,
+            "target_locator_message_id": False,
         }
+        target_locator_requested = bool(
+            self.config.allow_target_locator_write
+            or self.config.target_locator_output_path is not None
+        )
         return {
             "schema_version": SEARCH_SCHEMA_VERSION,
             "status": self.status,
@@ -714,6 +784,11 @@ class BoundedTelegramCollectorGitHubSearchResult:
             "target_fingerprint": self.target_fingerprint,
             "registry_target_fingerprint": self.registry_target_fingerprint,
             "selected_message_fingerprint": self.selected_message_fingerprint,
+            "target_locator_requested": target_locator_requested,
+            "target_locator_written": self.target_locator_written,
+            "target_locator_schema_version": TARGET_LOCATOR_SCHEMA_VERSION,
+            "target_locator_private_mode_confirmed": self.target_locator_private_mode_confirmed,
+            "target_locator_consumption_supported": True,
             "requested_max_messages": self.requested_max_messages,
             "messages_returned": self.messages_returned,
             "messages_examined": self.messages_examined,
@@ -755,6 +830,10 @@ class BoundedTelegramCollectorGitHubSearchResult:
                 "max_messages_explicit": self.config.max_messages is not None,
                 "write_authority_absent": write_authority_absent,
                 "publish_authority_absent": publish_authority_absent,
+                "target_locator_write_allowed": self.config.allow_target_locator_write,
+                "target_locator_output_path_present": self.config.target_locator_output_path
+                is not None,
+                "target_locator_consumption_supported": True,
             },
             "authority": {
                 "database_read_allowed": self.config.allow_database_read,
@@ -780,6 +859,7 @@ class BoundedTelegramCollectorGitHubSearchResult:
                 "provider_or_openai_called": False,
                 "telegram_send_or_edit_called": False,
                 "notifier_called": False,
+                "target_locator_write_attempted": self.target_locator_write_attempted,
             },
             "redactions_applied": {
                 "public_username_omitted": True,
@@ -803,6 +883,10 @@ class BoundedTelegramCollectorGitHubSearchResult:
                 "redis_url_omitted": True,
                 "telegram_credentials_omitted": True,
                 "confirm_token_omitted": True,
+                "target_locator_path_omitted": True,
+                "target_locator_basename_omitted": True,
+                "target_locator_content_omitted": True,
+                "target_locator_raw_target_values_omitted": True,
                 "exception_detail_omitted": True,
                 "traceback_omitted": True,
                 "stderr_omitted": True,
@@ -1439,6 +1523,10 @@ async def _run_bounded_telegram_collector_github_search(
     )
     registry_target_fingerprint: str | None = None
     selected_message_fingerprint: str | None = None
+    selected_target_message_id: int | None = None
+    target_locator_write_attempted = False
+    target_locator_written = False
+    target_locator_private_mode_confirmed = False
     messages_returned = 0
     messages_examined = 0
     messages_with_text_surface_count = 0
@@ -1478,6 +1566,9 @@ async def _run_bounded_telegram_collector_github_search(
             selected_preview_match="preview" in selected_source_kinds,
             selected_regex_match="regex" in selected_source_kinds,
             safe_failure_bucket=safe_failure_bucket,
+            target_locator_write_attempted=target_locator_write_attempted,
+            target_locator_written=target_locator_written,
+            target_locator_private_mode_confirmed=target_locator_private_mode_confirmed,
         )
 
     gate_error = _search_authority_gate_error(
@@ -1577,7 +1668,17 @@ async def _run_bounded_telegram_collector_github_search(
                 continue
             github_matching_message_count += 1
             if selected_message_fingerprint is None:
-                selected_message_fingerprint = _target_message_fingerprint(projection.message_id)
+                raw_message_id = message.get("id")
+                if (
+                    not _valid_target_message_id(raw_message_id)
+                    or not _valid_target_message_id(projection.message_id)
+                    or raw_message_id != projection.message_id
+                ):
+                    raise BoundedHistoryIngestError(
+                        "github_url_live_search_selected_message_id_invalid"
+                    )
+                selected_target_message_id = projection.message_id
+                selected_message_fingerprint = _target_message_fingerprint(selected_target_message_id)
                 selected_source_kinds = github_source_kinds
 
         if selected_message_fingerprint is None:
@@ -1610,6 +1711,25 @@ async def _run_bounded_telegram_collector_github_search(
                 result = make_result("blocked", "runtime_rollback_failed")
 
     assert result is not None
+    if result.ok and config.allow_target_locator_write:
+        assert normalized_source_value is not None
+        assert selected_target_message_id is not None
+        assert selected_message_fingerprint is not None
+        assert target_fingerprint is not None
+        target_locator_write_attempted = True
+        locator_error = _write_target_locator(
+            config.target_locator_output_path,
+            source_value=normalized_source_value,
+            target_message_id=selected_target_message_id,
+            target_fingerprint=target_fingerprint,
+            selected_message_fingerprint=selected_message_fingerprint,
+        )
+        if locator_error is None:
+            target_locator_written = True
+            target_locator_private_mode_confirmed = True
+            result = make_result("pass", "github_url_live_target_found")
+        else:
+            result = make_result("blocked", locator_error)
     return result
 
 
@@ -1631,6 +1751,8 @@ async def run_bounded_telegram_collector_history_ingest(
     state = BoundedTelegramCollectorHistoryIngestState()
     effective_logger = logger or logging.getLogger(__name__)
     mode = _normalize_mode(config.mode)
+    target_locator_error = _target_locator_argument_error(config)
+    target_locator_present = config.target_locator_path is not None
     rollout_scope, rollout_scope_error = _normalize_rollout_scope(config.rollout_scope)
     history_limit = _history_limit(config)
     normalized_source_values, target_error = _normalize_source_values(config)
@@ -1752,15 +1874,20 @@ async def run_bounded_telegram_collector_history_ingest(
         return make_result("blocked", "source_kind_unsupported")
     if config.chat_id is not None or config.registry_id is not None:
         return make_result("blocked", "direct_chat_or_registry_id_target_not_allowed")
-    if target_error is not None:
-        return make_result("blocked", target_error)
-    target_message_error = _target_message_id_error(
-        config,
-        rollout_scope=rollout_scope,
-        normalized_source_values=normalized_source_values,
-    )
-    if target_message_error is not None:
-        return make_result("blocked", target_message_error)
+    if target_locator_error is not None:
+        return make_result("blocked", target_locator_error)
+    if target_locator_present and rollout_scope != ROLLOUT_SCOPE_EXACT_TARGETS:
+        return make_result("blocked", "target_locator_rollout_scope_not_allowed")
+    if not target_locator_present:
+        if target_error is not None:
+            return make_result("blocked", target_error)
+        target_message_error = _target_message_id_error(
+            config,
+            rollout_scope=rollout_scope,
+            normalized_source_values=normalized_source_values,
+        )
+        if target_message_error is not None:
+            return make_result("blocked", target_message_error)
     if rollout_scope == ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY and config.registry_id_suffix:
         return make_result("blocked", "registry_id_suffix_not_allowed_for_full_registry_rollout")
     if _is_three_channel_rollout(config) and config.registry_id_suffix:
@@ -1784,6 +1911,34 @@ async def run_bounded_telegram_collector_history_ingest(
         return make_result("blocked", "runtime_config_not_allowed")
     if not config.allow_database_read:
         return make_result("blocked", "database_read_not_allowed")
+
+    if target_locator_present and mode == MODE_EXECUTE:
+        write_error = _execute_write_gate_error(config)
+        if write_error is not None:
+            return make_result("blocked", write_error)
+        if config.allow_source_outbox_publish and not config.allow_redis_publish:
+            return make_result("blocked", "redis_publish_not_allowed")
+
+    if target_locator_present:
+        config, target_locator_load_error = _consume_target_locator(config)
+        if target_locator_load_error is not None:
+            return make_result("blocked", target_locator_load_error)
+        normalized_source_values, target_error = _normalize_source_values(config)
+        normalized_source_value = (
+            normalized_source_values[0] if len(normalized_source_values) == 1 else None
+        )
+        input_target_fingerprints = tuple(
+            _input_target_fingerprint(value) for value in normalized_source_values
+        )
+        if target_error is not None:
+            return make_result("blocked", target_error)
+        target_message_error = _target_message_id_error(
+            config,
+            rollout_scope=rollout_scope,
+            normalized_source_values=normalized_source_values,
+        )
+        if target_message_error is not None:
+            return make_result("blocked", target_message_error)
 
     loader = runtime_config_loader or CollectorTelegramConfig.from_env
     state.runtime_config_attempted = True
@@ -2684,6 +2839,484 @@ def _is_bounded_auth_extra(value: object) -> bool:
     return isinstance(value, str) and value.startswith(f"{RUNNER_NAME}:")
 
 
+def _consume_target_locator(
+    config: BoundedTelegramCollectorHistoryIngestConfig,
+) -> tuple[BoundedTelegramCollectorHistoryIngestConfig, str | None]:
+    argument_error = _target_locator_argument_error(config)
+    if argument_error is not None:
+        return config, argument_error
+    if config.target_locator_path is None:
+        return config, None
+    try:
+        locator = _read_target_locator(config.target_locator_path)
+    except BoundedHistoryIngestError as exc:
+        return config, exc.error_code
+    return (
+        replace(
+            config,
+            source_value=str(locator["source_value"]),
+            source_values=(),
+            target_message_id=int(locator["target_message_id"]),
+        ),
+        None,
+    )
+
+
+def _target_locator_argument_error(
+    config: BoundedTelegramCollectorHistoryIngestConfig,
+) -> str | None:
+    if config.allow_target_locator_write or config.target_locator_output_path is not None:
+        return "target_locator_write_search_mode_required"
+    if config.target_locator_path is None:
+        return None
+    if config.source_value is not None or config.source_values or config.target_message_id is not None:
+        return "target_locator_direct_target_ambiguity"
+    return None
+
+
+def _validate_target_locator_output_path(value: object | None) -> str | None:
+    try:
+        parent_fd, target_name = _open_target_locator_parent_fd(
+            value,
+            reason_prefix="target_locator_output",
+        )
+    except BoundedHistoryIngestError as exc:
+        return exc.error_code
+    try:
+        try:
+            target_stat = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return "target_locator_output_parent_invalid"
+        if stat.S_ISLNK(target_stat.st_mode):
+            return "target_locator_output_target_symlink_not_allowed"
+        return "target_locator_output_target_exists"
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(parent_fd)
+
+
+def _write_target_locator(
+    output_path: object | None,
+    *,
+    source_value: str,
+    target_message_id: int,
+    target_fingerprint: str,
+    selected_message_fingerprint: str,
+) -> str | None:
+    try:
+        locator = {
+            "schema_version": TARGET_LOCATOR_SCHEMA_VERSION,
+            "source_kind": SOURCE_KIND_PUBLIC_USERNAME,
+            "source_value": source_value,
+            "target_message_id": target_message_id,
+            "target_fingerprint": target_fingerprint,
+            "selected_message_fingerprint": selected_message_fingerprint,
+        }
+        encoded = (
+            json.dumps(locator, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        return "target_locator_payload_invalid"
+    if len(encoded) > TARGET_LOCATOR_MAX_BYTES:
+        return "target_locator_payload_too_large"
+
+    try:
+        parent_fd, target_name = _open_target_locator_parent_fd(
+            output_path,
+            reason_prefix="target_locator_output",
+        )
+    except BoundedHistoryIngestError as exc:
+        return exc.error_code
+
+    fd: int | None = None
+    created_by_operation = False
+    created_identity: tuple[int, int] | None = None
+    error_code: str | None = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(
+                target_name,
+                flags,
+                TARGET_LOCATOR_PRIVATE_MODE,
+                dir_fd=parent_fd,
+            )
+            created_by_operation = True
+        except FileExistsError:
+            try:
+                existing_stat = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError:
+                error_code = "target_locator_output_target_exists"
+            else:
+                error_code = (
+                    "target_locator_output_target_symlink_not_allowed"
+                    if stat.S_ISLNK(existing_stat.st_mode)
+                    else "target_locator_output_target_exists"
+                )
+        except OSError as exc:
+            error_code = (
+                "target_locator_output_target_symlink_not_allowed"
+                if exc.errno == errno.ELOOP
+                else "target_locator_output_create_failed"
+            )
+
+        if fd is not None and error_code is None:
+            created_stat = os.fstat(fd)
+            created_identity = (created_stat.st_dev, created_stat.st_ino)
+            if not stat.S_ISREG(created_stat.st_mode):
+                error_code = "target_locator_output_create_failed"
+            else:
+                try:
+                    os.fchmod(fd, TARGET_LOCATOR_PRIVATE_MODE)
+                    private_stat = os.fstat(fd)
+                except OSError:
+                    error_code = "target_locator_output_private_mode_unconfirmed"
+                else:
+                    if stat.S_IMODE(private_stat.st_mode) != TARGET_LOCATOR_PRIVATE_MODE:
+                        error_code = "target_locator_output_private_mode_unconfirmed"
+
+        if fd is not None and error_code is None:
+            try:
+                written = os.write(fd, encoded)
+                if written != len(encoded):
+                    error_code = "target_locator_output_write_failed"
+                else:
+                    os.fsync(fd)
+                    if not _created_target_locator_matches(
+                        fd,
+                        parent_fd,
+                        target_name,
+                        created_identity=created_identity,
+                        expected_size=len(encoded),
+                    ):
+                        error_code = "target_locator_output_readback_failed"
+            except OSError:
+                error_code = "target_locator_output_write_failed"
+    except Exception:
+        error_code = error_code or "target_locator_output_write_failed"
+    finally:
+        if error_code is not None and created_by_operation:
+            if created_identity is None:
+                error_code = "target_locator_output_cleanup_unconfirmed"
+            elif not _remove_created_target_locator(
+                parent_fd,
+                target_name,
+                created_identity=created_identity,
+            ):
+                error_code = "target_locator_output_cleanup_failed"
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                if error_code is None:
+                    error_code = "target_locator_output_close_failed"
+                    if not _created_fd_matches_identity(fd, created_identity):
+                        error_code = "target_locator_output_cleanup_unconfirmed"
+                    elif not _remove_created_target_locator(
+                        parent_fd,
+                        target_name,
+                        created_identity=created_identity,
+                    ):
+                        error_code = "target_locator_output_cleanup_failed"
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        with contextlib.suppress(OSError):
+            os.close(parent_fd)
+    return error_code
+
+
+def _remove_created_target_locator(
+    parent_fd: int,
+    target_name: str,
+    *,
+    created_identity: tuple[int, int],
+) -> bool:
+    try:
+        current_stat = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if (
+        stat.S_ISREG(current_stat.st_mode)
+        and (current_stat.st_dev, current_stat.st_ino) == created_identity
+    ):
+        try:
+            os.unlink(target_name, dir_fd=parent_fd)
+        except OSError:
+            return False
+        return True
+    return False
+
+
+def _created_fd_matches_identity(
+    fd: int,
+    created_identity: tuple[int, int] | None,
+) -> bool:
+    if created_identity is None:
+        return False
+    try:
+        opened_stat = os.fstat(fd)
+    except OSError:
+        return False
+    return (opened_stat.st_dev, opened_stat.st_ino) == created_identity
+
+
+def _created_target_locator_matches(
+    fd: int,
+    parent_fd: int,
+    target_name: str,
+    *,
+    created_identity: tuple[int, int] | None,
+    expected_size: int,
+) -> bool:
+    if created_identity is None:
+        return False
+    try:
+        opened_stat = os.fstat(fd)
+        path_stat = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(opened_stat.st_mode)
+        and stat.S_ISREG(path_stat.st_mode)
+        and (opened_stat.st_dev, opened_stat.st_ino) == created_identity
+        and (path_stat.st_dev, path_stat.st_ino) == created_identity
+        and stat.S_IMODE(opened_stat.st_mode) == TARGET_LOCATOR_PRIVATE_MODE
+        and stat.S_IMODE(path_stat.st_mode) == TARGET_LOCATOR_PRIVATE_MODE
+        and opened_stat.st_size == expected_size
+        and path_stat.st_size == expected_size
+    )
+
+
+def _read_target_locator(value: object | None) -> dict[str, Any]:
+    encoded = _read_target_locator_bytes(value)
+    try:
+        decoded = encoded.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise BoundedHistoryIngestError("target_locator_input_invalid_utf8") from exc
+    try:
+        parsed = json.loads(decoded, object_pairs_hook=_target_locator_object_from_pairs)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise BoundedHistoryIngestError("target_locator_input_malformed_json") from exc
+    if not isinstance(parsed, dict):
+        raise BoundedHistoryIngestError("target_locator_input_field_set_invalid")
+    if frozenset(parsed) != _TARGET_LOCATOR_FIELDS:
+        raise BoundedHistoryIngestError("target_locator_input_field_set_invalid")
+    if parsed.get("schema_version") != TARGET_LOCATOR_SCHEMA_VERSION:
+        raise BoundedHistoryIngestError("target_locator_input_schema_unsupported")
+    if parsed.get("source_kind") != SOURCE_KIND_PUBLIC_USERNAME:
+        raise BoundedHistoryIngestError("target_locator_input_source_kind_unsupported")
+
+    source_value = parsed.get("source_value")
+    target_message_id = parsed.get("target_message_id")
+    target_fingerprint = parsed.get("target_fingerprint")
+    selected_message_fingerprint = parsed.get("selected_message_fingerprint")
+    if (
+        not isinstance(source_value, str)
+        or type(target_message_id) is not int
+        or not isinstance(target_fingerprint, str)
+        or not isinstance(selected_message_fingerprint, str)
+    ):
+        raise BoundedHistoryIngestError("target_locator_input_field_type_invalid")
+    normalized_source_value = _normalize_source_value(source_value)
+    if normalized_source_value is None:
+        raise BoundedHistoryIngestError("target_locator_input_source_value_invalid")
+    if source_value != normalized_source_value:
+        raise BoundedHistoryIngestError("target_locator_input_source_value_not_normalized")
+    if not _valid_target_message_id(target_message_id):
+        raise BoundedHistoryIngestError("target_locator_input_target_message_id_invalid")
+    if target_fingerprint != _input_target_fingerprint(normalized_source_value):
+        raise BoundedHistoryIngestError("target_locator_input_target_fingerprint_mismatch")
+    if selected_message_fingerprint != _target_message_fingerprint(target_message_id):
+        raise BoundedHistoryIngestError(
+            "target_locator_input_selected_message_fingerprint_mismatch"
+        )
+    return parsed
+
+
+def _read_target_locator_bytes(value: object | None) -> bytes:
+    parent_fd, target_name = _open_target_locator_parent_fd(
+        value,
+        reason_prefix="target_locator_input",
+    )
+    fd: int | None = None
+    try:
+        try:
+            target_stat = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise BoundedHistoryIngestError("target_locator_input_not_found") from exc
+        except OSError as exc:
+            raise BoundedHistoryIngestError("target_locator_input_read_failed") from exc
+        if stat.S_ISLNK(target_stat.st_mode):
+            raise BoundedHistoryIngestError("target_locator_input_target_symlink_not_allowed")
+        if not stat.S_ISREG(target_stat.st_mode):
+            raise BoundedHistoryIngestError("target_locator_input_not_regular")
+
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(target_name, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            reason_code = (
+                "target_locator_input_target_symlink_not_allowed"
+                if exc.errno == errno.ELOOP
+                else "target_locator_input_read_failed"
+            )
+            raise BoundedHistoryIngestError(reason_code) from exc
+
+        try:
+            opened_stat = os.fstat(fd)
+        except OSError as exc:
+            raise BoundedHistoryIngestError("target_locator_input_read_failed") from exc
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise BoundedHistoryIngestError("target_locator_input_not_regular")
+        if stat.S_IMODE(opened_stat.st_mode) != TARGET_LOCATOR_PRIVATE_MODE:
+            raise BoundedHistoryIngestError("target_locator_input_mode_not_private")
+        if opened_stat.st_size > TARGET_LOCATOR_MAX_BYTES:
+            raise BoundedHistoryIngestError("target_locator_input_too_large")
+        try:
+            encoded = os.read(fd, TARGET_LOCATOR_MAX_BYTES + 1)
+        except OSError as exc:
+            raise BoundedHistoryIngestError("target_locator_input_read_failed") from exc
+        if len(encoded) > TARGET_LOCATOR_MAX_BYTES:
+            raise BoundedHistoryIngestError("target_locator_input_too_large")
+        if len(encoded) != opened_stat.st_size:
+            raise BoundedHistoryIngestError("target_locator_input_changed_during_read")
+        try:
+            readback_stat = os.fstat(fd)
+        except OSError as exc:
+            raise BoundedHistoryIngestError(
+                "target_locator_input_changed_during_read"
+            ) from exc
+        if (
+            (readback_stat.st_dev, readback_stat.st_ino)
+            != (opened_stat.st_dev, opened_stat.st_ino)
+            or not stat.S_ISREG(readback_stat.st_mode)
+            or stat.S_IMODE(readback_stat.st_mode) != TARGET_LOCATOR_PRIVATE_MODE
+            or readback_stat.st_size != opened_stat.st_size
+        ):
+            raise BoundedHistoryIngestError("target_locator_input_changed_during_read")
+        return encoded
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(OSError):
+            os.close(parent_fd)
+
+
+def _target_locator_object_from_pairs(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate target locator field")
+        result[key] = value
+    return result
+
+
+def _open_target_locator_parent_fd(
+    value: object | None,
+    *,
+    reason_prefix: str,
+) -> tuple[int, str]:
+    root_components, relative_components = _target_locator_path_components(
+        value,
+        reason_prefix=reason_prefix,
+    )
+    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        current_fd = os.open("/", directory_flags)
+    except OSError as exc:
+        raise BoundedHistoryIngestError(f"{reason_prefix}_root_not_real") from exc
+
+    parent_components = (*root_components, *relative_components[:-1])
+    try:
+        for index, component in enumerate(parent_components):
+            is_allowed_root_component = index < len(root_components)
+            try:
+                component_stat = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError as exc:
+                reason = (
+                    f"{reason_prefix}_root_not_real"
+                    if is_allowed_root_component
+                    else f"{reason_prefix}_parent_missing"
+                )
+                raise BoundedHistoryIngestError(reason) from exc
+            except OSError as exc:
+                raise BoundedHistoryIngestError(f"{reason_prefix}_parent_invalid") from exc
+            if stat.S_ISLNK(component_stat.st_mode):
+                reason = (
+                    f"{reason_prefix}_root_not_real"
+                    if is_allowed_root_component
+                    else f"{reason_prefix}_parent_symlink_not_allowed"
+                )
+                raise BoundedHistoryIngestError(reason)
+            if not stat.S_ISDIR(component_stat.st_mode):
+                reason = (
+                    f"{reason_prefix}_root_not_real"
+                    if is_allowed_root_component
+                    else f"{reason_prefix}_parent_not_directory"
+                )
+                raise BoundedHistoryIngestError(reason)
+            try:
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    reason = (
+                        f"{reason_prefix}_root_not_real"
+                        if is_allowed_root_component
+                        else f"{reason_prefix}_parent_symlink_not_allowed"
+                    )
+                elif exc.errno == errno.ENOTDIR:
+                    reason = f"{reason_prefix}_parent_not_directory"
+                else:
+                    reason = f"{reason_prefix}_parent_invalid"
+                raise BoundedHistoryIngestError(reason) from exc
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd, relative_components[-1]
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(current_fd)
+        raise
+
+
+def _target_locator_path_components(
+    value: object | None,
+    *,
+    reason_prefix: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    if not isinstance(value, str) or not value:
+        raise BoundedHistoryIngestError(f"{reason_prefix}_path_relative")
+    if "\x00" in value or not value.startswith("/"):
+        raise BoundedHistoryIngestError(f"{reason_prefix}_path_relative")
+    raw_components = value.split("/")
+    if value.startswith("/tmp/"):
+        root_components = ("tmp",)
+        relative_components = tuple(raw_components[2:])
+    elif value.startswith("/var/tmp/"):
+        root_components = ("var", "tmp")
+        relative_components = tuple(raw_components[3:])
+    else:
+        raise BoundedHistoryIngestError(f"{reason_prefix}_path_outside_allowed_roots")
+    if not relative_components or any(
+        component in {"", ".", ".."} for component in relative_components
+    ):
+        raise BoundedHistoryIngestError(f"{reason_prefix}_path_traversal_not_allowed")
+    return root_components, relative_components
+
+
 def _normalize_mode(value: str) -> str:
     normalized = str(value or "").strip().lower()
     return normalized
@@ -2732,6 +3365,8 @@ def _search_authority_gate_error(
         return "source_kind_unsupported"
     if config.chat_id is not None or config.registry_id is not None:
         return "direct_chat_or_registry_id_target_not_allowed"
+    if config.target_locator_path is not None:
+        return "target_locator_input_not_allowed_in_search"
     if source_error is not None or normalized_source_value is None:
         return source_error or "search_requires_exactly_one_target"
     if config.max_messages is None:
@@ -2745,6 +3380,14 @@ def _search_authority_gate_error(
         return "search_registry_suffix_not_allowed"
     if config.max_targets is not None:
         return "search_max_targets_not_allowed"
+    if config.target_locator_output_path is not None and not config.allow_target_locator_write:
+        return "target_locator_write_authority_missing"
+    if config.allow_target_locator_write and not str(config.target_locator_output_path or "").strip():
+        return "target_locator_output_path_required"
+    if config.allow_target_locator_write:
+        locator_path_error = _validate_target_locator_output_path(config.target_locator_output_path)
+        if locator_path_error is not None:
+            return locator_path_error
     if not (config.confirm_token or "").strip():
         return "search_confirm_token_missing"
     if not _search_confirm_token_valid(config):
@@ -2828,6 +3471,10 @@ def _normalize_source_value(value: object | None) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = value.strip().lstrip("@").strip().lower()
+    try:
+        normalized.encode("utf-8", errors="strict")
+    except UnicodeError:
+        return None
     return normalized or None
 
 
@@ -2839,15 +3486,15 @@ def _target_message_id_error(
 ) -> str | None:
     if config.target_message_id is None:
         return None
-    if (
-        isinstance(config.target_message_id, bool)
-        or not isinstance(config.target_message_id, int)
-        or config.target_message_id <= 0
-    ):
+    if not _valid_target_message_id(config.target_message_id):
         return "target_message_id_invalid"
     if rollout_scope != ROLLOUT_SCOPE_EXACT_TARGETS or len(normalized_source_values) != 1:
         return "target_message_requires_single_exact_target"
     return None
+
+
+def _valid_target_message_id(value: object) -> bool:
+    return type(value) is int and value > 0
 
 
 def _source_outbox_write_allowed(config: BoundedTelegramCollectorHistoryIngestConfig) -> bool:
@@ -3222,6 +3869,9 @@ __all__ = [
     "SCHEMA_VERSION",
     "SEARCH_CONFIRM_TOKEN",
     "SEARCH_SCHEMA_VERSION",
+    "TARGET_LOCATOR_MAX_BYTES",
+    "TARGET_LOCATOR_PRIVATE_MODE",
+    "TARGET_LOCATOR_SCHEMA_VERSION",
     "THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN",
     "THREE_CHANNEL_SCHEMA_VERSION",
     "THREE_CHANNEL_TARGET_COUNT",

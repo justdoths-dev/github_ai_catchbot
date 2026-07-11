@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import stat
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -24,8 +26,12 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
     HISTORY_READ_CAUSE_RUNTIME_TDLIB_ACCESS_ISSUE,
     HISTORY_READ_CAUSE_TARGET_UNAVAILABLE,
     SEARCH_CONFIRM_TOKEN,
+    TARGET_LOCATOR_MAX_BYTES,
+    TARGET_LOCATOR_PRIVATE_MODE,
+    TARGET_LOCATOR_SCHEMA_VERSION,
     THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
     _TDLibBoundedHistoryClient,
+    _input_target_fingerprint,
     _target_message_fingerprint,
     build_default_bounded_history_search_runtime,
     run_bounded_telegram_collector_history_ingest,
@@ -1009,6 +1015,81 @@ def _search_message(
     return message
 
 
+@pytest.fixture
+def locator_tmp_path(tmp_path: Path):
+    assert tmp_path.is_absolute()
+    assert str(tmp_path).startswith(("/tmp/", "/var/tmp/"))
+    yield tmp_path
+    for path in sorted(tmp_path.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            path.rmdir()
+
+
+def _target_locator_payload(**overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "schema_version": TARGET_LOCATOR_SCHEMA_VERSION,
+        "source_kind": "public_username",
+        "source_value": "trendingrepo",
+        "target_message_id": RAW_MESSAGE_ID,
+        "target_fingerprint": _input_target_fingerprint("trendingrepo"),
+        "selected_message_fingerprint": _target_message_fingerprint(RAW_MESSAGE_ID),
+    }
+    values.update(overrides)
+    return values
+
+
+def _write_private_target_locator(
+    path: Path,
+    *,
+    payload: Any | None = None,
+    encoded: bytes | None = None,
+    mode: int = TARGET_LOCATOR_PRIVATE_MODE,
+) -> Path:
+    assert str(path).startswith(("/tmp/", "/var/tmp/"))
+    if encoded is None:
+        encoded = (
+            json.dumps(
+                _target_locator_payload() if payload is None else payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    path.write_bytes(encoded)
+    path.chmod(mode)
+    return path
+
+
+def _locator_ingest_config(
+    path: str | Path,
+    *,
+    mode: str = "plan",
+    **overrides: Any,
+) -> BoundedTelegramCollectorHistoryIngestConfig:
+    values: dict[str, Any] = {
+        "mode": mode,
+        "source_value": None,
+        "source_values": (),
+        "target_message_id": None,
+        "target_locator_path": str(path),
+    }
+    if mode == "plan":
+        values.update(
+            {
+                "allow_telegram_read": False,
+                "allow_database_write": False,
+                "allow_source_message_write": False,
+                "allow_source_version_write": False,
+                "allow_source_outbox_write": False,
+            }
+        )
+    values.update(overrides)
+    return _approved_config(**values)
+
+
 def _approved_three_channel_config(**overrides: Any) -> BoundedTelegramCollectorHistoryIngestConfig:
     values = {
         "mode": "execute",
@@ -1883,6 +1964,803 @@ async def test_search_close_failure_overrides_pass_without_exposing_details() ->
     assert builder.commit_calls == 0
     assert builder.close_commits == [False]
     assert CLOSE_EXCEPTION_DETAIL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_search_without_locator_arguments_preserves_default_behavior() -> None:
+    result, loader, builder, repository, history = await _run(
+        _approved_search_config(max_messages=1),
+        repository=SearchWriteBombRepository(),
+        history=SearchHistoryClient([_search_message("https://github.com/example/repo")]),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is True
+    assert report["reason_code"] == "github_url_live_target_found"
+    assert report["target_locator_requested"] is False
+    assert report["target_locator_written"] is False
+    assert report["target_locator_private_mode_confirmed"] is False
+    assert report["target_locator_consumption_supported"] is True
+    assert report["side_effects"]["target_locator_write_attempted"] is False
+    assert loader.calls == 1
+    assert builder.calls == 1
+    assert repository.upsert_calls == 0
+    assert history.search_calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 1, "from_message_id": 0, "offset": 0}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_positive_search_writes_exact_private_bounded_locator_without_report_leaks(
+    locator_tmp_path: Path,
+) -> None:
+    locator_path = locator_tmp_path / "sentinel-private-search-locator-71.json"
+    raw_url = "https://github.com/private-owner/private-repository"
+    result, _loader, builder, repository, history = await _run(
+        _approved_search_config(
+            max_messages=1,
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        ),
+        repository=SearchWriteBombRepository(),
+        history=SearchHistoryClient([_search_message(raw_url)]),
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+    encoded = locator_path.read_bytes()
+    locator = json.loads(encoded.decode("utf-8"))
+
+    assert result.ok is True
+    assert report["target_locator_requested"] is True
+    assert report["target_locator_written"] is True
+    assert report["target_locator_private_mode_confirmed"] is True
+    assert report["side_effects"]["target_locator_write_attempted"] is True
+    assert stat.S_IMODE(locator_path.stat().st_mode) == TARGET_LOCATOR_PRIVATE_MODE
+    assert 0 < len(encoded) <= TARGET_LOCATOR_MAX_BYTES
+    assert set(locator) == {
+        "schema_version",
+        "source_kind",
+        "source_value",
+        "target_message_id",
+        "target_fingerprint",
+        "selected_message_fingerprint",
+    }
+    assert locator == _target_locator_payload()
+    assert repository.upsert_calls == 0
+    assert repository.messages == {}
+    assert repository.versions == {}
+    assert repository.outbox == []
+    assert repository.cursor_updates == []
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+    assert len(history.search_calls) == 1
+    for raw_value in (
+        str(locator_path),
+        locator_path.name,
+        encoded.decode("utf-8"),
+        "trendingrepo",
+        str(RAW_MESSAGE_ID),
+        raw_url,
+    ):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_negative_search_with_locator_authority_writes_no_file(
+    locator_tmp_path: Path,
+) -> None:
+    locator_path = locator_tmp_path / "sentinel-negative-search-locator-72.json"
+    result, _loader, builder, repository, _history = await _run(
+        _approved_search_config(
+            max_messages=1,
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        ),
+        repository=SearchWriteBombRepository(),
+        history=SearchHistoryClient([_message(text="bounded search without an approved URL")]),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["reason_code"] == "github_url_live_target_not_found_in_approved_window"
+    assert report["target_locator_requested"] is True
+    assert report["target_locator_written"] is False
+    assert report["side_effects"]["target_locator_write_attempted"] is False
+    assert not locator_path.exists()
+    assert repository.upsert_calls == 0
+    assert builder.commit_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_projection_failure_after_positive_match_writes_no_locator(
+    locator_tmp_path: Path,
+) -> None:
+    locator_path = locator_tmp_path / "sentinel-projection-failure-locator-73.json"
+    invalid_message = _message(message_id=RAW_MESSAGE_ID + 1)
+    invalid_message["id"] = "not-an-integer-message-id"
+    result, _loader, builder, repository, _history = await _run(
+        _approved_search_config(
+            max_messages=2,
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        ),
+        repository=SearchWriteBombRepository(),
+        history=SearchHistoryClient(
+            [
+                _search_message("https://github.com/example/repo"),
+                invalid_message,
+            ]
+        ),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["reason_code"] == "github_url_live_search_projection_failed"
+    assert report["target_locator_written"] is False
+    assert report["side_effects"]["target_locator_write_attempted"] is False
+    assert not locator_path.exists()
+    assert repository.upsert_calls == 0
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_message_id", [0, -1, True])
+async def test_search_rejects_invalid_selected_message_id_before_locator_write(
+    locator_tmp_path: Path,
+    invalid_message_id: object,
+) -> None:
+    locator_path = locator_tmp_path / "sentinel-invalid-selected-id-locator.json"
+    result, _loader, _builder, repository, _history = await _run(
+        _approved_search_config(
+            max_messages=1,
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        ),
+        repository=SearchWriteBombRepository(),
+        history=SearchHistoryClient(
+            [
+                _search_message(
+                    "https://github.com/example/repo",
+                    message_id=invalid_message_id,  # type: ignore[arg-type]
+                )
+            ]
+        ),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["reason_code"] == "github_url_live_search_selected_message_id_invalid"
+    assert report["target_locator_written"] is False
+    assert not locator_path.exists()
+    assert repository.upsert_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_search_close_failure_writes_no_locator(
+    locator_tmp_path: Path,
+) -> None:
+    locator_path = locator_tmp_path / "sentinel-close-failure-locator-74.json"
+    result, _loader, builder, repository, _history = await _run(
+        _approved_search_config(
+            max_messages=1,
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        ),
+        repository=SearchWriteBombRepository(),
+        history=SearchHistoryClient([_search_message("https://github.com/example/repo")]),
+        close_error=RuntimeError(CLOSE_EXCEPTION_DETAIL),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["reason_code"] == "runtime_rollback_failed"
+    assert report["target_locator_written"] is False
+    assert report["side_effects"]["target_locator_write_attempted"] is False
+    assert not locator_path.exists()
+    assert repository.upsert_calls == 0
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("allow_write", "path_present", "reason_code"),
+    [
+        (False, True, "target_locator_write_authority_missing"),
+        (True, False, "target_locator_output_path_required"),
+    ],
+)
+async def test_search_locator_write_requires_explicit_authority_and_path_pair(
+    locator_tmp_path: Path,
+    allow_write: bool,
+    path_present: bool,
+    reason_code: str,
+) -> None:
+    locator_path = locator_tmp_path / "sentinel-locator-authority-pair-75.json"
+    result, loader, builder, repository, history = await _run(
+        _approved_search_config(
+            allow_target_locator_write=allow_write,
+            target_locator_output_path=str(locator_path) if path_present else None,
+        )
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["reason_code"] == reason_code
+    assert report["target_locator_written"] is False
+    assert not locator_path.exists()
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+
+
+@pytest.mark.asyncio
+async def test_search_locator_output_rejects_relative_outside_and_traversal_paths_before_runtime(
+    locator_tmp_path: Path,
+) -> None:
+    cases = (
+        ("relative-private-locator.json", "target_locator_output_path_relative"),
+        (
+            "/home/dev/sentinel-private-locator.json",
+            "target_locator_output_path_outside_allowed_roots",
+        ),
+        (
+            f"{locator_tmp_path}/segment/../sentinel-private-locator.json",
+            "target_locator_output_path_traversal_not_allowed",
+        ),
+    )
+    for output_path, reason_code in cases:
+        result, loader, builder, repository, history = await _run(
+            _approved_search_config(
+                allow_target_locator_write=True,
+                target_locator_output_path=output_path,
+            )
+        )
+        rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
+
+        assert result.ok is False
+        assert result.to_sanitized_dict()["reason_code"] == reason_code
+        assert loader.calls == 0
+        assert builder.calls == 0
+        assert repository.registry_lookups == []
+        assert history.calls == []
+        assert output_path not in rendered
+
+
+@pytest.mark.asyncio
+async def test_search_locator_output_rejects_symlink_target_without_touching_referent(
+    locator_tmp_path: Path,
+) -> None:
+    referent = locator_tmp_path / "sentinel-existing-referent.bin"
+    referent.write_bytes(b"sentinel-existing-referent-content")
+    locator_path = locator_tmp_path / "sentinel-symlink-target-locator-76.json"
+    locator_path.symlink_to(referent)
+    result, loader, builder, _repository, _history = await _run(
+        _approved_search_config(
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        )
+    )
+
+    assert result.ok is False
+    assert result.to_sanitized_dict()["reason_code"] == (
+        "target_locator_output_target_symlink_not_allowed"
+    )
+    assert locator_path.is_symlink()
+    assert referent.read_bytes() == b"sentinel-existing-referent-content"
+    assert loader.calls == 0
+    assert builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_search_locator_output_rejects_symlinked_parent(
+    locator_tmp_path: Path,
+) -> None:
+    real_parent = locator_tmp_path / "sentinel-real-parent"
+    real_parent.mkdir()
+    linked_parent = locator_tmp_path / "sentinel-linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    locator_path = linked_parent / "sentinel-parent-link-locator-77.json"
+    result, loader, builder, _repository, _history = await _run(
+        _approved_search_config(
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        )
+    )
+
+    assert result.ok is False
+    assert result.to_sanitized_dict()["reason_code"] == (
+        "target_locator_output_parent_symlink_not_allowed"
+    )
+    assert not (real_parent / locator_path.name).exists()
+    assert loader.calls == 0
+    assert builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_search_locator_output_never_overwrites_existing_target(
+    locator_tmp_path: Path,
+) -> None:
+    locator_path = locator_tmp_path / "sentinel-preexisting-locator-78.json"
+    original = b"sentinel-preexisting-target-must-remain"
+    locator_path.write_bytes(original)
+    locator_path.chmod(TARGET_LOCATOR_PRIVATE_MODE)
+    result, loader, builder, _repository, _history = await _run(
+        _approved_search_config(
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        )
+    )
+
+    assert result.ok is False
+    assert result.to_sanitized_dict()["reason_code"] == "target_locator_output_target_exists"
+    assert locator_path.read_bytes() == original
+    assert stat.S_IMODE(locator_path.stat().st_mode) == TARGET_LOCATOR_PRIVATE_MODE
+    assert loader.calls == 0
+    assert builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_search_locator_creation_uses_exclusive_nofollow_flags(
+    locator_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator_path = locator_tmp_path / "sentinel-atomic-flags-locator-79.json"
+    original_open = os.open
+    create_calls: list[tuple[object, int, int, int | None]] = []
+
+    def recording_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if flags & os.O_CREAT:
+            create_calls.append((path, flags, mode, dir_fd))
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(runner_module.os, "open", recording_open)
+    result, _loader, _builder, _repository, _history = await _run(
+        _approved_search_config(
+            max_messages=1,
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        ),
+        repository=SearchWriteBombRepository(),
+        history=SearchHistoryClient([_search_message("https://github.com/example/repo")]),
+    )
+
+    assert result.ok is True
+    assert len(create_calls) == 1
+    _path, flags, mode, dir_fd = create_calls[0]
+    assert flags & os.O_CREAT
+    assert flags & os.O_EXCL
+    if getattr(os, "O_NOFOLLOW", 0):
+        assert flags & os.O_NOFOLLOW
+    assert mode == TARGET_LOCATOR_PRIVATE_MODE
+    assert dir_fd is not None
+    assert locator_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_search_locator_short_write_removes_only_created_partial_file(
+    locator_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator_path = locator_tmp_path / "sentinel-short-write-locator-80.json"
+    original_write = os.write
+
+    def short_write(fd: int, data: bytes) -> int:
+        return original_write(fd, data[:-1])
+
+    monkeypatch.setattr(runner_module.os, "write", short_write)
+    result, _loader, _builder, _repository, _history = await _run(
+        _approved_search_config(
+            max_messages=1,
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        ),
+        repository=SearchWriteBombRepository(),
+        history=SearchHistoryClient([_search_message("https://github.com/example/repo")]),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["reason_code"] == "target_locator_output_write_failed"
+    assert report["side_effects"]["target_locator_write_attempted"] is True
+    assert report["target_locator_written"] is False
+    assert not locator_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_locator_input_rejects_relative_outside_traversal_and_missing_paths_before_runtime(
+    locator_tmp_path: Path,
+) -> None:
+    cases = (
+        ("relative-private-locator.json", "target_locator_input_path_relative"),
+        (
+            "/home/dev/sentinel-private-locator.json",
+            "target_locator_input_path_outside_allowed_roots",
+        ),
+        (
+            f"{locator_tmp_path}/segment/../sentinel-private-locator.json",
+            "target_locator_input_path_traversal_not_allowed",
+        ),
+        (
+            str(locator_tmp_path / "sentinel-missing-locator-81.json"),
+            "target_locator_input_not_found",
+        ),
+    )
+    for input_path, reason_code in cases:
+        result, loader, builder, repository, history = await _run(
+            _locator_ingest_config(input_path)
+        )
+        rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
+
+        assert result.ok is False
+        assert result.error_code == reason_code
+        assert loader.calls == 0
+        assert builder.calls == 0
+        assert repository.registry_lookups == []
+        assert history.calls == []
+        assert input_path not in rendered
+
+
+@pytest.mark.asyncio
+async def test_locator_input_rejects_target_and_parent_symlinks_and_non_regular_files(
+    locator_tmp_path: Path,
+) -> None:
+    referent = _write_private_target_locator(
+        locator_tmp_path / "sentinel-input-referent-82.json"
+    )
+    target_link = locator_tmp_path / "sentinel-input-target-link-82.json"
+    target_link.symlink_to(referent)
+    real_parent = locator_tmp_path / "sentinel-input-real-parent"
+    real_parent.mkdir()
+    linked_parent = locator_tmp_path / "sentinel-input-linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    directory_target = locator_tmp_path / "sentinel-input-directory-target"
+    directory_target.mkdir()
+    cases = (
+        (target_link, "target_locator_input_target_symlink_not_allowed"),
+        (
+            linked_parent / "sentinel-input-through-parent-link.json",
+            "target_locator_input_parent_symlink_not_allowed",
+        ),
+        (directory_target, "target_locator_input_not_regular"),
+    )
+    for input_path, reason_code in cases:
+        result, loader, builder, repository, history = await _run(
+            _locator_ingest_config(input_path)
+        )
+
+        assert result.ok is False
+        assert result.error_code == reason_code
+        assert loader.calls == 0
+        assert builder.calls == 0
+        assert repository.registry_lookups == []
+        assert history.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [0o644, 0o400])
+async def test_locator_input_requires_exact_private_mode(
+    locator_tmp_path: Path,
+    mode: int,
+) -> None:
+    locator_path = _write_private_target_locator(
+        locator_tmp_path / f"sentinel-input-mode-{mode:o}.json",
+        mode=mode,
+    )
+    result, loader, builder, repository, history = await _run(
+        _locator_ingest_config(locator_path)
+    )
+
+    assert result.ok is False
+    assert result.error_code == "target_locator_input_mode_not_private"
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+
+
+@pytest.mark.asyncio
+async def test_locator_input_rejects_oversized_file_before_json_parsing(
+    locator_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator_path = _write_private_target_locator(
+        locator_tmp_path / "sentinel-input-oversized-83.json",
+        encoded=b"x" * (TARGET_LOCATOR_MAX_BYTES + 1),
+    )
+    json_load_calls = 0
+
+    def forbidden_json_loads(*args: Any, **kwargs: Any) -> Any:
+        nonlocal json_load_calls
+        del args, kwargs
+        json_load_calls += 1
+        raise AssertionError("oversized locator must be rejected before JSON parsing")
+
+    monkeypatch.setattr(runner_module.json, "loads", forbidden_json_loads)
+    result, loader, builder, repository, history = await _run(
+        _locator_ingest_config(locator_path)
+    )
+
+    assert result.ok is False
+    assert result.error_code == "target_locator_input_too_large"
+    assert json_load_calls == 0
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("encoded", "reason_code"),
+    [
+        (b"\xff\xfe\xfd", "target_locator_input_invalid_utf8"),
+        (b'{"schema_version":', "target_locator_input_malformed_json"),
+    ],
+)
+async def test_locator_input_rejects_invalid_utf8_and_malformed_json(
+    locator_tmp_path: Path,
+    encoded: bytes,
+    reason_code: str,
+) -> None:
+    locator_path = _write_private_target_locator(
+        locator_tmp_path / f"sentinel-input-invalid-{reason_code}.json",
+        encoded=encoded,
+    )
+    result, loader, builder, repository, history = await _run(
+        _locator_ingest_config(locator_path)
+    )
+
+    assert result.ok is False
+    assert result.error_code == reason_code
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+
+
+@pytest.mark.asyncio
+async def test_locator_input_enforces_exact_schema_fields_types_normalization_and_id(
+    locator_tmp_path: Path,
+) -> None:
+    full = _target_locator_payload()
+    cases: tuple[tuple[str, Any, str], ...] = (
+        ("top-level-list", [], "target_locator_input_field_set_invalid"),
+        (
+            "missing-field",
+            {key: value for key, value in full.items() if key != "target_fingerprint"},
+            "target_locator_input_field_set_invalid",
+        ),
+        (
+            "unexpected-field",
+            full | {"unexpected": True},
+            "target_locator_input_field_set_invalid",
+        ),
+        (
+            "unsupported-schema",
+            _target_locator_payload(schema_version="github_url_live_target_locator_v2"),
+            "target_locator_input_schema_unsupported",
+        ),
+        (
+            "unsupported-source-kind",
+            _target_locator_payload(source_kind="chat_id"),
+            "target_locator_input_source_kind_unsupported",
+        ),
+        (
+            "source-type",
+            _target_locator_payload(source_value=123),
+            "target_locator_input_field_type_invalid",
+        ),
+        (
+            "message-id-type",
+            _target_locator_payload(target_message_id=True),
+            "target_locator_input_field_type_invalid",
+        ),
+        (
+            "target-fingerprint-type",
+            _target_locator_payload(target_fingerprint=123),
+            "target_locator_input_field_type_invalid",
+        ),
+        (
+            "selected-fingerprint-type",
+            _target_locator_payload(selected_message_fingerprint=123),
+            "target_locator_input_field_type_invalid",
+        ),
+        (
+            "empty-source",
+            _target_locator_payload(source_value=""),
+            "target_locator_input_source_value_invalid",
+        ),
+        (
+            "non-normalized-source",
+            _target_locator_payload(source_value="@TrendingRepo"),
+            "target_locator_input_source_value_not_normalized",
+        ),
+        (
+            "nonpositive-message-id",
+            _target_locator_payload(target_message_id=0),
+            "target_locator_input_target_message_id_invalid",
+        ),
+    )
+    for case_name, payload, reason_code in cases:
+        locator_path = _write_private_target_locator(
+            locator_tmp_path / f"sentinel-input-contract-{case_name}.json",
+            payload=payload,
+        )
+        result, loader, builder, repository, history = await _run(
+            _locator_ingest_config(locator_path)
+        )
+
+        assert result.ok is False
+        assert result.error_code == reason_code
+        assert loader.calls == 0
+        assert builder.calls == 0
+        assert repository.registry_lookups == []
+        assert history.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "reason_code"),
+    [
+        (
+            {"target_fingerprint": "sha256:0000000000000000"},
+            "target_locator_input_target_fingerprint_mismatch",
+        ),
+        (
+            {"selected_message_fingerprint": "sha256:0000000000000000"},
+            "target_locator_input_selected_message_fingerprint_mismatch",
+        ),
+    ],
+)
+async def test_locator_input_recomputes_and_binds_both_fingerprints(
+    locator_tmp_path: Path,
+    overrides: dict[str, Any],
+    reason_code: str,
+) -> None:
+    locator_path = _write_private_target_locator(
+        locator_tmp_path / f"sentinel-input-{reason_code}.json",
+        payload=_target_locator_payload(**overrides),
+    )
+    result, loader, builder, repository, history = await _run(
+        _locator_ingest_config(locator_path)
+    )
+
+    assert result.ok is False
+    assert result.error_code == reason_code
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "direct_overrides",
+    [
+        {"source_value": "trendingrepo"},
+        {"source_values": ("trendingrepo",)},
+        {"target_message_id": RAW_MESSAGE_ID},
+    ],
+)
+async def test_locator_input_is_mutually_exclusive_with_direct_target_arguments(
+    locator_tmp_path: Path,
+    direct_overrides: dict[str, Any],
+) -> None:
+    locator_path = _write_private_target_locator(
+        locator_tmp_path / "sentinel-input-direct-ambiguity-84.json"
+    )
+    original = locator_path.read_bytes()
+    result, loader, builder, repository, history = await _run(
+        _locator_ingest_config(locator_path, **direct_overrides)
+    )
+
+    assert result.ok is False
+    assert result.error_code == "target_locator_direct_target_ambiguity"
+    assert locator_path.read_bytes() == original
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+
+
+@pytest.mark.asyncio
+async def test_valid_locator_populates_existing_plan_path_without_telegram_or_writes(
+    locator_tmp_path: Path,
+) -> None:
+    locator_path = _write_private_target_locator(
+        locator_tmp_path / "sentinel-valid-plan-locator-85.json"
+    )
+    repository = SearchWriteBombRepository()
+    history = FakeHistoryClient([_message()])
+    result, loader, builder, repository, history = await _run(
+        _locator_ingest_config(locator_path),
+        repository=repository,
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is True
+    assert result.mode == "plan"
+    assert result.config.source_value == "trendingrepo"
+    assert result.config.target_message_id == RAW_MESSAGE_ID
+    assert report["target_locator_present"] is True
+    assert report["target_locator_consumption_supported"] is True
+    assert report["target_message_fingerprint"] == _target_message_fingerprint(RAW_MESSAGE_ID)
+    assert repository.registry_lookups == ["trendingrepo"]
+    assert repository.upsert_calls == 0
+    assert repository.messages == {}
+    assert repository.versions == {}
+    assert repository.outbox == []
+    assert repository.cursor_updates == []
+    assert history.calls == []
+    assert history.exact_calls == []
+    assert loader.calls == 1
+    assert builder.calls == 1
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+    for raw_value in (
+        str(locator_path),
+        locator_path.name,
+        locator_path.read_text(encoding="utf-8"),
+        "trendingrepo",
+        str(RAW_MESSAGE_ID),
+    ):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "reason_code", "expected_loader_calls"),
+    [
+        ({"operator_approved": False}, "operator_approval_missing", 0),
+        ({"confirm_token": None}, "confirm_token_missing", 0),
+        ({"confirm_token": "wrong"}, "confirm_token_invalid", 0),
+        ({"allow_telegram_read": False}, "telegram_read_not_allowed", 0),
+        ({"allow_database_write": False}, "database_write_not_allowed", 0),
+        ({"allow_source_message_write": False}, "source_message_write_not_allowed", 0),
+        ({"allow_source_version_write": False}, "source_version_write_not_allowed", 0),
+        ({"allow_source_outbox_write": False}, "source_outbox_write_not_allowed", 0),
+    ],
+)
+async def test_locator_input_cannot_bypass_existing_execute_gates(
+    locator_tmp_path: Path,
+    overrides: dict[str, Any],
+    reason_code: str,
+    expected_loader_calls: int,
+) -> None:
+    locator_path = _write_private_target_locator(
+        locator_tmp_path / f"sentinel-execute-gate-{reason_code}.json"
+    )
+    repository = FakeRepository()
+    history = FakeHistoryClient([_message()])
+    result, loader, builder, repository, history = await _run(
+        _locator_ingest_config(locator_path, mode="execute", **overrides),
+        repository=repository,
+        history=history,
+    )
+
+    assert result.ok is False
+    assert result.error_code == reason_code
+    assert loader.calls == expected_loader_calls
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert repository.upsert_calls == 0
+    assert repository.messages == {}
+    assert repository.versions == {}
+    assert repository.outbox == []
+    assert repository.cursor_updates == []
+    assert history.calls == []
+    assert history.exact_calls == []
 
 
 @pytest.mark.asyncio

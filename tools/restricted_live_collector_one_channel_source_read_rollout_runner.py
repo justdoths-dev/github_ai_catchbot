@@ -44,6 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
     parser.add_argument("--source-value", action="append", dest="source_values")
+    parser.add_argument("--target-locator-path", default=None)
+    parser.add_argument("--target-locator-output-path", default=None)
+    parser.add_argument("--allow-target-locator-write", action="store_true")
     parser.add_argument("--max-messages", type=int, default=None)
     output_group = parser.add_mutually_exclusive_group()
     output_group.add_argument("--emit-live-preflight-command", action="store_true")
@@ -55,6 +58,9 @@ def run(args: argparse.Namespace) -> RunnerResult:
     request = RestrictedLiveCollectorOneChannelSourceReadProofRequest(
         source_values=tuple(args.source_values or ()),
         requested_max_messages=args.max_messages,
+        target_locator_path=args.target_locator_path,
+        target_locator_output_path=args.target_locator_output_path,
+        allow_target_locator_write=bool(args.allow_target_locator_write),
     )
     if args.emit_live_search_preflight_command:
         builder = build_restricted_live_collector_github_url_search_preflight_packet

@@ -404,6 +404,9 @@ def test_parser_exposes_only_approved_bounded_flags() -> None:
         "--source-kind",
         "--source-value",
         "--target-message-id",
+        "--target-locator-path",
+        "--target-locator-output-path",
+        "--allow-target-locator-write",
         "--registry-id-suffix",
         "--max-targets",
         "--history-limit",
@@ -599,6 +602,199 @@ def test_search_mode_delegates_read_only_and_prints_search_specific_sanitized_js
         runner.SEARCH_CONFIRM_TOKEN,
     ):
         assert raw not in captured.out
+
+
+def test_search_private_locator_round_trips_into_actual_cli_plan_without_read_or_write(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    locator_path = tmp_path / "sentinel-private-target-locator.json"
+    search_runtime_builder = FakeRuntimeBuilder()
+    search_runtime_builder.history_client = FakeSearchHistoryClient()
+
+    try:
+        search_exit_code = runner.main(
+            [
+                "--mode",
+                "search",
+                "--operator-approved",
+                "--confirm-token",
+                runner.SEARCH_CONFIRM_TOKEN,
+                "--allow-runtime-config",
+                "--allow-database-read",
+                "--allow-telegram-read",
+                "--source-kind",
+                "public_username",
+                "--source-value",
+                "trendingrepo",
+                "--max-messages",
+                "30",
+                "--target-locator-output-path",
+                str(locator_path),
+                "--allow-target-locator-write",
+            ],
+            runtime_config_loader=_runtime_config,
+            runtime_builder=search_runtime_builder,
+        )
+        search_output = capsys.readouterr().out
+        search_report = json.loads(search_output)
+
+        assert search_exit_code == 0
+        assert search_report["target_locator_requested"] is True
+        assert search_report["target_locator_written"] is True
+        assert search_report["target_locator_schema_version"] == runner.TARGET_LOCATOR_SCHEMA_VERSION
+        assert search_report["target_locator_private_mode_confirmed"] is True
+        assert search_report["target_locator_consumption_supported"] is True
+        assert search_report["side_effects"]["database_write_attempted"] is False
+        assert search_report["side_effects"]["redis_publish_attempted"] is False
+        assert search_report["side_effects"]["provider_or_openai_called"] is False
+        assert search_report["side_effects"]["notifier_called"] is False
+        assert locator_path.is_file()
+        assert locator_path.stat().st_mode & 0o777 == 0o600
+        locator_content = locator_path.read_text(encoding="utf-8")
+        assert str(locator_path) not in search_output
+        assert locator_path.name not in search_output
+        assert locator_content not in search_output
+
+        plan_runtime_builder = FakeRuntimeBuilder()
+        plan_exit_code = runner.main(
+            [
+                "--mode",
+                "plan",
+                "--operator-approved",
+                "--allow-runtime-config",
+                "--allow-database-read",
+                "--source-kind",
+                "public_username",
+                "--target-locator-path",
+                str(locator_path),
+                "--history-limit",
+                "5",
+            ],
+            runtime_config_loader=_runtime_config,
+            runtime_builder=plan_runtime_builder,
+        )
+        plan_output = capsys.readouterr().out
+        plan_report = json.loads(plan_output)
+
+        assert plan_exit_code == 0
+        assert plan_report["mode"] == "plan"
+        assert plan_report["target_locator_present"] is True
+        assert plan_report["target_locator_consumption_supported"] is True
+        assert plan_report["target_message_fingerprint"].startswith("sha256:")
+        assert plan_runtime_builder.repository.registry_lookups == ["trendingrepo"]
+        assert plan_runtime_builder.history_client.calls == []
+        assert plan_runtime_builder.repository.messages == {}
+        assert plan_runtime_builder.repository.versions == {}
+        assert plan_runtime_builder.repository.outbox == []
+        assert plan_runtime_builder.repository.cursor_updates == []
+        assert plan_runtime_builder.commit_calls == 0
+        assert plan_runtime_builder.close_commits == [False]
+        assert plan_report["telegram_read_attempted"] is False
+        assert plan_report["database_write_attempted"] is False
+        assert plan_report["redis_publish_attempted"] is False
+        assert plan_report["authority"]["openai_attempted"] is False
+        assert plan_report["authority"]["github_attempted"] is False
+        assert plan_report["authority"]["x_attempted"] is False
+        assert plan_report["authority"]["web_attempted"] is False
+        assert plan_report["authority"]["redis_consume_or_ack"] is False
+        assert plan_report["side_effects"]["telegram_send_called"] is False
+        assert plan_report["side_effects"]["telegram_edit_called"] is False
+        assert plan_report["side_effects"]["openai_called"] is False
+        assert plan_report["side_effects"]["notification_table_write"] is False
+        for raw in (
+            str(locator_path),
+            locator_path.name,
+            locator_content,
+            "trendingrepo",
+            "123456",
+        ):
+            assert raw not in plan_output
+
+        ambiguity_exit_code = runner.main(
+            [
+                "--mode",
+                "plan",
+                "--operator-approved",
+                "--target-locator-path",
+                str(locator_path),
+                "--source-value",
+                "trendingrepo",
+            ],
+            runtime_config_loader=lambda: (_ for _ in ()).throw(
+                AssertionError("ambiguous target must fail before runtime config")
+            ),
+        )
+        ambiguity_report = json.loads(capsys.readouterr().out)
+        assert ambiguity_exit_code == 1
+        assert ambiguity_report["reason_code"] == "target_locator_direct_target_ambiguity"
+        assert ambiguity_report["runtime_config_attempted"] is False
+
+        execute_exit_code = runner.main(
+            [
+                "--mode",
+                "execute",
+                "--target-locator-path",
+                str(locator_path),
+            ],
+            runtime_config_loader=lambda: (_ for _ in ()).throw(
+                AssertionError("unapproved execute must fail before runtime config")
+            ),
+        )
+        execute_report = json.loads(capsys.readouterr().out)
+        assert execute_exit_code == 1
+        assert execute_report["reason_code"] == "operator_approval_missing"
+        assert execute_report["runtime_config_attempted"] is False
+        assert execute_report["telegram_read_attempted"] is False
+        assert execute_report["database_write_attempted"] is False
+
+        confirm_exit_code = runner.main(
+            [
+                "--mode",
+                "execute",
+                "--operator-approved",
+                "--target-locator-path",
+                str(locator_path),
+            ],
+            runtime_config_loader=lambda: (_ for _ in ()).throw(
+                AssertionError("unconfirmed execute must fail before runtime config")
+            ),
+        )
+        confirm_report = json.loads(capsys.readouterr().out)
+        assert confirm_exit_code == 1
+        assert confirm_report["reason_code"] == "confirm_token_missing"
+        assert confirm_report["runtime_config_attempted"] is False
+        assert confirm_report["telegram_read_attempted"] is False
+        assert confirm_report["database_write_attempted"] is False
+
+        write_gate_exit_code = runner.main(
+            [
+                "--mode",
+                "execute",
+                "--operator-approved",
+                "--confirm-token",
+                runner.EXECUTE_CONFIRM_TOKEN,
+                "--allow-runtime-config",
+                "--allow-database-read",
+                "--allow-telegram-read",
+                "--target-locator-path",
+                str(locator_path),
+            ],
+            runtime_config_loader=lambda: (_ for _ in ()).throw(
+                AssertionError("missing write authority must fail before runtime config")
+            ),
+        )
+        write_gate_report = json.loads(capsys.readouterr().out)
+        assert write_gate_exit_code == 1
+        assert write_gate_report["reason_code"] == "database_write_not_allowed"
+        assert write_gate_report["runtime_config_attempted"] is False
+        assert write_gate_report["telegram_read_attempted"] is False
+        assert write_gate_report["database_write_attempted"] is False
+    finally:
+        if locator_path.exists():
+            locator_path.unlink()
+
+    assert not locator_path.exists()
 
 
 def test_search_rejects_write_authority_before_runtime_config(capsys) -> None:

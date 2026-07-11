@@ -40,6 +40,7 @@ BOUNDED_RUNNER_PATH = "tools/bounded_collector_history_ingest_runner.py"
 ENV_OVERLAY_RUNNER_PATH = "tools/restricted_live_collector_one_channel_source_read_env_overlay_runner.py"
 PYTHON_EXECUTABLE_PLACEHOLDER = "venv/bin/python"
 SOURCE_VALUE_PLACEHOLDER = "<PUBLIC_USERNAME_SOURCE_VALUE>"
+TARGET_LOCATOR_PATH_PLACEHOLDER = "<PRIVATE_TARGET_LOCATOR_PATH>"
 RUNTIME_ENV_FILE_PLACEHOLDER = "<RUNTIME_ENV_FILE>"
 SEARCH_CONFIRM_TOKEN_PLACEHOLDER = "<SEARCH_CONFIRM_TOKEN>"
 
@@ -49,6 +50,9 @@ class RestrictedLiveCollectorOneChannelSourceReadProofRequest:
     source_value: str | None = None
     source_values: tuple[str, ...] = ()
     requested_max_messages: int | None = None
+    target_locator_path: str | None = None
+    target_locator_output_path: str | None = None
+    allow_target_locator_write: bool = False
 
 
 class _FakeTransaction:
@@ -285,6 +289,19 @@ class _FakeProofRuntimeBuilder:
 def build_restricted_live_collector_one_channel_source_read_rollout_packet(
     request: RestrictedLiveCollectorOneChannelSourceReadProofRequest,
 ) -> dict[str, Any]:
+    if (
+        request.target_locator_path is not None
+        or request.target_locator_output_path is not None
+        or request.allow_target_locator_write
+    ):
+        return _base_packet(
+            status="blocked",
+            reason_code="target_locator_preflight_only",
+            requested_max_messages=request.requested_max_messages,
+            target_count=0,
+            target_fingerprint=None,
+            target_locator_present=request.target_locator_path is not None,
+        )
     source_values = _request_source_values(request)
     normalized_source_values = tuple(
         value for value in (_normalize_source_value(value) for value in source_values) if value is not None
@@ -407,22 +424,39 @@ def build_restricted_live_collector_one_channel_source_read_preflight_packet(
     request: RestrictedLiveCollectorOneChannelSourceReadProofRequest,
 ) -> dict[str, Any]:
     source_values = _request_source_values(request)
-    normalized_source_values = tuple(
-        value for value in (_normalize_source_value(value) for value in source_values) if value is not None
+    target_locator_present = request.target_locator_path is not None
+    locator_error = _read_locator_request_error(request, source_values)
+    normalized_source_values = (
+        ()
+        if target_locator_present
+        else tuple(
+            value
+            for value in (_normalize_source_value(value) for value in source_values)
+            if value is not None
+        )
     )
-    target_error = _target_error(source_values, normalized_source_values)
+    target_error = locator_error or (
+        None
+        if target_locator_present
+        else _target_error(source_values, normalized_source_values)
+    )
     if target_error is not None:
         return _preflight_packet(
             status="blocked",
             reason_code=target_error,
             requested_max_messages=request.requested_max_messages,
-            target_count=len(source_values),
+            target_count=1 if target_locator_present else len(source_values),
             target_fingerprint=None,
             command_tokens=(),
+            target_locator_present=target_locator_present,
         )
 
     max_messages_error = _requested_max_messages_error(request.requested_max_messages)
-    target_fingerprint = _fingerprint("source_value", normalized_source_values[0])
+    target_fingerprint = (
+        None
+        if target_locator_present
+        else _fingerprint("source_value", normalized_source_values[0])
+    )
     if max_messages_error is not None:
         return _preflight_packet(
             status="blocked",
@@ -431,10 +465,14 @@ def build_restricted_live_collector_one_channel_source_read_preflight_packet(
             target_count=1,
             target_fingerprint=target_fingerprint,
             command_tokens=(),
+            target_locator_present=target_locator_present,
         )
 
     requested_max_messages = int(request.requested_max_messages)
-    command_tokens = _future_live_read_command_tokens(requested_max_messages=requested_max_messages)
+    command_tokens = _future_live_read_command_tokens(
+        requested_max_messages=requested_max_messages,
+        target_locator_present=target_locator_present,
+    )
     return _preflight_packet(
         status="pass",
         reason_code=PREFLIGHT_PASS_REASON_CODE,
@@ -442,6 +480,7 @@ def build_restricted_live_collector_one_channel_source_read_preflight_packet(
         target_count=1,
         target_fingerprint=target_fingerprint,
         command_tokens=command_tokens,
+        target_locator_present=target_locator_present,
     )
 
 
@@ -449,10 +488,16 @@ def build_restricted_live_collector_github_url_search_preflight_packet(
     request: RestrictedLiveCollectorOneChannelSourceReadProofRequest,
 ) -> dict[str, Any]:
     source_values = _request_source_values(request)
+    target_locator_requested = bool(
+        request.allow_target_locator_write or request.target_locator_output_path is not None
+    )
     normalized_source_values = tuple(
         value for value in (_normalize_source_value(value) for value in source_values) if value is not None
     )
-    target_error = _search_target_error(source_values, normalized_source_values)
+    target_error = _search_locator_request_error(request) or _search_target_error(
+        source_values,
+        normalized_source_values,
+    )
     target_fingerprint = (
         _fingerprint("source_value", normalized_source_values[0])
         if len(normalized_source_values) == 1
@@ -467,6 +512,7 @@ def build_restricted_live_collector_github_url_search_preflight_packet(
             target_fingerprint=target_fingerprint,
             operator_command_tokens=(),
             child_command_tokens=(),
+            target_locator_requested=target_locator_requested,
         )
 
     max_messages_error = _search_requested_max_messages_error(request.requested_max_messages)
@@ -479,6 +525,7 @@ def build_restricted_live_collector_github_url_search_preflight_packet(
             target_fingerprint=target_fingerprint,
             operator_command_tokens=(),
             child_command_tokens=(),
+            target_locator_requested=target_locator_requested,
         )
 
     requested_max_messages = int(request.requested_max_messages)
@@ -489,11 +536,14 @@ def build_restricted_live_collector_github_url_search_preflight_packet(
         target_count=1,
         target_fingerprint=target_fingerprint,
         operator_command_tokens=_future_live_search_command_tokens(
-            requested_max_messages=requested_max_messages
+            requested_max_messages=requested_max_messages,
+            target_locator_requested=target_locator_requested,
         ),
         child_command_tokens=_future_live_search_child_command_tokens(
-            requested_max_messages=requested_max_messages
+            requested_max_messages=requested_max_messages,
+            target_locator_requested=target_locator_requested,
         ),
+        target_locator_requested=target_locator_requested,
     )
 
 
@@ -527,6 +577,29 @@ def _request_source_values(request: RestrictedLiveCollectorOneChannelSourceReadP
         values.append(request.source_value)
     values.extend(request.source_values)
     return tuple(values)
+
+
+def _read_locator_request_error(
+    request: RestrictedLiveCollectorOneChannelSourceReadProofRequest,
+    source_values: Sequence[str | None],
+) -> str | None:
+    if request.allow_target_locator_write or request.target_locator_output_path is not None:
+        return "target_locator_write_search_mode_required"
+    if request.target_locator_path is not None and source_values:
+        return "target_locator_direct_target_ambiguity"
+    return None
+
+
+def _search_locator_request_error(
+    request: RestrictedLiveCollectorOneChannelSourceReadProofRequest,
+) -> str | None:
+    if request.target_locator_path is not None:
+        return "target_locator_input_not_allowed_in_search"
+    if request.target_locator_output_path is not None and not request.allow_target_locator_write:
+        return "target_locator_write_authority_missing"
+    if request.allow_target_locator_write and not str(request.target_locator_output_path or "").strip():
+        return "target_locator_output_path_required"
+    return None
 
 
 def _target_error(raw_values: Sequence[str | None], normalized_values: Sequence[str]) -> str | None:
@@ -586,6 +659,7 @@ def _base_packet(
     requested_max_messages: int | None,
     target_count: int,
     target_fingerprint: str | None,
+    target_locator_present: bool = False,
 ) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -608,6 +682,12 @@ def _base_packet(
             "unbounded_history_allowed": False,
             "exactly_one_history_request": True,
         },
+        "target_locator_present": target_locator_present,
+        "target_locator_consumption_supported": True,
+        "target_locator_path_omitted": True,
+        "target_locator_basename_omitted": True,
+        "target_locator_content_omitted": True,
+        "target_locator_raw_target_values_omitted": True,
         "planned_readiness_state": {
             "state": "planned_fake_backed_rollout_proof",
             "existing_collector_runner": RUNNER_NAME,
@@ -707,7 +787,16 @@ def _base_packet(
     }
 
 
-def _future_live_read_command_tokens(*, requested_max_messages: int) -> tuple[str, ...]:
+def _future_live_read_command_tokens(
+    *,
+    requested_max_messages: int,
+    target_locator_present: bool,
+) -> tuple[str, ...]:
+    target_tokens = (
+        ("--target-locator-path", TARGET_LOCATOR_PATH_PLACEHOLDER)
+        if target_locator_present
+        else ("--source-value", SOURCE_VALUE_PLACEHOLDER)
+    )
     return (
         PYTHON_EXECUTABLE_PLACEHOLDER,
         ENV_OVERLAY_RUNNER_PATH,
@@ -715,8 +804,7 @@ def _future_live_read_command_tokens(*, requested_max_messages: int) -> tuple[st
         "execute",
         "--runtime-env-file",
         RUNTIME_ENV_FILE_PLACEHOLDER,
-        "--source-value",
-        SOURCE_VALUE_PLACEHOLDER,
+        *target_tokens,
         "--max-messages",
         str(requested_max_messages),
         "--operator-approved",
@@ -725,7 +813,16 @@ def _future_live_read_command_tokens(*, requested_max_messages: int) -> tuple[st
     )
 
 
-def _future_live_read_child_command_tokens(*, requested_max_messages: int) -> tuple[str, ...]:
+def _future_live_read_child_command_tokens(
+    *,
+    requested_max_messages: int,
+    target_locator_present: bool,
+) -> tuple[str, ...]:
+    target_tokens = (
+        ("--target-locator-path", TARGET_LOCATOR_PATH_PLACEHOLDER)
+        if target_locator_present
+        else ("--source-value", SOURCE_VALUE_PLACEHOLDER)
+    )
     return (
         "sys.executable",
         BOUNDED_RUNNER_PATH,
@@ -741,8 +838,7 @@ def _future_live_read_child_command_tokens(*, requested_max_messages: int) -> tu
         "--allow-source-outbox-write",
         "--source-kind",
         SOURCE_KIND_PUBLIC_USERNAME,
-        "--source-value",
-        SOURCE_VALUE_PLACEHOLDER,
+        *target_tokens,
         "--max-messages",
         str(requested_max_messages),
         "--confirm-token",
@@ -750,7 +846,20 @@ def _future_live_read_child_command_tokens(*, requested_max_messages: int) -> tu
     )
 
 
-def _future_live_search_command_tokens(*, requested_max_messages: int) -> tuple[str, ...]:
+def _future_live_search_command_tokens(
+    *,
+    requested_max_messages: int,
+    target_locator_requested: bool,
+) -> tuple[str, ...]:
+    locator_tokens = (
+        (
+            "--target-locator-output-path",
+            TARGET_LOCATOR_PATH_PLACEHOLDER,
+            "--allow-target-locator-write",
+        )
+        if target_locator_requested
+        else ()
+    )
     return (
         PYTHON_EXECUTABLE_PLACEHOLDER,
         ENV_OVERLAY_RUNNER_PATH,
@@ -760,6 +869,7 @@ def _future_live_search_command_tokens(*, requested_max_messages: int) -> tuple[
         RUNTIME_ENV_FILE_PLACEHOLDER,
         "--source-value",
         SOURCE_VALUE_PLACEHOLDER,
+        *locator_tokens,
         "--max-messages",
         str(requested_max_messages),
         "--operator-approved",
@@ -768,7 +878,20 @@ def _future_live_search_command_tokens(*, requested_max_messages: int) -> tuple[
     )
 
 
-def _future_live_search_child_command_tokens(*, requested_max_messages: int) -> tuple[str, ...]:
+def _future_live_search_child_command_tokens(
+    *,
+    requested_max_messages: int,
+    target_locator_requested: bool,
+) -> tuple[str, ...]:
+    locator_tokens = (
+        (
+            "--target-locator-output-path",
+            TARGET_LOCATOR_PATH_PLACEHOLDER,
+            "--allow-target-locator-write",
+        )
+        if target_locator_requested
+        else ()
+    )
     return (
         "sys.executable",
         BOUNDED_RUNNER_PATH,
@@ -782,6 +905,7 @@ def _future_live_search_child_command_tokens(*, requested_max_messages: int) -> 
         SOURCE_KIND_PUBLIC_USERNAME,
         "--source-value",
         SOURCE_VALUE_PLACEHOLDER,
+        *locator_tokens,
         "--max-messages",
         str(requested_max_messages),
         "--confirm-token",
@@ -899,6 +1023,7 @@ def _preflight_packet(
     target_count: int,
     target_fingerprint: str | None,
     command_tokens: Sequence[str],
+    target_locator_present: bool = False,
 ) -> dict[str, Any]:
     packet = _base_packet(
         status=status,
@@ -906,9 +1031,13 @@ def _preflight_packet(
         requested_max_messages=requested_max_messages,
         target_count=target_count,
         target_fingerprint=target_fingerprint,
+        target_locator_present=target_locator_present,
     )
     child_command_tokens = (
-        _future_live_read_child_command_tokens(requested_max_messages=int(requested_max_messages))
+        _future_live_read_child_command_tokens(
+            requested_max_messages=int(requested_max_messages),
+            target_locator_present=target_locator_present,
+        )
         if status == "pass" and requested_max_messages is not None
         else ()
     )
@@ -951,6 +1080,7 @@ def _preflight_packet(
         "placeholders": {
             "runtime_env_file": RUNTIME_ENV_FILE_PLACEHOLDER,
             "source_value": SOURCE_VALUE_PLACEHOLDER,
+            "target_locator_path": TARGET_LOCATOR_PATH_PLACEHOLDER,
         },
         "exact_confirm_required": True,
         "confirm_token_label": "EXECUTE_CONFIRM_TOKEN",
@@ -1047,12 +1177,19 @@ def _preflight_packet(
         {
             "runtime_env_path_printed": False,
             "runtime_env_file_path_printed": False,
-            "command_uses_target_placeholder": SOURCE_VALUE_PLACEHOLDER in command_tokens,
+            "command_uses_target_placeholder": (
+                SOURCE_VALUE_PLACEHOLDER in command_tokens
+                or TARGET_LOCATOR_PATH_PLACEHOLDER in command_tokens
+            ),
             "command_uses_runtime_env_placeholder_only": True,
             "runtime_env_values_redacted": True,
             "actual_runtime_env_file_read_in_this_task": False,
             "confirm_token_is_repo_constant": status == "pass",
             "raw_source_value_printed": False,
+            "target_locator_path_printed": False,
+            "target_locator_basename_printed": False,
+            "target_locator_content_printed": False,
+            "target_locator_raw_target_values_printed": False,
         }
     )
     packet["completion_claims"].update(
@@ -1079,6 +1216,7 @@ def _search_preflight_packet(
     target_fingerprint: str | None,
     operator_command_tokens: Sequence[str],
     child_command_tokens: Sequence[str],
+    target_locator_requested: bool = False,
 ) -> dict[str, Any]:
     ready = status == "pass"
     forbidden_flags = (
@@ -1112,6 +1250,12 @@ def _search_preflight_packet(
             "history_request_maximum": 1,
             "unbounded_history_allowed": False,
         },
+        "target_locator_requested": target_locator_requested,
+        "target_locator_consumption_supported": True,
+        "target_locator_path_omitted": True,
+        "target_locator_basename_omitted": True,
+        "target_locator_content_omitted": True,
+        "target_locator_raw_target_values_omitted": True,
         "future_execution_command": {
             "wrapper_runner_path": ENV_OVERLAY_RUNNER_PATH,
             "child_runner_path": BOUNDED_RUNNER_PATH,
@@ -1121,6 +1265,7 @@ def _search_preflight_packet(
                 "runtime_env_file": RUNTIME_ENV_FILE_PLACEHOLDER,
                 "source_value": SOURCE_VALUE_PLACEHOLDER,
                 "confirm_token": SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
+                "target_locator_path": TARGET_LOCATOR_PATH_PLACEHOLDER,
             },
             "operator_approval_required": True,
             "confirm_token_required": True,
@@ -1182,6 +1327,10 @@ def _search_preflight_packet(
             "raw_url_printed": False,
             "raw_id_printed": False,
             "stderr_printed": False,
+            "target_locator_path_printed": False,
+            "target_locator_basename_printed": False,
+            "target_locator_content_printed": False,
+            "target_locator_raw_target_values_printed": False,
         },
         "completion_claims": {
             "BOUNDED_GITHUB_LIVE_SEARCH_PREFLIGHT_READY": ready,
@@ -1260,6 +1409,7 @@ __all__ = [
     "SEARCH_PREFLIGHT_PASS_REASON_CODE",
     "SEARCH_PREFLIGHT_SCHEMA_VERSION",
     "SOURCE_VALUE_PLACEHOLDER",
+    "TARGET_LOCATOR_PATH_PLACEHOLDER",
     "RestrictedLiveCollectorOneChannelSourceReadProofRequest",
     "build_restricted_live_collector_github_url_search_preflight_packet",
     "build_restricted_live_collector_one_channel_source_read_preflight_packet",
