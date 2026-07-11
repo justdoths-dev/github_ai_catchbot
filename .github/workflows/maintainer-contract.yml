@@ -1,0 +1,43 @@
+name: Maintainer Contract
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Optional exact base commit or ref for comparison.
+        required: false
+        type: string
+        default: HEAD^
+      head_ref:
+        description: Optional exact head commit or ref for comparison.
+        required: false
+        type: string
+        default: HEAD
+
+permissions:
+  contents: read
+
+jobs:
+  maintainer-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install declared test dependencies
+        run: python -m pip install --disable-pip-version-check -e ".[test]"
+      - name: Enforce maintainer contract
+        uses: justdoths-dev/crypto-memory-automation-oss@0230354268a921a46437b94fa80a3c781ff6f682
+        with:
+          contract: .cma/maintainer.toml
+          base-ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.base_ref }}
+          head-ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_ref }}
+          execute-validations: "true"
+          format: github
+          working-directory: .

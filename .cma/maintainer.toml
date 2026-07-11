@@ -1,0 +1,43 @@
+version = 1
+
+[scope]
+allowed_paths = [
+  ".cma/**",
+  ".codex/**",
+  ".github/workflows/**",
+  ".gitignore",
+  "AGENTS.md",
+  "alembic.ini",
+  "compose/**",
+  "docs/**",
+  "migrations/**",
+  "ops/**",
+  "pyproject.toml",
+  "scripts/**",
+  "src/**",
+  "tests/**",
+  "tools/**",
+]
+max_changed_files = 30
+fail_on_untracked_files = true
+
+[execution]
+default_mode = "plan"
+minimal_environment = true
+
+[[validation]]
+name = "compile"
+argv = ["python", "-m", "compileall", "src", "tests", "tools"]
+timeout_seconds = 180
+
+[[validation]]
+name = "bounded-unit-tests"
+argv = [
+  "python",
+  "-m",
+  "pytest",
+  "-q",
+  "tests/unit/services/collector_telegram/test_bounded_history_ingest_runner.py",
+  "tests/unit/tools/test_bounded_collector_history_ingest_runner.py",
+]
+timeout_seconds = 600
