@@ -3003,11 +3003,11 @@ def _write_target_locator(
         if error_code is not None and created_by_operation:
             if created_identity is None:
                 error_code = "target_locator_output_cleanup_unconfirmed"
-            elif not _remove_created_target_locator(
+            elif _remove_created_target_locator(
                 parent_fd,
                 target_name,
                 created_identity=created_identity,
-            ):
+            ) != "removed":
                 error_code = "target_locator_output_cleanup_failed"
         if fd is not None:
             try:
@@ -3015,14 +3015,18 @@ def _write_target_locator(
             except OSError:
                 if error_code is None:
                     error_code = "target_locator_output_close_failed"
-                    if not _created_fd_matches_identity(fd, created_identity):
+                    if created_identity is None:
                         error_code = "target_locator_output_cleanup_unconfirmed"
-                    elif not _remove_created_target_locator(
-                        parent_fd,
-                        target_name,
-                        created_identity=created_identity,
-                    ):
-                        error_code = "target_locator_output_cleanup_failed"
+                    else:
+                        cleanup_result = _remove_created_target_locator(
+                            parent_fd,
+                            target_name,
+                            created_identity=created_identity,
+                        )
+                        if cleanup_result == "unconfirmed":
+                            error_code = "target_locator_output_cleanup_unconfirmed"
+                        elif cleanup_result == "failed":
+                            error_code = "target_locator_output_cleanup_failed"
                 with contextlib.suppress(OSError):
                     os.close(fd)
         with contextlib.suppress(OSError):
@@ -3035,34 +3039,25 @@ def _remove_created_target_locator(
     target_name: str,
     *,
     created_identity: tuple[int, int],
-) -> bool:
+) -> str:
     try:
         current_stat = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return "missing"
     except OSError:
-        return False
-    if (
+        return "unconfirmed"
+    if not (
         stat.S_ISREG(current_stat.st_mode)
         and (current_stat.st_dev, current_stat.st_ino) == created_identity
     ):
-        try:
-            os.unlink(target_name, dir_fd=parent_fd)
-        except OSError:
-            return False
-        return True
-    return False
-
-
-def _created_fd_matches_identity(
-    fd: int,
-    created_identity: tuple[int, int] | None,
-) -> bool:
-    if created_identity is None:
-        return False
+        return "unconfirmed"
     try:
-        opened_stat = os.fstat(fd)
+        os.unlink(target_name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return "missing"
     except OSError:
-        return False
-    return (opened_stat.st_dev, opened_stat.st_ino) == created_identity
+        return "failed"
+    return "removed"
 
 
 def _created_target_locator_matches(

@@ -2376,6 +2376,162 @@ async def test_search_locator_short_write_removes_only_created_partial_file(
 
 
 @pytest.mark.asyncio
+async def test_search_locator_close_after_actual_close_removes_created_private_locator(
+    locator_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator_path = locator_tmp_path / "sentinel-close-after-close-locator-80a.json"
+    raw_url = "https://github.com/private-owner/private-repository"
+    expected_locator_content = (
+        json.dumps(
+            _target_locator_payload(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    original_close = os.close
+    locator_close_fds: list[int] = []
+
+    def close_after_actual_locator_close(fd: int) -> None:
+        try:
+            descriptor_stat = os.fstat(fd)
+            locator_stat = locator_path.stat()
+        except OSError:
+            original_close(fd)
+            return
+        if (
+            stat.S_ISREG(descriptor_stat.st_mode)
+            and (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            == (locator_stat.st_dev, locator_stat.st_ino)
+        ):
+            locator_close_fds.append(fd)
+            original_close(fd)
+            raise OSError(CLOSE_EXCEPTION_DETAIL)
+        original_close(fd)
+
+    monkeypatch.setattr(runner_module.os, "close", close_after_actual_locator_close)
+    result, _loader, _builder, _repository, _history = await _run(
+        _approved_search_config(
+            max_messages=1,
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        ),
+        repository=SearchWriteBombRepository(),
+        history=SearchHistoryClient([_search_message(raw_url)]),
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["reason_code"] == "target_locator_output_close_failed"
+    assert report["target_locator_written"] is False
+    assert report["side_effects"]["target_locator_write_attempted"] is True
+    assert len(locator_close_fds) == 1
+    assert not locator_path.exists()
+    for raw_value in (
+        str(locator_path),
+        locator_path.name,
+        expected_locator_content,
+        "trendingrepo",
+        str(RAW_MESSAGE_ID),
+        raw_url,
+    ):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_search_locator_close_failure_preserves_replacement_inode(
+    locator_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    locator_path = locator_tmp_path / "sentinel-close-replacement-locator-80b.json"
+    replacement_path = locator_tmp_path / "sentinel-close-replacement-source-80b.json"
+    replacement_content = b"sentinel replacement content must remain"
+    replacement_mode = 0o640
+    replacement_details: dict[str, object] = {}
+    created_locator_identity: tuple[int, int] | None = None
+    raw_url = "https://github.com/private-owner/private-repository"
+    expected_locator_content = (
+        json.dumps(
+            _target_locator_payload(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    original_close = os.close
+    locator_close_fds: list[int] = []
+
+    def close_and_replace_locator(fd: int) -> None:
+        nonlocal created_locator_identity
+        try:
+            descriptor_stat = os.fstat(fd)
+            locator_stat = locator_path.stat()
+        except OSError:
+            original_close(fd)
+            return
+        if (
+            stat.S_ISREG(descriptor_stat.st_mode)
+            and (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            == (locator_stat.st_dev, locator_stat.st_ino)
+        ):
+            locator_close_fds.append(fd)
+            created_locator_identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            original_close(fd)
+            replacement_path.write_bytes(replacement_content)
+            replacement_path.chmod(replacement_mode)
+            os.replace(replacement_path, locator_path)
+            replacement_stat = locator_path.stat()
+            replacement_details["identity"] = (
+                replacement_stat.st_dev,
+                replacement_stat.st_ino,
+            )
+            replacement_details["mode"] = stat.S_IMODE(replacement_stat.st_mode)
+            raise OSError(CLOSE_EXCEPTION_DETAIL)
+        original_close(fd)
+
+    monkeypatch.setattr(runner_module.os, "close", close_and_replace_locator)
+    result, _loader, _builder, _repository, _history = await _run(
+        _approved_search_config(
+            max_messages=1,
+            allow_target_locator_write=True,
+            target_locator_output_path=str(locator_path),
+        ),
+        repository=SearchWriteBombRepository(),
+        history=SearchHistoryClient([_search_message(raw_url)]),
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+    replacement_stat_after = locator_path.stat()
+
+    assert result.ok is False
+    assert report["reason_code"] == "target_locator_output_cleanup_unconfirmed"
+    assert report["target_locator_written"] is False
+    assert report["side_effects"]["target_locator_write_attempted"] is True
+    assert len(locator_close_fds) == 1
+    assert locator_path.exists()
+    assert created_locator_identity is not None
+    assert replacement_details["identity"] != created_locator_identity
+    assert (replacement_stat_after.st_dev, replacement_stat_after.st_ino) == replacement_details["identity"]
+    assert stat.S_IMODE(replacement_stat_after.st_mode) == replacement_details["mode"]
+    assert locator_path.read_bytes() == replacement_content
+    assert replacement_details["mode"] == replacement_mode
+    for raw_value in (
+        str(locator_path),
+        locator_path.name,
+        expected_locator_content,
+        replacement_content.decode("utf-8"),
+        "trendingrepo",
+        str(RAW_MESSAGE_ID),
+        raw_url,
+    ):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
 async def test_locator_input_rejects_relative_outside_traversal_and_missing_paths_before_runtime(
     locator_tmp_path: Path,
 ) -> None:
