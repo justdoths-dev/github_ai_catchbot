@@ -14,8 +14,10 @@ if str(REPO_ROOT) not in sys.path:
 from src.services.collector_telegram.bounded_history_ingest_runner import render_sanitized_json
 from src.services.collector_telegram.restricted_source_read_rollout import (
     RestrictedLiveCollectorOneChannelSourceReadProofRequest,
+    build_restricted_live_collector_github_url_search_preflight_packet,
     build_restricted_live_collector_one_channel_source_read_preflight_packet,
     build_restricted_live_collector_one_channel_source_read_rollout_packet,
+    restricted_live_collector_github_url_search_argument_error_report,
     restricted_live_collector_one_channel_source_read_argument_error_report,
 )
 
@@ -43,7 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source-value", action="append", dest="source_values")
     parser.add_argument("--max-messages", type=int, default=None)
-    parser.add_argument("--emit-live-preflight-command", action="store_true")
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument("--emit-live-preflight-command", action="store_true")
+    output_group.add_argument("--emit-live-search-preflight-command", action="store_true")
     return parser
 
 
@@ -52,23 +56,28 @@ def run(args: argparse.Namespace) -> RunnerResult:
         source_values=tuple(args.source_values or ()),
         requested_max_messages=args.max_messages,
     )
-    builder = (
-        build_restricted_live_collector_one_channel_source_read_preflight_packet
-        if args.emit_live_preflight_command
-        else build_restricted_live_collector_one_channel_source_read_rollout_packet
-    )
+    if args.emit_live_search_preflight_command:
+        builder = build_restricted_live_collector_github_url_search_preflight_packet
+    elif args.emit_live_preflight_command:
+        builder = build_restricted_live_collector_one_channel_source_read_preflight_packet
+    else:
+        builder = build_restricted_live_collector_one_channel_source_read_rollout_packet
     report = builder(request)
     return RunnerResult(exit_code=0 if report["status"] == "pass" else 1, report=report)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
     try:
-        args = build_parser().parse_args(argv)
+        args = build_parser().parse_args(effective_argv)
     except CliArgumentError as exc:
+        error_report = (
+            restricted_live_collector_github_url_search_argument_error_report(str(exc))
+            if "--emit-live-search-preflight-command" in effective_argv
+            else restricted_live_collector_one_channel_source_read_argument_error_report(str(exc))
+        )
         sys.stdout.write(
-            render_sanitized_json(
-                restricted_live_collector_one_channel_source_read_argument_error_report(str(exc))
-            )
+            render_sanitized_json(error_report)
         )
         return 1
     result = run(args)

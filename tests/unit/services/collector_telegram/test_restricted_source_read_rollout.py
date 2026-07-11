@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from src.services.collector_telegram.bounded_history_ingest_runner import SEARCH_CONFIRM_TOKEN
 from src.services.collector_telegram.restricted_source_read_rollout import (
     BOUNDED_RUNNER_PATH,
     COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS,
@@ -15,8 +16,12 @@ from src.services.collector_telegram.restricted_source_read_rollout import (
     PASS_REASON_CODE,
     PREFLIGHT_PASS_REASON_CODE,
     RUNTIME_ENV_FILE_PLACEHOLDER,
+    SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
+    SEARCH_PREFLIGHT_PASS_REASON_CODE,
+    SEARCH_PREFLIGHT_SCHEMA_VERSION,
     SOURCE_VALUE_PLACEHOLDER,
     RestrictedLiveCollectorOneChannelSourceReadProofRequest,
+    build_restricted_live_collector_github_url_search_preflight_packet,
     build_restricted_live_collector_one_channel_source_read_preflight_packet,
     build_restricted_live_collector_one_channel_source_read_rollout_packet,
 )
@@ -40,6 +45,17 @@ def _preflight_packet(**overrides):
     }
     values.update(overrides)
     return build_restricted_live_collector_one_channel_source_read_preflight_packet(
+        RestrictedLiveCollectorOneChannelSourceReadProofRequest(**values)
+    )
+
+
+def _search_preflight_packet(**overrides):
+    values = {
+        "source_value": "@trendingrepo",
+        "requested_max_messages": 30,
+    }
+    values.update(overrides)
+    return build_restricted_live_collector_github_url_search_preflight_packet(
         RestrictedLiveCollectorOneChannelSourceReadProofRequest(**values)
     )
 
@@ -431,3 +447,99 @@ def test_live_preflight_command_packet_requires_explicit_bounded_message_cap(
     assert report["completion_claims"]["F1_LIVE_ONE_CHANNEL_SOURCE_READ_PREFLIGHT_PACKET_READY"] is False
     assert report["completion_claims"]["F1_LIVE_ONE_CHANNEL_EXACT_COMMAND_PACKET_READY"] is False
     assert report["authority"]["live_telegram_read_attempted"] is False
+
+
+def test_search_preflight_reuses_wrapper_with_placeholder_only_read_authority() -> None:
+    report = _search_preflight_packet()
+    rendered = json.dumps(report, sort_keys=True)
+    command = report["future_execution_command"]
+    operator_tokens = command["operator_command_tokens"]
+    child_tokens = command["child_command_tokens"]
+
+    assert report["schema_version"] == SEARCH_PREFLIGHT_SCHEMA_VERSION
+    assert report["status"] == "pass"
+    assert report["reason_code"] == SEARCH_PREFLIGHT_PASS_REASON_CODE
+    assert report["mode"] == "search"
+    assert report["target_scope"]["target_count"] == 1
+    assert report["target_scope"]["target_fingerprint"].startswith("sha256:")
+    assert report["bounded_read"]["requested_max_messages"] == 30
+    assert report["bounded_read"]["history_request_maximum"] == 1
+    assert operator_tokens == [
+        "venv/bin/python",
+        ENV_OVERLAY_RUNNER_PATH,
+        "--mode",
+        "search",
+        "--runtime-env-file",
+        RUNTIME_ENV_FILE_PLACEHOLDER,
+        "--source-value",
+        SOURCE_VALUE_PLACEHOLDER,
+        "--max-messages",
+        "30",
+        "--operator-approved",
+        "--confirm-token",
+        SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
+    ]
+    assert child_tokens == [
+        "sys.executable",
+        BOUNDED_RUNNER_PATH,
+        "--mode",
+        "search",
+        "--operator-approved",
+        "--allow-runtime-config",
+        "--allow-database-read",
+        "--allow-telegram-read",
+        "--source-kind",
+        "public_username",
+        "--source-value",
+        SOURCE_VALUE_PLACEHOLDER,
+        "--max-messages",
+        "30",
+        "--confirm-token",
+        SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
+    ]
+    for forbidden in command["forbidden_flags_absent"]:
+        assert forbidden not in operator_tokens
+        assert forbidden not in child_tokens
+    assert command["database_write_disabled"] is True
+    assert command["source_truth_write_disabled"] is True
+    assert command["redis_disabled"] is True
+    assert command["provider_openai_notifier_disabled"] is True
+    assert command["confirm_token_value_printed"] is False
+    assert report["actual_attempted_operations"]["runtime_env_read_attempted"] is False
+    assert report["actual_attempted_operations"]["child_runner_invoked"] is False
+    assert report["completion_claims"]["BOUNDED_GITHUB_LIVE_SEARCH_PREFLIGHT_READY"] is True
+    assert SEARCH_CONFIRM_TOKEN not in rendered
+    assert "trendingrepo" not in rendered
+    assert "runtime.env" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason_code", "target_count"),
+    [
+        ({"source_value": None}, "search_requires_exactly_one_target", 0),
+        (
+            {"source_value": None, "source_values": ("alpha_tools", "beta_tools", "gamma_tools")},
+            "search_requires_exactly_one_target",
+            3,
+        ),
+        ({"requested_max_messages": None}, "search_max_messages_required", 1),
+        ({"requested_max_messages": 0}, "search_max_messages_out_of_bounds", 1),
+        ({"requested_max_messages": 31}, "search_max_messages_out_of_bounds", 1),
+    ],
+)
+def test_search_preflight_rejects_invalid_target_or_cap_without_command(
+    overrides: dict[str, object],
+    reason_code: str,
+    target_count: int,
+) -> None:
+    report = _search_preflight_packet(**overrides)
+
+    assert report["schema_version"] == SEARCH_PREFLIGHT_SCHEMA_VERSION
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == reason_code
+    assert report["target_scope"]["target_count"] == target_count
+    assert report["future_execution_command"]["operator_command_tokens"] == []
+    assert report["future_execution_command"]["child_command_tokens"] == []
+    assert report["actual_attempted_operations"]["runtime_env_read_attempted"] is False
+    assert report["actual_attempted_operations"]["child_runner_invoked"] is False
+    assert report["completion_claims"]["BOUNDED_GITHUB_LIVE_SEARCH_PREFLIGHT_READY"] is False

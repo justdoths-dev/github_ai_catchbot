@@ -23,8 +23,11 @@ from src.services.collector_telegram.bounded_history_ingest_runner import (
     HISTORY_READ_CAUSE_REQUEST_CONSTRUCTION_REPAIR,
     HISTORY_READ_CAUSE_RUNTIME_TDLIB_ACCESS_ISSUE,
     HISTORY_READ_CAUSE_TARGET_UNAVAILABLE,
+    SEARCH_CONFIRM_TOKEN,
     THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
     _TDLibBoundedHistoryClient,
+    _target_message_fingerprint,
+    build_default_bounded_history_search_runtime,
     run_bounded_telegram_collector_history_ingest,
 )
 from src.services.collector_telegram.config import CollectorTelegramConfig
@@ -317,6 +320,31 @@ class FakeRepository:
         )
 
 
+class SearchWriteBombRepository(FakeRepository):
+    def transaction(self) -> FakeTransaction:
+        raise AssertionError("search must not open a repository write transaction")
+
+    async def upsert_source_message(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        raise AssertionError("search must not upsert source messages")
+
+    async def append_source_message_version_if_changed(self, *args: Any, **kwargs: Any):
+        del args, kwargs
+        raise AssertionError("search must not append source versions")
+
+    async def insert_outbox_event(self, *args: Any, **kwargs: Any) -> bool:
+        del args, kwargs
+        raise AssertionError("search must not insert outbox events")
+
+    async def mark_outbox_published(self, *args: Any, **kwargs: Any) -> bool:
+        del args, kwargs
+        raise AssertionError("search must not mark outbox events published")
+
+    async def update_channel_sync_cursor(self, **kwargs: Any) -> None:
+        del kwargs
+        raise AssertionError("search must not update the channel cursor")
+
+
 class FakeHistoryClient:
     def __init__(
         self,
@@ -374,6 +402,35 @@ class FakeHistoryClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class SearchHistoryClient(FakeHistoryClient):
+    def __init__(self, messages: list[dict[str, Any]], **kwargs: Any) -> None:
+        super().__init__(messages, **kwargs)
+        self.search_calls: list[dict[str, int]] = []
+
+    async def fetch_newest_history_messages(
+        self,
+        *,
+        chat_id: int,
+        limit: int,
+        from_message_id: int = 0,
+        offset: int = 0,
+    ):
+        self.search_calls.append(
+            {
+                "chat_id": chat_id,
+                "limit": limit,
+                "from_message_id": from_message_id,
+                "offset": offset,
+            }
+        )
+        return await super().fetch_newest_history_messages(
+            chat_id=chat_id,
+            limit=limit,
+            from_message_id=from_message_id,
+            offset=offset,
+        )
 
 
 class FakeRedisPublisher:
@@ -556,6 +613,7 @@ class FakeDefaultHistoryClient:
         self.tdlib = tdlib
         self.state = state
         self.close_calls = 0
+        self.close_error: Exception | None = None
 
     async def fetch_newest_history_messages(self, *, chat_id: int, limit: int):
         del chat_id, limit
@@ -567,6 +625,8 @@ class FakeDefaultHistoryClient:
 
     async def close(self) -> None:
         self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class ImplicitTransaction:
@@ -907,6 +967,46 @@ def _approved_config(**overrides: Any) -> BoundedTelegramCollectorHistoryIngestC
     }
     values.update(overrides)
     return BoundedTelegramCollectorHistoryIngestConfig(**values)
+
+
+def _approved_search_config(**overrides: Any) -> BoundedTelegramCollectorHistoryIngestConfig:
+    values = {
+        "mode": "search",
+        "source_kind": "public_username",
+        "source_value": "trendingrepo",
+        "operator_approved": True,
+        "confirm_token": SEARCH_CONFIRM_TOKEN,
+        "allow_runtime_config": True,
+        "allow_database_read": True,
+        "allow_telegram_read": True,
+        "max_messages": 3,
+    }
+    values.update(overrides)
+    return BoundedTelegramCollectorHistoryIngestConfig(**values)
+
+
+def _search_message(
+    url: str,
+    *,
+    source_kind: str = "regex",
+    message_id: int = RAW_MESSAGE_ID,
+) -> dict[str, Any]:
+    message = _message(text="bounded search surface", message_id=message_id)
+    content = message["content"]
+    formatted_text = content["text"]
+    if source_kind == "entity":
+        formatted_text["entities"] = [
+            {
+                "offset": 0,
+                "length": 7,
+                "type": {"@type": "textEntityTypeTextUrl", "url": url},
+            }
+        ]
+    elif source_kind == "preview":
+        content["link_preview"] = {"url": url}
+    else:
+        formatted_text["text"] = f"bounded search surface {url}"
+    return message
 
 
 def _approved_three_channel_config(**overrides: Any) -> BoundedTelegramCollectorHistoryIngestConfig:
@@ -1360,6 +1460,429 @@ async def test_execute_requires_confirm_token_before_runtime_or_live_read() -> N
     assert history.calls == []
     assert report["telegram_read_attempted"] is False
     assert report["database_write_attempted"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("overrides", "reason_code"),
+    [
+        ({"operator_approved": False}, "operator_approval_missing"),
+        ({"confirm_token": None}, "search_confirm_token_missing"),
+        ({"confirm_token": "wrong"}, "search_confirm_token_invalid"),
+        ({"source_value": None}, "search_requires_exactly_one_target"),
+        ({"source_values": ("alpha_tools", "beta_tools")}, "search_requires_exactly_one_target"),
+        (
+            {"source_values": ("alpha_tools", "beta_tools", "gamma_tools")},
+            "search_requires_exactly_one_target",
+        ),
+        ({"max_messages": None}, "search_max_messages_required"),
+        ({"max_messages": 0}, "search_max_messages_out_of_bounds"),
+        ({"max_messages": 31}, "search_max_messages_out_of_bounds"),
+        ({"target_message_id": 1}, "search_target_message_id_not_allowed"),
+        ({"registry_id_suffix": "11111111"}, "search_registry_suffix_not_allowed"),
+        ({"max_targets": 1}, "search_max_targets_not_allowed"),
+        ({"allow_database_write": True}, "search_write_authority_not_allowed"),
+        ({"allow_source_message_write": True}, "search_write_authority_not_allowed"),
+        ({"allow_source_version_write": True}, "search_write_authority_not_allowed"),
+        ({"allow_source_outbox_write": True}, "search_write_authority_not_allowed"),
+        ({"allow_outbox_write": True}, "search_write_authority_not_allowed"),
+        ({"allow_source_outbox_publish": True}, "search_publish_authority_not_allowed"),
+        ({"allow_redis_publish": True}, "search_publish_authority_not_allowed"),
+        ({"allow_runtime_config": False}, "runtime_config_not_allowed"),
+        ({"allow_database_read": False}, "database_read_not_allowed"),
+        ({"allow_telegram_read": False}, "telegram_read_not_allowed"),
+    ],
+)
+async def test_search_gates_block_before_runtime_config_and_construction(
+    overrides: dict[str, Any],
+    reason_code: str,
+) -> None:
+    result, loader, builder, repository, history = await _run(
+        _approved_search_config(**overrides)
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["schema_version"] == "github_url_live_target_bounded_search_v1"
+    assert report["reason_code"] == reason_code
+    assert loader.calls == 0
+    assert builder.calls == 0
+    assert repository.registry_lookups == []
+    assert history.calls == []
+    assert report["telegram_read_attempted"] is False
+    assert report["side_effects"]["database_write_attempted"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_messages", [1, 30])
+async def test_search_accepts_explicit_one_and_thirty_message_bounds(max_messages: int) -> None:
+    history = SearchHistoryClient([_search_message("https://github.com/example/repo")])
+    result, loader, builder, _repository, _history = await _run(
+        _approved_search_config(max_messages=max_messages),
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is True
+    assert loader.calls == 1
+    assert builder.calls == 1
+    assert report["requested_max_messages"] == max_messages
+    assert history.search_calls == [
+        {
+            "chat_id": RAW_CHAT_ID,
+            "limit": max_messages,
+            "from_message_id": 0,
+            "offset": 0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_search_uses_one_exact_history_read_selects_later_match_and_never_writes() -> None:
+    non_match = _message(text="bounded non-match", message_id=RAW_MESSAGE_ID + 2)
+    matching = _search_message(
+        "https://www.github.com/example/repo",
+        message_id=RAW_MESSAGE_ID + 1,
+    )
+    history = SearchHistoryClient([non_match, matching])
+    repository = SearchWriteBombRepository()
+    result, _loader, builder, repository, _history = await _run(
+        _approved_search_config(max_messages=2),
+        repository=repository,
+        history=history,
+        commit_error=AssertionError("search must not commit"),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is True
+    assert report["status"] == "pass"
+    assert report["reason_code"] == "github_url_live_target_found"
+    assert report["messages_returned"] == 2
+    assert report["messages_examined"] == 2
+    assert report["history_request_count"] == 1
+    assert report["selected_message_fingerprint"] == _target_message_fingerprint(RAW_MESSAGE_ID + 1)
+    assert repository.registry_lookups == ["trendingrepo"]
+    assert history.search_calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 2, "from_message_id": 0, "offset": 0}
+    ]
+    assert history.exact_calls == []
+    assert repository.upsert_calls == 0
+    assert repository.messages == {}
+    assert repository.versions == {}
+    assert repository.outbox == []
+    assert repository.cursor_updates == []
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+    assert report["side_effects"]["history_ingest_processor_instantiated"] is False
+    assert report["side_effects"]["read_exact_message_called"] is False
+    assert report["side_effects"]["redis_publish_attempted"] is False
+    assert report["rollback_close_readback"] == {
+        "close_attempted": True,
+        "close_succeeded": True,
+        "rollback_requested": True,
+        "commit_requested": False,
+        "commit_called": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_selects_first_match_in_provider_order_and_counts_all_matches() -> None:
+    first = _search_message("https://gist.github.com/example/one", message_id=RAW_MESSAGE_ID + 2)
+    second = _search_message("https://docs.github.com/example/two", message_id=RAW_MESSAGE_ID + 1)
+    result, _loader, _builder, _repository, _history = await _run(
+        _approved_search_config(max_messages=2),
+        history=SearchHistoryClient([first, second]),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is True
+    assert report["github_matching_message_count"] == 2
+    assert report["selected_message_fingerprint"] == _target_message_fingerprint(RAW_MESSAGE_ID + 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("messages", "reason_code"),
+    [
+        ([], "github_url_live_search_history_empty"),
+        ([_message(text="no approved url")], "github_url_live_target_not_found_in_approved_window"),
+    ],
+)
+async def test_search_empty_and_not_found_are_bounded_blocked_results(
+    messages: list[dict[str, Any]],
+    reason_code: str,
+) -> None:
+    result, _loader, builder, repository, history = await _run(
+        _approved_search_config(),
+        history=SearchHistoryClient(messages),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == reason_code
+    assert report["history_request_count"] == 1
+    assert report["github_url_present"] is False
+    assert repository.upsert_calls == 0
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+    assert history.exact_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("url", "found"),
+    [
+        ("https://github.com/example/repo", True),
+        ("https://www.github.com/example/repo", True),
+        ("https://gist.github.com/example/repo", True),
+        ("https://docs.github.com/example/repo", True),
+        ("https://github.com.example.invalid/example/repo", False),
+        ("https://example-github.com/example/repo", False),
+        ("https://github.example/example/repo", False),
+    ],
+)
+async def test_search_matches_parsed_github_hostname_without_substring_spoofs(
+    url: str,
+    found: bool,
+) -> None:
+    result, _loader, _builder, _repository, _history = await _run(
+        _approved_search_config(max_messages=1),
+        history=SearchHistoryClient([_search_message(url)]),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is found
+    assert report["github_url_present"] is found
+    assert report["reason_code"] == (
+        "github_url_live_target_found"
+        if found
+        else "github_url_live_target_not_found_in_approved_window"
+    )
+
+
+@pytest.mark.asyncio
+async def test_search_reuses_entity_preview_regex_projection_and_omits_raw_surfaces() -> None:
+    entity_url = "https://github.com/private-entity/repository"
+    preview_url = "https://gist.github.com/private-preview/repository"
+    regex_url = "https://www.github.com/private-regex/repository"
+    message = _search_message(entity_url, source_kind="entity")
+    message["content"]["text"]["text"] = f"bounded {regex_url}"
+    message["content"]["link_preview"] = {"url": preview_url}
+    original = deepcopy(message)
+    result, _loader, builder, repository, _history = await _run(
+        _approved_search_config(max_messages=1),
+        history=SearchHistoryClient([message]),
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is True
+    assert message == original
+    assert report["messages_with_text_surface_count"] == 1
+    assert report["messages_with_entity_surface_count"] == 1
+    assert report["messages_with_url_surface_count"] == 1
+    assert report["messages_with_entity_url_source_count"] == 1
+    assert report["messages_with_preview_url_source_count"] == 1
+    assert report["messages_with_regex_url_source_count"] == 1
+    assert report["selected_match_source_buckets"] == {
+        "entity": True,
+        "preview": True,
+        "regex": True,
+    }
+    assert all(value is False for value in report["raw_values_printed"].values())
+    assert all(value is True for value in report["redactions_applied"].values())
+    assert repository.upsert_calls == 0
+    assert builder.commit_calls == 0
+    for raw_value in (
+        "trendingrepo",
+        str(RAW_CHAT_ID),
+        str(RAW_MESSAGE_ID),
+        entity_url,
+        preview_url,
+        regex_url,
+        DB_URL,
+        RAW_SECRET,
+        EXCEPTION_DETAIL,
+    ):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_search_fails_closed_when_provider_returns_more_than_requested() -> None:
+    history = SearchHistoryClient(
+        [
+            _search_message("https://github.com/example/one", message_id=RAW_MESSAGE_ID + 1),
+            _search_message("https://github.com/example/two", message_id=RAW_MESSAGE_ID),
+        ]
+    )
+    result, _loader, builder, repository, _history = await _run(
+        _approved_search_config(max_messages=1),
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["reason_code"] == "history_result_exceeds_requested_limit"
+    assert report["messages_returned"] == 2
+    assert report["messages_examined"] == 0
+    assert report["telegram_read_succeeded"] is True
+    assert repository.upsert_calls == 0
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+    assert len(history.search_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_non_target_channel_message_without_writes() -> None:
+    history = SearchHistoryClient(
+        [
+            _search_message(
+                "https://github.com/example/repo",
+                message_id=RAW_MESSAGE_ID,
+            )
+            | {"chat_id": RAW_CHAT_ID + 1}
+        ]
+    )
+    result, _loader, builder, repository, _history = await _run(
+        _approved_search_config(max_messages=1),
+        history=history,
+    )
+
+    assert result.ok is False
+    assert result.to_sanitized_dict()["reason_code"] == "non_target_channel_history_message"
+    assert repository.upsert_calls == 0
+    assert repository.cursor_updates == []
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+    assert len(history.search_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_search_rejects_redis_runtime_before_telegram_read_and_never_publishes() -> None:
+    publisher = FakeRedisPublisher()
+    history = SearchHistoryClient([_search_message("https://github.com/example/repo")])
+    result, _loader, builder, repository, _history = await _run(
+        _approved_search_config(max_messages=1),
+        history=history,
+        redis_publisher=publisher,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["reason_code"] == "search_redis_runtime_not_allowed"
+    assert history.search_calls == []
+    assert publisher.publish_calls == []
+    assert repository.registry_lookups == []
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+async def test_search_preserves_allowlisted_tdlib_failure_bucket_without_details() -> None:
+    failure = BoundedHistoryIngestError(
+        "telegram_history_read_failed",
+        history_read_failure_cause_bucket=HISTORY_READ_CAUSE_TARGET_UNAVAILABLE,
+    )
+    history = SearchHistoryClient([], failure_by_chat={RAW_CHAT_ID: failure})
+    result, _loader, builder, repository, _history = await _run(
+        _approved_search_config(max_messages=1),
+        history=history,
+    )
+    rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
+
+    assert result.ok is False
+    assert result.reason_code == "telegram_history_read_failed"
+    assert result.to_sanitized_dict()["safe_failure_bucket"] == HISTORY_READ_CAUSE_TARGET_UNAVAILABLE
+    assert repository.upsert_calls == 0
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+    assert EXCEPTION_DETAIL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_search_replaces_unapproved_internal_reason_text_before_rendering() -> None:
+    history = SearchHistoryClient(
+        [],
+        failure_by_chat={RAW_CHAT_ID: BoundedHistoryIngestError(EXCEPTION_DETAIL)},
+    )
+    result, _loader, _builder, _repository, _history = await _run(
+        _approved_search_config(max_messages=1),
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.reason_code == EXCEPTION_DETAIL
+    assert report["reason_code"] == "github_url_live_search_failed"
+    assert report["safe_failure_bucket"] is None
+    assert EXCEPTION_DETAIL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_default_search_runtime_never_constructs_redis_and_rolls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = FakeDefaultSession()
+    engine, history_clients = _install_default_runtime_fakes(monkeypatch, session)
+    state = BoundedTelegramCollectorHistoryIngestState()
+    handle = await build_default_bounded_history_search_runtime(
+        replace(_runtime_config(), redis_url="redis://private-runtime-value"),
+        state,
+        runner_module.logging.getLogger(__name__),
+    )
+
+    assert handle.redis_publisher is None
+    assert handle.commit is None
+    await handle.close(False)
+    assert session.commit_calls == 0
+    assert session.rollback_calls == 1
+    assert session.close_calls == 1
+    assert engine.dispose_calls == 1
+    assert history_clients[0].close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_default_search_runtime_propagates_cleanup_failure_after_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = FakeDefaultSession()
+    engine, history_clients = _install_default_runtime_fakes(monkeypatch, session)
+    handle = await build_default_bounded_history_search_runtime(
+        _runtime_config(),
+        BoundedTelegramCollectorHistoryIngestState(),
+        runner_module.logging.getLogger(__name__),
+    )
+    history_clients[0].close_error = RuntimeError(CLOSE_EXCEPTION_DETAIL)
+
+    with pytest.raises(RuntimeError, match=CLOSE_EXCEPTION_DETAIL):
+        await handle.close(False)
+
+    assert session.rollback_calls == 1
+    assert session.close_calls == 1
+    assert engine.dispose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_search_close_failure_overrides_pass_without_exposing_details() -> None:
+    result, _loader, builder, repository, _history = await _run(
+        _approved_search_config(max_messages=1),
+        repository=SearchWriteBombRepository(),
+        history=SearchHistoryClient([_search_message("https://github.com/example/repo")]),
+        close_error=RuntimeError(CLOSE_EXCEPTION_DETAIL),
+        commit_error=AssertionError("search must not commit"),
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["reason_code"] == "runtime_rollback_failed"
+    assert report["rollback_close_readback"]["close_attempted"] is True
+    assert report["rollback_close_readback"]["close_succeeded"] is False
+    assert repository.upsert_calls == 0
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+    assert CLOSE_EXCEPTION_DETAIL not in rendered
 
 
 @pytest.mark.asyncio
@@ -3204,6 +3727,38 @@ async def test_tdlib_history_response_invalid_and_timeout_remain_distinct() -> N
     assert timeout_exc.value.error_code == "telegram_history_read_timeout"
     assert timeout_exc.value.history_read_failure_cause_bucket is None
     assert timeout_state.telegram_read_called is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("history_messages", "reason_code"),
+    [
+        ([_message(), "invalid-extra"], "history_result_exceeds_requested_limit"),
+        (["invalid-only"], "telegram_history_response_invalid"),
+    ],
+)
+async def test_tdlib_history_client_fails_closed_before_filtering_provider_items(
+    history_messages: list[Any],
+    reason_code: str,
+) -> None:
+    state = BoundedTelegramCollectorHistoryIngestState()
+    transport = FakeTDLibTransport(
+        auth_payloads=[{"@type": "authorizationStateReady"}],
+        history_response={"@type": "messages", "messages": history_messages},
+    )
+    client = _TDLibBoundedHistoryClient(
+        TDLibClient(_runtime_config(), transport=transport),
+        state=state,
+        auth_ready_timeout_sec=0.1,
+    )
+
+    with pytest.raises(BoundedHistoryIngestError) as exc_info:
+        await client.fetch_newest_history_messages(chat_id=RAW_CHAT_ID, limit=1)
+
+    assert exc_info.value.error_code == reason_code
+    assert state.history_request_count == 1
+    assert state.telegram_read_called is True
+    assert state.telegram_read_succeeded is False
 
 
 @pytest.mark.asyncio

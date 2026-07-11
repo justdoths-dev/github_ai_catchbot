@@ -25,6 +25,12 @@ MAX_LIMIT = 50
 LOOKBACK_DAYS = 7
 RECOMMENDED_COUNT = 3
 MAX_MESSAGES_NEXT_STEP = 1
+SIGNAL_OBSERVATION_SOURCE = "postgresql_source_messages"
+SIGNAL_OBSERVATION_SCOPE = "persisted_source_messages_7d"
+SIGNAL_OBSERVATION_SCOPE_REASON_CODE = "persisted_source_messages_window_only"
+BOUNDED_LIVE_HISTORY_SEARCH_NEXT_STEP = (
+    "bounded_live_history_search_required_for_target_or_absence_proof"
+)
 
 _PUBLIC_USERNAME_RE = re.compile(r"^@?[A-Za-z0-9_]{5,32}$")
 _BAD_ACCESS_STATES = frozenset({"access_lost", "forbidden", "not_found", "left"})
@@ -109,6 +115,12 @@ class ChannelCandidate:
             "recent_signal_messages_7d": self.recent_signal_messages_7d,
             "signal_density_7d": density,
             "signal_buckets_7d": self.signal_buckets_7d.to_sanitized_dict(),
+            "signal_observation": {
+                "scope": SIGNAL_OBSERVATION_SCOPE,
+                "observed_message_count": self.recent_messages_7d,
+                "github_link_observed": self.signal_buckets_7d.github_link_seen,
+                "github_link_absence_proven": False,
+            },
             "recommended_bucket": self.recommended_bucket,
         }
 
@@ -128,10 +140,25 @@ class ChannelCandidateInventoryResult:
 
     def to_sanitized_dict(self) -> dict[str, Any]:
         selectable_count = sum(1 for candidate in self.candidates if candidate.selectable)
+        github_link_observed = any(
+            candidate.signal_buckets_7d.github_link_seen for candidate in self.candidates
+        )
+        operator_next_step = None
+        if self.candidates and not github_link_observed:
+            operator_next_step = BOUNDED_LIVE_HISTORY_SEARCH_NEXT_STEP
         return {
             "schema_version": SCHEMA_VERSION,
             "status": self.status,
             "reason_code": self.reason_code,
+            "signal_observation_scope": {
+                "source": SIGNAL_OBSERVATION_SOURCE,
+                "window_days": LOOKBACK_DAYS,
+                "live_telegram_history_examined": False,
+                "full_channel_history_examined": False,
+                "signal_absence_proven": False,
+                "scope_reason_code": SIGNAL_OBSERVATION_SCOPE_REASON_CODE,
+            },
+            "operator_next_step": operator_next_step,
             "authority": {
                 "database_read_allowed": self.config.allow_database_read,
                 "database_write_allowed": False,

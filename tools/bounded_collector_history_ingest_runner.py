@@ -12,16 +12,19 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.services.collector_telegram.bounded_history_ingest_runner import (
+    BoundedTelegramCollectorGitHubSearchResult,
     BoundedTelegramCollectorHistoryIngestConfig,
     BoundedTelegramCollectorHistoryIngestResult,
     BoundedTelegramCollectorHistoryIngestRuntimeBuilder,
     CollectorTelegramConfig,
     EXECUTE_CONFIRM_TOKEN,
     FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN,
+    SEARCH_CONFIRM_TOKEN,
     THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
     argument_error_report,
     render_sanitized_json,
     run_bounded_telegram_collector_history_ingest_sync,
+    search_argument_error_report,
 )
 
 
@@ -46,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run bounded Telegram collector history ingest for exact or capped full-registry targets.",
         add_help=False,
     )
-    parser.add_argument("--mode", choices=("plan", "execute"), default="plan")
+    parser.add_argument("--mode", choices=("plan", "execute", "search"), default="plan")
     parser.add_argument("--rollout-scope", default="exact-targets")
     parser.add_argument("--source-kind", default="public_username")
     parser.add_argument("--source-value", action="append", dest="source_values")
@@ -117,10 +120,16 @@ def main(
     runtime_config_loader=None,
     runtime_builder: BoundedTelegramCollectorHistoryIngestRuntimeBuilder | None = None,
 ) -> int:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
     try:
-        args = build_parser().parse_args(argv)
+        args = build_parser().parse_args(effective_argv)
     except CliArgumentError as exc:
-        sys.stdout.write(render_sanitized_json(argument_error_report(str(exc))))
+        error_report = (
+            search_argument_error_report(str(exc))
+            if _argv_requests_search(effective_argv)
+            else argument_error_report(str(exc))
+        )
+        sys.stdout.write(render_sanitized_json(error_report))
         return 1
     result = run(
         args,
@@ -131,7 +140,17 @@ def main(
     return result.exit_code
 
 
+def _argv_requests_search(argv: Sequence[str]) -> bool:
+    for index, token in enumerate(argv):
+        if token == "--mode" and index + 1 < len(argv):
+            return argv[index + 1].strip().lower() == "search"
+        if token.startswith("--mode="):
+            return token.partition("=")[2].strip().lower() == "search"
+    return False
+
+
 __all__ = [
+    "BoundedTelegramCollectorGitHubSearchResult",
     "BoundedTelegramCollectorHistoryIngestConfig",
     "BoundedTelegramCollectorHistoryIngestResult",
     "BoundedTelegramCollectorHistoryIngestRuntimeBuilder",
@@ -140,6 +159,7 @@ __all__ = [
     "EXECUTE_CONFIRM_TOKEN",
     "FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN",
     "RunnerResult",
+    "SEARCH_CONFIRM_TOKEN",
     "THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN",
     "build_parser",
     "main",

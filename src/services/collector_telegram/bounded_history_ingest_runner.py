@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import contextlib
 import hashlib
 import json
@@ -10,6 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -30,12 +32,15 @@ from .tdlib_client import TDJsonTransport, TDLibClient
 SCHEMA_VERSION = "live_collector_one_channel_source_last_rollout_v1"
 THREE_CHANNEL_SCHEMA_VERSION = "live_collector_three_channel_source_last_rollout_v1"
 FULL_REGISTRY_SCHEMA_VERSION = "live_collector_full_registry_source_last_rollout_v1"
+SEARCH_SCHEMA_VERSION = "github_url_live_target_bounded_search_v1"
 RUNNER_NAME = "bounded_collector_history_ingest_runner"
 MODE_PLAN = "plan"
 MODE_EXECUTE = "execute"
+MODE_SEARCH = "search"
 EXECUTE_CONFIRM_TOKEN = "LIVE_COLLECTOR_1_CHANNEL_SOURCE_LAST_EXECUTE"
 THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN = "LIVE_COLLECTOR_3_CHANNEL_SOURCE_LAST_EXECUTE"
 FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN = "LIVE_COLLECTOR_FULL_REGISTRY_SOURCE_LAST_EXECUTE"
+SEARCH_CONFIRM_TOKEN = "GITHUB_URL_LIVE_TARGET_BOUNDED_SEARCH"
 THREE_CHANNEL_TARGET_COUNT = 3
 MAX_FULL_REGISTRY_TARGETS = 30
 ROLLOUT_SCOPE_EXACT_TARGETS = "exact_targets"
@@ -102,6 +107,58 @@ _EXACT_MESSAGE_READ_FAILURE_CAUSE_BUCKETS = frozenset(
         EXACT_MESSAGE_READ_CAUSE_TDLIB_ERROR,
         EXACT_MESSAGE_READ_CAUSE_UNSUPPORTED_RESPONSE,
         EXACT_MESSAGE_READ_CAUSE_TIMEOUT,
+    }
+)
+_SEARCH_REASON_CODES = frozenset(
+    {
+        "github_url_live_target_found",
+        "github_url_live_target_not_found_in_approved_window",
+        "github_url_live_search_history_empty",
+        "github_url_live_search_projection_failed",
+        "github_url_live_search_failed",
+        "unsupported_cli_argument",
+        "operator_approval_missing",
+        "search_rollout_scope_not_allowed",
+        "search_requires_exactly_one_target",
+        "search_max_messages_required",
+        "search_max_messages_out_of_bounds",
+        "search_target_message_id_not_allowed",
+        "search_registry_suffix_not_allowed",
+        "search_max_targets_not_allowed",
+        "search_confirm_token_missing",
+        "search_confirm_token_invalid",
+        "search_write_authority_not_allowed",
+        "search_publish_authority_not_allowed",
+        "search_history_request_count_exceeded",
+        "search_redis_runtime_not_allowed",
+        "search_runtime_commit_not_allowed",
+        "source_kind_unsupported",
+        "direct_chat_id_target_not_allowed",
+        "direct_registry_id_target_not_allowed",
+        "direct_chat_or_registry_id_target_not_allowed",
+        "runtime_config_not_allowed",
+        "database_read_not_allowed",
+        "telegram_read_not_allowed",
+        "runtime_config_failed",
+        "registry_target_missing",
+        "registry_target_multiple",
+        "registry_id_invalid",
+        "registry_target_not_active",
+        "registry_target_not_joined",
+        "registry_target_chat_id_missing",
+        "registry_target_chat_id_invalid",
+        "tdlib_log_suppression_unconfirmed",
+        "tdlib_initialize_failed",
+        "tdlib_parameters_required",
+        "tdlib_not_authorized",
+        "tdlib_auth_state_invalid",
+        "tdlib_auth_ready_timeout",
+        "telegram_history_read_failed",
+        "telegram_history_response_invalid",
+        "telegram_history_read_timeout",
+        "history_result_exceeds_requested_limit",
+        "non_target_channel_history_message",
+        "runtime_rollback_failed",
     }
 )
 
@@ -248,6 +305,7 @@ class BoundedTelegramCollectorHistoryIngestState:
     registry_lookup_attempted: bool = False
     registry_targets_seen_count: int = 0
     history_window_attempts: int = 0
+    history_request_count: int = 0
     tdlib_auth_ready_checked: bool = False
     tdlib_auth_ready: bool = False
     tdlib_parameters_submitted: bool = False
@@ -255,6 +313,7 @@ class BoundedTelegramCollectorHistoryIngestState:
     tdlib_log_suppression_confirmed: bool = False
     telegram_read_attempted: bool = False
     telegram_read_called: bool = False
+    telegram_read_succeeded: bool = False
     exact_message_read_attempted: bool = False
     exact_message_read_succeeded: bool = False
     exact_message_read_failure_cause_bucket: str | None = None
@@ -265,6 +324,9 @@ class BoundedTelegramCollectorHistoryIngestState:
     source_outbox_publish_attempted: bool = False
     redis_publish_attempted: bool = False
     event_outbox_status_write_attempted: bool = False
+    runtime_close_attempted: bool = False
+    runtime_close_succeeded: bool = False
+    runtime_close_commit_requested: bool | None = None
 
     @property
     def database_write_attempted(self) -> bool:
@@ -583,6 +645,180 @@ class BoundedTelegramCollectorHistoryIngestResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BoundedTelegramCollectorGitHubSearchResult:
+    status: str
+    reason_code: str
+    config: BoundedTelegramCollectorHistoryIngestConfig
+    state: BoundedTelegramCollectorHistoryIngestState = field(default_factory=BoundedTelegramCollectorHistoryIngestState)
+    target_fingerprint: str | None = None
+    registry_target_fingerprint: str | None = None
+    selected_message_fingerprint: str | None = None
+    requested_max_messages: int | None = None
+    messages_returned: int = 0
+    messages_examined: int = 0
+    messages_with_text_surface_count: int = 0
+    messages_with_entity_surface_count: int = 0
+    messages_with_url_surface_count: int = 0
+    messages_with_entity_url_source_count: int = 0
+    messages_with_preview_url_source_count: int = 0
+    messages_with_regex_url_source_count: int = 0
+    github_matching_message_count: int = 0
+    selected_entity_match: bool = False
+    selected_preview_match: bool = False
+    selected_regex_match: bool = False
+    safe_failure_bucket: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "pass"
+
+    def to_sanitized_dict(self) -> dict[str, Any]:
+        write_authority_absent = not (
+            self.config.allow_database_write
+            or self.config.allow_source_message_write
+            or self.config.allow_source_version_write
+            or _source_outbox_write_allowed(self.config)
+        )
+        publish_authority_absent = not (
+            self.config.allow_source_outbox_publish or self.config.allow_redis_publish
+        )
+        raw_values_printed = {
+            "public_username": False,
+            "channel_title": False,
+            "chat_id": False,
+            "registry_id": False,
+            "message_id": False,
+            "source_text": False,
+            "caption_text": False,
+            "url": False,
+            "hostname": False,
+            "repo_owner_name": False,
+            "entities": False,
+            "tdlib_payload": False,
+            "message_link": False,
+            "runtime_env_path": False,
+            "runtime_value": False,
+            "database_url": False,
+            "redis_url": False,
+            "credential": False,
+            "confirm_token": False,
+            "exception_body": False,
+            "traceback": False,
+            "stderr": False,
+        }
+        return {
+            "schema_version": SEARCH_SCHEMA_VERSION,
+            "status": self.status,
+            "reason_code": _sanitize_search_reason_code(self.reason_code),
+            "mode": MODE_SEARCH,
+            "target_fingerprint": self.target_fingerprint,
+            "registry_target_fingerprint": self.registry_target_fingerprint,
+            "selected_message_fingerprint": self.selected_message_fingerprint,
+            "requested_max_messages": self.requested_max_messages,
+            "messages_returned": self.messages_returned,
+            "messages_examined": self.messages_examined,
+            "messages_with_text_surface_count": self.messages_with_text_surface_count,
+            "messages_with_entity_surface_count": self.messages_with_entity_surface_count,
+            "messages_with_url_surface_count": self.messages_with_url_surface_count,
+            "messages_with_entity_url_source_count": self.messages_with_entity_url_source_count,
+            "messages_with_preview_url_source_count": self.messages_with_preview_url_source_count,
+            "messages_with_regex_url_source_count": self.messages_with_regex_url_source_count,
+            "github_matching_message_count": self.github_matching_message_count,
+            "github_url_present": self.github_matching_message_count > 0,
+            "selected_match_source_buckets": {
+                "entity": self.selected_entity_match,
+                "preview": self.selected_preview_match,
+                "regex": self.selected_regex_match,
+            },
+            "history_request_count": self.state.history_request_count,
+            "telegram_read_attempted": self.state.telegram_read_attempted,
+            "telegram_read_called": self.state.telegram_read_called,
+            "telegram_read_succeeded": self.state.telegram_read_succeeded,
+            "tdlib": {
+                "auth_ready_checked": self.state.tdlib_auth_ready_checked,
+                "auth_ready": self.state.tdlib_auth_ready,
+                "parameters_submitted": self.state.tdlib_parameters_submitted,
+                "log_suppression_attempted": self.state.tdlib_log_suppression_attempted,
+                "log_suppression_confirmed": self.state.tdlib_log_suppression_confirmed,
+            },
+            "safe_failure_bucket": self.safe_failure_bucket
+            if self.safe_failure_bucket in _HISTORY_READ_FAILURE_CAUSE_BUCKETS
+            else None,
+            "gates": {
+                "operator_approved": self.config.operator_approved,
+                "confirm_token_present": bool((self.config.confirm_token or "").strip()),
+                "confirm_token_valid": _search_confirm_token_valid(self.config),
+                "runtime_config_allowed": self.config.allow_runtime_config,
+                "database_read_allowed": self.config.allow_database_read,
+                "telegram_read_allowed": self.config.allow_telegram_read,
+                "exact_single_public_username_required": True,
+                "max_messages_explicit": self.config.max_messages is not None,
+                "write_authority_absent": write_authority_absent,
+                "publish_authority_absent": publish_authority_absent,
+            },
+            "authority": {
+                "database_read_allowed": self.config.allow_database_read,
+                "telegram_read_allowed": self.config.allow_telegram_read,
+                "database_write_allowed": False,
+                "source_truth_write_allowed": False,
+                "cursor_write_allowed": False,
+                "redis_allowed": False,
+                "provider_calls_allowed": False,
+                "openai_allowed": False,
+                "notifier_allowed": False,
+            },
+            "side_effects": {
+                "database_write_attempted": self.state.database_write_attempted,
+                "source_message_write_attempted": self.state.source_message_write_attempted,
+                "source_version_write_attempted": self.state.source_version_write_attempted,
+                "source_outbox_write_attempted": self.state.source_outbox_write_attempted,
+                "channel_cursor_write_attempted": self.state.channel_cursor_write_attempted,
+                "source_outbox_publish_attempted": self.state.source_outbox_publish_attempted,
+                "redis_publish_attempted": self.state.redis_publish_attempted,
+                "history_ingest_processor_instantiated": False,
+                "read_exact_message_called": self.state.exact_message_read_attempted,
+                "provider_or_openai_called": False,
+                "telegram_send_or_edit_called": False,
+                "notifier_called": False,
+            },
+            "redactions_applied": {
+                "public_username_omitted": True,
+                "channel_title_omitted": True,
+                "full_chat_id_omitted": True,
+                "full_registry_id_omitted": True,
+                "full_message_id_omitted": True,
+                "raw_message_json_omitted": True,
+                "message_text_omitted": True,
+                "caption_text_omitted": True,
+                "raw_url_omitted": True,
+                "hostname_omitted": True,
+                "repo_owner_name_omitted": True,
+                "entities_json_omitted": True,
+                "url_surface_json_omitted": True,
+                "tdlib_payload_omitted": True,
+                "message_link_omitted": True,
+                "runtime_env_path_omitted": True,
+                "runtime_values_omitted": True,
+                "database_url_omitted": True,
+                "redis_url_omitted": True,
+                "telegram_credentials_omitted": True,
+                "confirm_token_omitted": True,
+                "exception_detail_omitted": True,
+                "traceback_omitted": True,
+                "stderr_omitted": True,
+            },
+            "raw_values_printed": raw_values_printed,
+            "rollback_close_readback": {
+                "close_attempted": self.state.runtime_close_attempted,
+                "close_succeeded": self.state.runtime_close_succeeded,
+                "rollback_requested": self.state.runtime_close_commit_requested is False,
+                "commit_requested": self.state.runtime_close_commit_requested is True,
+                "commit_called": False,
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class _ResolvedTarget:
     chat_id: int
     registry_id: str
@@ -677,6 +913,7 @@ class _TDLibBoundedHistoryClient:
         extra = f"{RUNNER_NAME}:{uuid4()}"
         payload["@extra"] = extra
         self._state.telegram_read_called = True
+        self._state.history_request_count += 1
         await self._tdlib.send(payload)
 
         deadline = time.monotonic() + self._timeout_sec
@@ -695,7 +932,12 @@ class _TDLibBoundedHistoryClient:
             messages = response.get("messages")
             if not isinstance(messages, list):
                 raise BoundedHistoryIngestError("telegram_history_response_invalid")
-            return tuple(message for message in messages if isinstance(message, Mapping))
+            if len(messages) > limit:
+                raise BoundedHistoryIngestError("history_result_exceeds_requested_limit")
+            if any(not isinstance(message, Mapping) for message in messages):
+                raise BoundedHistoryIngestError("telegram_history_response_invalid")
+            self._state.telegram_read_succeeded = True
+            return tuple(messages)
         raise BoundedHistoryIngestError("telegram_history_read_timeout")
 
     async def read_exact_message(self, *, chat_id: int, message_id: int) -> Mapping[str, Any] | None:
@@ -1133,13 +1375,259 @@ async def build_default_bounded_history_ingest_runtime(
     )
 
 
+async def build_default_bounded_history_search_runtime(
+    runtime_config: CollectorTelegramConfig,
+    state: BoundedTelegramCollectorHistoryIngestState,
+    logger: logging.Logger,
+) -> BoundedTelegramCollectorHistoryIngestRuntimeHandle:
+    runtime_config.ensure_runtime_dirs()
+    engine = create_async_engine(runtime_config.database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    session = session_factory()
+    repository = CollectorRepository(session, logger=logger)
+    tdlib = TDLibClient(runtime_config, transport=TDJsonTransport(), logger=logger)
+    history_client = _TDLibBoundedHistoryClient(tdlib, state=state)
+
+    async def rollback() -> None:
+        await session.rollback()
+
+    async def close(commit: bool) -> None:
+        if commit:
+            raise BoundedHistoryIngestError("search_runtime_commit_not_allowed")
+        rollback_error: Exception | None = None
+        cleanup_error: Exception | None = None
+        try:
+            await session.rollback()
+        except Exception as exc:
+            rollback_error = exc
+        for cleanup in (history_client.close, session.close, engine.dispose):
+            try:
+                await cleanup()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if rollback_error is not None:
+            raise rollback_error
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    return BoundedTelegramCollectorHistoryIngestRuntimeHandle(
+        repository=repository,
+        history_client=history_client,
+        redis_publisher=None,
+        close=close,
+        commit=None,
+        rollback=rollback,
+    )
+
+
+async def _run_bounded_telegram_collector_github_search(
+    config: BoundedTelegramCollectorHistoryIngestConfig,
+    *,
+    runtime_config_loader: RuntimeConfigLoader | None = None,
+    runtime_builder: BoundedTelegramCollectorHistoryIngestRuntimeBuilder | None = None,
+    logger: logging.Logger | None = None,
+) -> BoundedTelegramCollectorGitHubSearchResult:
+    state = BoundedTelegramCollectorHistoryIngestState()
+    effective_logger = logger or logging.getLogger(__name__)
+    normalized_source_value, source_error = _normalize_search_source_value(config)
+    requested_max_messages = _search_requested_max_messages(config.max_messages)
+    target_fingerprint = (
+        _input_target_fingerprint(normalized_source_value)
+        if normalized_source_value is not None
+        else None
+    )
+    registry_target_fingerprint: str | None = None
+    selected_message_fingerprint: str | None = None
+    messages_returned = 0
+    messages_examined = 0
+    messages_with_text_surface_count = 0
+    messages_with_entity_surface_count = 0
+    messages_with_url_surface_count = 0
+    messages_with_entity_url_source_count = 0
+    messages_with_preview_url_source_count = 0
+    messages_with_regex_url_source_count = 0
+    github_matching_message_count = 0
+    selected_source_kinds: set[str] = set()
+
+    def make_result(
+        status: str,
+        reason_code: str,
+        *,
+        safe_failure_bucket: str | None = None,
+    ) -> BoundedTelegramCollectorGitHubSearchResult:
+        return BoundedTelegramCollectorGitHubSearchResult(
+            status=status,
+            reason_code=reason_code,
+            config=config,
+            state=state,
+            target_fingerprint=target_fingerprint,
+            registry_target_fingerprint=registry_target_fingerprint,
+            selected_message_fingerprint=selected_message_fingerprint,
+            requested_max_messages=requested_max_messages,
+            messages_returned=messages_returned,
+            messages_examined=messages_examined,
+            messages_with_text_surface_count=messages_with_text_surface_count,
+            messages_with_entity_surface_count=messages_with_entity_surface_count,
+            messages_with_url_surface_count=messages_with_url_surface_count,
+            messages_with_entity_url_source_count=messages_with_entity_url_source_count,
+            messages_with_preview_url_source_count=messages_with_preview_url_source_count,
+            messages_with_regex_url_source_count=messages_with_regex_url_source_count,
+            github_matching_message_count=github_matching_message_count,
+            selected_entity_match="entity" in selected_source_kinds,
+            selected_preview_match="preview" in selected_source_kinds,
+            selected_regex_match="regex" in selected_source_kinds,
+            safe_failure_bucket=safe_failure_bucket,
+        )
+
+    gate_error = _search_authority_gate_error(
+        config,
+        normalized_source_value=normalized_source_value,
+        source_error=source_error,
+    )
+    if gate_error is not None:
+        return make_result("blocked", gate_error)
+
+    loader = runtime_config_loader or CollectorTelegramConfig.from_env
+    state.runtime_config_attempted = True
+    try:
+        runtime_config = loader()
+    except Exception:
+        return make_result("blocked", "runtime_config_failed")
+
+    builder = runtime_builder or build_default_bounded_history_search_runtime
+    state.runtime_builder_attempted = True
+    runtime: BoundedTelegramCollectorHistoryIngestRuntimeHandle | None = None
+    result: BoundedTelegramCollectorGitHubSearchResult | None = None
+    try:
+        runtime = await builder(runtime_config, state, effective_logger)
+        if runtime.redis_publisher is not None:
+            raise BoundedHistoryIngestError("search_redis_runtime_not_allowed")
+
+        assert normalized_source_value is not None
+        assert requested_max_messages is not None
+        targets = await _resolve_exact_public_username_targets(
+            config=config,
+            repository=runtime.repository,
+            state=state,
+            normalized_source_values=(normalized_source_value,),
+        )
+        target = targets[0]
+        registry_target_fingerprint = _target_fingerprint(target)
+
+        state.telegram_read_attempted = True
+        request_count_before = state.history_request_count
+        messages = await runtime.history_client.fetch_newest_history_messages(
+            chat_id=target.chat_id,
+            limit=requested_max_messages,
+            from_message_id=0,
+            offset=0,
+        )
+        if state.history_request_count == request_count_before:
+            state.history_request_count += 1
+            state.telegram_read_called = True
+        if state.history_request_count != request_count_before + 1:
+            raise BoundedHistoryIngestError("search_history_request_count_exceeded")
+        state.telegram_read_succeeded = True
+
+        returned_messages = tuple(messages)
+        messages_returned = len(returned_messages)
+        if messages_returned > requested_max_messages:
+            raise BoundedHistoryIngestError("history_result_exceeds_requested_limit")
+        if any(not isinstance(message, Mapping) for message in returned_messages):
+            raise BoundedHistoryIngestError("telegram_history_response_invalid")
+        selected_messages = tuple(dict(message) for message in returned_messages)
+        _validate_selected_history_messages_for_target(selected_messages, target)
+        if not selected_messages:
+            result = make_result("blocked", "github_url_live_search_history_empty")
+            raise _RunResultReady
+
+        projection_builder = MessageProjectionBuilder(logger=effective_logger)
+        for message in selected_messages:
+            try:
+                projection = projection_builder.build_source_projection(copy.deepcopy(message))
+            except Exception as exc:
+                raise BoundedHistoryIngestError("github_url_live_search_projection_failed") from exc
+
+            messages_examined += 1
+            messages_with_text_surface_count += int(bool(projection.text_surface))
+            messages_with_entity_surface_count += int(bool(projection.entities_json))
+            url_entries = tuple(
+                entry
+                for entry in (projection.url_surface_json or ())
+                if isinstance(entry, Mapping)
+            )
+            messages_with_url_surface_count += int(bool(url_entries))
+            source_kinds = {
+                str(entry.get("source_kind"))
+                for entry in url_entries
+                if entry.get("source_kind") in {"entity", "preview", "regex"}
+            }
+            messages_with_entity_url_source_count += int("entity" in source_kinds)
+            messages_with_preview_url_source_count += int("preview" in source_kinds)
+            messages_with_regex_url_source_count += int("regex" in source_kinds)
+
+            github_source_kinds = {
+                str(entry.get("source_kind"))
+                for entry in url_entries
+                if entry.get("source_kind") in {"entity", "preview", "regex"}
+                and _is_github_url(entry.get("observed_url"))
+            }
+            if not github_source_kinds:
+                continue
+            github_matching_message_count += 1
+            if selected_message_fingerprint is None:
+                selected_message_fingerprint = _target_message_fingerprint(projection.message_id)
+                selected_source_kinds = github_source_kinds
+
+        if selected_message_fingerprint is None:
+            result = make_result(
+                "blocked",
+                "github_url_live_target_not_found_in_approved_window",
+            )
+        else:
+            result = make_result("pass", "github_url_live_target_found")
+        raise _RunResultReady
+    except _RunResultReady:
+        pass
+    except BoundedHistoryIngestError as exc:
+        result = make_result(
+            "blocked",
+            exc.error_code,
+            safe_failure_bucket=exc.history_read_failure_cause_bucket,
+        )
+    except Exception:
+        result = make_result("blocked", "github_url_live_search_failed")
+    finally:
+        if runtime is not None:
+            state.runtime_close_attempted = True
+            state.runtime_close_commit_requested = False
+            try:
+                await runtime.close(False)
+                state.runtime_close_succeeded = True
+            except Exception:
+                state.runtime_close_succeeded = False
+                result = make_result("blocked", "runtime_rollback_failed")
+
+    assert result is not None
+    return result
+
+
 async def run_bounded_telegram_collector_history_ingest(
     config: BoundedTelegramCollectorHistoryIngestConfig,
     *,
     runtime_config_loader: RuntimeConfigLoader | None = None,
     runtime_builder: BoundedTelegramCollectorHistoryIngestRuntimeBuilder | None = None,
     logger: logging.Logger | None = None,
-) -> BoundedTelegramCollectorHistoryIngestResult:
+) -> BoundedTelegramCollectorHistoryIngestResult | BoundedTelegramCollectorGitHubSearchResult:
+    if _normalize_mode(config.mode) == MODE_SEARCH:
+        return await _run_bounded_telegram_collector_github_search(
+            config,
+            runtime_config_loader=runtime_config_loader,
+            runtime_builder=runtime_builder,
+            logger=logger,
+        )
+
     state = BoundedTelegramCollectorHistoryIngestState()
     effective_logger = logger or logging.getLogger(__name__)
     mode = _normalize_mode(config.mode)
@@ -1533,7 +2021,7 @@ def run_bounded_telegram_collector_history_ingest_sync(
     runtime_config_loader: RuntimeConfigLoader | None = None,
     runtime_builder: BoundedTelegramCollectorHistoryIngestRuntimeBuilder | None = None,
     logger: logging.Logger | None = None,
-) -> BoundedTelegramCollectorHistoryIngestResult:
+) -> BoundedTelegramCollectorHistoryIngestResult | BoundedTelegramCollectorGitHubSearchResult:
     return asyncio.run(
         run_bounded_telegram_collector_history_ingest(
             config,
@@ -1554,6 +2042,14 @@ def argument_error_report(error_code: str) -> dict[str, Any]:
         ok=False,
         error_code=error_code,
         config=BoundedTelegramCollectorHistoryIngestConfig(),
+    ).to_sanitized_dict()
+
+
+def search_argument_error_report(error_code: str) -> dict[str, Any]:
+    return BoundedTelegramCollectorGitHubSearchResult(
+        status="blocked",
+        reason_code=error_code,
+        config=BoundedTelegramCollectorHistoryIngestConfig(mode=MODE_SEARCH),
     ).to_sanitized_dict()
 
 
@@ -2193,6 +2689,84 @@ def _normalize_mode(value: str) -> str:
     return normalized
 
 
+def _normalize_search_source_value(
+    config: BoundedTelegramCollectorHistoryIngestConfig,
+) -> tuple[str | None, str | None]:
+    raw_values: Sequence[object | None]
+    if config.source_values:
+        raw_values = tuple(config.source_values)
+    elif config.source_value is not None:
+        raw_values = (config.source_value,)
+    else:
+        raw_values = ()
+    if len(raw_values) != 1:
+        return None, "search_requires_exactly_one_target"
+    normalized = _normalize_source_value(raw_values[0])
+    if normalized is None:
+        return None, "search_requires_exactly_one_target"
+    if _looks_like_direct_chat_id(normalized):
+        return normalized, "direct_chat_id_target_not_allowed"
+    if _looks_like_registry_id(normalized):
+        return normalized, "direct_registry_id_target_not_allowed"
+    return normalized, None
+
+
+def _search_requested_max_messages(value: object | None) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return None
+
+
+def _search_authority_gate_error(
+    config: BoundedTelegramCollectorHistoryIngestConfig,
+    *,
+    normalized_source_value: str | None,
+    source_error: str | None,
+) -> str | None:
+    if not config.operator_approved:
+        return "operator_approval_missing"
+    rollout_scope, rollout_scope_error = _normalize_rollout_scope(config.rollout_scope)
+    if rollout_scope_error is not None or rollout_scope != ROLLOUT_SCOPE_EXACT_TARGETS:
+        return "search_rollout_scope_not_allowed"
+    if config.source_kind != SOURCE_KIND_PUBLIC_USERNAME:
+        return "source_kind_unsupported"
+    if config.chat_id is not None or config.registry_id is not None:
+        return "direct_chat_or_registry_id_target_not_allowed"
+    if source_error is not None or normalized_source_value is None:
+        return source_error or "search_requires_exactly_one_target"
+    if config.max_messages is None:
+        return "search_max_messages_required"
+    requested_max_messages = _search_requested_max_messages(config.max_messages)
+    if requested_max_messages is None or not 1 <= requested_max_messages <= MAX_MESSAGES_HARD_LIMIT:
+        return "search_max_messages_out_of_bounds"
+    if config.target_message_id is not None:
+        return "search_target_message_id_not_allowed"
+    if config.registry_id_suffix is not None:
+        return "search_registry_suffix_not_allowed"
+    if config.max_targets is not None:
+        return "search_max_targets_not_allowed"
+    if not (config.confirm_token or "").strip():
+        return "search_confirm_token_missing"
+    if not _search_confirm_token_valid(config):
+        return "search_confirm_token_invalid"
+    if (
+        config.allow_database_write
+        or config.allow_source_message_write
+        or config.allow_source_version_write
+        or _source_outbox_write_allowed(config)
+    ):
+        return "search_write_authority_not_allowed"
+    if config.allow_source_outbox_publish or config.allow_redis_publish:
+        return "search_publish_authority_not_allowed"
+    if not config.allow_runtime_config:
+        return "runtime_config_not_allowed"
+    if not config.allow_database_read:
+        return "database_read_not_allowed"
+    if not config.allow_telegram_read:
+        return "telegram_read_not_allowed"
+    return None
+
+
 def _history_limit(config: BoundedTelegramCollectorHistoryIngestConfig) -> int:
     value = config.history_limit if config.max_messages is None else config.max_messages
     return int(value)
@@ -2281,6 +2855,8 @@ def _source_outbox_write_allowed(config: BoundedTelegramCollectorHistoryIngestCo
 
 
 def _confirm_token_valid(config: BoundedTelegramCollectorHistoryIngestConfig) -> bool:
+    if _normalize_mode(config.mode) == MODE_SEARCH:
+        return _search_confirm_token_valid(config)
     if _is_full_registry_rollout(config):
         expected = FULL_REGISTRY_EXECUTE_CONFIRM_TOKEN
     elif _is_three_channel_rollout(config):
@@ -2288,6 +2864,10 @@ def _confirm_token_valid(config: BoundedTelegramCollectorHistoryIngestConfig) ->
     else:
         expected = EXECUTE_CONFIRM_TOKEN
     return (config.confirm_token or "").strip() == expected
+
+
+def _search_confirm_token_valid(config: BoundedTelegramCollectorHistoryIngestConfig) -> bool:
+    return (config.confirm_token or "").strip() == SEARCH_CONFIRM_TOKEN
 
 
 def _is_three_channel_rollout(config: BoundedTelegramCollectorHistoryIngestConfig) -> bool:
@@ -2487,6 +3067,24 @@ def _target_fingerprint(target: _ResolvedTarget | None) -> str | None:
     return _fingerprint("registry_target", f"{target.registry_id}:{target.chat_id}")
 
 
+def _is_github_url(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"} or hostname is None:
+        return False
+    normalized_hostname = hostname.lower()
+    return normalized_hostname == "github.com" or normalized_hostname.endswith(".github.com")
+
+
+def _sanitize_search_reason_code(value: object) -> str:
+    return str(value) if value in _SEARCH_REASON_CODES else "github_url_live_search_failed"
+
+
 def _report_status(status: str, ok: bool) -> str:
     if ok:
         return "pass"
@@ -2605,6 +3203,7 @@ def _safe_exception_class(exc: BaseException) -> str:
 
 __all__ = [
     "BoundedHistoryIngestError",
+    "BoundedTelegramCollectorGitHubSearchResult",
     "BoundedTelegramCollectorHistoryIngestConfig",
     "BoundedTelegramCollectorHistoryIngestResult",
     "BoundedTelegramCollectorHistoryIngestRuntimeBuilder",
@@ -2618,8 +3217,11 @@ __all__ = [
     "MAX_HISTORY_LIMIT",
     "MAX_FULL_REGISTRY_TARGETS",
     "MAX_MESSAGES_HARD_LIMIT",
+    "MODE_SEARCH",
     "RUNNER_NAME",
     "SCHEMA_VERSION",
+    "SEARCH_CONFIRM_TOKEN",
+    "SEARCH_SCHEMA_VERSION",
     "THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN",
     "THREE_CHANNEL_SCHEMA_VERSION",
     "THREE_CHANNEL_TARGET_COUNT",
@@ -2627,7 +3229,9 @@ __all__ = [
     "ROLLOUT_SCOPE_FULL_TRACKED_REGISTRY",
     "argument_error_report",
     "build_default_bounded_history_ingest_runtime",
+    "build_default_bounded_history_search_runtime",
     "render_sanitized_json",
     "run_bounded_telegram_collector_history_ingest",
     "run_bounded_telegram_collector_history_ingest_sync",
+    "search_argument_error_report",
 ]

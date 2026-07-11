@@ -99,6 +99,15 @@ def test_inventory_passes_with_three_selectable_public_usernames_and_omits_raw_v
     assert report["schema_version"] == "channel_candidate_inventory_v1"
     assert report["status"] == "pass"
     assert report["reason_code"] == "channel_candidate_inventory_ready"
+    assert report["signal_observation_scope"] == {
+        "source": "postgresql_source_messages",
+        "window_days": 7,
+        "live_telegram_history_examined": False,
+        "full_channel_history_examined": False,
+        "signal_absence_proven": False,
+        "scope_reason_code": "persisted_source_messages_window_only",
+    }
+    assert report["operator_next_step"] is None
     assert report["selectable_candidate_count"] == 3
     assert report["authority"]["database_read_allowed"] is True
     assert report["authority"]["database_write_allowed"] is False
@@ -115,6 +124,16 @@ def test_inventory_passes_with_three_selectable_public_usernames_and_omits_raw_v
     assert parsed["candidates"][0]["public_username"].startswith("@")
     assert parsed["candidates"][0]["access_state"] == "joined_active"
     assert parsed["candidates"][0]["recent_messages_7d"] >= parsed["candidates"][0]["recent_signal_messages_7d"]
+    assert parsed["candidates"][0]["signal_observation"] == {
+        "scope": "persisted_source_messages_7d",
+        "observed_message_count": parsed["candidates"][0]["recent_messages_7d"],
+        "github_link_observed": parsed["candidates"][0]["signal_buckets_7d"]["github_link_seen"],
+        "github_link_absence_proven": False,
+    }
+    assert any(
+        candidate["signal_observation"]["github_link_observed"] is False
+        for candidate in parsed["candidates"]
+    )
     assert any(candidate["recommended_bucket"] == "good_f2_candidate" for candidate in parsed["candidates"])
     assert DB_URL_SENTINEL not in rendered
     assert RAW_CHAT_ID_SENTINEL not in rendered
@@ -144,6 +163,39 @@ def test_inventory_blocks_when_fewer_than_three_selectable_candidates() -> None:
     assert report["reason_code"] == "insufficient_selectable_channel_candidates"
     assert report["selectable_candidate_count"] == 1
     assert any(candidate["recommended_bucket"].startswith("avoid_") for candidate in report["candidates"])
+
+
+def test_inventory_projects_live_history_search_when_persisted_sample_has_no_github_signal() -> None:
+    repository = FakeRepository(
+        [
+            _row(source_value="firstchannel", recent_messages_7d=2, recent_signal_messages_7d=1),
+            _row(source_value="secondchannel", recent_messages_7d=1, recent_signal_messages_7d=1),
+            _row(source_value="thirdchannel", recent_messages_7d=3, recent_signal_messages_7d=1),
+        ]
+    )
+
+    result = run_channel_candidate_inventory_sync(
+        _approved_config(),
+        runtime_config_loader=_runtime_config_loader,
+        repository_builder=FakeRepositoryBuilder(repository),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["schema_version"] == "channel_candidate_inventory_v1"
+    assert report["status"] == "pass"
+    assert report["reason_code"] == "channel_candidate_inventory_ready"
+    assert report["operator_next_step"] == (
+        "bounded_live_history_search_required_for_target_or_absence_proof"
+    )
+    assert [
+        candidate["signal_observation"]["observed_message_count"]
+        for candidate in report["candidates"]
+    ] == [3, 2, 1]
+    assert all(
+        candidate["signal_observation"]["github_link_observed"] is False
+        and candidate["signal_observation"]["github_link_absence_proven"] is False
+        for candidate in report["candidates"]
+    )
 
 
 def test_authority_gates_block_before_runtime_env_or_database_read() -> None:
@@ -188,6 +240,7 @@ def test_authority_gates_block_before_runtime_env_or_database_read() -> None:
         assert result.ok is False
         assert report["reason_code"] == reason_code
         assert report["candidate_count"] == 0
+        assert report["operator_next_step"] is None
 
 
 def test_sql_repository_reads_registry_and_source_message_aggregates_without_selecting_raw_values() -> None:

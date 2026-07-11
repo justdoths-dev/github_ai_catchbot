@@ -19,6 +19,8 @@ if str(REPO_ROOT) not in sys.path:
 from src.services.collector_telegram.bounded_history_ingest_runner import (
     EXECUTE_CONFIRM_TOKEN,
     MAX_MESSAGES_HARD_LIMIT,
+    SEARCH_CONFIRM_TOKEN,
+    SEARCH_SCHEMA_VERSION,
     SOURCE_KIND_PUBLIC_USERNAME,
     THREE_CHANNEL_EXECUTE_CONFIRM_TOKEN,
     THREE_CHANNEL_TARGET_COUNT,
@@ -35,6 +37,8 @@ WRAPPER_RUNNER_PATH = "tools/restricted_live_collector_one_channel_source_read_e
 SOURCE_VALUE_PLACEHOLDER = "<PUBLIC_USERNAME_SOURCE_VALUE>"
 RUNTIME_ENV_FILE_PLACEHOLDER = "<RUNTIME_ENV_FILE>"
 SCHEMA_VERSION = "restricted_live_collector_one_channel_source_read_env_overlay_runner_v1"
+SEARCH_WRAPPER_SCHEMA_VERSION = "restricted_live_collector_github_url_search_env_overlay_runner_v1"
+SEARCH_CONFIRM_TOKEN_PLACEHOLDER = "<SEARCH_CONFIRM_TOKEN>"
 
 SubprocessRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -126,6 +130,182 @@ _SIDE_EFFECT_PROJECTION_KEYS = (
     "telegram_send_called",
     "telegram_edit_called",
 )
+_SEARCH_SELECTED_MATCH_SOURCE_KEYS = ("entity", "preview", "regex")
+_SEARCH_TDLIB_KEYS = (
+    "auth_ready_checked",
+    "auth_ready",
+    "parameters_submitted",
+    "log_suppression_attempted",
+    "log_suppression_confirmed",
+)
+_SEARCH_GATE_KEYS = (
+    "operator_approved",
+    "confirm_token_present",
+    "confirm_token_valid",
+    "runtime_config_allowed",
+    "database_read_allowed",
+    "telegram_read_allowed",
+    "exact_single_public_username_required",
+    "max_messages_explicit",
+    "write_authority_absent",
+    "publish_authority_absent",
+)
+_SEARCH_AUTHORITY_KEYS = (
+    "database_read_allowed",
+    "telegram_read_allowed",
+    "database_write_allowed",
+    "source_truth_write_allowed",
+    "cursor_write_allowed",
+    "redis_allowed",
+    "provider_calls_allowed",
+    "openai_allowed",
+    "notifier_allowed",
+)
+_SEARCH_SIDE_EFFECT_KEYS = (
+    "database_write_attempted",
+    "source_message_write_attempted",
+    "source_version_write_attempted",
+    "source_outbox_write_attempted",
+    "channel_cursor_write_attempted",
+    "source_outbox_publish_attempted",
+    "redis_publish_attempted",
+    "history_ingest_processor_instantiated",
+    "read_exact_message_called",
+    "provider_or_openai_called",
+    "telegram_send_or_edit_called",
+    "notifier_called",
+)
+_SEARCH_REDACTION_KEYS = (
+    "public_username_omitted",
+    "channel_title_omitted",
+    "full_chat_id_omitted",
+    "full_registry_id_omitted",
+    "full_message_id_omitted",
+    "raw_message_json_omitted",
+    "message_text_omitted",
+    "caption_text_omitted",
+    "raw_url_omitted",
+    "hostname_omitted",
+    "repo_owner_name_omitted",
+    "entities_json_omitted",
+    "url_surface_json_omitted",
+    "tdlib_payload_omitted",
+    "message_link_omitted",
+    "runtime_env_path_omitted",
+    "runtime_values_omitted",
+    "database_url_omitted",
+    "redis_url_omitted",
+    "telegram_credentials_omitted",
+    "confirm_token_omitted",
+    "exception_detail_omitted",
+    "traceback_omitted",
+    "stderr_omitted",
+)
+_SEARCH_RAW_VALUE_KEYS = (
+    "public_username",
+    "channel_title",
+    "chat_id",
+    "registry_id",
+    "message_id",
+    "source_text",
+    "caption_text",
+    "url",
+    "hostname",
+    "repo_owner_name",
+    "entities",
+    "tdlib_payload",
+    "message_link",
+    "runtime_env_path",
+    "runtime_value",
+    "database_url",
+    "redis_url",
+    "credential",
+    "confirm_token",
+    "exception_body",
+    "traceback",
+    "stderr",
+)
+_SEARCH_ROLLBACK_CLOSE_KEYS = (
+    "close_attempted",
+    "close_succeeded",
+    "rollback_requested",
+    "commit_requested",
+    "commit_called",
+)
+_SEARCH_COUNT_KEYS = (
+    "requested_max_messages",
+    "messages_returned",
+    "messages_examined",
+    "messages_with_text_surface_count",
+    "messages_with_entity_surface_count",
+    "messages_with_url_surface_count",
+    "messages_with_entity_url_source_count",
+    "messages_with_preview_url_source_count",
+    "messages_with_regex_url_source_count",
+    "github_matching_message_count",
+    "history_request_count",
+)
+_SEARCH_REASON_CODES = frozenset(
+    {
+        "operator_approval_missing",
+        "search_rollout_scope_not_allowed",
+        "source_kind_unsupported",
+        "direct_chat_or_registry_id_target_not_allowed",
+        "direct_chat_id_target_not_allowed",
+        "direct_registry_id_target_not_allowed",
+        "search_requires_exactly_one_target",
+        "search_max_messages_required",
+        "search_max_messages_out_of_bounds",
+        "search_target_message_id_not_allowed",
+        "search_registry_suffix_not_allowed",
+        "search_max_targets_not_allowed",
+        "search_confirm_token_missing",
+        "search_confirm_token_invalid",
+        "search_write_authority_not_allowed",
+        "search_publish_authority_not_allowed",
+        "runtime_config_not_allowed",
+        "database_read_not_allowed",
+        "telegram_read_not_allowed",
+        "runtime_config_failed",
+        "search_redis_runtime_not_allowed",
+        "search_runtime_commit_not_allowed",
+        "search_history_request_count_exceeded",
+        "tdlib_log_suppression_unconfirmed",
+        "tdlib_initialize_failed",
+        "tdlib_parameters_required",
+        "tdlib_not_authorized",
+        "tdlib_auth_state_invalid",
+        "tdlib_auth_ready_timeout",
+        "telegram_history_read_failed",
+        "telegram_history_response_invalid",
+        "telegram_history_read_timeout",
+        "github_url_live_search_history_empty",
+        "github_url_live_target_not_found_in_approved_window",
+        "github_url_live_target_found",
+        "history_result_exceeds_requested_limit",
+        "github_url_live_search_projection_failed",
+        "github_url_live_search_failed",
+        "runtime_rollback_failed",
+        "source_value_missing",
+        "registry_target_missing",
+        "registry_target_multiple",
+        "registry_id_invalid",
+        "registry_id_suffix_mismatch",
+        "registry_target_not_active",
+        "registry_target_not_joined",
+        "registry_target_chat_id_missing",
+        "registry_target_chat_id_invalid",
+        "non_target_channel_history_message",
+    }
+)
+_SEARCH_FAILURE_BUCKETS = frozenset(
+    {
+        "request_construction_repair",
+        "bounded_window_adjustment",
+        "runtime_tdlib_access_issue",
+        "target_unavailable",
+    }
+)
 
 
 class CliArgumentError(ValueError):
@@ -149,7 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Build a collector-only runtime env overlay before one-channel live source-read execution.",
         add_help=False,
     )
-    parser.add_argument("--mode", choices=("plan", "execute"), default="plan")
+    parser.add_argument("--mode", choices=("plan", "execute", "search"), default="plan")
     parser.add_argument("--runtime-env-file", default=None)
     parser.add_argument("--source-value", action="append", dest="source_values")
     parser.add_argument("--max-messages", type=int, default=None)
@@ -164,6 +344,9 @@ def run(
     subprocess_runner: SubprocessRunner | None = None,
 ) -> RunnerResult:
     mode = str(args.mode or "plan")
+    if mode == "search":
+        return _run_search(args, subprocess_runner=subprocess_runner)
+
     normalized_sources, target_error = _normalize_public_username_targets(tuple(args.source_values or ()))
     max_messages = args.max_messages
     max_messages_error = _max_messages_error(max_messages)
@@ -297,6 +480,120 @@ def run(
     return RunnerResult(exit_code=0 if child_returncode == 0 else 1, report=report)
 
 
+def _run_search(
+    args: argparse.Namespace,
+    *,
+    subprocess_runner: SubprocessRunner | None,
+) -> RunnerResult:
+    source_values = tuple(args.source_values or ())
+    max_messages = args.max_messages
+    normalized_source, target_error = _normalize_search_public_username_target(source_values)
+    target_fingerprint = _fingerprint("source_value", normalized_source)
+
+    def blocked(reason_code: str) -> RunnerResult:
+        return RunnerResult(
+            exit_code=1,
+            report=_base_search_report(
+                status="blocked",
+                reason_code=reason_code,
+                requested_max_messages=max_messages,
+                target_count=len(source_values),
+                target_fingerprint=target_fingerprint,
+            ),
+        )
+
+    if not bool(args.operator_approved):
+        return blocked("operator_approval_missing")
+    if target_error is not None:
+        return blocked(target_error)
+    max_messages_error = _search_max_messages_error(max_messages)
+    if max_messages_error is not None:
+        return blocked(max_messages_error)
+    confirm_token = str(args.confirm_token or "").strip()
+    if not confirm_token:
+        return blocked("search_confirm_token_missing")
+    if confirm_token != SEARCH_CONFIRM_TOKEN:
+        return blocked("search_confirm_token_invalid")
+    if not args.runtime_env_file:
+        return blocked("runtime_env_file_required")
+
+    assert normalized_source is not None
+    assert isinstance(max_messages, int)
+    overlay_result = build_collector_runtime_env_overlay(str(args.runtime_env_file))
+    if not overlay_result.ok:
+        return RunnerResult(
+            exit_code=1,
+            report=_base_search_report(
+                status="blocked",
+                reason_code=str(overlay_result.reason_code),
+                requested_max_messages=max_messages,
+                target_count=1,
+                target_fingerprint=target_fingerprint,
+                runtime_env_read_attempted=True,
+                overlay_report=overlay_result.to_sanitized_dict(),
+            ),
+        )
+
+    child_command = _search_child_command_tokens(
+        source_value=normalized_source,
+        max_messages=max_messages,
+    )
+    runner = subprocess_runner or subprocess.run
+    try:
+        completed = runner(
+            list(child_command),
+            cwd=str(REPO_ROOT),
+            env=dict(overlay_result.child_overlay),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except Exception:
+        report = _base_search_report(
+            status="failed",
+            reason_code="child_bounded_search_invocation_failed",
+            requested_max_messages=max_messages,
+            target_count=1,
+            target_fingerprint=target_fingerprint,
+            runtime_env_read_attempted=True,
+            overlay_report=overlay_result.to_sanitized_dict(),
+            redacted_child_command_tokens=_redacted_search_child_command_tokens(
+                max_messages=max_messages
+            ),
+        )
+        return RunnerResult(exit_code=1, report=report)
+    child_report = _parse_child_report(getattr(completed, "stdout", ""))
+    child_returncode = int(getattr(completed, "returncode", 1))
+    projection = _project_search_child_report(child_report)
+    if child_returncode == 0 and projection.get("status") == "pass":
+        status = "pass"
+        reason_code = "child_bounded_search_passed"
+    elif child_returncode != 0 and projection.get("status") == "blocked":
+        status = "blocked"
+        reason_code = "child_bounded_search_blocked"
+    else:
+        status = "failed"
+        reason_code = "child_bounded_search_failed"
+    report = _base_search_report(
+        status=status,
+        reason_code=reason_code,
+        requested_max_messages=max_messages,
+        target_count=1,
+        target_fingerprint=target_fingerprint,
+        runtime_env_read_attempted=True,
+        overlay_report=overlay_result.to_sanitized_dict(),
+        redacted_child_command_tokens=_redacted_search_child_command_tokens(max_messages=max_messages),
+        child_runner_invoked=True,
+        child_runner_returncode=child_returncode,
+        child_runner_report=child_report,
+    )
+    if status in {"pass", "blocked"} and report["search_contract_projection"]["reviewable"] is not True:
+        status = "failed"
+        report["status"] = status
+        report["reason_code"] = "child_bounded_search_contract_invalid"
+    return RunnerResult(exit_code=0 if status == "pass" else 1, report=report)
+
+
 def restricted_env_overlay_argument_error_report(error_code: str) -> dict[str, Any]:
     return _base_report(
         status="blocked",
@@ -307,19 +604,44 @@ def restricted_env_overlay_argument_error_report(error_code: str) -> dict[str, A
     )
 
 
+def restricted_search_env_overlay_argument_error_report(error_code: str) -> dict[str, Any]:
+    return _base_search_report(
+        status="blocked",
+        reason_code=error_code,
+        requested_max_messages=None,
+        target_count=0,
+        target_fingerprint=None,
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     subprocess_runner: SubprocessRunner | None = None,
 ) -> int:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
     try:
-        args = build_parser().parse_args(argv)
+        args = build_parser().parse_args(effective_argv)
     except CliArgumentError as exc:
-        sys.stdout.write(render_sanitized_json(restricted_env_overlay_argument_error_report(str(exc))))
+        error_report = (
+            restricted_search_env_overlay_argument_error_report(str(exc))
+            if _argv_requests_search(effective_argv)
+            else restricted_env_overlay_argument_error_report(str(exc))
+        )
+        sys.stdout.write(render_sanitized_json(error_report))
         return 1
     result = run(args, subprocess_runner=subprocess_runner)
     sys.stdout.write(render_sanitized_json(result.report))
     return result.exit_code
+
+
+def _argv_requests_search(argv: Sequence[str]) -> bool:
+    for index, token in enumerate(argv):
+        if token == "--mode" and index + 1 < len(argv):
+            return argv[index + 1].strip().lower() == "search"
+        if token.startswith("--mode="):
+            return token.partition("=")[2].strip().lower() == "search"
+    return False
 
 
 def _base_report(
@@ -502,6 +824,228 @@ def _base_report(
             "production_rollout_complete": False,
         },
     }
+
+
+def _base_search_report(
+    *,
+    status: str,
+    reason_code: str,
+    requested_max_messages: int | None,
+    target_count: int,
+    target_fingerprint: str | None,
+    runtime_env_read_attempted: bool = False,
+    overlay_report: Mapping[str, Any] | None = None,
+    redacted_child_command_tokens: Sequence[str] = (),
+    child_runner_invoked: bool = False,
+    child_runner_returncode: int | None = None,
+    child_runner_report: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    projection = _project_search_child_report(child_runner_report)
+    projected_side_effects = _mapping_child(projection, "side_effects")
+    projected_gates = _mapping_child(projection, "gates")
+    projected_authority = _mapping_child(projection, "authority")
+    projected_redactions = _mapping_child(projection, "redactions_applied")
+    projected_raw_values = _mapping_child(projection, "raw_values_printed")
+    projected_rollback_close = _mapping_child(projection, "rollback_close_readback")
+    history_request_count = projection.get("history_request_count")
+    projection_ready = (
+        projection.get("stdout_parsed_as_json") is True
+        and projection.get("schema_version") == SEARCH_SCHEMA_VERSION
+        and projection.get("mode") == "search"
+        and projection.get("status") in {"pass", "blocked"}
+        and projection.get("reason_code") is not None
+    )
+    terminal_read_reason_codes = {
+        "github_url_live_target_found",
+        "github_url_live_target_not_found_in_approved_window",
+        "github_url_live_search_history_empty",
+    }
+    terminal_read_contract_satisfied = (
+        projection.get("reason_code") not in terminal_read_reason_codes
+        or (
+            history_request_count == 1
+            and projection.get("telegram_read_attempted") is True
+            and projection.get("telegram_read_called") is True
+            and projection.get("telegram_read_succeeded") is True
+            and projected_rollback_close.get("close_attempted") is True
+            and projected_rollback_close.get("close_succeeded") is True
+            and projected_rollback_close.get("rollback_requested") is True
+            and projected_rollback_close.get("commit_requested") is False
+            and projected_rollback_close.get("commit_called") is False
+        )
+    )
+    gate_contract_satisfied = all(projected_gates.get(key) is True for key in _SEARCH_GATE_KEYS)
+    authority_contract_satisfied = (
+        projected_authority.get("database_read_allowed") is True
+        and projected_authority.get("telegram_read_allowed") is True
+        and all(
+            projected_authority.get(key) is False
+            for key in _SEARCH_AUTHORITY_KEYS
+            if key not in {"database_read_allowed", "telegram_read_allowed"}
+        )
+    )
+    search_contract_projection = {
+        "child_report_available": projection.get("stdout_parsed_as_json") is True,
+        "child_schema_valid": projection.get("schema_version") == SEARCH_SCHEMA_VERSION,
+        "child_mode_is_search": projection.get("mode") == "search",
+        "child_returncode_consistent": (
+            (child_runner_returncode == 0 and projection.get("status") == "pass")
+            or (child_runner_returncode not in {None, 0} and projection.get("status") == "blocked")
+        ),
+        "history_request_count_within_bound": (
+            isinstance(history_request_count, int)
+            and not isinstance(history_request_count, bool)
+            and 0 <= history_request_count <= 1
+        ),
+        "terminal_read_contract_satisfied": terminal_read_contract_satisfied,
+        "gate_contract_satisfied": gate_contract_satisfied,
+        "authority_contract_satisfied": authority_contract_satisfied,
+        "write_publish_side_effects_absent": all(
+            projected_side_effects.get(key) is False for key in _SEARCH_SIDE_EFFECT_KEYS
+        ),
+        "redactions_complete": all(projected_redactions.get(key) is True for key in _SEARCH_REDACTION_KEYS),
+        "raw_values_not_printed": all(projected_raw_values.get(key) is False for key in _SEARCH_RAW_VALUE_KEYS),
+    }
+    search_contract_projection["reviewable"] = projection_ready and all(search_contract_projection.values())
+    redaction_audit = {
+        "runtime_env_values_printed": False,
+        "runtime_env_file_contents_printed": False,
+        "runtime_env_file_path_printed": False,
+        "raw_source_value_printed": False,
+        "confirm_token_value_printed": False,
+        "child_stdout_printed": False,
+        "child_stderr_printed": False,
+    }
+    return {
+        "schema_version": SEARCH_WRAPPER_SCHEMA_VERSION,
+        "status": status,
+        "reason_code": reason_code,
+        "mode": "search",
+        "target_scope": {
+            "exact_single_public_username_required": True,
+            "target_count": target_count,
+            "target_fingerprint": target_fingerprint,
+            "raw_source_value_printed": False,
+            "direct_chat_id_allowed": False,
+            "direct_registry_id_allowed": False,
+            "broad_target_allowed": False,
+        },
+        "bounded_read": {
+            "requested_max_messages": requested_max_messages,
+            "hard_max_messages": MAX_MESSAGES_HARD_LIMIT,
+            "history_request_maximum": 1,
+            "unbounded_history_allowed": False,
+        },
+        "runtime_env_overlay": overlay_report
+        or {
+            "schema_version": "collector_runtime_env_overlay_v1",
+            "status": "not_attempted",
+            "reason_code": "runtime_env_overlay_not_attempted",
+            "source_runtime_env_allows_extra_keys": True,
+            "source_unknown_keys_ignored": True,
+            "source_forbidden_keys_ignored": True,
+            "child_overlay_only": True,
+            "child_overlay_allowed_keys": list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS),
+            "child_overlay_keys": [],
+            "child_overlay_rejects_unknown_keys": True,
+            "child_overlay_rejects_forbidden_keys": True,
+            "runtime_env_values_printed": False,
+            "runtime_env_file_contents_printed": False,
+            "runtime_env_file_path_printed": False,
+        },
+        "child_command": {
+            "uses_sys_executable_for_child": True,
+            "child_runner_path": CHILD_RUNNER_PATH,
+            "wrapper_runner_path": WRAPPER_RUNNER_PATH,
+            "command_tokens": list(redacted_child_command_tokens),
+            "redacted_command_tokens": True,
+            "source_value_placeholder": SOURCE_VALUE_PLACEHOLDER,
+            "confirm_token_placeholder": SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
+            "confirm_token_value_printed": False,
+            "forbidden_flags_absent": [
+                "--allow-database-write",
+                "--allow-source-message-write",
+                "--allow-source-version-write",
+                "--allow-source-outbox-write",
+                "--allow-source-outbox-publish",
+                "--allow-redis-publish",
+                "--target-message-id",
+                "--registry-id-suffix",
+                "--max-targets",
+            ],
+        },
+        "actual_attempted_operations": {
+            "runtime_env_read_attempted": runtime_env_read_attempted,
+            "child_runner_invoked": child_runner_invoked,
+            "child_runner_returncode": child_runner_returncode,
+            "live_telegram_read_attempted_by_wrapper": False,
+            "database_write_attempted_by_wrapper": False,
+            "redis_attempted_by_wrapper": False,
+            "provider_or_openai_attempted_by_wrapper": False,
+            "telegram_send_or_edit_attempted": False,
+        },
+        "child_report": {
+            "stdout_parsed_as_json": projection.get("stdout_parsed_as_json") is True,
+            "status": projection.get("status"),
+            "reason_code": projection.get("reason_code"),
+            "stdout_printed": False,
+            "stderr_printed": False,
+        },
+        "search_child_report_projection": projection,
+        "search_contract_projection": search_contract_projection,
+        "redaction_audit": redaction_audit,
+        "completion_claims": {
+            "BOUNDED_GITHUB_LIVE_SEARCH_PROJECTION_READY": projection_ready,
+            "BOUNDED_GITHUB_LIVE_SEARCH_REVIEWABLE": search_contract_projection["reviewable"],
+            "LIVE_COLLECTOR_1_CHANNEL_CLOSED": False,
+            "LIVE_COLLECTOR_3_CHANNEL_CLOSED": False,
+            "PRODUCTION_ROLLOUT_CLOSED": False,
+            "PRODUCT_COMPLETE_CLOSED": False,
+        },
+    }
+
+
+def _project_search_child_report(child_report: Mapping[str, Any] | None) -> dict[str, Any]:
+    parsed = child_report is not None
+    report = child_report if isinstance(child_report, Mapping) else {}
+    projection: dict[str, Any] = {
+        "stdout_parsed_as_json": parsed,
+        "schema_version": SEARCH_SCHEMA_VERSION if report.get("schema_version") == SEARCH_SCHEMA_VERSION else None,
+        "status": _safe_search_status(report.get("status")),
+        "reason_code": _safe_search_reason_code(report.get("reason_code")),
+        "mode": "search" if report.get("mode") == "search" else None,
+        "target_fingerprint": _safe_fingerprint(report.get("target_fingerprint")),
+        "registry_target_fingerprint": _safe_fingerprint(report.get("registry_target_fingerprint")),
+        "selected_message_fingerprint": _safe_fingerprint(report.get("selected_message_fingerprint")),
+        "github_url_present": _safe_bool(report.get("github_url_present")),
+        "selected_match_source_buckets": _project_bool_mapping(
+            _mapping_child(report, "selected_match_source_buckets"),
+            _SEARCH_SELECTED_MATCH_SOURCE_KEYS,
+        ),
+        "telegram_read_attempted": _safe_bool(report.get("telegram_read_attempted")),
+        "telegram_read_called": _safe_bool(report.get("telegram_read_called")),
+        "telegram_read_succeeded": _safe_bool(report.get("telegram_read_succeeded")),
+        "tdlib": _project_bool_mapping(_mapping_child(report, "tdlib"), _SEARCH_TDLIB_KEYS),
+        "safe_failure_bucket": _safe_search_failure_bucket(report.get("safe_failure_bucket")),
+        "gates": _project_bool_mapping(_mapping_child(report, "gates"), _SEARCH_GATE_KEYS),
+        "authority": _project_bool_mapping(_mapping_child(report, "authority"), _SEARCH_AUTHORITY_KEYS),
+        "side_effects": _project_bool_mapping(_mapping_child(report, "side_effects"), _SEARCH_SIDE_EFFECT_KEYS),
+        "redactions_applied": _project_bool_mapping(
+            _mapping_child(report, "redactions_applied"),
+            _SEARCH_REDACTION_KEYS,
+        ),
+        "raw_values_printed": _project_bool_mapping(
+            _mapping_child(report, "raw_values_printed"),
+            _SEARCH_RAW_VALUE_KEYS,
+        ),
+        "rollback_close_readback": _project_bool_mapping(
+            _mapping_child(report, "rollback_close_readback"),
+            _SEARCH_ROLLBACK_CLOSE_KEYS,
+        ),
+    }
+    for key in _SEARCH_COUNT_KEYS:
+        projection[key] = _safe_nonnegative_int(report.get(key))
+    return projection
 
 
 def _compact_child_report(child_runner_report: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -906,6 +1450,27 @@ def _child_command_tokens(*, source_values: Sequence[str], max_messages: int) ->
     )
 
 
+def _search_child_command_tokens(*, source_value: str, max_messages: int) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        CHILD_RUNNER_PATH,
+        "--mode",
+        "search",
+        "--operator-approved",
+        "--allow-runtime-config",
+        "--allow-database-read",
+        "--allow-telegram-read",
+        "--source-kind",
+        SOURCE_KIND_PUBLIC_USERNAME,
+        "--source-value",
+        source_value,
+        "--max-messages",
+        str(max_messages),
+        "--confirm-token",
+        SEARCH_CONFIRM_TOKEN,
+    )
+
+
 def _redacted_child_plan_command_tokens(*, target_count: int, max_messages: int) -> tuple[str, ...]:
     source_tokens: list[str] = []
     for _ in range(target_count):
@@ -955,6 +1520,48 @@ def _redacted_child_execute_command_tokens(*, target_count: int, max_messages: i
         "--confirm-token",
         confirm_token_placeholder,
     )
+
+
+def _redacted_search_child_command_tokens(*, max_messages: int) -> tuple[str, ...]:
+    return (
+        "sys.executable",
+        CHILD_RUNNER_PATH,
+        "--mode",
+        "search",
+        "--operator-approved",
+        "--allow-runtime-config",
+        "--allow-database-read",
+        "--allow-telegram-read",
+        "--source-kind",
+        SOURCE_KIND_PUBLIC_USERNAME,
+        "--source-value",
+        SOURCE_VALUE_PLACEHOLDER,
+        "--max-messages",
+        str(max_messages),
+        "--confirm-token",
+        SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
+    )
+
+
+def _normalize_search_public_username_target(
+    values: Sequence[object | None],
+) -> tuple[str | None, str | None]:
+    if len(values) != 1:
+        return None, "search_requires_exactly_one_target"
+    normalized, error = _normalize_public_username(values[0])
+    if normalized is None:
+        return None, "search_requires_exactly_one_target"
+    return normalized, error
+
+
+def _search_max_messages_error(value: object | None) -> str | None:
+    if value is None:
+        return "search_max_messages_required"
+    if not isinstance(value, int) or isinstance(value, bool):
+        return "search_max_messages_out_of_bounds"
+    if value < 1 or value > MAX_MESSAGES_HARD_LIMIT:
+        return "search_max_messages_out_of_bounds"
+    return None
 
 
 def _normalize_public_username_targets(values: Sequence[object | None]) -> tuple[tuple[str, ...], str | None]:
@@ -1134,6 +1741,24 @@ def _safe_report_string(value: object) -> str | None:
     return stripped
 
 
+def _safe_search_status(value: object) -> str | None:
+    if value in {"pass", "blocked"}:
+        return str(value)
+    return None
+
+
+def _safe_search_reason_code(value: object) -> str | None:
+    if isinstance(value, str) and value in _SEARCH_REASON_CODES:
+        return value
+    return None
+
+
+def _safe_search_failure_bucket(value: object) -> str | None:
+    if isinstance(value, str) and value in _SEARCH_FAILURE_BUCKETS:
+        return value
+    return None
+
+
 def _safe_fingerprint(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -1173,11 +1798,14 @@ __all__ = [
     "RUNTIME_ENV_FILE_PLACEHOLDER",
     "RunnerResult",
     "SCHEMA_VERSION",
+    "SEARCH_CONFIRM_TOKEN_PLACEHOLDER",
+    "SEARCH_WRAPPER_SCHEMA_VERSION",
     "SOURCE_VALUE_PLACEHOLDER",
     "WRAPPER_RUNNER_PATH",
     "build_parser",
     "main",
     "restricted_env_overlay_argument_error_report",
+    "restricted_search_env_overlay_argument_error_report",
     "run",
 ]
 

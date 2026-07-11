@@ -27,8 +27,10 @@ from .runtime_env_overlay import (
 
 SCHEMA_VERSION = "restricted_live_collector_one_channel_source_read_rollout_v1"
 PREFLIGHT_SCHEMA_VERSION = "restricted_live_collector_one_channel_source_read_preflight_v1"
+SEARCH_PREFLIGHT_SCHEMA_VERSION = "github_url_live_target_bounded_search_preflight_v1"
 PASS_REASON_CODE = "one_channel_source_read_rollout_proof_ready"
 PREFLIGHT_PASS_REASON_CODE = "one_channel_live_read_preflight_command_packet_ready"
+SEARCH_PREFLIGHT_PASS_REASON_CODE = "github_url_live_target_bounded_search_preflight_ready"
 SOURCE_KIND_PUBLIC_USERNAME = "public_username"
 FAKE_CHAT_ID = 9876543210123
 FAKE_MESSAGE_ID = 444555666
@@ -39,6 +41,7 @@ ENV_OVERLAY_RUNNER_PATH = "tools/restricted_live_collector_one_channel_source_re
 PYTHON_EXECUTABLE_PLACEHOLDER = "venv/bin/python"
 SOURCE_VALUE_PLACEHOLDER = "<PUBLIC_USERNAME_SOURCE_VALUE>"
 RUNTIME_ENV_FILE_PLACEHOLDER = "<RUNTIME_ENV_FILE>"
+SEARCH_CONFIRM_TOKEN_PLACEHOLDER = "<SEARCH_CONFIRM_TOKEN>"
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +445,58 @@ def build_restricted_live_collector_one_channel_source_read_preflight_packet(
     )
 
 
+def build_restricted_live_collector_github_url_search_preflight_packet(
+    request: RestrictedLiveCollectorOneChannelSourceReadProofRequest,
+) -> dict[str, Any]:
+    source_values = _request_source_values(request)
+    normalized_source_values = tuple(
+        value for value in (_normalize_source_value(value) for value in source_values) if value is not None
+    )
+    target_error = _search_target_error(source_values, normalized_source_values)
+    target_fingerprint = (
+        _fingerprint("source_value", normalized_source_values[0])
+        if len(normalized_source_values) == 1
+        else None
+    )
+    if target_error is not None:
+        return _search_preflight_packet(
+            status="blocked",
+            reason_code=target_error,
+            requested_max_messages=request.requested_max_messages,
+            target_count=len(source_values),
+            target_fingerprint=target_fingerprint,
+            operator_command_tokens=(),
+            child_command_tokens=(),
+        )
+
+    max_messages_error = _search_requested_max_messages_error(request.requested_max_messages)
+    if max_messages_error is not None:
+        return _search_preflight_packet(
+            status="blocked",
+            reason_code=max_messages_error,
+            requested_max_messages=request.requested_max_messages,
+            target_count=1,
+            target_fingerprint=target_fingerprint,
+            operator_command_tokens=(),
+            child_command_tokens=(),
+        )
+
+    requested_max_messages = int(request.requested_max_messages)
+    return _search_preflight_packet(
+        status="pass",
+        reason_code=SEARCH_PREFLIGHT_PASS_REASON_CODE,
+        requested_max_messages=requested_max_messages,
+        target_count=1,
+        target_fingerprint=target_fingerprint,
+        operator_command_tokens=_future_live_search_command_tokens(
+            requested_max_messages=requested_max_messages
+        ),
+        child_command_tokens=_future_live_search_child_command_tokens(
+            requested_max_messages=requested_max_messages
+        ),
+    )
+
+
 def restricted_live_collector_one_channel_source_read_argument_error_report(error_code: str) -> dict[str, Any]:
     return _base_packet(
         status="blocked",
@@ -449,6 +504,20 @@ def restricted_live_collector_one_channel_source_read_argument_error_report(erro
         requested_max_messages=None,
         target_count=0,
         target_fingerprint=None,
+    )
+
+
+def restricted_live_collector_github_url_search_argument_error_report(
+    error_code: str,
+) -> dict[str, Any]:
+    return _search_preflight_packet(
+        status="blocked",
+        reason_code=error_code,
+        requested_max_messages=None,
+        target_count=0,
+        target_fingerprint=None,
+        operator_command_tokens=(),
+        child_command_tokens=(),
     )
 
 
@@ -476,6 +545,20 @@ def _target_error(raw_values: Sequence[str | None], normalized_values: Sequence[
     return None
 
 
+def _search_target_error(raw_values: Sequence[str | None], normalized_values: Sequence[str]) -> str | None:
+    if len(raw_values) != 1 or len(normalized_values) != 1:
+        return "search_requires_exactly_one_target"
+    raw_value = raw_values[0]
+    normalized = normalized_values[0]
+    if _is_broad_target_value(raw_value, normalized):
+        return "broad_target_not_allowed"
+    if _looks_like_direct_chat_id(normalized):
+        return "direct_chat_id_target_not_allowed"
+    if _looks_like_registry_id(normalized):
+        return "direct_registry_id_target_not_allowed"
+    return None
+
+
 def _requested_max_messages_error(value: int | None) -> str | None:
     if value is None:
         return "requested_max_messages_required"
@@ -483,6 +566,16 @@ def _requested_max_messages_error(value: int | None) -> str | None:
         return "requested_max_messages_out_of_bounds"
     if value < 1 or value > MAX_MESSAGES_HARD_LIMIT:
         return "requested_max_messages_out_of_bounds"
+    return None
+
+
+def _search_requested_max_messages_error(value: int | None) -> str | None:
+    if value is None:
+        return "search_max_messages_required"
+    if not isinstance(value, int) or isinstance(value, bool):
+        return "search_max_messages_out_of_bounds"
+    if value < 1 or value > MAX_MESSAGES_HARD_LIMIT:
+        return "search_max_messages_out_of_bounds"
     return None
 
 
@@ -654,6 +747,45 @@ def _future_live_read_child_command_tokens(*, requested_max_messages: int) -> tu
         str(requested_max_messages),
         "--confirm-token",
         EXECUTE_CONFIRM_TOKEN,
+    )
+
+
+def _future_live_search_command_tokens(*, requested_max_messages: int) -> tuple[str, ...]:
+    return (
+        PYTHON_EXECUTABLE_PLACEHOLDER,
+        ENV_OVERLAY_RUNNER_PATH,
+        "--mode",
+        "search",
+        "--runtime-env-file",
+        RUNTIME_ENV_FILE_PLACEHOLDER,
+        "--source-value",
+        SOURCE_VALUE_PLACEHOLDER,
+        "--max-messages",
+        str(requested_max_messages),
+        "--operator-approved",
+        "--confirm-token",
+        SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
+    )
+
+
+def _future_live_search_child_command_tokens(*, requested_max_messages: int) -> tuple[str, ...]:
+    return (
+        "sys.executable",
+        BOUNDED_RUNNER_PATH,
+        "--mode",
+        "search",
+        "--operator-approved",
+        "--allow-runtime-config",
+        "--allow-database-read",
+        "--allow-telegram-read",
+        "--source-kind",
+        SOURCE_KIND_PUBLIC_USERNAME,
+        "--source-value",
+        SOURCE_VALUE_PLACEHOLDER,
+        "--max-messages",
+        str(requested_max_messages),
+        "--confirm-token",
+        SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
     )
 
 
@@ -938,6 +1070,130 @@ def _preflight_packet(
     return packet
 
 
+def _search_preflight_packet(
+    *,
+    status: str,
+    reason_code: str,
+    requested_max_messages: int | None,
+    target_count: int,
+    target_fingerprint: str | None,
+    operator_command_tokens: Sequence[str],
+    child_command_tokens: Sequence[str],
+) -> dict[str, Any]:
+    ready = status == "pass"
+    forbidden_flags = (
+        "--allow-database-write",
+        "--allow-source-message-write",
+        "--allow-source-version-write",
+        "--allow-source-outbox-write",
+        "--allow-source-outbox-publish",
+        "--allow-redis-publish",
+        "--target-message-id",
+        "--registry-id-suffix",
+        "--max-targets",
+    )
+    return {
+        "schema_version": SEARCH_PREFLIGHT_SCHEMA_VERSION,
+        "status": status,
+        "reason_code": reason_code,
+        "mode": "search",
+        "target_scope": {
+            "exact_single_public_username_required": True,
+            "target_count": target_count,
+            "target_fingerprint": target_fingerprint,
+            "broad_registry_scan_allowed": False,
+            "direct_chat_id_allowed": False,
+            "direct_registry_id_allowed": False,
+            "raw_source_value_printed": False,
+        },
+        "bounded_read": {
+            "requested_max_messages": requested_max_messages,
+            "hard_max_messages": MAX_MESSAGES_HARD_LIMIT,
+            "history_request_maximum": 1,
+            "unbounded_history_allowed": False,
+        },
+        "future_execution_command": {
+            "wrapper_runner_path": ENV_OVERLAY_RUNNER_PATH,
+            "child_runner_path": BOUNDED_RUNNER_PATH,
+            "operator_command_tokens": list(operator_command_tokens),
+            "child_command_tokens": list(child_command_tokens),
+            "placeholders": {
+                "runtime_env_file": RUNTIME_ENV_FILE_PLACEHOLDER,
+                "source_value": SOURCE_VALUE_PLACEHOLDER,
+                "confirm_token": SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
+            },
+            "operator_approval_required": True,
+            "confirm_token_required": True,
+            "confirm_token_value_printed": False,
+            "max_messages_required": True,
+            "database_read_enabled": ready,
+            "telegram_read_enabled": ready,
+            "database_write_disabled": True,
+            "source_truth_write_disabled": True,
+            "cursor_write_disabled": True,
+            "redis_disabled": True,
+            "provider_openai_notifier_disabled": True,
+            "raw_output_disabled": True,
+            "forbidden_flags_absent": list(forbidden_flags),
+        },
+        "runtime_env": {
+            "required": True,
+            "loader": "collector_runtime_env_overlay.build_collector_runtime_env_overlay",
+            "wrapper_runner_path": ENV_OVERLAY_RUNNER_PATH,
+            "child_runner_path": BOUNDED_RUNNER_PATH,
+            "child_overlay_only": ready,
+            "child_overlay_allowed_keys": list(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS),
+            "source_unknown_keys_ignored": ready,
+            "source_forbidden_keys_ignored": ready,
+            "runtime_env_loaded": False,
+            "runtime_env_file_path_printed": False,
+            "runtime_env_values_printed": False,
+            "runtime_env_file_contents_printed": False,
+        },
+        "authority": {
+            "database_read_planned": ready,
+            "telegram_read_planned": ready,
+            "database_write_planned": False,
+            "source_truth_write_planned": False,
+            "cursor_write_planned": False,
+            "redis_planned": False,
+            "provider_or_openai_planned": False,
+            "notifier_planned": False,
+        },
+        "actual_attempted_operations": {
+            "runtime_env_read_attempted": False,
+            "child_runner_invoked": False,
+            "database_read_attempted": False,
+            "telegram_read_attempted": False,
+            "database_write_attempted": False,
+            "source_truth_write_attempted": False,
+            "cursor_write_attempted": False,
+            "redis_attempted": False,
+            "provider_or_openai_attempted": False,
+            "notifier_attempted": False,
+        },
+        "redaction_audit": {
+            "fingerprints_only": True,
+            "raw_source_value_printed": False,
+            "runtime_env_path_printed": False,
+            "runtime_env_values_printed": False,
+            "confirm_token_value_printed": False,
+            "raw_message_text_printed": False,
+            "raw_url_printed": False,
+            "raw_id_printed": False,
+            "stderr_printed": False,
+        },
+        "completion_claims": {
+            "BOUNDED_GITHUB_LIVE_SEARCH_PREFLIGHT_READY": ready,
+            "LIVE_TELEGRAM_READ_AUTHORITY_REMAINS_CLOSED_IN_THIS_TASK": True,
+            "LIVE_COLLECTOR_1_CHANNEL_CLOSED": False,
+            "LIVE_COLLECTOR_3_CHANNEL_CLOSED": False,
+            "PRODUCTION_ROLLOUT_CLOSED": False,
+            "PRODUCT_COMPLETE_CLOSED": False,
+        },
+    }
+
+
 def _fake_runtime_config() -> CollectorTelegramConfig:
     return CollectorTelegramConfig(
         app_env=CollectorEnvironment.TEST,
@@ -1000,9 +1256,14 @@ __all__ = [
     "PREFLIGHT_SCHEMA_VERSION",
     "RUNTIME_ENV_FILE_PLACEHOLDER",
     "SCHEMA_VERSION",
+    "SEARCH_CONFIRM_TOKEN_PLACEHOLDER",
+    "SEARCH_PREFLIGHT_PASS_REASON_CODE",
+    "SEARCH_PREFLIGHT_SCHEMA_VERSION",
     "SOURCE_VALUE_PLACEHOLDER",
     "RestrictedLiveCollectorOneChannelSourceReadProofRequest",
+    "build_restricted_live_collector_github_url_search_preflight_packet",
     "build_restricted_live_collector_one_channel_source_read_preflight_packet",
     "build_restricted_live_collector_one_channel_source_read_rollout_packet",
+    "restricted_live_collector_github_url_search_argument_error_report",
     "restricted_live_collector_one_channel_source_read_argument_error_report",
 ]

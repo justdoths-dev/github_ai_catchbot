@@ -4,6 +4,7 @@ import ast
 import json
 from pathlib import Path
 
+from src.services.collector_telegram.bounded_history_ingest_runner import SEARCH_CONFIRM_TOKEN
 from src.services.collector_telegram.restricted_source_read_rollout import (
     BOUNDED_RUNNER_PATH,
     COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS,
@@ -13,6 +14,8 @@ from src.services.collector_telegram.restricted_source_read_rollout import (
     FAKE_MESSAGE_ID,
     FAKE_MESSAGE_TEXT,
     RUNTIME_ENV_FILE_PLACEHOLDER,
+    SEARCH_CONFIRM_TOKEN_PLACEHOLDER,
+    SEARCH_PREFLIGHT_SCHEMA_VERSION,
     SOURCE_VALUE_PLACEHOLDER,
 )
 from tools import restricted_live_collector_one_channel_source_read_rollout_runner as runner
@@ -32,7 +35,12 @@ def test_parser_exposes_only_fake_backed_source_read_proof_flags() -> None:
                 if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value.startswith("--"):
                     parser_flags.add(arg.value)
 
-    assert parser_flags == {"--source-value", "--max-messages", "--emit-live-preflight-command"}
+    assert parser_flags == {
+        "--source-value",
+        "--max-messages",
+        "--emit-live-preflight-command",
+        "--emit-live-search-preflight-command",
+    }
 
 
 def test_runner_prints_operator_packet_without_live_authority_or_raw_values(capsys) -> None:
@@ -161,6 +169,75 @@ def test_runner_prints_preflight_command_packet_without_live_authority_or_raw_va
         "private stderr",
     ):
         assert raw not in captured.out
+
+
+def test_runner_prints_placeholder_only_search_preflight_without_live_authority(capsys) -> None:
+    exit_code = runner.main(
+        [
+            "--source-value",
+            "@trendingrepo",
+            "--max-messages",
+            "30",
+            "--emit-live-search-preflight-command",
+        ]
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    command = report["future_execution_command"]
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert report["schema_version"] == SEARCH_PREFLIGHT_SCHEMA_VERSION
+    assert report["status"] == "pass"
+    assert report["mode"] == "search"
+    assert command["wrapper_runner_path"] == ENV_OVERLAY_RUNNER_PATH
+    assert command["child_runner_path"] == BOUNDED_RUNNER_PATH
+    assert SEARCH_CONFIRM_TOKEN_PLACEHOLDER in command["operator_command_tokens"]
+    assert SEARCH_CONFIRM_TOKEN_PLACEHOLDER in command["child_command_tokens"]
+    assert "--allow-database-read" in command["child_command_tokens"]
+    assert "--allow-telegram-read" in command["child_command_tokens"]
+    for forbidden in command["forbidden_flags_absent"]:
+        assert forbidden not in command["operator_command_tokens"]
+        assert forbidden not in command["child_command_tokens"]
+    assert command["confirm_token_value_printed"] is False
+    assert report["actual_attempted_operations"]["child_runner_invoked"] is False
+    assert SEARCH_CONFIRM_TOKEN not in captured.out
+    assert "trendingrepo" not in captured.out
+    assert "runtime.env" not in captured.out
+
+
+def test_runner_rejects_both_preflight_selectors_as_json(capsys) -> None:
+    exit_code = runner.main(
+        [
+            "--emit-live-preflight-command",
+            "--emit-live-search-preflight-command",
+        ]
+    )
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == "unsupported_cli_argument"
+
+
+def test_search_preflight_parser_failure_uses_search_schema_without_argument_echo(capsys) -> None:
+    exit_code = runner.main(
+        [
+            "--emit-live-search-preflight-command",
+            "--private-unsupported-search-argument",
+        ]
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert captured.err == ""
+    assert report["schema_version"] == SEARCH_PREFLIGHT_SCHEMA_VERSION
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == "unsupported_cli_argument"
+    assert report["mode"] == "search"
+    assert report["actual_attempted_operations"]["child_runner_invoked"] is False
+    assert "private-unsupported-search-argument" not in captured.out
 
 
 def test_runner_rejects_unsupported_live_authority_flags_as_json(capsys) -> None:

@@ -27,7 +27,7 @@ class FakeRepository:
         assert limit == 10
         assert lookback_days == 7
         return [
-            _row("alphaagents", "Alpha Agents", 18, 5, github_link_seen=True, ai_dev_context_seen=True),
+            _row("alphaagents", "Alpha Agents", 18, 5, ai_dev_context_seen=True),
             _row("betacoding", "Beta Coding", 10, 3, vibe_coding_seen=True),
             _row("gammatools", "Gamma Tools", 8, 1, x_link_seen=True),
         ]
@@ -70,6 +70,17 @@ def test_main_with_required_flags_returns_sanitized_json_only_and_empty_stderr(c
     assert parsed["schema_version"] == "channel_candidate_inventory_v1"
     assert parsed["status"] == "pass"
     assert parsed["reason_code"] == "channel_candidate_inventory_ready"
+    assert parsed["signal_observation_scope"] == {
+        "source": "postgresql_source_messages",
+        "window_days": 7,
+        "live_telegram_history_examined": False,
+        "full_channel_history_examined": False,
+        "signal_absence_proven": False,
+        "scope_reason_code": "persisted_source_messages_window_only",
+    }
+    assert parsed["operator_next_step"] == (
+        "bounded_live_history_search_required_for_target_or_absence_proof"
+    )
     assert parsed["selection_guidance"] == {
         "recommended_count": 3,
         "max_messages_next_step": 1,
@@ -79,6 +90,16 @@ def test_main_with_required_flags_returns_sanitized_json_only_and_empty_stderr(c
     assert [candidate["rank"] for candidate in parsed["candidates"]] == [1, 2, 3]
     assert all(candidate["public_username"].startswith("@") for candidate in parsed["candidates"])
     assert all(candidate["access_state"] == "joined_active" for candidate in parsed["candidates"])
+    assert all(
+        candidate["signal_observation"]
+        == {
+            "scope": "persisted_source_messages_7d",
+            "observed_message_count": candidate["recent_messages_7d"],
+            "github_link_observed": False,
+            "github_link_absence_proven": False,
+        }
+        for candidate in parsed["candidates"]
+    )
     assert parsed["authority"]["database_read_allowed"] is True
     assert parsed["authority"]["database_write_allowed"] is False
     assert parsed["authority"]["redis_allowed"] is False

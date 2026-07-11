@@ -238,6 +238,44 @@ class FakeHistoryClient:
         return None
 
 
+class FakeSearchHistoryClient(FakeHistoryClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.search_calls: list[dict[str, int]] = []
+
+    async def fetch_newest_history_messages(
+        self,
+        *,
+        chat_id: int,
+        limit: int,
+        from_message_id: int = 0,
+        offset: int = 0,
+    ):
+        self.search_calls.append(
+            {
+                "chat_id": chat_id,
+                "limit": limit,
+                "from_message_id": from_message_id,
+                "offset": offset,
+            }
+        )
+        return (
+            {
+                "@type": "message",
+                "chat_id": chat_id,
+                "id": 123456,
+                "date": 1713550000,
+                "content": {
+                    "@type": "messageText",
+                    "text": {
+                        "text": "private search text https://github.com/private-owner/private-repo",
+                        "entities": [],
+                    },
+                },
+            },
+        )
+
+
 class FakeRedisPublisher:
     def __init__(self) -> None:
         self.publish_calls: list[tuple[Any, Any]] = []
@@ -496,6 +534,124 @@ def test_execute_accepts_max_messages_alias_for_exact_one_channel_live_read(caps
         RAW_SECRET,
     ):
         assert raw not in output
+
+
+def test_search_mode_delegates_read_only_and_prints_search_specific_sanitized_json(capsys) -> None:
+    runtime_builder = FakeRuntimeBuilder()
+    runtime_builder.history_client = FakeSearchHistoryClient()
+    exit_code = runner.main(
+        [
+            "--mode",
+            "search",
+            "--operator-approved",
+            "--confirm-token",
+            runner.SEARCH_CONFIRM_TOKEN,
+            "--allow-runtime-config",
+            "--allow-database-read",
+            "--allow-telegram-read",
+            "--source-kind",
+            "public_username",
+            "--source-value",
+            "trendingrepo",
+            "--max-messages",
+            "30",
+        ],
+        runtime_config_loader=_runtime_config,
+        runtime_builder=runtime_builder,
+    )
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert parsed["schema_version"] == "github_url_live_target_bounded_search_v1"
+    assert parsed["status"] == "pass"
+    assert parsed["reason_code"] == "github_url_live_target_found"
+    assert parsed["mode"] == "search"
+    assert parsed["requested_max_messages"] == 30
+    assert parsed["history_request_count"] == 1
+    assert parsed["messages_returned"] == 1
+    assert parsed["github_url_present"] is True
+    assert runtime_builder.history_client.search_calls == [
+        {"chat_id": RAW_CHAT_ID, "limit": 30, "from_message_id": 0, "offset": 0}
+    ]
+    assert runtime_builder.repository.messages == {}
+    assert runtime_builder.repository.versions == {}
+    assert runtime_builder.repository.outbox == []
+    assert runtime_builder.repository.cursor_updates == []
+    assert runtime_builder.commit_calls == 0
+    assert runtime_builder.close_commits == [False]
+    assert parsed["side_effects"]["database_write_attempted"] is False
+    assert parsed["side_effects"]["redis_publish_attempted"] is False
+    assert parsed["side_effects"]["read_exact_message_called"] is False
+    assert all(value is False for value in parsed["raw_values_printed"].values())
+    for raw in (
+        "trendingrepo",
+        str(RAW_CHAT_ID),
+        "123456",
+        "private search text",
+        "https://github.com/private-owner/private-repo",
+        "github.com",
+        "private-owner",
+        DB_URL,
+        REDIS_URL,
+        RAW_SECRET,
+        runner.SEARCH_CONFIRM_TOKEN,
+    ):
+        assert raw not in captured.out
+
+
+def test_search_rejects_write_authority_before_runtime_config(capsys) -> None:
+    runtime_builder = FakeRuntimeBuilder()
+
+    def forbidden_runtime_config():
+        raise AssertionError("runtime config must not load")
+
+    exit_code = runner.main(
+        [
+            "--mode",
+            "search",
+            "--operator-approved",
+            "--confirm-token",
+            runner.SEARCH_CONFIRM_TOKEN,
+            "--allow-runtime-config",
+            "--allow-database-read",
+            "--allow-telegram-read",
+            "--allow-database-write",
+            "--source-kind",
+            "public_username",
+            "--source-value",
+            "trendingrepo",
+            "--max-messages",
+            "1",
+        ],
+        runtime_config_loader=forbidden_runtime_config,
+        runtime_builder=runtime_builder,
+    )
+    parsed = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert parsed["schema_version"] == "github_url_live_target_bounded_search_v1"
+    assert parsed["reason_code"] == "search_write_authority_not_allowed"
+    assert parsed["telegram_read_attempted"] is False
+    assert runtime_builder.repository.registry_lookups == []
+    assert runtime_builder.history_client.calls == []
+    assert runtime_builder.close_commits == []
+
+
+def test_search_parser_failure_uses_search_schema_and_omits_argument_text(capsys) -> None:
+    exit_code = runner.main(["--mode", "search", "--private-unsupported-argument"])
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert captured.err == ""
+    assert parsed["schema_version"] == "github_url_live_target_bounded_search_v1"
+    assert parsed["status"] == "blocked"
+    assert parsed["reason_code"] == "unsupported_cli_argument"
+    assert parsed["mode"] == "search"
+    assert parsed["telegram_read_attempted"] is False
+    assert "private-unsupported-argument" not in captured.out
 
 
 def test_execute_target_message_id_delegates_without_raw_message_id(capsys) -> None:

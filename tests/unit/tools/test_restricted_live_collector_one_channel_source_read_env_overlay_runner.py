@@ -369,6 +369,100 @@ def _three_channel_child_report() -> dict[str, Any]:
     }
 
 
+def _search_child_report(
+    *,
+    status: str = "pass",
+    reason_code: str = "github_url_live_target_found",
+    github_url_present: bool = True,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "github_url_live_target_bounded_search_v1",
+        "status": status,
+        "reason_code": reason_code,
+        "mode": "search",
+        "target_fingerprint": "sha256:1111111111111111",
+        "registry_target_fingerprint": "sha256:2222222222222222",
+        "selected_message_fingerprint": "sha256:3333333333333333" if github_url_present else None,
+        "requested_max_messages": 30,
+        "messages_returned": 3,
+        "messages_examined": 3,
+        "messages_with_text_surface_count": 3,
+        "messages_with_entity_surface_count": 1,
+        "messages_with_url_surface_count": 2,
+        "messages_with_entity_url_source_count": 1,
+        "messages_with_preview_url_source_count": 1,
+        "messages_with_regex_url_source_count": 1,
+        "github_matching_message_count": 1 if github_url_present else 0,
+        "github_url_present": github_url_present,
+        "selected_match_source_buckets": {
+            "entity": github_url_present,
+            "preview": False,
+            "regex": False,
+        },
+        "history_request_count": 1,
+        "telegram_read_attempted": True,
+        "telegram_read_called": True,
+        "telegram_read_succeeded": True,
+        "tdlib": {
+            "auth_ready_checked": True,
+            "auth_ready": True,
+            "parameters_submitted": True,
+            "log_suppression_attempted": True,
+            "log_suppression_confirmed": True,
+        },
+        "safe_failure_bucket": None,
+        "gates": {
+            "operator_approved": True,
+            "confirm_token_present": True,
+            "confirm_token_valid": True,
+            "runtime_config_allowed": True,
+            "database_read_allowed": True,
+            "telegram_read_allowed": True,
+            "exact_single_public_username_required": True,
+            "max_messages_explicit": True,
+            "write_authority_absent": True,
+            "publish_authority_absent": True,
+        },
+        "authority": {
+            "database_read_allowed": True,
+            "telegram_read_allowed": True,
+            "database_write_allowed": False,
+            "source_truth_write_allowed": False,
+            "cursor_write_allowed": False,
+            "redis_allowed": False,
+            "provider_calls_allowed": False,
+            "openai_allowed": False,
+            "notifier_allowed": False,
+        },
+        "side_effects": {
+            "database_write_attempted": False,
+            "source_message_write_attempted": False,
+            "source_version_write_attempted": False,
+            "source_outbox_write_attempted": False,
+            "channel_cursor_write_attempted": False,
+            "source_outbox_publish_attempted": False,
+            "redis_publish_attempted": False,
+            "history_ingest_processor_instantiated": False,
+            "read_exact_message_called": False,
+            "provider_or_openai_called": False,
+            "telegram_send_or_edit_called": False,
+            "notifier_called": False,
+        },
+        "redactions_applied": {key: True for key in runner._SEARCH_REDACTION_KEYS},
+        "raw_values_printed": {key: False for key in runner._SEARCH_RAW_VALUE_KEYS},
+        "rollback_close_readback": {
+            "close_attempted": True,
+            "close_succeeded": True,
+            "rollback_requested": True,
+            "commit_requested": False,
+            "commit_called": False,
+        },
+        "unsafe_raw_source": "trendingrepo",
+        "unsafe_raw_url": "https://github.com/private/raw",
+        "unsafe_confirm_token": runner.SEARCH_CONFIRM_TOKEN,
+    }
+
+
 def test_parser_exposes_only_env_overlay_preflight_flags() -> None:
     source = TOOL_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -387,6 +481,7 @@ def test_parser_exposes_only_env_overlay_preflight_flags() -> None:
         "--operator-approved",
         "--confirm-token",
     }
+    assert runner.build_parser().parse_args(["--mode", "search"]).mode == "search"
 
 
 def test_plan_mode_emits_sanitized_json_and_does_not_invoke_child_runner(tmp_path: Path, capsys) -> None:
@@ -1166,6 +1261,438 @@ def test_three_channel_wrong_confirm_blocks_before_runtime_env_read_or_child_inv
     assert report["reason_code"] == "confirm_token_invalid"
     assert report["actual_attempted_operations"]["runtime_env_read_attempted"] is False
     assert report["actual_attempted_operations"]["child_runner_invoked"] is False
+
+
+@pytest.mark.parametrize(
+    ("argv", "reason_code"),
+    [
+        (
+            [
+                "--mode",
+                "search",
+                "--source-value",
+                "trendingrepo",
+                "--max-messages",
+                "1",
+                "--confirm-token",
+                runner.SEARCH_CONFIRM_TOKEN,
+            ],
+            "operator_approval_missing",
+        ),
+        (
+            [
+                "--mode",
+                "search",
+                "--operator-approved",
+                "--source-value",
+                "trendingrepo",
+                "--max-messages",
+                "1",
+            ],
+            "search_confirm_token_missing",
+        ),
+        (
+            [
+                "--mode",
+                "search",
+                "--operator-approved",
+                "--source-value",
+                "trendingrepo",
+                "--max-messages",
+                "1",
+                "--confirm-token",
+                "wrong-token",
+            ],
+            "search_confirm_token_invalid",
+        ),
+        (
+            [
+                "--mode",
+                "search",
+                "--operator-approved",
+                "--source-value",
+                "alpha_tools",
+                "--source-value",
+                "beta_tools",
+                "--source-value",
+                "gamma_tools",
+                "--max-messages",
+                "1",
+                "--confirm-token",
+                runner.SEARCH_CONFIRM_TOKEN,
+            ],
+            "search_requires_exactly_one_target",
+        ),
+        (
+            [
+                "--mode",
+                "search",
+                "--operator-approved",
+                "--source-value",
+                "trendingrepo",
+                "--confirm-token",
+                runner.SEARCH_CONFIRM_TOKEN,
+            ],
+            "search_max_messages_required",
+        ),
+        (
+            [
+                "--mode",
+                "search",
+                "--operator-approved",
+                "--source-value",
+                "trendingrepo",
+                "--max-messages",
+                "31",
+                "--confirm-token",
+                runner.SEARCH_CONFIRM_TOKEN,
+            ],
+            "search_max_messages_out_of_bounds",
+        ),
+    ],
+)
+def test_search_gates_block_before_runtime_env_read_or_child_invoke(
+    argv: list[str],
+    reason_code: str,
+    capsys,
+) -> None:
+    def forbidden_runner(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("search gate failure must not invoke child runner")
+
+    exit_code = runner.main(argv, subprocess_runner=forbidden_runner)
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert captured.err == ""
+    assert report["schema_version"] == runner.SEARCH_WRAPPER_SCHEMA_VERSION
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == reason_code
+    assert report["actual_attempted_operations"]["runtime_env_read_attempted"] is False
+    assert report["actual_attempted_operations"]["child_runner_invoked"] is False
+    assert report["search_child_report_projection"]["stdout_parsed_as_json"] is False
+
+
+def test_search_parser_failure_uses_search_wrapper_schema_without_argument_echo(capsys) -> None:
+    exit_code = runner.main(["--mode", "search", "--private-unsupported-search-argument"])
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert captured.err == ""
+    assert report["schema_version"] == runner.SEARCH_WRAPPER_SCHEMA_VERSION
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == "unsupported_cli_argument"
+    assert report["mode"] == "search"
+    assert report["actual_attempted_operations"]["runtime_env_read_attempted"] is False
+    assert report["actual_attempted_operations"]["child_runner_invoked"] is False
+    assert "private-unsupported-search-argument" not in captured.out
+
+
+def test_search_invokes_exact_read_only_child_and_projects_sanitized_result(tmp_path: Path, capsys) -> None:
+    env_file = _fixture_env(tmp_path)
+    child_report = _search_child_report()
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_runner(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps(child_report, sort_keys=True) + "\n",
+            stderr="SENTINEL_PRIVATE_SEARCH_STDERR_SHOULD_NOT_PRINT",
+        )
+
+    exit_code = runner.main(
+        [
+            "--mode",
+            "search",
+            "--runtime-env-file",
+            str(env_file),
+            "--source-value",
+            "@trendingrepo",
+            "--max-messages",
+            "30",
+            "--operator-approved",
+            "--confirm-token",
+            runner.SEARCH_CONFIRM_TOKEN,
+        ],
+        subprocess_runner=fake_runner,
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    projection = report["search_child_report_projection"]
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert command == [
+        sys.executable,
+        runner.CHILD_RUNNER_PATH,
+        "--mode",
+        "search",
+        "--operator-approved",
+        "--allow-runtime-config",
+        "--allow-database-read",
+        "--allow-telegram-read",
+        "--source-kind",
+        "public_username",
+        "--source-value",
+        "trendingrepo",
+        "--max-messages",
+        "30",
+        "--confirm-token",
+        runner.SEARCH_CONFIRM_TOKEN,
+    ]
+    for forbidden in (
+        "--allow-database-write",
+        "--allow-source-message-write",
+        "--allow-source-version-write",
+        "--allow-source-outbox-write",
+        "--allow-source-outbox-publish",
+        "--allow-redis-publish",
+        "--target-message-id",
+        "--registry-id-suffix",
+        "--max-targets",
+    ):
+        assert forbidden not in command
+    assert set(kwargs["env"]) <= set(COLLECTOR_RUNTIME_ENV_ALLOWED_KEYS)
+    assert report["schema_version"] == runner.SEARCH_WRAPPER_SCHEMA_VERSION
+    assert report["status"] == "pass"
+    assert report["reason_code"] == "child_bounded_search_passed"
+    assert projection["schema_version"] == "github_url_live_target_bounded_search_v1"
+    assert projection["reason_code"] == "github_url_live_target_found"
+    assert projection["history_request_count"] == 1
+    assert projection["github_url_present"] is True
+    assert projection["side_effects"]["database_write_attempted"] is False
+    assert projection["side_effects"]["redis_publish_attempted"] is False
+    assert projection["rollback_close_readback"]["rollback_requested"] is True
+    assert report["search_contract_projection"]["reviewable"] is True
+    assert not any(key.startswith("F1_") or key.startswith("F2_") for key in report["completion_claims"])
+    for raw in (
+        "trendingrepo",
+        "https://github.com/private/raw",
+        runner.SEARCH_CONFIRM_TOKEN,
+        "SENTINEL_PRIVATE_SEARCH_STDERR_SHOULD_NOT_PRINT",
+    ) + SENTINEL_VALUES:
+        assert raw not in captured.out
+
+
+def test_search_projects_bounded_not_found_without_raw_child_output(tmp_path: Path, capsys) -> None:
+    env_file = _fixture_env(tmp_path)
+    child_report = _search_child_report(
+        status="blocked",
+        reason_code="github_url_live_target_not_found_in_approved_window",
+        github_url_present=False,
+    )
+
+    def fake_runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=1,
+            stdout=json.dumps(child_report, sort_keys=True) + "\n",
+            stderr="SENTINEL_PRIVATE_SEARCH_STDERR_SHOULD_NOT_PRINT",
+        )
+
+    exit_code = runner.main(
+        [
+            "--mode",
+            "search",
+            "--runtime-env-file",
+            str(env_file),
+            "--source-value",
+            "trendingrepo",
+            "--max-messages",
+            "30",
+            "--operator-approved",
+            "--confirm-token",
+            runner.SEARCH_CONFIRM_TOKEN,
+        ],
+        subprocess_runner=fake_runner,
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == "child_bounded_search_blocked"
+    assert report["search_child_report_projection"]["reason_code"] == (
+        "github_url_live_target_not_found_in_approved_window"
+    )
+    assert report["search_child_report_projection"]["github_url_present"] is False
+    assert report["search_contract_projection"]["reviewable"] is True
+    assert "https://github.com/private/raw" not in captured.out
+    assert runner.SEARCH_CONFIRM_TOKEN not in captured.out
+    assert "SENTINEL_PRIVATE_SEARCH_STDERR_SHOULD_NOT_PRINT" not in captured.out
+
+
+def test_search_projects_allowlisted_history_failure_bucket_without_raw_details(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    env_file = _fixture_env(tmp_path)
+    child_report = _search_child_report(
+        status="blocked",
+        reason_code="telegram_history_read_failed",
+        github_url_present=False,
+    )
+    child_report["telegram_read_succeeded"] = False
+    child_report["safe_failure_bucket"] = "target_unavailable"
+    child_report["private_exception_detail"] = "SENTINEL_PRIVATE_HISTORY_FAILURE"
+
+    def fake_runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=1,
+            stdout=json.dumps(child_report, sort_keys=True) + "\n",
+            stderr="SENTINEL_PRIVATE_SEARCH_STDERR_SHOULD_NOT_PRINT",
+        )
+
+    exit_code = runner.main(
+        [
+            "--mode",
+            "search",
+            "--runtime-env-file",
+            str(env_file),
+            "--source-value",
+            "trendingrepo",
+            "--max-messages",
+            "30",
+            "--operator-approved",
+            "--confirm-token",
+            runner.SEARCH_CONFIRM_TOKEN,
+        ],
+        subprocess_runner=fake_runner,
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert report["status"] == "blocked"
+    assert report["reason_code"] == "child_bounded_search_blocked"
+    assert report["search_child_report_projection"]["reason_code"] == "telegram_history_read_failed"
+    assert report["search_child_report_projection"]["safe_failure_bucket"] == "target_unavailable"
+    assert report["search_contract_projection"]["reviewable"] is True
+    assert "SENTINEL_PRIVATE_HISTORY_FAILURE" not in captured.out
+    assert "SENTINEL_PRIVATE_SEARCH_STDERR_SHOULD_NOT_PRINT" not in captured.out
+
+
+def test_search_terminal_result_without_one_successful_history_request_fails_closed(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    env_file = _fixture_env(tmp_path)
+    child_report = _search_child_report()
+    child_report["history_request_count"] = 0
+    child_report["telegram_read_called"] = False
+    child_report["telegram_read_succeeded"] = False
+
+    def fake_runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=json.dumps(child_report, sort_keys=True) + "\n",
+            stderr="",
+        )
+
+    exit_code = runner.main(
+        [
+            "--mode",
+            "search",
+            "--runtime-env-file",
+            str(env_file),
+            "--source-value",
+            "trendingrepo",
+            "--max-messages",
+            "30",
+            "--operator-approved",
+            "--confirm-token",
+            runner.SEARCH_CONFIRM_TOKEN,
+        ],
+        subprocess_runner=fake_runner,
+    )
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert report["status"] == "failed"
+    assert report["reason_code"] == "child_bounded_search_contract_invalid"
+    assert report["search_contract_projection"]["history_request_count_within_bound"] is True
+    assert report["search_contract_projection"]["terminal_read_contract_satisfied"] is False
+    assert report["search_contract_projection"]["reviewable"] is False
+
+
+def test_search_malformed_child_output_fails_closed_without_printing_it(tmp_path: Path, capsys) -> None:
+    env_file = _fixture_env(tmp_path)
+
+    def fake_runner(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=1,
+            stdout="not-json SENTINEL_SEARCH_RAW_STDOUT",
+            stderr="SENTINEL_PRIVATE_SEARCH_STDERR_SHOULD_NOT_PRINT",
+        )
+
+    exit_code = runner.main(
+        [
+            "--mode",
+            "search",
+            "--runtime-env-file",
+            str(env_file),
+            "--source-value",
+            "trendingrepo",
+            "--max-messages",
+            "1",
+            "--operator-approved",
+            "--confirm-token",
+            runner.SEARCH_CONFIRM_TOKEN,
+        ],
+        subprocess_runner=fake_runner,
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert report["status"] == "failed"
+    assert report["reason_code"] == "child_bounded_search_failed"
+    assert report["search_child_report_projection"]["stdout_parsed_as_json"] is False
+    assert report["search_contract_projection"]["reviewable"] is False
+    assert "SENTINEL_SEARCH_RAW_STDOUT" not in captured.out
+    assert "SENTINEL_PRIVATE_SEARCH_STDERR_SHOULD_NOT_PRINT" not in captured.out
+
+
+def test_search_child_invocation_failure_is_sanitized(tmp_path: Path, capsys) -> None:
+    env_file = _fixture_env(tmp_path)
+
+    def failing_runner(*_args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise RuntimeError("SENTINEL_PRIVATE_SEARCH_INVOCATION_FAILURE")
+
+    exit_code = runner.main(
+        [
+            "--mode",
+            "search",
+            "--runtime-env-file",
+            str(env_file),
+            "--source-value",
+            "trendingrepo",
+            "--max-messages",
+            "30",
+            "--operator-approved",
+            "--confirm-token",
+            runner.SEARCH_CONFIRM_TOKEN,
+        ],
+        subprocess_runner=failing_runner,
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code == 1
+    assert captured.err == ""
+    assert report["status"] == "failed"
+    assert report["reason_code"] == "child_bounded_search_invocation_failed"
+    assert report["actual_attempted_operations"]["runtime_env_read_attempted"] is True
+    assert report["actual_attempted_operations"]["child_runner_invoked"] is False
+    assert "SENTINEL_PRIVATE_SEARCH_INVOCATION_FAILURE" not in captured.out
 
 
 def test_cli_rejects_unsupported_authority_flags_as_json(capsys) -> None:
