@@ -353,6 +353,14 @@ _SEARCH_FAILURE_BUCKETS = frozenset(
         "target_unavailable",
     }
 )
+_EXACT_MESSAGE_READ_FAILURE_BUCKETS = frozenset(
+    {
+        "not_found",
+        "tdlib_error",
+        "unsupported_response",
+        "timeout",
+    }
+)
 
 
 class CliArgumentError(ValueError):
@@ -1275,6 +1283,16 @@ def _project_child_report(child_report: Mapping[str, Any] | None) -> dict[str, A
         "target_locator_consumption_supported": _safe_bool(
             report.get("target_locator_consumption_supported")
         ),
+        "history_window_attempts": _safe_nonnegative_int(report.get("history_window_attempts")),
+        "history_read_failure_cause_bucket": _safe_search_failure_bucket(
+            report.get("history_read_failure_cause_bucket")
+        ),
+        "exact_message_read_attempted": _safe_bool(report.get("exact_message_read_attempted")),
+        "exact_message_read_succeeded": _safe_bool(report.get("exact_message_read_succeeded")),
+        "exact_message_read_failure_cause_bucket": _safe_exact_message_read_failure_bucket(
+            report.get("exact_message_read_failure_cause_bucket")
+        ),
+        "telegram_read_succeeded": _safe_bool(report.get("telegram_read_succeeded")),
         "authority": _project_bool_mapping(_mapping_child(report, "authority"), _AUTHORITY_PROJECTION_KEYS),
         "gates": _project_bool_mapping(_mapping_child(report, "gates"), _GATE_PROJECTION_KEYS),
         "bounded_counts": _project_count_mapping(_mapping_child(report, "bounded_counts"), _BOUNDED_COUNT_PROJECTION_KEYS),
@@ -1928,6 +1946,15 @@ def _project_per_channel_results(value: object) -> list[dict[str, Any]]:
                 "reason_code": _safe_report_string(item.get("reason_code")),
                 "messages_requested": _safe_nonnegative_int(item.get("messages_requested")),
                 "messages_seen": _safe_nonnegative_int(item.get("messages_seen")),
+                "history_window_attempts": _safe_nonnegative_int(item.get("history_window_attempts")),
+                "history_read_failure_cause_bucket": _safe_search_failure_bucket(
+                    item.get("history_read_failure_cause_bucket")
+                ),
+                "exact_message_read_attempted": _safe_bool(item.get("exact_message_read_attempted")),
+                "exact_message_read_succeeded": _safe_bool(item.get("exact_message_read_succeeded")),
+                "exact_message_read_failure_cause_bucket": _safe_exact_message_read_failure_bucket(
+                    item.get("exact_message_read_failure_cause_bucket")
+                ),
                 "bounded_counts": _project_count_mapping(
                     _mapping_child(item, "bounded_counts"),
                     _BOUNDED_COUNT_PROJECTION_KEYS,
@@ -2007,6 +2034,12 @@ def _safe_search_reason_code(value: object) -> str | None:
 
 def _safe_search_failure_bucket(value: object) -> str | None:
     if isinstance(value, str) and value in _SEARCH_FAILURE_BUCKETS:
+        return value
+    return None
+
+
+def _safe_exact_message_read_failure_bucket(value: object) -> str | None:
+    if isinstance(value, str) and value in _EXACT_MESSAGE_READ_FAILURE_BUCKETS:
         return value
     return None
 

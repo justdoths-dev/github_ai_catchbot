@@ -668,6 +668,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "tdlib_log_suppression_confirmed": self.state.tdlib_log_suppression_confirmed,
             "telegram_read_attempted": self.state.telegram_read_attempted,
             "telegram_read_called": self.state.telegram_read_called,
+            "telegram_read_succeeded": self.state.telegram_read_succeeded,
             "database_write_attempted": self.state.database_write_attempted,
             "source_message_write_attempted": self.state.source_message_write_attempted,
             "source_version_write_attempted": self.state.source_version_write_attempted,
@@ -1179,7 +1180,12 @@ async def _read_direct_exact_target_message(
     state.exact_message_read_succeeded = False
     state.exact_message_read_failure_cause_bucket = None
 
-    message = await history_client.read_exact_message(
+    read_exact_message = getattr(history_client, "read_exact_message", None)
+    if not callable(read_exact_message):
+        state.exact_message_read_failure_cause_bucket = EXACT_MESSAGE_READ_CAUSE_UNSUPPORTED_RESPONSE
+        return ()
+
+    message = await read_exact_message(
         chat_id=target.chat_id,
         message_id=target_message_id,
     )
@@ -1217,8 +1223,10 @@ async def _fetch_history_for_target(
             limit=history_limit,
         )
 
-    bounded_window_failure: BoundedHistoryIngestError | None = None
+    first_non_bounded_history_failure: BoundedHistoryIngestError | None = None
+    latest_bounded_window_history_failure: BoundedHistoryIngestError | None = None
     saw_successful_window = False
+    direct_exact_reader_available = callable(getattr(history_client, "read_exact_message", None))
     for window in _exact_target_history_read_windows(
         target_message_id=target_message_id,
         history_limit=history_limit,
@@ -1232,23 +1240,24 @@ async def _fetch_history_for_target(
                 offset=window.offset,
             )
         except BoundedHistoryIngestError as exc:
-            if (
-                exc.error_code == "telegram_history_read_failed"
-                and exc.history_read_failure_cause_bucket == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT
-            ):
-                bounded_window_failure = exc
-                continue
-            raise
+            if exc.error_code != "telegram_history_read_failed":
+                raise
+            if exc.history_read_failure_cause_bucket == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT:
+                latest_bounded_window_history_failure = exc
+            elif first_non_bounded_history_failure is None:
+                first_non_bounded_history_failure = exc
+            if not direct_exact_reader_available:
+                break
+            continue
 
-        saw_successful_window = True
         if len(messages) > window.limit:
             raise BoundedHistoryIngestError("history_result_exceeds_requested_limit")
+        saw_successful_window = True
         selected_messages = _select_exact_target_messages(messages, target_message_id=target_message_id)
         if selected_messages:
             return tuple(selected_messages)
 
-    if bounded_window_failure is not None and not saw_successful_window:
-        anchorless_bounded_window_failure: BoundedHistoryIngestError | None = None
+    if latest_bounded_window_history_failure is not None and not saw_successful_window:
         for window in _exact_target_anchorless_history_read_windows():
             state.history_window_attempts += 1
             try:
@@ -1259,21 +1268,20 @@ async def _fetch_history_for_target(
                     offset=window.offset,
                 )
             except BoundedHistoryIngestError as exc:
-                if (
-                    exc.error_code == "telegram_history_read_failed"
-                    and exc.history_read_failure_cause_bucket == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT
-                ):
-                    anchorless_bounded_window_failure = exc
-                    continue
-                raise
+                if exc.error_code != "telegram_history_read_failed":
+                    raise
+                if exc.history_read_failure_cause_bucket == HISTORY_READ_CAUSE_BOUNDED_WINDOW_ADJUSTMENT:
+                    latest_bounded_window_history_failure = exc
+                elif first_non_bounded_history_failure is None:
+                    first_non_bounded_history_failure = exc
+                continue
 
             if len(messages) > window.limit:
                 raise BoundedHistoryIngestError("history_result_exceeds_requested_limit")
+            saw_successful_window = True
             selected_messages = _select_exact_target_messages(messages, target_message_id=target_message_id)
             if selected_messages:
                 return tuple(selected_messages)
-        if anchorless_bounded_window_failure is not None:
-            raise anchorless_bounded_window_failure
 
     direct_message = await _read_direct_exact_target_message(
         history_client=history_client,
@@ -1283,6 +1291,12 @@ async def _fetch_history_for_target(
     )
     if direct_message:
         return direct_message
+    if saw_successful_window:
+        return ()
+    if first_non_bounded_history_failure is not None:
+        raise first_non_bounded_history_failure
+    if latest_bounded_window_history_failure is not None:
+        raise latest_bounded_window_history_failure
     return ()
 
 

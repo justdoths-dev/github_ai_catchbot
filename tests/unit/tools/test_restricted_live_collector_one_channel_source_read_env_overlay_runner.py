@@ -121,6 +121,12 @@ def _rich_child_report(
         },
         "telegram_read_attempted": True,
         "telegram_read_called": True,
+        "telegram_read_succeeded": True,
+        "history_window_attempts": 1,
+        "history_read_failure_cause_bucket": None,
+        "exact_message_read_attempted": False,
+        "exact_message_read_succeeded": False,
+        "exact_message_read_failure_cause_bucket": None,
         "database_read_attempted": True,
         "database_write_attempted": write_attempts,
         "source_message_write_attempted": write_attempts,
@@ -226,6 +232,11 @@ def _three_channel_child_report() -> dict[str, Any]:
                 "reason_code": "ok",
                 "messages_requested": 1,
                 "messages_seen": 1,
+                "history_window_attempts": 1,
+                "history_read_failure_cause_bucket": None,
+                "exact_message_read_attempted": False,
+                "exact_message_read_succeeded": False,
+                "exact_message_read_failure_cause_bucket": None,
                 "bounded_counts": {
                     "source_messages_created": 0,
                     "source_versions_created": 0,
@@ -309,6 +320,12 @@ def _three_channel_child_report() -> dict[str, Any]:
         },
         "telegram_read_attempted": True,
         "telegram_read_called": True,
+        "telegram_read_succeeded": True,
+        "history_window_attempts": 3,
+        "history_read_failure_cause_bucket": None,
+        "exact_message_read_attempted": False,
+        "exact_message_read_succeeded": False,
+        "exact_message_read_failure_cause_bucket": None,
         "database_read_attempted": True,
         "database_write_attempted": False,
         "source_message_write_attempted": False,
@@ -812,6 +829,12 @@ def test_execute_projects_rich_child_pass_readback_without_raw_stdout(tmp_path: 
     assert projection["gates"]["source_outbox_publish_allowed"] is False
     assert projection["gates"]["redis_publish_allowed"] is False
     assert projection["telegram_read_called"] is True
+    assert projection["telegram_read_succeeded"] is True
+    assert projection["history_window_attempts"] == 1
+    assert projection["history_read_failure_cause_bucket"] is None
+    assert projection["exact_message_read_attempted"] is False
+    assert projection["exact_message_read_succeeded"] is False
+    assert projection["exact_message_read_failure_cause_bucket"] is None
     assert projection["database_write_attempted"] is True
     assert projection["source_message_write_attempted"] is True
     assert projection["source_version_write_attempted"] is True
@@ -875,6 +898,110 @@ def test_execute_projects_rich_child_pass_readback_without_raw_stdout(tmp_path: 
     assert "SENTINEL_PRIVATE_STDERR_SHOULD_NOT_PRINT" not in captured.out
     for value in SENTINEL_VALUES + CHILD_STDOUT_SENTINELS:
         assert value not in captured.out
+
+
+def test_child_projection_allowlists_history_and_exact_message_readback_buckets() -> None:
+    history_buckets = (
+        "request_construction_repair",
+        "bounded_window_adjustment",
+        "runtime_tdlib_access_issue",
+        "target_unavailable",
+    )
+    exact_message_buckets = (
+        "not_found",
+        "tdlib_error",
+        "unsupported_response",
+        "timeout",
+    )
+
+    for history_bucket, exact_message_bucket in zip(
+        history_buckets,
+        exact_message_buckets,
+        strict=True,
+    ):
+        projection = runner._project_child_report(
+            {
+                "history_window_attempts": 4,
+                "history_read_failure_cause_bucket": history_bucket,
+                "exact_message_read_attempted": True,
+                "exact_message_read_succeeded": False,
+                "exact_message_read_failure_cause_bucket": exact_message_bucket,
+                "telegram_read_succeeded": False,
+                "per_channel_results": [
+                    {
+                        "history_window_attempts": 4,
+                        "history_read_failure_cause_bucket": history_bucket,
+                        "exact_message_read_attempted": True,
+                        "exact_message_read_succeeded": False,
+                        "exact_message_read_failure_cause_bucket": exact_message_bucket,
+                    }
+                ],
+            }
+        )
+        channel_projection = projection["per_channel_results"][0]
+
+        assert projection["history_window_attempts"] == 4
+        assert projection["history_read_failure_cause_bucket"] == history_bucket
+        assert projection["exact_message_read_attempted"] is True
+        assert projection["exact_message_read_succeeded"] is False
+        assert projection["exact_message_read_failure_cause_bucket"] == exact_message_bucket
+        assert projection["telegram_read_succeeded"] is False
+        assert channel_projection["history_window_attempts"] == 4
+        assert channel_projection["history_read_failure_cause_bucket"] == history_bucket
+        assert channel_projection["exact_message_read_attempted"] is True
+        assert channel_projection["exact_message_read_succeeded"] is False
+        assert channel_projection["exact_message_read_failure_cause_bucket"] == exact_message_bucket
+
+
+def test_child_projection_rejects_unsafe_readback_values_without_raw_passthrough() -> None:
+    unsafe_history_bucket = "SENTINEL_RAW_TDLIB_HISTORY_ERROR_DETAIL"
+    unsafe_exact_bucket = "SENTINEL_RAW_TDLIB_EXACT_ERROR_DETAIL"
+    unsafe_source_text = "SENTINEL_RAW_SOURCE_TEXT_DETAIL"
+    unsafe_locator_value = "SENTINEL_PRIVATE_LOCATOR_VALUE"
+    projection = runner._project_child_report(
+        {
+            "history_window_attempts": -1,
+            "history_read_failure_cause_bucket": unsafe_history_bucket,
+            "exact_message_read_attempted": "true",
+            "exact_message_read_succeeded": 1,
+            "exact_message_read_failure_cause_bucket": unsafe_exact_bucket,
+            "telegram_read_succeeded": "false",
+            "source_text": unsafe_source_text,
+            "target_locator_content": unsafe_locator_value,
+            "per_channel_results": [
+                {
+                    "history_window_attempts": True,
+                    "history_read_failure_cause_bucket": unsafe_history_bucket,
+                    "exact_message_read_attempted": "true",
+                    "exact_message_read_succeeded": 1,
+                    "exact_message_read_failure_cause_bucket": unsafe_exact_bucket,
+                    "source_text": unsafe_source_text,
+                    "target_locator_content": unsafe_locator_value,
+                }
+            ],
+        }
+    )
+    channel_projection = projection["per_channel_results"][0]
+    rendered = json.dumps(projection, sort_keys=True)
+
+    assert projection["history_window_attempts"] is None
+    assert projection["history_read_failure_cause_bucket"] is None
+    assert projection["exact_message_read_attempted"] is None
+    assert projection["exact_message_read_succeeded"] is None
+    assert projection["exact_message_read_failure_cause_bucket"] is None
+    assert projection["telegram_read_succeeded"] is None
+    assert channel_projection["history_window_attempts"] is None
+    assert channel_projection["history_read_failure_cause_bucket"] is None
+    assert channel_projection["exact_message_read_attempted"] is None
+    assert channel_projection["exact_message_read_succeeded"] is None
+    assert channel_projection["exact_message_read_failure_cause_bucket"] is None
+    for unsafe_value in (
+        unsafe_history_bucket,
+        unsafe_exact_bucket,
+        unsafe_source_text,
+        unsafe_locator_value,
+    ):
+        assert unsafe_value not in rendered
 
 
 def test_execute_projects_duplicate_noop_readback_closure_without_current_run_writes(
@@ -1279,6 +1406,14 @@ def test_three_channel_execute_projects_rich_child_pass_without_raw_output(tmp_p
     assert projection["target_count"] == 3
     assert len(projection["target_fingerprints"]) == 3
     assert len(projection["per_channel_results"]) == 3
+    assert projection["history_window_attempts"] == 3
+    assert projection["telegram_read_succeeded"] is True
+    for channel_result in projection["per_channel_results"]:
+        assert channel_result["history_window_attempts"] == 1
+        assert channel_result["history_read_failure_cause_bucket"] is None
+        assert channel_result["exact_message_read_attempted"] is False
+        assert channel_result["exact_message_read_succeeded"] is False
+        assert channel_result["exact_message_read_failure_cause_bucket"] is None
     assert projection["readback"]["source_current_found_count"] == 3
     assert projection["duplicate_noop_proof"]["proved_count"] == 3
     assert report["f2_three_channel_readback_closure"]["closed"] is True
