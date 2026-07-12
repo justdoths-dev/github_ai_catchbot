@@ -21,7 +21,7 @@ from .repositories import AnalysisRouterRepository, AsyncSessionLike
 from .routing_policy import ALLOWED_JUDGE_PROFILES, AnalysisRoutingPolicy
 
 
-SCHEMA_VERSION = "bounded_analysis_router_runner_v2"
+SCHEMA_VERSION = "bounded_analysis_router_runner_v3"
 RUNNER_NAME = "bounded_analysis_router_job_runner"
 MODE_PREVIEW = "preview"
 MODE_EXECUTE = "execute"
@@ -34,6 +34,12 @@ DEFAULT_MAX_MESSAGES = 1
 HARD_MAX_MESSAGES = 1
 DEFAULT_SCAN_LIMIT = 25
 HARD_SCAN_LIMIT = 100
+DEFAULT_PENDING_SCAN_LIMIT = 25
+HARD_PENDING_SCAN_LIMIT = 100
+JUDGE_CALL_EVENT_TYPE = "judge.call.requested.v1"
+JUDGE_CALL_AGGREGATE_TYPE = "judge_run"
+JUDGE_CALL_DEDUPE_PREFIX = "judge-call:"
+JUDGE_CALL_ALLOWED_STATUSES = frozenset({"pending", "published"})
 EXPECTED_STREAM_FIELDS = frozenset(
     {
         "job_id",
@@ -80,6 +86,7 @@ class BoundedAnalysisRouterConfig:
     allow_redis_consume: bool = False
     allow_database_write: bool = False
     allow_redis_ack: bool = False
+    allow_unrelated_pending_preservation: bool = False
     trigger_event_id: UUID | None = None
     trigger_event_suffix: str | None = None
     candidate_group_suffix: str | None = None
@@ -119,6 +126,15 @@ class BoundedAnalysisRouterState:
     group_last_delivered_id_suffix: str | None = None
     target_after_group_last_delivered: bool | None = None
     target_is_next_deliverable: bool | None = None
+    pending_preflight_error: str | None = None
+    pending_inspection_bounded: bool | None = None
+    pending_preflight_confirmed: bool | None = None
+    unrelated_pending_before_count: int | None = None
+    unrelated_pending_after_count: int | None = None
+    unrelated_pending_preserved: bool | None = None
+    target_pending_before: bool | None = None
+    target_pending_after: bool | None = None
+    database_commit_succeeded: bool = False
 
 
 @dataclass(slots=True)
@@ -138,6 +154,24 @@ class AnalysisRequestOutboxEvent:
     status: str
     dedupe_key: str | None = None
     created_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class JudgeCallHandoffEvent:
+    event_id: UUID
+    event_type: str
+    aggregate_type: str
+    aggregate_id: UUID
+    payload_json: dict[str, Any]
+    status: str
+    dedupe_key: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class JudgeCallHandoffReadback:
+    judge_run_id: UUID | None
+    bundle_id: UUID | None
+    events: tuple[JudgeCallHandoffEvent, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +213,11 @@ class BoundedAnalysisRouterResult:
     request_current: bool | None = None
     bundle_ready: bool | None = None
     existing_judge_run_found: bool | None = None
+    judge_run_id_suffix: str | None = None
+    judge_call_handoff_found: bool = False
+    judge_call_handoff_ready: bool = False
+    judge_call_event_status: str | None = None
+    judge_call_event_id_suffix: str | None = None
     planned_action: str | None = None
     would_fail_closed: bool = False
 
@@ -201,6 +240,7 @@ class BoundedAnalysisRouterResult:
             "messages_matched": self.messages_matched,
             "messages_processed_count": self.messages_processed_count,
             "database_write_attempted": self.state.database_write_attempted,
+            "database_commit_succeeded": self.state.database_commit_succeeded,
             "judge_runs_written_count": self.counters.judge_runs_written_count,
             "existing_judge_run_reused_count": self.counters.existing_judge_run_reused_count,
             "judge_call_requested_outbox_count": self.counters.judge_call_requested_outbox_count,
@@ -214,11 +254,23 @@ class BoundedAnalysisRouterResult:
             "group_last_delivered_id_suffix": self.state.group_last_delivered_id_suffix,
             "target_after_group_last_delivered": self.state.target_after_group_last_delivered,
             "target_is_next_deliverable": self.state.target_is_next_deliverable,
+            "pending_inspection_bounded": self.state.pending_inspection_bounded,
+            "pending_preflight_confirmed": self.state.pending_preflight_confirmed,
+            "unrelated_pending_before_count": self.state.unrelated_pending_before_count,
+            "unrelated_pending_after_count": self.state.unrelated_pending_after_count,
+            "unrelated_pending_preserved": self.state.unrelated_pending_preserved,
+            "target_pending_before": self.state.target_pending_before,
+            "target_pending_after": self.state.target_pending_after,
             "target_message_found": self.target_message_found,
             "analysis_request_event_found": self.analysis_request_event_found,
             "request_current": self.request_current,
             "bundle_ready": self.bundle_ready,
             "existing_judge_run_found": self.existing_judge_run_found,
+            "judge_run_id_suffix": self.judge_run_id_suffix,
+            "judge_call_handoff_found": self.judge_call_handoff_found,
+            "judge_call_handoff_ready": self.judge_call_handoff_ready,
+            "judge_call_event_status": self.judge_call_event_status,
+            "judge_call_event_id_suffix": self.judge_call_event_id_suffix,
             "planned_action": self.planned_action,
             "would_fail_closed": self.would_fail_closed,
             "gates": {
@@ -229,6 +281,7 @@ class BoundedAnalysisRouterResult:
                 "redis_consume_allowed": self.config.allow_redis_consume,
                 "database_write_allowed": self.config.allow_database_write,
                 "redis_ack_allowed": self.config.allow_redis_ack,
+                "unrelated_pending_preservation_allowed": self.config.allow_unrelated_pending_preservation,
                 "candidate_group_suffix": self.config.candidate_group_suffix,
                 "max_messages": self.config.max_messages,
                 "scan_limit": self.config.scan_limit,
@@ -241,6 +294,7 @@ class BoundedAnalysisRouterResult:
                 "redis_mutation": self.state.redis_group_created or self.state.redis_ack_attempted,
                 "db_read": self.state.database_read_attempted,
                 "db_write": self.state.database_write_attempted,
+                "db_commit": self.state.database_commit_succeeded,
                 "judge_run_created": self.counters.judge_runs_written_count > 0,
                 "judge_call_requested_event_emitted": self.counters.judge_call_requested_outbox_count > 0,
                 "evidence_assembler_called": False,
@@ -270,6 +324,8 @@ class BoundedAnalysisRouterResult:
                 "full_bundle_id_omitted": True,
                 "full_judge_run_id_omitted": True,
                 "redis_message_id_omitted": True,
+                "pending_message_ids_omitted": True,
+                "pending_consumer_names_omitted": True,
                 "idempotency_key_omitted": True,
                 "payload_json_omitted": True,
                 "bundle_data_omitted": True,
@@ -310,10 +366,17 @@ class RedisTargetConsumer(Protocol):
     async def preflight_group(
         self,
         selected: TargetedAnalysisRouteMessage,
+        config: BoundedAnalysisRouterConfig,
         state: BoundedAnalysisRouterState,
     ) -> None: ...
 
     async def ack(self, message_id: str, state: BoundedAnalysisRouterState) -> int: ...
+
+    async def confirm_unrelated_pending_preserved(
+        self,
+        selected: TargetedAnalysisRouteMessage,
+        state: BoundedAnalysisRouterState,
+    ) -> bool: ...
 
 
 class RedisTargetConsumerClient(Protocol):
@@ -328,6 +391,15 @@ class RedisTargetConsumerClient(Protocol):
     ) -> Any: ...
 
     async def xinfo_groups(self, name: str) -> Any: ...
+
+    async def xpending_range(
+        self,
+        name: str,
+        groupname: str,
+        min: str,
+        max: str,
+        count: int,
+    ) -> Any: ...
 
     async def xreadgroup(
         self,
@@ -391,10 +463,17 @@ class AnalysisRouteRepository(Protocol):
         prompt_cache_key: str,
     ) -> None: ...
 
+    async def read_judge_call_handoff(
+        self,
+        *,
+        judge_run_id: UUID,
+    ) -> JudgeCallHandoffReadback: ...
+
 
 @dataclass(frozen=True, slots=True)
 class BoundedAnalysisRouterDatabaseHandle:
     repository: AnalysisRouteRepository
+    commit: Callable[[], Awaitable[None]]
     close: Callable[[bool], Awaitable[None]]
 
 
@@ -429,6 +508,7 @@ class BoundedAnalysisRouteRedisConsumer:
         self._queue_name = queue_name
         self._consumer_group = consumer_group
         self._consumer_name = consumer_name or f"bounded-analysis-router-{uuid4().hex}"
+        self._preflight_pending_ids: frozenset[str] | None = None
 
     async def find_target(
         self,
@@ -450,6 +530,7 @@ class BoundedAnalysisRouteRedisConsumer:
     async def preflight_group(
         self,
         selected: TargetedAnalysisRouteMessage,
+        config: BoundedAnalysisRouterConfig,
         state: BoundedAnalysisRouterState,
     ) -> None:
         state.redis_read_attempted = True
@@ -460,6 +541,12 @@ class BoundedAnalysisRouteRedisConsumer:
         state.group_last_delivered_id_suffix = None
         state.target_after_group_last_delivered = False
         state.target_is_next_deliverable = False
+        state.pending_preflight_error = None
+        state.pending_inspection_bounded = None
+        state.pending_preflight_confirmed = None
+        state.unrelated_pending_before_count = None
+        state.target_pending_before = None
+        self._preflight_pending_ids = None
 
         raw_groups = await self._client.xinfo_groups(self._queue_name)
         group = _find_consumer_group(raw_groups, self._consumer_group)
@@ -471,12 +558,19 @@ class BoundedAnalysisRouteRedisConsumer:
         state.group_lag = _int_or_none(group.get("lag"))
         last_delivered_id = _string_or_none(group.get("last-delivered-id"))
         state.group_last_delivered_id_suffix = _optional_id_suffix(last_delivered_id)
+        if config.allow_unrelated_pending_preservation:
+            await self._inspect_unrelated_pending_preflight(selected, state)
+            if state.pending_preflight_error is not None:
+                return
         if not last_delivered_id:
             return
 
         target_after_last = _redis_stream_id_greater(selected.redis_message_id, last_delivered_id)
         state.target_after_group_last_delivered = target_after_last
-        if state.group_pending != 0 or not target_after_last:
+        if (
+            state.group_pending != 0
+            and not config.allow_unrelated_pending_preservation
+        ) or not target_after_last:
             return
 
         normalized_last_delivered_id = _normalize_redis_stream_id(last_delivered_id)
@@ -492,6 +586,96 @@ class BoundedAnalysisRouteRedisConsumer:
         state.target_is_next_deliverable = bool(
             next_entries and next_entries[0][0] == selected.redis_message_id
         )
+
+    async def confirm_unrelated_pending_preserved(
+        self,
+        selected: TargetedAnalysisRouteMessage,
+        state: BoundedAnalysisRouterState,
+    ) -> bool:
+        state.redis_read_attempted = True
+        expected_ids = self._preflight_pending_ids
+        if expected_ids is None:
+            state.unrelated_pending_preserved = False
+            return False
+
+        raw_groups = await self._client.xinfo_groups(self._queue_name)
+        group = _find_consumer_group(raw_groups, self._consumer_group)
+        if group is None:
+            state.unrelated_pending_preserved = False
+            return False
+        pending_count = _int_or_none(group.get("pending"))
+        state.unrelated_pending_after_count = pending_count
+        if pending_count is None or pending_count > HARD_PENDING_SCAN_LIMIT or pending_count < 0:
+            state.unrelated_pending_preserved = False
+            return False
+
+        pending_ids, error = await self._read_pending_ids(pending_count)
+        if error is not None or pending_ids is None:
+            state.unrelated_pending_preserved = False
+            return False
+        state.target_pending_after = selected.redis_message_id in pending_ids
+        state.unrelated_pending_preserved = (
+            state.target_pending_after is False
+            and pending_ids == expected_ids
+            and pending_count == len(expected_ids)
+        )
+        return state.unrelated_pending_preserved
+
+    async def _inspect_unrelated_pending_preflight(
+        self,
+        selected: TargetedAnalysisRouteMessage,
+        state: BoundedAnalysisRouterState,
+    ) -> None:
+        pending_count = state.group_pending
+        state.unrelated_pending_before_count = pending_count
+        state.pending_inspection_bounded = False
+        if pending_count is None or pending_count < 0:
+            state.pending_preflight_error = "redis_pending_readback_unconfirmed"
+            return
+        if pending_count > HARD_PENDING_SCAN_LIMIT:
+            state.pending_preflight_error = "redis_pending_scan_limit_exceeded"
+            return
+
+        first_pending_ids, error = await self._read_pending_ids(pending_count)
+        if error is not None or first_pending_ids is None:
+            state.pending_preflight_error = error or "redis_pending_readback_unconfirmed"
+            return
+        state.pending_inspection_bounded = True
+        state.target_pending_before = selected.redis_message_id in first_pending_ids
+        if state.target_pending_before:
+            state.pending_preflight_error = "target_message_already_pending"
+            return
+
+        raw_groups = await self._client.xinfo_groups(self._queue_name)
+        group = _find_consumer_group(raw_groups, self._consumer_group)
+        if group is None or _int_or_none(group.get("pending")) != pending_count:
+            state.pending_preflight_error = "redis_pending_readback_unconfirmed"
+            return
+        second_pending_ids, error = await self._read_pending_ids(pending_count)
+        if error is not None or second_pending_ids is None or second_pending_ids != first_pending_ids:
+            state.pending_preflight_error = "redis_pending_readback_unconfirmed"
+            return
+
+        self._preflight_pending_ids = first_pending_ids
+        state.pending_preflight_confirmed = True
+
+    async def _read_pending_ids(self, expected_count: int) -> tuple[frozenset[str] | None, str | None]:
+        if expected_count == 0:
+            return frozenset(), None
+        if expected_count > HARD_PENDING_SCAN_LIMIT:
+            return None, "redis_pending_scan_limit_exceeded"
+        scan_count = min(HARD_PENDING_SCAN_LIMIT, max(DEFAULT_PENDING_SCAN_LIMIT, expected_count))
+        raw_pending = await self._client.xpending_range(
+            self._queue_name,
+            self._consumer_group,
+            "-",
+            "+",
+            scan_count,
+        )
+        pending_ids = _pending_message_ids(raw_pending)
+        if pending_ids is None or len(pending_ids) != expected_count:
+            return None, "redis_pending_readback_unconfirmed"
+        return frozenset(pending_ids), None
 
     async def consume_target(
         self,
@@ -584,6 +768,68 @@ class SqlAlchemyBoundedAnalysisRouteRepository:
     async def insert_judge_call_requested_outbox(self, **kwargs: Any) -> None:
         await self._router_repository.insert_judge_call_requested_outbox(**kwargs)
 
+    async def read_judge_call_handoff(
+        self,
+        *,
+        judge_run_id: UUID,
+    ) -> JudgeCallHandoffReadback:
+        result = await self._session.execute(
+            _sql(
+                """
+                SELECT
+                    judge_runs.judge_run_id AS judge_run_id,
+                    judge_runs.bundle_id AS judge_run_bundle_id,
+                    event_outbox.event_id AS event_id,
+                    event_outbox.event_type AS event_type,
+                    event_outbox.aggregate_type AS aggregate_type,
+                    event_outbox.aggregate_id AS aggregate_id,
+                    event_outbox.payload_json AS payload_json,
+                    event_outbox.status AS status,
+                    event_outbox.dedupe_key AS dedupe_key
+                FROM judge_runs
+                LEFT JOIN event_outbox
+                  ON event_outbox.dedupe_key = :dedupe_key
+                WHERE judge_runs.judge_run_id = CAST(:judge_run_id AS uuid)
+                ORDER BY event_outbox.created_at ASC, event_outbox.event_id ASC
+                """
+            ),
+            {
+                "judge_run_id": str(judge_run_id),
+                "dedupe_key": f"{JUDGE_CALL_DEDUPE_PREFIX}{judge_run_id}",
+            },
+        )
+        rows = list(result.mappings().all())
+        if not rows:
+            return JudgeCallHandoffReadback(judge_run_id=None, bundle_id=None, events=())
+
+        judge_run_uuid = _uuid_or_none(rows[0].get("judge_run_id"))
+        bundle_uuid = _uuid_or_none(rows[0].get("judge_run_bundle_id"))
+        events: list[JudgeCallHandoffEvent] = []
+        for row in rows:
+            event_id = _uuid_or_none(row.get("event_id"))
+            aggregate_id = _uuid_or_none(row.get("aggregate_id"))
+            if event_id is None or aggregate_id is None:
+                continue
+            payload = row.get("payload_json")
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            events.append(
+                JudgeCallHandoffEvent(
+                    event_id=event_id,
+                    event_type=str(row.get("event_type") or ""),
+                    aggregate_type=str(row.get("aggregate_type") or ""),
+                    aggregate_id=aggregate_id,
+                    payload_json=payload if isinstance(payload, dict) else {},
+                    status=str(row.get("status") or ""),
+                    dedupe_key=str(row["dedupe_key"]) if row.get("dedupe_key") is not None else None,
+                )
+            )
+        return JudgeCallHandoffReadback(
+            judge_run_id=judge_run_uuid,
+            bundle_id=bundle_uuid,
+            events=tuple(events),
+        )
+
 
 async def build_default_bounded_analysis_router_redis_consumer(
     runtime_config: BoundedAnalysisRouterRuntimeConfig,
@@ -626,12 +872,22 @@ async def build_default_bounded_analysis_router_database(
     state.database_session_opened = True
     repository = SqlAlchemyBoundedAnalysisRouteRepository(session)
 
-    async def close(commit: bool) -> None:
+    committed = False
+
+    async def commit_database() -> None:
+        nonlocal committed
+        if committed:
+            return
+        state.database_commit_attempted = True
+        await session.commit()
+        committed = True
+        state.database_commit_succeeded = True
+
+    async def close(should_commit: bool) -> None:
         try:
-            if commit:
-                state.database_commit_attempted = True
-                await session.commit()
-            else:
+            if should_commit and not committed:
+                await commit_database()
+            elif not should_commit and not committed:
                 await session.rollback()
         finally:
             try:
@@ -639,7 +895,7 @@ async def build_default_bounded_analysis_router_database(
             finally:
                 await engine.dispose()
 
-    return BoundedAnalysisRouterDatabaseHandle(repository=repository, close=close)
+    return BoundedAnalysisRouterDatabaseHandle(repository=repository, commit=commit_database, close=close)
 
 
 def load_bounded_analysis_router_runtime_config(
@@ -728,6 +984,8 @@ async def run_bounded_analysis_router(
     request_current: bool | None = None
     bundle_ready: bool | None = None
     existing_judge_run_found: bool | None = None
+    judge_run_id: UUID | None = None
+    handoff: JudgeCallHandoffReadback | None = None
     planned_action: str | None = None
     would_fail_closed = False
 
@@ -773,8 +1031,8 @@ async def run_bounded_analysis_router(
             )
             raise _AnalysisRouterResultReady
 
-        await redis_handle.consumer.preflight_group(selected, state)
-        group_preflight_error = _group_preflight_error(state)
+        await redis_handle.consumer.preflight_group(selected, config, state)
+        group_preflight_error = _group_preflight_error(config, state)
         if group_preflight_error is not None:
             would_fail_closed = True
             if config.mode == MODE_EXECUTE:
@@ -790,6 +1048,29 @@ async def run_bounded_analysis_router(
                     would_fail_closed=would_fail_closed,
                 )
                 raise _AnalysisRouterResultReady
+
+        if config.mode == MODE_EXECUTE:
+            consumed, consume_seen, consume_matched = await redis_handle.consumer.consume_target(config, state)
+            if (
+                consumed is None
+                or consume_seen != HARD_MAX_MESSAGES
+                or consume_matched != HARD_MAX_MESSAGES
+                or consumed.redis_message_id != selected.redis_message_id
+                or consumed.fields != selected.fields
+            ):
+                result = _result(
+                    "blocked",
+                    "target_message_not_consumable_exactly",
+                    config=config,
+                    state=state,
+                    selected=selected,
+                    messages_seen=messages_seen,
+                    messages_matched=messages_matched,
+                    planned_action="noop",
+                    would_fail_closed=True,
+                )
+                raise _AnalysisRouterResultReady
+            selected = consumed
 
         database_handle = await (database_builder or build_default_bounded_analysis_router_database)(
             runtime_config,
@@ -1088,31 +1369,6 @@ async def run_bounded_analysis_router(
                 )
                 raise _AnalysisRouterResultReady
 
-            consumed, consume_seen, consume_matched = await redis_handle.consumer.consume_target(config, state)
-            if (
-                consumed is None
-                or consume_seen != HARD_MAX_MESSAGES
-                or consume_matched != HARD_MAX_MESSAGES
-                or consumed.redis_message_id != selected.redis_message_id
-            ):
-                result = _result(
-                    "blocked",
-                    "target_message_not_consumable_exactly",
-                    config=config,
-                    state=state,
-                    selected=selected,
-                    event=event,
-                    job=job,
-                    messages_seen=messages_seen,
-                    messages_matched=messages_matched,
-                    request_current=request_current,
-                    bundle_ready=bundle_ready,
-                    existing_judge_run_found=existing_judge_run_found,
-                    planned_action="noop",
-                    would_fail_closed=True,
-                )
-                raise _AnalysisRouterResultReady
-
             state.database_write_attempted = True
             judge_run_id, created = await repository.get_or_create_judge_run(
                 bundle_id=job.bundle_id,
@@ -1157,8 +1413,86 @@ async def run_bounded_analysis_router(
                 request_current=request_current,
                 bundle_ready=bundle_ready,
                 existing_judge_run_found=existing_judge_run_found,
+                judge_run_id=judge_run_id,
+                handoff=handoff,
                 planned_action=planned_action,
                 would_fail_closed=would_fail_closed,
+            )
+            raise _AnalysisRouterResultReady
+
+        try:
+            await database_handle.commit()
+        except Exception as exc:
+            result = _result(
+                "failed",
+                "database_write_failed",
+                error_class=_safe_exception_class(exc),
+                config=config,
+                state=state,
+                selected=selected,
+                event=event,
+                job=job,
+                counters=counters,
+                messages_seen=messages_seen,
+                messages_matched=messages_matched,
+                request_current=request_current,
+                bundle_ready=bundle_ready,
+                existing_judge_run_found=existing_judge_run_found,
+                judge_run_id=judge_run_id,
+                planned_action=planned_action,
+                would_fail_closed=would_fail_closed,
+            )
+            raise _AnalysisRouterResultReady
+
+        try:
+            handoff = await repository.read_judge_call_handoff(judge_run_id=judge_run_id)
+            handoff_ready = _judge_call_handoff_ready(
+                handoff,
+                judge_run_id=judge_run_id,
+                candidate_group_id=job.candidate_group_id,
+                bundle_id=job.bundle_id,
+            )
+        except Exception as exc:
+            result = _result(
+                "failed",
+                "judge_call_handoff_readback_failed",
+                error_class=_safe_exception_class(exc),
+                config=config,
+                state=state,
+                selected=selected,
+                event=event,
+                job=job,
+                counters=counters,
+                messages_seen=messages_seen,
+                messages_matched=messages_matched,
+                request_current=request_current,
+                bundle_ready=bundle_ready,
+                existing_judge_run_found=existing_judge_run_found,
+                judge_run_id=judge_run_id,
+                planned_action=planned_action,
+                would_fail_closed=True,
+            )
+            raise _AnalysisRouterResultReady
+
+        if not handoff_ready:
+            result = _result(
+                "failed",
+                "judge_call_handoff_readback_failed",
+                config=config,
+                state=state,
+                selected=selected,
+                event=event,
+                job=job,
+                counters=counters,
+                messages_seen=messages_seen,
+                messages_matched=messages_matched,
+                request_current=request_current,
+                bundle_ready=bundle_ready,
+                existing_judge_run_found=existing_judge_run_found,
+                judge_run_id=judge_run_id,
+                handoff=handoff,
+                planned_action=planned_action,
+                would_fail_closed=True,
             )
             raise _AnalysisRouterResultReady
 
@@ -1181,6 +1515,8 @@ async def run_bounded_analysis_router(
                 request_current=request_current,
                 bundle_ready=bundle_ready,
                 existing_judge_run_found=existing_judge_run_found,
+                judge_run_id=judge_run_id,
+                handoff=handoff,
                 planned_action=planned_action,
                 would_fail_closed=would_fail_closed,
             )
@@ -1207,6 +1543,8 @@ async def run_bounded_analysis_router(
                 request_current=request_current,
                 bundle_ready=bundle_ready,
                 existing_judge_run_found=existing_judge_run_found,
+                judge_run_id=judge_run_id,
+                handoff=handoff,
                 planned_action=planned_action,
                 would_fail_closed=would_fail_closed,
             )
@@ -1229,10 +1567,46 @@ async def run_bounded_analysis_router(
                 request_current=request_current,
                 bundle_ready=bundle_ready,
                 existing_judge_run_found=existing_judge_run_found,
+                judge_run_id=judge_run_id,
+                handoff=handoff,
                 planned_action=planned_action,
                 would_fail_closed=would_fail_closed,
             )
             raise _AnalysisRouterResultReady
+
+        if config.allow_unrelated_pending_preservation:
+            try:
+                unrelated_pending_preserved = await redis_handle.consumer.confirm_unrelated_pending_preserved(
+                    selected,
+                    state,
+                )
+            except Exception:
+                unrelated_pending_preserved = False
+                state.unrelated_pending_preserved = False
+            if not unrelated_pending_preserved:
+                result = _result(
+                    "failed",
+                    "unrelated_pending_preservation_readback_failed",
+                    config=config,
+                    state=state,
+                    selected=selected,
+                    event=event,
+                    job=job,
+                    counters=counters,
+                    messages_seen=messages_seen,
+                    messages_matched=messages_matched,
+                    messages_processed_count=1,
+                    redis_ack_status="acked",
+                    redis_acked_count=acked_count,
+                    request_current=request_current,
+                    bundle_ready=bundle_ready,
+                    existing_judge_run_found=existing_judge_run_found,
+                    judge_run_id=judge_run_id,
+                    handoff=handoff,
+                    planned_action=planned_action,
+                    would_fail_closed=True,
+                )
+                raise _AnalysisRouterResultReady
 
         result = _result(
             "routed" if counters.judge_runs_written_count else "reused",
@@ -1251,6 +1625,8 @@ async def run_bounded_analysis_router(
             request_current=request_current,
             bundle_ready=bundle_ready,
             existing_judge_run_found=existing_judge_run_found,
+            judge_run_id=judge_run_id,
+            handoff=handoff,
             planned_action=planned_action,
             would_fail_closed=would_fail_closed,
         )
@@ -1350,6 +1726,8 @@ def _result(
     request_current: bool | None = None,
     bundle_ready: bool | None = None,
     existing_judge_run_found: bool | None = None,
+    judge_run_id: UUID | None = None,
+    handoff: JudgeCallHandoffReadback | None = None,
     planned_action: str | None = None,
     would_fail_closed: bool = False,
 ) -> BoundedAnalysisRouterResult:
@@ -1390,6 +1768,15 @@ def _result(
         request_current=request_current,
         bundle_ready=bundle_ready,
         existing_judge_run_found=existing_judge_run_found,
+        judge_run_id_suffix=_optional_id_suffix(judge_run_id),
+        judge_call_handoff_found=_judge_call_handoff_found(handoff),
+        judge_call_handoff_ready=_judge_call_handoff_ready_for_result(
+            handoff,
+            judge_run_id=judge_run_id,
+            job=job,
+        ),
+        judge_call_event_status=_judge_call_handoff_event_status(handoff),
+        judge_call_event_id_suffix=_judge_call_handoff_event_suffix(handoff),
         planned_action=planned_action,
         would_fail_closed=would_fail_closed,
     )
@@ -1476,11 +1863,20 @@ def _gate_error(config: BoundedAnalysisRouterConfig) -> str | None:
     return None
 
 
-def _group_preflight_error(state: BoundedAnalysisRouterState) -> str | None:
+def _group_preflight_error(
+    config: BoundedAnalysisRouterConfig,
+    state: BoundedAnalysisRouterState,
+) -> str | None:
     if state.group_exists is not True:
         return "redis_consumer_group_missing"
+    if config.allow_unrelated_pending_preservation and state.pending_preflight_error is not None:
+        return state.pending_preflight_error
     if state.group_pending != 0:
-        return "redis_consumer_group_pending_nonzero"
+        if config.allow_unrelated_pending_preservation:
+            if state.pending_preflight_confirmed is not True:
+                return "redis_pending_readback_unconfirmed"
+        else:
+            return "redis_consumer_group_pending_nonzero"
     if state.target_after_group_last_delivered is not True:
         return "target_not_after_group_last_delivered"
     if state.target_is_next_deliverable is not True:
@@ -1611,6 +2007,21 @@ def _flatten_group_stream_entries(raw: Any) -> list[tuple[str, Mapping[str, Any]
     return messages
 
 
+def _pending_message_ids(raw: Any) -> set[str] | None:
+    pending_ids: set[str] = set()
+    for entry in raw or []:
+        if isinstance(entry, Mapping):
+            message_id = _string_or_none(entry.get("message_id"))
+        elif isinstance(entry, (list, tuple)) and entry:
+            message_id = _string_or_none(entry[0])
+        else:
+            return None
+        if message_id is None or _normalize_redis_stream_id(message_id) is None or message_id in pending_ids:
+            return None
+        pending_ids.add(message_id)
+    return pending_ids
+
+
 def _find_consumer_group(raw: Any, group_name: str) -> dict[str, Any] | None:
     for item in raw or []:
         group = _decode_group_info(item)
@@ -1658,6 +2069,64 @@ def _event_from_mapping(row: Mapping[str, Any]) -> AnalysisRequestOutboxEvent:
         dedupe_key=str(row["dedupe_key"]) if row.get("dedupe_key") is not None else None,
         created_at=row.get("created_at"),
     )
+
+
+def _judge_call_handoff_ready(
+    handoff: JudgeCallHandoffReadback,
+    *,
+    judge_run_id: UUID,
+    candidate_group_id: str,
+    bundle_id: str,
+) -> bool:
+    if handoff.judge_run_id != judge_run_id or _id_text(handoff.bundle_id) != _id_text(bundle_id):
+        return False
+    if len(handoff.events) != 1:
+        return False
+    event = handoff.events[0]
+    payload_judge_run_id = _uuid_or_none(event.payload_json.get("judge_run_id"))
+    payload_candidate_group_id = _uuid_or_none(event.payload_json.get("candidate_group_id"))
+    payload_bundle_id = _uuid_or_none(event.payload_json.get("bundle_id"))
+    return (
+        event.event_type == JUDGE_CALL_EVENT_TYPE
+        and event.aggregate_type == JUDGE_CALL_AGGREGATE_TYPE
+        and event.aggregate_id == judge_run_id
+        and payload_judge_run_id == judge_run_id
+        and _id_text(payload_candidate_group_id) == _id_text(candidate_group_id)
+        and _id_text(payload_bundle_id) == _id_text(bundle_id)
+        and event.status in JUDGE_CALL_ALLOWED_STATUSES
+        and event.dedupe_key == f"{JUDGE_CALL_DEDUPE_PREFIX}{judge_run_id}"
+    )
+
+
+def _judge_call_handoff_found(handoff: JudgeCallHandoffReadback | None) -> bool:
+    return handoff is not None and handoff.judge_run_id is not None and bool(handoff.events)
+
+
+def _judge_call_handoff_ready_for_result(
+    handoff: JudgeCallHandoffReadback | None,
+    *,
+    judge_run_id: UUID | None,
+    job: AnalysisRequestedJob | None,
+) -> bool:
+    return bool(
+        handoff is not None
+        and judge_run_id is not None
+        and job is not None
+        and _judge_call_handoff_ready(
+            handoff,
+            judge_run_id=judge_run_id,
+            candidate_group_id=job.candidate_group_id,
+            bundle_id=job.bundle_id,
+        )
+    )
+
+
+def _judge_call_handoff_event_status(handoff: JudgeCallHandoffReadback | None) -> str | None:
+    return handoff.events[0].status if handoff is not None and len(handoff.events) == 1 else None
+
+
+def _judge_call_handoff_event_suffix(handoff: JudgeCallHandoffReadback | None) -> str | None:
+    return _optional_id_suffix(handoff.events[0].event_id) if handoff is not None and len(handoff.events) == 1 else None
 
 
 def _uuid_or_none(value: Any) -> UUID | None:
@@ -1765,11 +2234,15 @@ __all__ = [
     "BoundedAnalysisRouterResult",
     "BoundedAnalysisRouterRuntimeConfig",
     "DEFAULT_MAX_MESSAGES",
+    "DEFAULT_PENDING_SCAN_LIMIT",
     "DEFAULT_SCAN_LIMIT",
     "EVENT_TYPE",
     "EXPECTED_STREAM_FIELDS",
     "HARD_MAX_MESSAGES",
+    "HARD_PENDING_SCAN_LIMIT",
     "HARD_SCAN_LIMIT",
+    "JudgeCallHandoffEvent",
+    "JudgeCallHandoffReadback",
     "MODE_EXECUTE",
     "MODE_PREVIEW",
     "QUEUE_NAME",

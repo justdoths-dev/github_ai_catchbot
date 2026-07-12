@@ -4,7 +4,7 @@ import ast
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from src.services.analysis_router.bounded_analysis_router_runner import (
     AnalysisRequestOutboxEvent,
@@ -12,6 +12,8 @@ from src.services.analysis_router.bounded_analysis_router_runner import (
     BoundedAnalysisRouterDatabaseHandle,
     BoundedAnalysisRouterRedisHandle,
     BoundedAnalysisRouterRuntimeConfig,
+    JudgeCallHandoffEvent,
+    JudgeCallHandoffReadback,
 )
 from src.services.analysis_router.config import AnalysisRouterConfig
 from src.services.analysis_router.models import BundleRouteRecord, BundleShapeStats, CandidateRouteState
@@ -36,6 +38,36 @@ class FakeRedisClient:
     async def xlen(self, name: str) -> int:
         assert name == "q.analysis.route"
         return len(self.entries)
+
+    async def xrange(self, name: str, min: str = "-", max: str = "+", count: int | None = None):
+        assert name == "q.analysis.route"
+        assert max == "+"
+        if min == "-":
+            entries = self.entries
+        elif min.startswith("("):
+            entries = [entry for entry in self.entries if tuple(map(int, entry[0].split("-"))) > tuple(map(int, min[1:].split("-")))]
+        else:
+            raise AssertionError(f"unexpected xrange min: {min}")
+        return entries[: count or len(entries)]
+
+    async def xinfo_groups(self, name: str):
+        assert name == "q.analysis.route"
+        return [
+            {
+                "name": "analysis-router",
+                "pending": 0,
+                "lag": len(self.entries),
+                "last-delivered-id": "0-0",
+            }
+        ]
+
+    async def xpending_range(self, name: str, groupname: str, min: str, max: str, count: int):
+        assert name == "q.analysis.route"
+        assert groupname == "analysis-router"
+        assert min == "-"
+        assert max == "+"
+        assert count == 0
+        return []
 
     async def xgroup_create(self, name: str, groupname: str, id: str = "$", mkstream: bool = False) -> None:
         assert name == "q.analysis.route"
@@ -105,12 +137,37 @@ class FakeRepository:
         del bundle_id
         return self.shape
 
+    async def load_existing_judge_run(self, **kwargs):
+        del kwargs
+        return None
+
     async def get_or_create_judge_run(self, **kwargs):
         del kwargs
         return self.created_judge_run_id, True
 
     async def insert_judge_call_requested_outbox(self, **kwargs) -> None:
         self.outbox_calls.append(kwargs)
+
+    async def read_judge_call_handoff(self, *, judge_run_id):
+        return JudgeCallHandoffReadback(
+            judge_run_id=judge_run_id,
+            bundle_id=UUID(str(self.bundle.bundle_id)),
+            events=(
+                JudgeCallHandoffEvent(
+                    event_id=uuid4(),
+                    event_type="judge.call.requested.v1",
+                    aggregate_type="judge_run",
+                    aggregate_id=judge_run_id,
+                    payload_json={
+                        "judge_run_id": str(judge_run_id),
+                        "candidate_group_id": str(self.event.aggregate_id),
+                        "bundle_id": str(self.bundle.bundle_id),
+                    },
+                    status="pending",
+                    dedupe_key=f"judge-call:{judge_run_id}",
+                ),
+            ),
+        )
 
 
 class FakeDatabaseBuilder:
@@ -122,10 +179,14 @@ class FakeDatabaseBuilder:
         del runtime_config, logger
         state.database_session_opened = True
 
+        async def commit() -> None:
+            state.database_commit_attempted = True
+            state.database_commit_succeeded = True
+
         async def close(commit: bool) -> None:
             self.close_commits.append(commit)
 
-        return BoundedAnalysisRouterDatabaseHandle(repository=self.repository, close=close)
+        return BoundedAnalysisRouterDatabaseHandle(repository=self.repository, commit=commit, close=close)
 
 
 def _runtime_config() -> BoundedAnalysisRouterRuntimeConfig:
@@ -215,9 +276,9 @@ def test_main_with_no_flags_returns_json_only_fail_closed_and_empty_stderr(capsy
 
     assert exit_code == 1
     assert captured.err == ""
-    assert parsed["schema_version"] == "bounded_analysis_router_runner_v1"
+    assert parsed["schema_version"] == "bounded_analysis_router_runner_v3"
     assert parsed["runner_name"] == "bounded_analysis_router_job_runner"
-    assert parsed["mode"] == "analysis_route_one_shot_consume"
+    assert parsed["mode"] == "preview"
     assert parsed["ok"] is False
     assert parsed["status"] == "blocked"
     assert parsed["error_code"] == "operator_approval_missing"
@@ -247,16 +308,56 @@ def test_parser_exposes_only_bounded_approved_flags() -> None:
 
     assert parser_flags == {
         "--operator-approved",
+        "--mode",
         "--allow-runtime-config",
+        "--allow-redis-read",
+        "--allow-database-read",
         "--allow-redis-consume",
         "--allow-database-write",
         "--allow-redis-ack",
+        "--allow-unrelated-pending-preservation",
         "--trigger-event-id",
         "--trigger-event-suffix",
+        "--candidate-group-suffix",
+        "--aggregate-suffix",
         "--redis-message-id",
         "--max-messages",
         "--scan-limit",
     }
+
+
+def test_unrelated_pending_preservation_flag_defaults_false_and_preview_stays_read_only(capsys) -> None:
+    default_args = runner.build_parser().parse_args([])
+    enabled_args = runner.build_parser().parse_args(["--allow-unrelated-pending-preservation"])
+    assert default_args.allow_unrelated_pending_preservation is False
+    assert enabled_args.allow_unrelated_pending_preservation is True
+
+    event, repository, redis = _fake_parts()
+    exit_code = runner.main(
+        [
+            "--mode",
+            "preview",
+            "--operator-approved",
+            "--allow-runtime-config",
+            "--allow-redis-read",
+            "--allow-database-read",
+            "--allow-unrelated-pending-preservation",
+            "--trigger-event-suffix",
+            str(event.event_id)[-8:],
+        ],
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=FakeDatabaseBuilder(repository),
+    )
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
+
+    assert exit_code == 0
+    assert parsed["gates"]["unrelated_pending_preservation_allowed"] is True
+    assert parsed["side_effects"]["redis_consume_called"] is False
+    assert parsed["side_effects"]["db_write"] is False
+    assert parsed["redis_ack_attempted"] is False
+    assert redis.acked == []
 
 
 def test_valid_cli_fake_run_prints_json_only_and_redacts_sensitive_values(capsys) -> None:
@@ -264,8 +365,12 @@ def test_valid_cli_fake_run_prints_json_only_and_redacts_sensitive_values(capsys
 
     exit_code = runner.main(
         [
+            "--mode",
+            "execute",
             "--operator-approved",
             "--allow-runtime-config",
+            "--allow-redis-read",
+            "--allow-database-read",
             "--allow-redis-consume",
             "--allow-database-write",
             "--allow-redis-ack",
@@ -342,7 +447,7 @@ def test_invalid_uuid_or_suffix_returns_sanitized_json_without_runtime_config(ca
     invalid_suffix = json.loads(capsys.readouterr().out)
 
     assert invalid_id_exit == 1
-    assert invalid_id["error_code"] == "invalid_trigger_event_id"
+    assert invalid_id["error_code"] == "full_trigger_event_id_selector_not_allowed"
     assert invalid_id["side_effects"]["redis_consume_called"] is False
     assert invalid_id["database_write_attempted"] is False
     assert invalid_suffix_exit == 1

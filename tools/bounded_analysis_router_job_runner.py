@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-redis-consume", action="store_true")
     parser.add_argument("--allow-database-write", action="store_true")
     parser.add_argument("--allow-redis-ack", action="store_true")
+    parser.add_argument("--allow-unrelated-pending-preservation", action="store_true")
     parser.add_argument("--trigger-event-id")
     parser.add_argument("--trigger-event-suffix")
     parser.add_argument("--candidate-group-suffix", "--aggregate-suffix", dest="candidate_group_suffix")
@@ -109,6 +110,7 @@ def run(
             allow_redis_consume=bool(args.allow_redis_consume),
             allow_database_write=bool(args.allow_database_write),
             allow_redis_ack=bool(args.allow_redis_ack),
+            allow_unrelated_pending_preservation=bool(args.allow_unrelated_pending_preservation),
             trigger_event_id=trigger_event_id,
             trigger_event_suffix=trigger_event_suffix,
             candidate_group_suffix=candidate_group_suffix,

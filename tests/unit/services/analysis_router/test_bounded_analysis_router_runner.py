@@ -16,10 +16,21 @@ from src.services.analysis_router.bounded_analysis_router_runner import (
     BoundedAnalysisRouterRedisHandle,
     BoundedAnalysisRouterRuntimeConfig,
     AnalysisRequestOutboxEvent,
+    JudgeCallHandoffEvent,
+    JudgeCallHandoffReadback,
     run_bounded_analysis_router,
 )
 from src.services.analysis_router.config import AnalysisRouterConfig
 from src.services.analysis_router.models import BundleRouteRecord, BundleShapeStats, CandidateRouteState
+from src.services.outbox_relay.bounded_judge_call_requested_outbox_publish_runner import (
+    BoundedJudgeCallRequestedOutboxPublishConfig,
+    BoundedJudgeCallRequestedPublishRuntimeConfig,
+    BoundedJudgeCallRequestedRedisPublisherHandle,
+    BoundedJudgeCallRequestedRepositoryHandle,
+    JudgeRunLocatorRecord,
+    run_bounded_judge_call_requested_outbox_publish,
+)
+from src.services.outbox_relay.models import OutboxEventRow
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -43,6 +54,9 @@ class FakeRedisClient:
         order: list[str] | None = None,
         group_exists: bool = True,
         group_pending: int = 0,
+        pending_entries: list[dict[str, object]] | None = None,
+        pending_snapshots: list[list[dict[str, object]]] | None = None,
+        delivered_entries: list[tuple[str, dict[str, object]]] | None = None,
         group_lag: int | None = None,
         group_last_delivered_id: str = "0-0",
     ) -> None:
@@ -52,6 +66,9 @@ class FakeRedisClient:
         self.order = order
         self.group_exists = group_exists
         self.group_pending = group_pending
+        self.pending_entries = pending_entries or []
+        self.pending_snapshots = pending_snapshots or []
+        self.delivered_entries = delivered_entries if delivered_entries is not None else self.entries
         self.group_lag = len(self.entries) if group_lag is None else group_lag
         self.group_last_delivered_id = group_last_delivered_id
         self.group_created = False
@@ -62,6 +79,7 @@ class FakeRedisClient:
         self.xinfo_calls = 0
         self.read_calls = 0
         self.xreadgroup_blocks: list[int | None] = []
+        self.xpending_range_calls: list[dict[str, object]] = []
 
     async def xlen(self, name: str) -> int:
         assert name == "q.analysis.route"
@@ -117,6 +135,23 @@ class FakeRedisClient:
             }
         ]
 
+    async def xpending_range(
+        self,
+        name: str,
+        groupname: str,
+        min: str,
+        max: str,
+        count: int,
+    ) -> list[dict[str, object]]:
+        assert name == "q.analysis.route"
+        assert groupname == "analysis-router"
+        assert min == "-"
+        assert max == "+"
+        self.xpending_range_calls.append({"count": count})
+        if self.pending_snapshots:
+            return self.pending_snapshots.pop(0)[:count]
+        return self.pending_entries[:count]
+
     async def xreadgroup(
         self,
         groupname: str,
@@ -131,10 +166,10 @@ class FakeRedisClient:
         assert block is None
         self.xreadgroup_blocks.append(block)
         self.read_calls += 1
-        if self.cursor >= len(self.entries):
+        if self.cursor >= len(self.delivered_entries):
             return []
-        end = min(len(self.entries), self.cursor + (count or len(self.entries)))
-        batch = self.entries[self.cursor : end]
+        end = min(len(self.delivered_entries), self.cursor + (count or len(self.delivered_entries)))
+        batch = self.delivered_entries[self.cursor : end]
         self.cursor = end
         return [("q.analysis.route", batch)]
 
@@ -179,8 +214,11 @@ class FakeRepository:
         bundle: BundleRouteRecord | None,
         shape: BundleShapeStats | None = None,
         existing_judge_run_id: UUID | None = None,
+        fail_fetch_event: BaseException | None = None,
         fail_get_or_create: BaseException | None = None,
         fail_insert_outbox: BaseException | None = None,
+        handoff_readbacks: list[JudgeCallHandoffReadback] | None = None,
+        fail_handoff_readback: BaseException | None = None,
         order: list[str] | None = None,
     ) -> None:
         self.event = event
@@ -188,8 +226,11 @@ class FakeRepository:
         self.bundle = bundle
         self.shape = shape or BundleShapeStats(member_count=1, supporting_count=0)
         self.existing_judge_run_id = existing_judge_run_id
+        self.fail_fetch_event = fail_fetch_event
         self.fail_get_or_create = fail_get_or_create
         self.fail_insert_outbox = fail_insert_outbox
+        self.handoff_readbacks = handoff_readbacks or []
+        self.fail_handoff_readback = fail_handoff_readback
         self.order = order
         self.fetch_event_calls: list[str] = []
         self.candidate_state_calls: list[str] = []
@@ -198,9 +239,13 @@ class FakeRepository:
         self.get_or_create_calls: list[dict[str, object]] = []
         self.outbox_calls: list[dict[str, object]] = []
         self.created_judge_run_id = uuid4()
+        self.judge_call_event_id = uuid4()
+        self.handoff_readback_calls: list[UUID] = []
 
     async def fetch_analysis_request_event(self, trigger_event_id: str):
         self.fetch_event_calls.append(trigger_event_id)
+        if self.fail_fetch_event is not None:
+            raise self.fail_fetch_event
         return self.event if self.event and str(self.event.event_id) == trigger_event_id else None
 
     async def load_candidate_route_state(self, candidate_group_id: str):
@@ -235,6 +280,36 @@ class FakeRepository:
             raise self.fail_insert_outbox
         self.outbox_calls.append(kwargs)
 
+    async def read_judge_call_handoff(self, *, judge_run_id: UUID) -> JudgeCallHandoffReadback:
+        if self.order is not None:
+            self.order.append("db:handoff_readback")
+        self.handoff_readback_calls.append(judge_run_id)
+        if self.fail_handoff_readback is not None:
+            raise self.fail_handoff_readback
+        if self.handoff_readbacks:
+            return self.handoff_readbacks.pop(0)
+        assert self.event is not None
+        payload = self.event.payload_json
+        return JudgeCallHandoffReadback(
+            judge_run_id=judge_run_id,
+            bundle_id=UUID(str(payload["bundle_id"])),
+            events=(
+                JudgeCallHandoffEvent(
+                    event_id=self.judge_call_event_id,
+                    event_type="judge.call.requested.v1",
+                    aggregate_type="judge_run",
+                    aggregate_id=judge_run_id,
+                    payload_json={
+                        "judge_run_id": str(judge_run_id),
+                        "candidate_group_id": str(payload["candidate_group_id"]),
+                        "bundle_id": str(payload["bundle_id"]),
+                    },
+                    status="pending",
+                    dedupe_key=f"judge-call:{judge_run_id}",
+                ),
+            ),
+        )
+
 
 class FakeDatabaseBuilder:
     def __init__(
@@ -242,27 +317,37 @@ class FakeDatabaseBuilder:
         repository: FakeRepository,
         *,
         close_error: BaseException | None = None,
+        commit_error: BaseException | None = None,
         order: list[str] | None = None,
     ) -> None:
         self.repository = repository
         self.close_error = close_error
+        self.commit_error = commit_error
         self.order = order
         self.calls = 0
         self.close_commits: list[bool] = []
+        self.commit_calls = 0
 
     async def __call__(self, runtime_config, state, logger):
         del runtime_config, logger
         self.calls += 1
         state.database_session_opened = True
 
+        async def commit() -> None:
+            self.commit_calls += 1
+            state.database_commit_attempted = True
+            if self.order is not None:
+                self.order.append("db:commit")
+            if self.commit_error is not None:
+                raise self.commit_error
+            state.database_commit_succeeded = True
+
         async def close(commit: bool) -> None:
             self.close_commits.append(commit)
-            if self.order is not None:
-                self.order.append("db:commit" if commit else "db:rollback")
             if self.close_error is not None:
                 raise self.close_error
 
-        return BoundedAnalysisRouterDatabaseHandle(repository=self.repository, close=close)
+        return BoundedAnalysisRouterDatabaseHandle(repository=self.repository, commit=commit, close=close)
 
 
 class RaisingDatabaseBuilder:
@@ -320,6 +405,7 @@ def _approved_config(**overrides) -> BoundedAnalysisRouterConfig:
         "allow_redis_consume": True,
         "allow_database_write": True,
         "allow_redis_ack": True,
+        "allow_unrelated_pending_preservation": False,
         "trigger_event_id": uuid4(),
         "trigger_event_suffix": None,
         "redis_message_id": None,
@@ -395,6 +481,45 @@ def _thin_fields(event_id: UUID, candidate_group_id: UUID, **overrides: object) 
     }
     fields.update(overrides)
     return fields
+
+
+def _handoff(
+    judge_run_id: UUID,
+    candidate_group_id: UUID,
+    bundle_id: UUID,
+    *,
+    status: str = "pending",
+    aggregate_id: UUID | None = None,
+    payload_candidate_group_id: UUID | None = None,
+    payload_bundle_id: UUID | None = None,
+    event_id: UUID | None = None,
+    events: tuple[JudgeCallHandoffEvent, ...] | None = None,
+) -> JudgeCallHandoffReadback:
+    if events is not None:
+        return JudgeCallHandoffReadback(
+            judge_run_id=judge_run_id,
+            bundle_id=bundle_id,
+            events=events,
+        )
+    return JudgeCallHandoffReadback(
+        judge_run_id=judge_run_id,
+        bundle_id=bundle_id,
+        events=(
+            JudgeCallHandoffEvent(
+                event_id=event_id or uuid4(),
+                event_type="judge.call.requested.v1",
+                aggregate_type="judge_run",
+                aggregate_id=aggregate_id or judge_run_id,
+                payload_json={
+                    "judge_run_id": str(judge_run_id),
+                    "candidate_group_id": str(payload_candidate_group_id or candidate_group_id),
+                    "bundle_id": str(payload_bundle_id or bundle_id),
+                },
+                status=status,
+                dedupe_key=f"judge-call:{judge_run_id}",
+            ),
+        ),
+    )
 
 
 def _redis_stream_id_greater(left: str, right: str) -> bool:
@@ -771,6 +896,7 @@ async def test_group_pending_nonzero_blocks_before_xreadgroup_db_write_or_ack() 
     assert result.state.redis_ack_attempted is False
     assert result.state.database_write_attempted is False
     assert redis.read_calls == 0
+    assert redis.xpending_range_calls == []
     assert redis.acked == []
     assert database_builder.calls == 0
 
@@ -1175,6 +1301,11 @@ async def test_successful_fake_backed_run_creates_one_judge_run_one_outbox_and_a
     assert report["target_is_next_deliverable"] is True
     assert redis.xinfo_calls == 1
     assert redis.read_calls == 1
+    assert report["judge_call_handoff_found"] is True
+    assert report["judge_call_handoff_ready"] is True
+    assert report["judge_call_event_status"] == "pending"
+    assert report["judge_call_event_id_suffix"] == str(repository.judge_call_event_id)[-8:]
+    assert report["judge_run_id_suffix"] == str(repository.created_judge_run_id)[-8:]
 
 
 @pytest.mark.asyncio
@@ -1222,7 +1353,7 @@ async def test_string_db_contract_ids_route_successfully_and_ack_selected_messag
     assert result.counters.judge_runs_written_count == 1
     assert result.counters.judge_call_requested_outbox_count == 1
     assert database_builder.close_commits == [True]
-    assert order == ["db:get_or_create", "db:outbox", "db:commit", "redis:ack"]
+    assert order == ["db:get_or_create", "db:outbox", "db:commit", "db:handoff_readback", "redis:ack"]
     assert redis.acked == [STREAM_ID]
 
 
@@ -1239,7 +1370,7 @@ async def test_successful_fake_backed_run_commits_before_ack() -> None:
     )
 
     assert result.ok is True
-    assert order == ["db:get_or_create", "db:outbox", "db:commit", "redis:ack"]
+    assert order == ["db:get_or_create", "db:outbox", "db:commit", "db:handoff_readback", "redis:ack"]
 
 
 @pytest.mark.asyncio
@@ -1269,7 +1400,7 @@ async def test_existing_judge_run_reuse_does_not_duplicate_outbox_but_acks_after
 @pytest.mark.asyncio
 async def test_db_commit_failure_does_not_ack() -> None:
     _event_id, _candidate_group_id, _bundle_id, repository, redis, config = _success_parts()
-    database_builder = FakeDatabaseBuilder(repository, close_error=RuntimeError(RAW_EXCEPTION_DETAIL))
+    database_builder = FakeDatabaseBuilder(repository, commit_error=RuntimeError(RAW_EXCEPTION_DETAIL))
 
     result = await run_bounded_analysis_router(
         config,
@@ -1283,10 +1414,86 @@ async def test_db_commit_failure_does_not_ack() -> None:
     assert result.error_code == "database_write_failed"
     assert result.state.redis_ack_attempted is False
     assert redis.acked == []
-    assert database_builder.close_commits == [True]
+    assert database_builder.commit_calls == 1
+    assert repository.handoff_readback_calls == []
     assert RAW_EXCEPTION_DETAIL not in rendered
     assert DB_URL not in rendered
     assert REDIS_URL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_db_read_exception_before_judge_run_returns_database_read_failed_without_ack() -> None:
+    _event_id, _candidate_group_id, _bundle_id, repository, redis, config = _success_parts()
+    repository.fail_fetch_event = RuntimeError(RAW_EXCEPTION_DETAIL)
+    database_builder = FakeDatabaseBuilder(repository)
+
+    result = await run_bounded_analysis_router(
+        config,
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+    rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
+
+    assert result.error_code == "database_read_failed"
+    assert result.error_code != "bounded_analysis_router_failed"
+    assert result.error_class == "RuntimeError"
+    assert result.error_class != "UnboundLocalError"
+    assert database_builder.commit_calls == 0
+    assert repository.handoff_readback_calls == []
+    assert result.state.redis_ack_attempted is False
+    assert redis.acked == []
+    assert RAW_EXCEPTION_DETAIL not in rendered
+    assert DB_URL not in rendered
+    assert REDIS_URL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_exception_returns_database_write_failed_without_ack() -> None:
+    _event_id, _candidate_group_id, _bundle_id, repository, redis, config = _success_parts()
+    repository.fail_get_or_create = RuntimeError(RAW_EXCEPTION_DETAIL)
+    database_builder = FakeDatabaseBuilder(repository)
+
+    result = await run_bounded_analysis_router(
+        config,
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+    rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
+
+    assert result.error_code == "database_write_failed"
+    assert result.error_class == "RuntimeError"
+    assert result.error_class != "UnboundLocalError"
+    assert database_builder.commit_calls == 0
+    assert repository.handoff_readback_calls == []
+    assert result.state.redis_ack_attempted is False
+    assert redis.acked == []
+    assert RAW_EXCEPTION_DETAIL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_insert_outbox_exception_returns_database_write_failed_without_ack() -> None:
+    _event_id, _candidate_group_id, _bundle_id, repository, redis, config = _success_parts()
+    repository.fail_insert_outbox = RuntimeError(RAW_EXCEPTION_DETAIL)
+    database_builder = FakeDatabaseBuilder(repository)
+
+    result = await run_bounded_analysis_router(
+        config,
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+    rendered = json.dumps(result.to_sanitized_dict(), sort_keys=True)
+
+    assert result.error_code == "database_write_failed"
+    assert result.error_class == "RuntimeError"
+    assert result.error_class != "UnboundLocalError"
+    assert database_builder.commit_calls == 0
+    assert repository.handoff_readback_calls == []
+    assert result.state.redis_ack_attempted is False
+    assert redis.acked == []
+    assert RAW_EXCEPTION_DETAIL not in rendered
 
 
 @pytest.mark.asyncio
@@ -1310,6 +1517,420 @@ async def test_redis_ack_failure_reports_failure_after_db_commit() -> None:
     assert database_builder.close_commits == [True]
     assert redis.acked == []
     assert RAW_EXCEPTION_DETAIL not in rendered
+
+
+@pytest.mark.asyncio
+async def test_opt_in_preserves_unrelated_pending_and_reads_durable_handoff_before_exact_ack() -> None:
+    order: list[str] = []
+    event_id, candidate_group_id, _bundle_id, repository, _redis, _config = _success_parts(order=order)
+    unrelated_pending_id = "1709999999999-0"
+    redis = FakeRedisClient(
+        [(STREAM_ID, _thin_fields(event_id, candidate_group_id))],
+        group_pending=1,
+        pending_entries=[{"message_id": unrelated_pending_id}],
+        order=order,
+    )
+    database_builder = FakeDatabaseBuilder(repository, order=order)
+
+    result = await run_bounded_analysis_router(
+        _approved_config(
+            trigger_event_id=event_id,
+            allow_unrelated_pending_preservation=True,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.status == "routed"
+    assert report["unrelated_pending_before_count"] == 1
+    assert report["unrelated_pending_after_count"] == 1
+    assert report["unrelated_pending_preserved"] is True
+    assert report["target_pending_before"] is False
+    assert report["target_pending_after"] is False
+    assert report["pending_inspection_bounded"] is True
+    assert report["pending_preflight_confirmed"] is True
+    assert report["judge_call_handoff_ready"] is True
+    assert report["judge_call_event_id_suffix"] == str(repository.judge_call_event_id)[-8:]
+    assert redis.xpending_range_calls == [{"count": 25}, {"count": 25}, {"count": 25}]
+    assert redis.read_calls == 1
+    assert redis.acked == [STREAM_ID]
+    assert order == ["db:get_or_create", "db:outbox", "db:commit", "db:handoff_readback", "redis:ack"]
+    assert unrelated_pending_id not in json.dumps(report, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_opt_in_blocks_target_already_pending_before_consume_db_or_ack() -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    redis = FakeRedisClient(
+        [(STREAM_ID, _thin_fields(event_id, candidate_group_id))],
+        group_pending=1,
+        pending_entries=[{"message_id": STREAM_ID}],
+    )
+    database_builder = RaisingDatabaseBuilder()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(
+            trigger_event_id=event_id,
+            allow_unrelated_pending_preservation=True,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+
+    assert result.error_code == "target_message_already_pending"
+    assert result.state.target_pending_before is True
+    assert result.state.redis_consume_attempted is False
+    assert result.state.database_write_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert redis.read_calls == 0
+    assert redis.acked == []
+    assert database_builder.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("group_pending", "pending_entries", "pending_snapshots", "expected_error"),
+    (
+        (101, [], None, "redis_pending_scan_limit_exceeded"),
+        (2, [{"message_id": "1709999999999-0"}], None, "redis_pending_readback_unconfirmed"),
+        (1, [{"message_id": "not-a-redis-stream-id"}], None, "redis_pending_readback_unconfirmed"),
+        (
+            1,
+            [],
+            [[{"message_id": "1709999999999-0"}], [{"message_id": "1709999999998-0"}]],
+            "redis_pending_readback_unconfirmed",
+        ),
+    ),
+)
+async def test_opt_in_blocks_ambiguous_pending_inventory_before_consume_db_or_ack(
+    group_pending: int,
+    pending_entries: list[dict[str, object]],
+    pending_snapshots: list[list[dict[str, object]]] | None,
+    expected_error: str,
+) -> None:
+    event_id = uuid4()
+    candidate_group_id = uuid4()
+    redis = FakeRedisClient(
+        [(STREAM_ID, _thin_fields(event_id, candidate_group_id))],
+        group_pending=group_pending,
+        pending_entries=pending_entries,
+        pending_snapshots=pending_snapshots,
+    )
+    database_builder = RaisingDatabaseBuilder()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(
+            trigger_event_id=event_id,
+            allow_unrelated_pending_preservation=True,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+
+    assert result.error_code == expected_error
+    assert result.state.redis_consume_attempted is False
+    assert result.state.database_write_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert redis.read_calls == 0
+    assert redis.acked == []
+    assert database_builder.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_delivered_message_race_blocks_without_db_write_or_ack() -> None:
+    event_id, candidate_group_id, _bundle_id, repository, _redis, _config = _success_parts()
+    redis = FakeRedisClient(
+        [(STREAM_ID, _thin_fields(event_id, candidate_group_id))],
+        delivered_entries=[("1710000000001-0", _thin_fields(uuid4(), uuid4()))],
+    )
+    database_builder = RaisingDatabaseBuilder()
+
+    result = await run_bounded_analysis_router(
+        _approved_config(trigger_event_id=event_id),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+
+    assert result.error_code == "target_message_not_consumable_exactly"
+    assert redis.read_calls == 1
+    assert result.state.database_write_attempted is False
+    assert result.state.redis_ack_attempted is False
+    assert redis.acked == []
+    assert database_builder.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_judge_run",
+        "missing_event",
+        "wrong_aggregate",
+        "wrong_candidate_group",
+        "wrong_bundle",
+        "duplicate_event",
+        "unsupported_status",
+    ),
+)
+async def test_durable_handoff_readback_mismatch_does_not_ack_after_commit(case: str) -> None:
+    event_id, candidate_group_id, bundle_id, repository, redis, config = _success_parts()
+    judge_run_id = repository.created_judge_run_id
+    valid = _handoff(judge_run_id, candidate_group_id, bundle_id)
+    event = valid.events[0]
+    if case == "missing_judge_run":
+        readback = JudgeCallHandoffReadback(judge_run_id=None, bundle_id=None, events=())
+    elif case == "missing_event":
+        readback = JudgeCallHandoffReadback(judge_run_id=judge_run_id, bundle_id=bundle_id, events=())
+    elif case == "wrong_aggregate":
+        readback = _handoff(judge_run_id, candidate_group_id, bundle_id, aggregate_id=uuid4())
+    elif case == "wrong_candidate_group":
+        readback = _handoff(judge_run_id, candidate_group_id, bundle_id, payload_candidate_group_id=uuid4())
+    elif case == "wrong_bundle":
+        readback = _handoff(judge_run_id, candidate_group_id, bundle_id, payload_bundle_id=uuid4())
+    elif case == "duplicate_event":
+        duplicate = JudgeCallHandoffEvent(
+            event_id=uuid4(),
+            event_type=event.event_type,
+            aggregate_type=event.aggregate_type,
+            aggregate_id=event.aggregate_id,
+            payload_json=event.payload_json,
+            status=event.status,
+            dedupe_key=event.dedupe_key,
+        )
+        readback = _handoff(judge_run_id, candidate_group_id, bundle_id, events=(event, duplicate))
+    else:
+        readback = _handoff(judge_run_id, candidate_group_id, bundle_id, status="failed")
+    repository.handoff_readbacks = [readback]
+    database_builder = FakeDatabaseBuilder(repository)
+
+    result = await run_bounded_analysis_router(
+        config,
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=database_builder,
+    )
+
+    assert result.error_code == "judge_call_handoff_readback_failed"
+    assert result.state.database_commit_succeeded is True
+    assert database_builder.commit_calls == 1
+    assert result.state.redis_ack_attempted is False
+    assert redis.acked == []
+    assert len(repository.outbox_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_handoff_readback_retry_reuses_judge_run_without_duplicate_outbox() -> None:
+    event_id, candidate_group_id, bundle_id, repository, redis, config = _success_parts()
+    judge_run_id = repository.created_judge_run_id
+    repository.handoff_readbacks = [
+        JudgeCallHandoffReadback(judge_run_id=judge_run_id, bundle_id=bundle_id, events=())
+    ]
+
+    first = await run_bounded_analysis_router(
+        config,
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=FakeDatabaseBuilder(repository),
+    )
+    repository.existing_judge_run_id = judge_run_id
+    retry_redis = FakeRedisClient([(STREAM_ID, _thin_fields(event_id, candidate_group_id))])
+    second = await run_bounded_analysis_router(
+        config,
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(retry_redis),
+        database_builder=FakeDatabaseBuilder(repository),
+    )
+
+    assert first.error_code == "judge_call_handoff_readback_failed"
+    assert first.state.redis_ack_attempted is False
+    assert second.status == "reused"
+    assert second.judge_call_handoff_ready is True
+    assert second.counters.existing_judge_run_reused_count == 1
+    assert len(repository.get_or_create_calls) == 2
+    assert len(repository.outbox_calls) == 1
+    assert retry_redis.acked == [STREAM_ID]
+
+
+@pytest.mark.asyncio
+async def test_existing_judge_run_reuse_with_opt_in_preserves_unrelated_pending() -> None:
+    existing_judge_run_id = uuid4()
+    event_id, candidate_group_id, _bundle_id, repository, _redis, _config = _success_parts(
+        existing_judge_run_id=existing_judge_run_id
+    )
+    redis = FakeRedisClient(
+        [(STREAM_ID, _thin_fields(event_id, candidate_group_id))],
+        group_pending=1,
+        pending_entries=[{"message_id": "1709999999999-0"}],
+    )
+
+    result = await run_bounded_analysis_router(
+        _approved_config(
+            trigger_event_id=event_id,
+            allow_unrelated_pending_preservation=True,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=FakeDatabaseBuilder(repository),
+    )
+
+    assert result.status == "reused"
+    assert result.counters.existing_judge_run_reused_count == 1
+    assert result.counters.judge_runs_written_count == 0
+    assert repository.outbox_calls == []
+    assert result.judge_call_handoff_ready is True
+    assert result.state.unrelated_pending_preserved is True
+    assert redis.acked == [STREAM_ID]
+
+
+@pytest.mark.asyncio
+async def test_post_ack_pending_preservation_readback_failure_does_not_compensate() -> None:
+    event_id, candidate_group_id, _bundle_id, repository, _redis, _config = _success_parts()
+    redis = FakeRedisClient(
+        [(STREAM_ID, _thin_fields(event_id, candidate_group_id))],
+        group_pending=1,
+        pending_snapshots=[
+            [{"message_id": "1709999999999-0"}],
+            [{"message_id": "1709999999999-0"}],
+            [{"message_id": "1709999999998-0"}],
+        ],
+    )
+
+    result = await run_bounded_analysis_router(
+        _approved_config(
+            trigger_event_id=event_id,
+            allow_unrelated_pending_preservation=True,
+        ),
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=FakeDatabaseBuilder(repository),
+    )
+
+    assert result.error_code == "unrelated_pending_preservation_readback_failed"
+    assert result.redis_ack_status == "acked"
+    assert result.redis_acked_count == 1
+    assert result.state.unrelated_pending_preserved is False
+    assert redis.acked == [STREAM_ID]
+
+
+@pytest.mark.asyncio
+async def test_returned_handoff_suffix_is_accepted_by_existing_judge_call_publisher_selector() -> None:
+    event_id, candidate_group_id, bundle_id, repository, redis, config = _success_parts()
+    router_result = await run_bounded_analysis_router(
+        config,
+        runtime_config_loader=_runtime_config,
+        redis_builder=FakeRedisBuilder(redis),
+        database_builder=FakeDatabaseBuilder(repository),
+    )
+    assert router_result.judge_call_event_id_suffix is not None
+
+    judge_run_id = repository.created_judge_run_id
+    outbox_event = OutboxEventRow(
+        event_id=repository.judge_call_event_id,
+        event_type="judge.call.requested.v1",
+        aggregate_type="judge_run",
+        aggregate_id=judge_run_id,
+        dedupe_key=f"judge-call:{judge_run_id}",
+        payload_json={
+            "judge_run_id": str(judge_run_id),
+            "candidate_group_id": str(candidate_group_id),
+            "bundle_id": str(bundle_id),
+            "model": "gpt-5.4-mini",
+            "reasoning_effort": "low",
+            "prompt_version": "judge_github_primary_v1",
+            "prompt_cache_key": "redacted-test-cache-key",
+        },
+        status="pending",
+        fail_count=0,
+        created_at=datetime.now(timezone.utc),
+    )
+
+    class PublisherRepository:
+        def __init__(self) -> None:
+            self.selector_suffix: str | None = None
+            self.published: list[UUID] = []
+            self.attempts: list[dict[str, object]] = []
+
+        async def fetch_target_events(self, *, trigger_event_id, trigger_event_suffix, limit):
+            assert trigger_event_id is None
+            assert limit == 2
+            self.selector_suffix = trigger_event_suffix
+            return [outbox_event] if trigger_event_suffix == router_result.judge_call_event_id_suffix else []
+
+        async def load_judge_run(self, requested_judge_run_id):
+            assert requested_judge_run_id == judge_run_id
+            return JudgeRunLocatorRecord(
+                judge_run_id=judge_run_id,
+                bundle_id=bundle_id,
+                status="pending",
+            )
+
+        async def mark_published(self, *, event_id, published_at=None):
+            del published_at
+            self.published.append(event_id)
+
+        async def insert_job_attempt(self, **kwargs):
+            self.attempts.append(kwargs)
+
+    class Publisher:
+        def __init__(self) -> None:
+            self.routes: list[object] = []
+
+        async def publish(self, route, message):
+            self.routes.append((route, message))
+            return "1700000000000-0"
+
+    publisher_repository = PublisherRepository()
+    publisher = Publisher()
+
+    async def repository_builder(runtime_config, state, logger):
+        del runtime_config, logger
+        state.database_session_opened = True
+
+        async def close(commit: bool) -> None:
+            assert commit is True
+
+        return BoundedJudgeCallRequestedRepositoryHandle(repository=publisher_repository, close=close)
+
+    async def publisher_builder(runtime_config, state, logger):
+        del runtime_config, logger
+        state.redis_publisher_created = True
+
+        async def close() -> None:
+            return None
+
+        return BoundedJudgeCallRequestedRedisPublisherHandle(publisher=publisher, close=close)
+
+    publish_result = await run_bounded_judge_call_requested_outbox_publish(
+        BoundedJudgeCallRequestedOutboxPublishConfig(
+            operator_approved=True,
+            allow_runtime_config=True,
+            allow_database_read=True,
+            allow_redis_publish=True,
+            allow_database_write=True,
+            trigger_event_suffix=router_result.judge_call_event_id_suffix,
+            max_events=1,
+        ),
+        runtime_config_loader=lambda: BoundedJudgeCallRequestedPublishRuntimeConfig(
+            database_url=DB_URL,
+            redis_url=REDIS_URL,
+        ),
+        repository_builder=repository_builder,
+        redis_publisher_builder=publisher_builder,
+    )
+
+    assert publish_result.status == "published"
+    assert publisher_repository.selector_suffix == router_result.judge_call_event_id_suffix
+    assert publisher_repository.published == [repository.judge_call_event_id]
+    assert len(publisher.routes) == 1
+    route, _message = publisher.routes[0]
+    assert route.queue_name == "q.analysis.judge"
+    assert route.stage_name == "judge"
 
 
 def test_source_ast_guard_no_forbidden_authority_or_broad_worker_calls() -> None:
