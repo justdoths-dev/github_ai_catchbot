@@ -43,6 +43,19 @@ class NotifierTelegramRepositoryProtocol(Protocol):
     async def load_existing_plan_by_material(
         self, *, analysis_id: UUID, target_chat_id: int, material_change_hash: str
     ) -> dict | None: ...
+    async def load_existing_plan_by_subject_material(
+        self, *, dedupe_subject_key: str, target_chat_id: int, material_change_hash: str
+    ) -> dict | None: ...
+    async def load_legacy_equivalent_plan(
+        self,
+        *,
+        analysis_id: UUID,
+        dedupe_subject_key: str,
+        target_chat_id: int,
+        delivery_decision: str,
+        urgency_profile: str,
+        render_profile: str | None,
+    ) -> dict | None: ...
     async def insert_notification_plan(self, draft: NotificationPlanDraft) -> UUID: ...
     async def load_analysis(self, analysis_id: UUID) -> AnalysisRenderContext | None: ...
     async def load_judge_output_render_fields(self, judge_output_id: UUID) -> JudgeOutputRenderContext | None: ...
@@ -145,7 +158,9 @@ class NotifierTelegramService:
                 transport_error_code=reason_code,
             )
         if intent.delivery_decision == "suppress" or not intent.target_chat_id:
-            await self._concretize_plan(intent, status="suppressed")
+            intent, duplicate_result = await self._claim_and_reconcile_plan(intent, status="suppressed")
+            if duplicate_result is not None:
+                return duplicate_result
             await self._transition(intent, to_state="suppressed", reason_code=intent.suppress_reason_code or "notification_suppressed")
             return DeliveryResult(
                 delivery_status="suppressed",
@@ -157,7 +172,9 @@ class NotifierTelegramService:
         if intent.delivery_decision == "send_digest" or (
             intent.urgency_profile == "digest" and not self._config.enable_digest_runtime
         ):
-            await self._concretize_plan(intent, status="suppressed")
+            intent, duplicate_result = await self._claim_and_reconcile_plan(intent, status="suppressed")
+            if duplicate_result is not None:
+                return duplicate_result
             await self._transition(intent, to_state="suppressed", reason_code="notification_digest_deferred")
             return DeliveryResult(
                 delivery_status="suppressed",
@@ -173,9 +190,9 @@ class NotifierTelegramService:
             await self._transition(intent, to_state="failed_terminal", reason_code="notification_missing_candidate_render_context")
             return None
 
-        plan_id = await self._concretize_plan(intent, status="planned")
-        if plan_id != intent.notification_plan_id:
-            intent = replace(intent, notification_plan_id=plan_id)
+        intent, duplicate_result = await self._claim_and_reconcile_plan(intent, status="planned")
+        if duplicate_result is not None:
+            return duplicate_result
 
         plan_row = await self._repository.load_notification_plan(intent.notification_plan_id)
         send_after = _effective_send_after(plan_row, intent)
@@ -343,16 +360,41 @@ class NotifierTelegramService:
     async def _concretize_plan(self, intent: NotificationIntentJob, *, status: str) -> UUID:
         existing = await self._repository.load_notification_plan(intent.notification_plan_id)
         if existing is not None:
+            _validate_plan_identity(existing, intent)
             return UUID(str(existing["notification_plan_id"]))
-        material_existing = await self._repository.load_existing_plan_by_material(
-            analysis_id=intent.analysis_id,
-            target_chat_id=intent.target_chat_id,
-            material_change_hash=intent.material_change_hash,
+        legacy_loader = getattr(self._repository, "load_legacy_equivalent_plan", None)
+        if legacy_loader is not None:
+            legacy_existing = await legacy_loader(
+                analysis_id=intent.analysis_id,
+                dedupe_subject_key=intent.dedupe_subject_key,
+                target_chat_id=intent.target_chat_id,
+                delivery_decision=intent.delivery_decision,
+                urgency_profile=intent.urgency_profile,
+                render_profile=intent.render_profile,
+            )
+            if legacy_existing is not None:
+                return UUID(str(legacy_existing["notification_plan_id"]))
+        subject_material_loader = getattr(
+            self._repository,
+            "load_existing_plan_by_subject_material",
+            None,
         )
+        if subject_material_loader is not None:
+            material_existing = await subject_material_loader(
+                dedupe_subject_key=intent.dedupe_subject_key,
+                target_chat_id=intent.target_chat_id,
+                material_change_hash=intent.material_change_hash,
+            )
+        else:
+            material_existing = await self._repository.load_existing_plan_by_material(
+                analysis_id=intent.analysis_id,
+                target_chat_id=intent.target_chat_id,
+                material_change_hash=intent.material_change_hash,
+            )
         if material_existing is not None:
             return UUID(str(material_existing["notification_plan_id"]))
         async with self._repository.transaction():
-            return await self._repository.insert_notification_plan(
+            plan_id = await self._repository.insert_notification_plan(
                 NotificationPlanDraft(
                     notification_plan_id=intent.notification_plan_id,
                     analysis_id=intent.analysis_id,
@@ -369,6 +411,47 @@ class NotifierTelegramService:
                     status=status,
                 )
             )
+        if plan_id == intent.notification_plan_id:
+            claimed_plan = await self._repository.load_notification_plan(plan_id)
+            if claimed_plan is None:
+                raise NotifierIdempotencyGuardError("notification_plan_claim_readback_missing")
+            _validate_plan_identity(claimed_plan, intent)
+        return plan_id
+
+    async def _claim_and_reconcile_plan(
+        self,
+        intent: NotificationIntentJob,
+        *,
+        status: str,
+    ) -> tuple[NotificationIntentJob, DeliveryResult | None]:
+        plan_id = await self._concretize_plan(intent, status=status)
+        if plan_id == intent.notification_plan_id:
+            return intent, None
+
+        claimed_plan = await self._repository.load_notification_plan(plan_id)
+        if claimed_plan is None:
+            raise NotifierIdempotencyGuardError("notification_plan_claim_readback_missing")
+        if (
+            UUID(str(claimed_plan["analysis_id"])) != intent.analysis_id
+            or UUID(str(claimed_plan["candidate_group_id"])) != intent.candidate_group_id
+        ):
+            await self._transition_for_plan_id(
+                plan_id,
+                to_state=str(claimed_plan.get("status") or "planned"),
+                reason_code="notification_duplicate_repost_noop",
+            )
+            return (
+                intent,
+                DeliveryResult(
+                    delivery_status="suppressed",
+                    telegram_chat_id=intent.target_chat_id,
+                    telegram_message_id=None,
+                    attempt_count=0,
+                    transport_error_code="notification_duplicate_repost_noop",
+                ),
+            )
+        _validate_plan_identity(claimed_plan, intent)
+        return replace(intent, notification_plan_id=plan_id), None
 
     async def _perform_delivery(
         self,
@@ -506,6 +589,25 @@ class NotifierTelegramService:
                 to_state=to_state,
                 reason_code=reason_code,
             )
+
+
+def _validate_plan_identity(plan_row: dict, intent: NotificationIntentJob) -> None:
+    try:
+        identity_matches = (
+            UUID(str(plan_row["analysis_id"])) == intent.analysis_id
+            and UUID(str(plan_row["candidate_group_id"])) == intent.candidate_group_id
+            and str(plan_row["delivery_decision"]) == intent.delivery_decision
+            and str(plan_row["urgency_profile"]) == intent.urgency_profile
+            and int(plan_row["target_chat_id"]) == intent.target_chat_id
+            and plan_row.get("target_thread_id") == intent.target_thread_id
+            and plan_row.get("render_profile") == intent.render_profile
+            and str(plan_row["dedupe_subject_key"]) == intent.dedupe_subject_key
+            and str(plan_row["material_change_hash"]) == intent.material_change_hash
+        )
+    except (KeyError, TypeError, ValueError, AttributeError):
+        identity_matches = False
+    if not identity_matches:
+        raise NotifierIdempotencyGuardError("notification_plan_identity_mismatch")
 
 
 def _extract_chat_id(message: object, fallback: int) -> int:

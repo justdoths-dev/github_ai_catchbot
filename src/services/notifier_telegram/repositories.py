@@ -188,6 +188,113 @@ class NotifierTelegramRepository:
         row = result.mappings().first()
         return dict(row) if row else None
 
+    async def load_existing_plan_by_subject_material(
+        self,
+        *,
+        dedupe_subject_key: str,
+        target_chat_id: int,
+        material_change_hash: str,
+    ) -> dict[str, Any] | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT p.notification_plan_id, p.analysis_id, p.candidate_group_id,
+                       p.delivery_decision, p.urgency_profile, p.target_chat_id,
+                       p.target_thread_id, p.render_profile, p.dedupe_subject_key,
+                       p.material_change_hash, p.send_after, p.suppress_reason_code, p.status
+                FROM notification_material_claims claim
+                JOIN notification_plans p
+                  ON p.notification_plan_id = claim.notification_plan_id
+                WHERE claim.dedupe_subject_key = :dedupe_subject_key
+                  AND claim.target_chat_id = :target_chat_id
+                  AND claim.material_change_hash = :material_change_hash
+                """
+            ),
+            {
+                "dedupe_subject_key": dedupe_subject_key,
+                "target_chat_id": target_chat_id,
+                "material_change_hash": material_change_hash,
+            },
+        )
+        row = result.mappings().first()
+        if row is not None:
+            return dict(row)
+
+        legacy_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT notification_plan_id, analysis_id, candidate_group_id, delivery_decision,
+                       urgency_profile, target_chat_id, target_thread_id, render_profile,
+                       dedupe_subject_key, material_change_hash, send_after,
+                       suppress_reason_code, status
+                FROM notification_plans
+                WHERE dedupe_subject_key = :dedupe_subject_key
+                  AND target_chat_id = :target_chat_id
+                  AND material_change_hash = :material_change_hash
+                ORDER BY created_at DESC, notification_plan_id DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "dedupe_subject_key": dedupe_subject_key,
+                "target_chat_id": target_chat_id,
+                "material_change_hash": material_change_hash,
+            },
+        )
+        legacy_row = legacy_result.mappings().first()
+        return dict(legacy_row) if legacy_row else None
+
+    async def load_legacy_equivalent_plan(
+        self,
+        *,
+        analysis_id: UUID,
+        dedupe_subject_key: str,
+        target_chat_id: int,
+        delivery_decision: str,
+        urgency_profile: str,
+        render_profile: str | None,
+    ) -> dict[str, Any] | None:
+        result = await self._session.execute(
+            sa.text(
+                """
+                SELECT p.notification_plan_id, p.analysis_id, p.candidate_group_id,
+                       p.delivery_decision, p.urgency_profile, p.target_chat_id,
+                       p.target_thread_id, p.render_profile, p.dedupe_subject_key,
+                       p.material_change_hash, p.send_after, p.suppress_reason_code, p.status
+                FROM analyses incoming
+                JOIN notification_plans p
+                  ON p.target_chat_id = :target_chat_id
+                JOIN analyses prior
+                  ON prior.analysis_id = p.analysis_id
+                JOIN candidate_group_proposals prior_candidate
+                  ON prior_candidate.candidate_group_id = p.candidate_group_id
+                WHERE incoming.analysis_id = CAST(:analysis_id AS uuid)
+                  AND prior_candidate.dedupe_subject_key = :dedupe_subject_key
+                  AND p.dedupe_subject_key = p.candidate_group_id::text
+                  AND p.delivery_decision::text = :delivery_decision
+                  AND p.urgency_profile::text = :urgency_profile
+                  AND p.render_profile IS NOT DISTINCT FROM :render_profile
+                  AND prior.verdict = incoming.verdict
+                  AND prior.delivery_decision = incoming.delivery_decision
+                  AND prior.reason_codes_json = incoming.reason_codes_json
+                  AND prior.recommended_action_ko IS NOT DISTINCT FROM incoming.recommended_action_ko
+                  AND prior.freshness_note_ko IS NOT DISTINCT FROM incoming.freshness_note_ko
+                ORDER BY p.created_at DESC, p.notification_plan_id DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "analysis_id": str(analysis_id),
+                "dedupe_subject_key": dedupe_subject_key,
+                "target_chat_id": target_chat_id,
+                "delivery_decision": delivery_decision,
+                "urgency_profile": urgency_profile,
+                "render_profile": render_profile,
+            },
+        )
+        row = result.mappings().first()
+        return dict(row) if row else None
+
     async def load_idempotency_plan_snapshots(self, intent: NotificationIntentJob) -> list[NotifierPlanIdempotencySnapshot]:
         result = await self._session.execute(
             sa.text(
@@ -221,9 +328,7 @@ class NotifierTelegramRepository:
                 LEFT JOIN notification_delivery_records d ON d.notification_plan_id = p.notification_plan_id
                 WHERE p.notification_plan_id = CAST(:notification_plan_id AS uuid)
                    OR (
-                       p.analysis_id = CAST(:analysis_id AS uuid)
-                       AND p.candidate_group_id = CAST(:candidate_group_id AS uuid)
-                       AND p.target_chat_id = :target_chat_id
+                       p.target_chat_id = :target_chat_id
                        AND p.dedupe_subject_key = :dedupe_subject_key
                        AND p.material_change_hash = :material_change_hash
                    )
@@ -233,8 +338,6 @@ class NotifierTelegramRepository:
             ),
             {
                 "notification_plan_id": str(intent.notification_plan_id),
-                "analysis_id": str(intent.analysis_id),
-                "candidate_group_id": str(intent.candidate_group_id),
                 "target_chat_id": intent.target_chat_id,
                 "dedupe_subject_key": intent.dedupe_subject_key,
                 "material_change_hash": intent.material_change_hash,
@@ -259,6 +362,66 @@ class NotifierTelegramRepository:
         return snapshots
 
     async def insert_notification_plan(self, draft: NotificationPlanDraft) -> UUID:
+        legacy_equivalent = await self.load_legacy_equivalent_plan(
+            analysis_id=draft.analysis_id,
+            dedupe_subject_key=draft.dedupe_subject_key,
+            target_chat_id=draft.target_chat_id,
+            delivery_decision=draft.delivery_decision,
+            urgency_profile=draft.urgency_profile,
+            render_profile=draft.render_profile,
+        )
+        if legacy_equivalent is not None:
+            return UUID(str(legacy_equivalent["notification_plan_id"]))
+
+        existing = await self.load_existing_plan_by_subject_material(
+            dedupe_subject_key=draft.dedupe_subject_key,
+            target_chat_id=draft.target_chat_id,
+            material_change_hash=draft.material_change_hash,
+        )
+        if existing is not None:
+            return UUID(str(existing["notification_plan_id"]))
+
+        claim_result = await self._session.execute(
+            sa.text(
+                """
+                INSERT INTO notification_material_claims (
+                    notification_material_claim_id,
+                    dedupe_subject_key,
+                    target_chat_id,
+                    material_change_hash,
+                    notification_plan_id,
+                    created_at
+                ) VALUES (
+                    gen_random_uuid(),
+                    :dedupe_subject_key,
+                    :target_chat_id,
+                    :material_change_hash,
+                    CAST(:notification_plan_id AS uuid),
+                    now()
+                )
+                ON CONFLICT ON CONSTRAINT uq_notification_material_claims_subject_target_material
+                DO NOTHING
+                RETURNING notification_plan_id
+                """
+            ),
+            {
+                "dedupe_subject_key": draft.dedupe_subject_key,
+                "target_chat_id": draft.target_chat_id,
+                "material_change_hash": draft.material_change_hash,
+                "notification_plan_id": str(draft.notification_plan_id),
+            },
+        )
+        claimed = claim_result.scalar_one_or_none()
+        if claimed is None:
+            claimed_plan = await self.load_existing_plan_by_subject_material(
+                dedupe_subject_key=draft.dedupe_subject_key,
+                target_chat_id=draft.target_chat_id,
+                material_change_hash=draft.material_change_hash,
+            )
+            if claimed_plan is None:
+                raise RuntimeError("notification material claim conflicted but plan was not found")
+            return UUID(str(claimed_plan["notification_plan_id"]))
+
         result = await self._session.execute(
             sa.text(
                 """
@@ -317,16 +480,7 @@ class NotifierTelegramRepository:
         inserted = result.scalar_one_or_none()
         if inserted is not None:
             return UUID(str(inserted))
-        existing = await self.load_existing_plan_by_material(
-            analysis_id=draft.analysis_id,
-            target_chat_id=draft.target_chat_id,
-            material_change_hash=draft.material_change_hash,
-        )
-        if existing is None:
-            existing = await self.load_notification_plan(draft.notification_plan_id)
-        if existing is None:
-            raise RuntimeError("notification plan insert conflicted but existing row was not found")
-        return UUID(str(existing["notification_plan_id"]))
+        raise RuntimeError("notification plan identity conflicted after material claim")
 
     async def insert_published_notification_plan_created_outbox(
         self,

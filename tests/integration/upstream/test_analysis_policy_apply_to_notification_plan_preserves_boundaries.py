@@ -27,6 +27,7 @@ from services.policy_engine.worker import PolicyEngineWorker
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[2] / "fixtures" / "upstream"
+FEEDBACK_AWARE_DELIVERY_POLICY_VERSION = "delivery_policy_v1_feedback_aware_channel_policy_v1"
 
 
 class Tx:
@@ -404,7 +405,7 @@ async def test_policy_apply_rehydrates_outbox_and_emits_single_notification_plan
     assert analysis.schema_version == "analysis_v1"
     assert analysis.policy_version == "verdict_policy_v1"
     assert analysis.prompt_version == "judge_prompt_v1"
-    assert analysis.delivery_policy_version == "delivery_policy_v1"
+    assert analysis.delivery_policy_version == FEEDBACK_AWARE_DELIVERY_POLICY_VERSION
     assert analysis.verdict == "inspect_now"
     assert analysis.delivery_decision == "send_now"
     assert analysis.model_proposed_verdict == "later"
@@ -535,22 +536,52 @@ async def test_stale_current_bundle_stops_before_analysis_or_notification(monkey
 
 
 @pytest.mark.asyncio
-async def test_existing_analysis_idempotency_reuse_prevents_duplicate_analysis_and_notification(monkeypatch) -> None:
+async def test_legacy_analysis_coexists_with_feedback_aware_analysis_and_retry_is_noop(monkeypatch) -> None:
     _install_downstream_tripwires(monkeypatch)
     ledger = AnalysisPolicyApplyLedger(_load_fixture())
-    ledger.existing[(ledger.judge_output_id, "verdict_policy_v1", "delivery_policy_v1")] = ExistingAnalysisRecord(
+    legacy_identity = (ledger.judge_output_id, "verdict_policy_v1", "delivery_policy_v1")
+    feedback_aware_identity = (
+        ledger.judge_output_id,
+        "verdict_policy_v1",
+        FEEDBACK_AWARE_DELIVERY_POLICY_VERSION,
+    )
+    legacy_record = ExistingAnalysisRecord(
         analysis_id=uuid4(),
         judge_output_id=ledger.judge_output_id,
         policy_version="verdict_policy_v1",
         delivery_policy_version="delivery_policy_v1",
     )
+    ledger.existing[legacy_identity] = legacy_record
 
     await _run_worker(ledger)
 
-    assert ledger.analyses == []
-    assert ledger.state_transitions == []
-    assert _notification_plan_events(ledger) == []
-    assert ledger.notification_outbox == []
+    assert len(ledger.analyses) == 1
+    _analysis_id, analysis = ledger.analyses[0]
+    assert (
+        analysis.judge_output_id,
+        analysis.policy_version,
+        analysis.delivery_policy_version,
+    ) == feedback_aware_identity
+    assert set(ledger.existing) == {legacy_identity, feedback_aware_identity}
+    assert ledger.existing[legacy_identity] is legacy_record
+    assert len(ledger.state_transitions) == 1
+    assert len(_notification_plan_events(ledger)) == 1
+    assert len(ledger.notification_outbox) == 1
+
+    analyses_before_retry = list(ledger.analyses)
+    existing_before_retry = dict(ledger.existing)
+    transitions_before_retry = list(ledger.state_transitions)
+    outbox_before_retry = list(ledger.notification_outbox)
+    plan_events_before_retry = list(_notification_plan_events(ledger))
+
+    await _run_worker(ledger)
+
+    assert ledger.analyses == analyses_before_retry
+    assert ledger.existing == existing_before_retry
+    assert ledger.existing[legacy_identity] is legacy_record
+    assert ledger.state_transitions == transitions_before_retry
+    assert ledger.notification_outbox == outbox_before_retry
+    assert _notification_plan_events(ledger) == plan_events_before_retry
 
 
 @pytest.mark.asyncio

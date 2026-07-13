@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any, Protocol
 from uuid import UUID
 
+from .channel_override_policy import ChannelOverrideInput, ChannelOverridePolicy
 from .config import PolicyEngineConfig
 from .delivery_policy import DeliveryPolicy
+from .feedback_eval import (
+    DEFAULT_FEEDBACK_WINDOW_DAYS,
+    MAX_FEEDBACK_ROWS,
+    ChannelFeedbackAggregate,
+    ChannelFeedbackSample,
+    FeedbackEvalEngine,
+)
 from .models import (
     AnalysisDraft,
+    AnalysisInsertResult,
     AnalysisPolicyJob,
     BundlePolicyContext,
     CandidatePolicyContext,
@@ -26,6 +36,13 @@ class PolicyEngineRepositoryProtocol(Protocol):
     def transaction(self): ...
     async def load_job_by_trigger_event_id(self, trigger_event_id: UUID) -> AnalysisPolicyJob | None: ...
     async def load_candidate_context(self, candidate_group_id: UUID) -> CandidatePolicyContext | None: ...
+    async def load_channel_feedback_sample(
+        self,
+        candidate_group_id: UUID,
+        *,
+        sample_limit: int,
+        window_days: int,
+    ) -> ChannelFeedbackSample: ...
     async def load_judge_run(self, judge_run_id: UUID) -> JudgeRunPolicyContext | None: ...
     async def load_judge_output(self, judge_output_id: UUID) -> JudgeOutputPolicyContext | None: ...
     async def load_bundle_context(self, bundle_id: UUID) -> BundlePolicyContext | None: ...
@@ -37,6 +54,7 @@ class PolicyEngineRepositoryProtocol(Protocol):
         delivery_policy_version: str,
     ) -> ExistingAnalysisRecord | None: ...
     async def insert_analysis(self, draft: AnalysisDraft) -> UUID: ...
+    async def insert_analysis_if_absent(self, draft: AnalysisDraft) -> AnalysisInsertResult: ...
     async def insert_state_transition(self, **kwargs) -> None: ...
     async def insert_notification_plan_created_outbox(self, intent: NotificationPlanIntent) -> None: ...
 
@@ -49,6 +67,8 @@ class PolicyEngineService:
         repository: PolicyEngineRepository | PolicyEngineRepositoryProtocol,
         verdict_policy: VerdictPolicy | None = None,
         delivery_policy: DeliveryPolicy | None = None,
+        feedback_eval_engine: FeedbackEvalEngine | None = None,
+        channel_override_policy: ChannelOverridePolicy | None = None,
         notification_intent_builder: NotificationIntentBuilder | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -59,7 +79,10 @@ class PolicyEngineService:
             enable_later_delivery=config.enable_later_delivery,
             enable_silent_later=config.enable_silent_later,
         )
+        self._feedback_eval_engine = feedback_eval_engine or FeedbackEvalEngine()
+        self._channel_override_policy = channel_override_policy or ChannelOverridePolicy()
         self._notification_intent_builder = notification_intent_builder or NotificationIntentBuilder(config=config)
+        self._policy_identity = _effective_policy_identity(config)
         self._logger = logger or logging.getLogger(__name__)
 
     async def handle_trigger_event(self, trigger_event_id: str | UUID) -> None:
@@ -125,18 +148,33 @@ class PolicyEngineService:
             )
             return
 
+        policy_version, delivery_policy_version = self._policy_identity
         existing = await self._repository.load_existing_analysis(
             judge_output_id=job.judge_output_id,
-            policy_version=self._config.policy_version,
-            delivery_policy_version=self._config.delivery_policy_version,
+            policy_version=policy_version,
+            delivery_policy_version=delivery_policy_version,
         )
         if existing is not None:
             return
 
         analysis, evaluation = self._build_analysis(job=job, judge_run=judge_run, judge_output=judge_output, bundle=bundle)
+        feedback_aggregate = await self._load_feedback_aggregate(job.candidate_group_id)
+        analysis, evaluation = self._apply_channel_feedback_policy(
+            analysis=analysis,
+            evaluation=evaluation,
+            bundle=bundle,
+            feedback_aggregate=feedback_aggregate,
+        )
 
         async with self._repository.transaction():
-            analysis_id = await self._repository.insert_analysis(analysis)
+            insert_if_absent = getattr(self._repository, "insert_analysis_if_absent", None)
+            if insert_if_absent is None:
+                analysis_id = await self._repository.insert_analysis(analysis)
+            else:
+                insert_result = await insert_if_absent(analysis)
+                if not insert_result.created:
+                    return
+                analysis_id = insert_result.analysis_id
             await self._repository.insert_state_transition(
                 object_type="analysis",
                 object_id=analysis_id,
@@ -148,6 +186,7 @@ class PolicyEngineService:
                 analysis_id=analysis_id,
                 analysis=analysis,
                 evaluation=evaluation,
+                dedupe_subject_key=candidate.dedupe_subject_key,
             )
             if intent is not None:
                 await self._repository.insert_notification_plan_created_outbox(intent)
@@ -218,13 +257,14 @@ class PolicyEngineService:
             reason_codes=reason_codes,
         )
 
+        policy_version, delivery_policy_version = self._policy_identity
         analysis = AnalysisDraft(
             candidate_group_id=job.candidate_group_id,
             judge_output_id=job.judge_output_id,
             schema_version="analysis_v1",
-            policy_version=self._config.policy_version,
+            policy_version=policy_version,
             prompt_version=judge_run.prompt_version,
-            delivery_policy_version=self._config.delivery_policy_version,
+            delivery_policy_version=delivery_policy_version,
             verdict=verdict_decision.verdict,
             delivery_decision=delivery_decision.delivery_decision,
             scores_json=scores,
@@ -245,6 +285,73 @@ class PolicyEngineService:
         )
         return analysis, evaluation
 
+    async def _load_feedback_aggregate(self, candidate_group_id: UUID) -> ChannelFeedbackAggregate:
+        load_sample = getattr(self._repository, "load_channel_feedback_sample", None)
+        if load_sample is None:
+            return ChannelFeedbackAggregate.neutral()
+        sample = await load_sample(
+            candidate_group_id,
+            sample_limit=MAX_FEEDBACK_ROWS,
+            window_days=DEFAULT_FEEDBACK_WINDOW_DAYS,
+        )
+        return self._feedback_eval_engine.aggregate_channel_sample(sample)
+
+    def _apply_channel_feedback_policy(
+        self,
+        *,
+        analysis: AnalysisDraft,
+        evaluation: PolicyEvaluation,
+        bundle: BundlePolicyContext,
+        feedback_aggregate: ChannelFeedbackAggregate,
+    ) -> tuple[AnalysisDraft, PolicyEvaluation]:
+        if not feedback_aggregate.policy_active or feedback_aggregate.channel_tier != "C":
+            return analysis, evaluation
+
+        artifact_type = bundle.current_primary_artifact_type or "unknown"
+        override = self._channel_override_policy.evaluate(
+            ChannelOverrideInput(
+                channel_tier=feedback_aggregate.channel_tier,
+                artifact_type=artifact_type,
+                verdict=analysis.verdict,
+                delivery_decision=analysis.delivery_decision,
+                urgency_profile=evaluation.urgency_profile,
+                reason_codes=tuple(evaluation.reason_codes),
+                text_idea_enabled=True,
+                ai_noise_signal_count=_ai_noise_signal_count(evaluation.reason_codes),
+                external_evidence_present=artifact_type not in {"unknown", "text_idea"},
+            )
+        )
+        if override.live_delivery_decision == analysis.delivery_decision:
+            return analysis, evaluation
+
+        reason_codes = [*analysis.reason_codes_json]
+        for reason_code in override.reason_codes:
+            if reason_code not in reason_codes:
+                reason_codes.append(reason_code)
+        if override.live_delivery_decision == "suppress":
+            urgency_profile = "suppressed"
+            suppress_reason_code = override.reason_codes[0] if override.reason_codes else "channel_feedback_suppressed"
+        elif override.live_delivery_decision == "send_digest":
+            urgency_profile = "digest"
+            suppress_reason_code = None
+        else:
+            return analysis, evaluation
+
+        return (
+            replace(
+                analysis,
+                delivery_decision=override.live_delivery_decision,  # type: ignore[arg-type]
+                reason_codes_json=reason_codes,
+            ),
+            replace(
+                evaluation,
+                delivery_decision=override.live_delivery_decision,  # type: ignore[arg-type]
+                urgency_profile=urgency_profile,  # type: ignore[arg-type]
+                reason_codes=reason_codes,
+                suppress_reason_code=suppress_reason_code,
+            ),
+        )
+
 
 def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
@@ -259,3 +366,15 @@ def _text_column_value(value: Any) -> str | None:
         lines = [item for item in value if isinstance(item, str)]
         return "\n".join(lines) if lines else None
     return None
+
+
+def _ai_noise_signal_count(reason_codes: list[str]) -> int:
+    noise_terms = ("ai_noise", "ai_only", "generic_ai", "weak_ai", "bad_channel_fit")
+    return sum(1 for reason_code in reason_codes if any(term in reason_code for term in noise_terms))
+
+
+def _effective_policy_identity(config: PolicyEngineConfig) -> tuple[str, str]:
+    return (
+        config.policy_version,
+        f"{config.delivery_policy_version}_feedback_aware_channel_policy_v1",
+    )

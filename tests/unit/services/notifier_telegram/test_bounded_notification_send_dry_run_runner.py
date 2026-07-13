@@ -16,6 +16,7 @@ from src.services.notifier_telegram.bounded_notification_send_dry_run_runner imp
     QUEUE_NAME,
     REQUIRED_THIN_QUEUE_FIELDS,
     BoundedNotificationSendDryRunConfig,
+    BoundedNotificationSendDryRunError,
     BoundedNotificationSendDryRunRuntimeConfig,
     BoundedNotificationSendDryRunState,
     NotificationDryRunExecution,
@@ -422,6 +423,9 @@ class ExecuteContextRepositoryFake:
         }
         return draft.notification_plan_id
 
+    async def load_notification_plan(self, notification_plan_id: UUID):
+        return self.plans.get(notification_plan_id)
+
     async def insert_notification_render(self, draft: NotificationRenderDraft) -> UUID | None:
         for existing in self.renders:
             if (
@@ -517,6 +521,31 @@ class ExecuteContextRepositoryFake:
 
     async def load_event_outbox(self, event_id: UUID):
         return self.events.get(event_id)
+
+
+class CrossCandidateClaimRepositoryFake(ExecuteContextRepositoryFake):
+    def __init__(self, intent: NotificationIntentJob) -> None:
+        super().__init__()
+        self.winner_plan_id = uuid4()
+        self.plans[self.winner_plan_id] = {
+            "notification_plan_id": self.winner_plan_id,
+            "analysis_id": uuid4(),
+            "candidate_group_id": uuid4(),
+            "delivery_decision": intent.delivery_decision,
+            "urgency_profile": intent.urgency_profile,
+            "target_chat_id": intent.target_chat_id,
+            "target_thread_id": intent.target_thread_id,
+            "render_profile": intent.render_profile,
+            "dedupe_subject_key": intent.dedupe_subject_key,
+            "material_change_hash": intent.material_change_hash,
+            "send_after": intent.send_after,
+            "suppress_reason_code": intent.suppress_reason_code,
+            "status": "planned",
+        }
+
+    async def insert_notification_plan(self, draft) -> UUID:
+        del draft
+        return self.winner_plan_id
 
 
 @pytest.mark.asyncio
@@ -806,6 +835,21 @@ async def test_duplicate_execute_context_reuses_dry_run_delivery_record_and_resu
     assert second.notifier_owned_write_counts["notification_renders_insert_calls"] == 0
     assert second.notifier_owned_write_counts["notification_delivery_records_insert_calls"] == 0
     assert second.notifier_owned_write_counts["event_outbox_delivery_result_insert_calls"] == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_context_cross_candidate_claim_fails_before_render_or_delivery_writes() -> None:
+    intent = _intent()
+    repository = CrossCandidateClaimRepositoryFake(intent)
+
+    with pytest.raises(BoundedNotificationSendDryRunError) as exc_info:
+        await _execute_context(repository, _context(intent), BoundedNotificationSendDryRunState())
+
+    assert exc_info.value.error_code == "notification_duplicate_repost_noop"
+    assert repository.renders == []
+    assert repository.delivery_records == {}
+    assert repository.events == {}
+    assert repository.state_transitions == []
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,7 @@ class CandidatePolicyContext:
     candidate_group_id: UUID
     current_bundle_id: UUID | None
     current_analysis_id: UUID | None
+    dedupe_subject_key: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -106,6 +107,12 @@ class ExistingAnalysisRecord:
     judge_output_id: UUID
     policy_version: str
     delivery_policy_version: str
+
+
+@dataclass(slots=True, frozen=True)
+class AnalysisInsertResult:
+    analysis_id: UUID
+    created: bool
 
 
 @dataclass(slots=True, frozen=True)

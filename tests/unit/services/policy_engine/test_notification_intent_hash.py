@@ -8,11 +8,13 @@ from services.policy_engine.notification_intent import material_change_hash_for_
 def _hash(
     *,
     candidate_group_id: str,
+    dedupe_subject_key: str | None = None,
     verdict: str = "inspect_now",
     reason_codes_json: list[str] | None = None,
 ) -> str:
     return material_change_hash_for_analysis(
         candidate_group_id=candidate_group_id,
+        dedupe_subject_key=dedupe_subject_key,
         verdict=verdict,
         delivery_decision="send_now",
         urgency_profile="high",
@@ -48,3 +50,32 @@ def test_material_hash_changes_when_verdict_or_reason_material_changes() -> None
         candidate_group_id=candidate_group_id,
         reason_codes_json=["policy_threshold_later"],
     )
+
+
+def test_canonical_subject_suppresses_cross_candidate_repost_but_material_change_escapes() -> None:
+    first_candidate_group_id = str(uuid4())
+    repost_candidate_group_id = str(uuid4())
+    canonical_subject = "github:repo:example/example-tool"
+
+    first = _hash(
+        candidate_group_id=first_candidate_group_id,
+        dedupe_subject_key=canonical_subject,
+    )
+    exact_repost = _hash(
+        candidate_group_id=repost_candidate_group_id,
+        dedupe_subject_key=canonical_subject,
+    )
+    material_change = _hash(
+        candidate_group_id=repost_candidate_group_id,
+        dedupe_subject_key=canonical_subject,
+        reason_codes_json=["policy_threshold_inspect_now", "new_material_evidence"],
+    )
+    other_subject = _hash(
+        candidate_group_id=repost_candidate_group_id,
+        dedupe_subject_key="github:repo:other/other-tool",
+    )
+
+    assert first_candidate_group_id != repost_candidate_group_id
+    assert exact_repost == first
+    assert material_change != first
+    assert other_subject != first

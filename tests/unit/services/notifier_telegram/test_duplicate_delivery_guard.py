@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -8,7 +9,13 @@ import pytest
 
 from services.notifier_telegram.models import NotificationPlanDraft
 from services.notifier_telegram.service import NotifierIdempotencyGuardError
-from tests.component.services.notifier_telegram._fakes import RaisingTelegramClient, config, repo_with_valid_case, service
+from tests.component.services.notifier_telegram._fakes import (
+    FakeRepository,
+    RaisingTelegramClient,
+    config,
+    repo_with_valid_case,
+    service,
+)
 
 
 @pytest.mark.asyncio
@@ -193,6 +200,264 @@ async def test_existing_pending_plan_is_reused_without_duplicate_plan_insert() -
 
 
 @pytest.mark.asyncio
+async def test_cross_candidate_pending_material_claim_noops_before_render_or_transport() -> None:
+    repository, intent = repo_with_valid_case()
+    client = RaisingTelegramClient()
+    existing_plan_id = _add_plan(repository, intent, status="planned")
+    candidate_group_id = uuid4()
+    analysis_id = uuid4()
+    repository.candidates[candidate_group_id] = replace(
+        repository.candidates[intent.candidate_group_id],
+        candidate_group_id=candidate_group_id,
+    )
+    repository.analyses[analysis_id] = replace(
+        repository.analyses[intent.analysis_id],
+        analysis_id=analysis_id,
+        candidate_group_id=candidate_group_id,
+    )
+    incoming = replace(
+        intent,
+        notification_plan_id=uuid4(),
+        analysis_id=analysis_id,
+        candidate_group_id=candidate_group_id,
+    )
+
+    result = await service(
+        repository,
+        cfg=config(dry_run=False, enable_notification_send=True),
+        client=client,
+    ).handle_intent(incoming)
+
+    assert result is not None
+    assert result.delivery_status == "suppressed"
+    assert result.transport_error_code == "notification_duplicate_repost_noop"
+    assert client.calls == 0
+    assert set(repository.plans) == {existing_plan_id}
+    assert repository.renders == []
+    assert repository.delivery_records == []
+
+
+@pytest.mark.asyncio
+async def test_same_candidate_cross_analysis_material_claim_noops_before_transport() -> None:
+    repository, intent = repo_with_valid_case()
+    client = RaisingTelegramClient()
+    existing_plan_id = _add_plan(repository, intent, status="planned")
+    analysis_id = uuid4()
+    repository.analyses[analysis_id] = replace(
+        repository.analyses[intent.analysis_id],
+        analysis_id=analysis_id,
+    )
+    incoming = replace(
+        intent,
+        notification_plan_id=uuid4(),
+        analysis_id=analysis_id,
+    )
+
+    result = await service(
+        repository,
+        cfg=config(dry_run=False, enable_notification_send=True),
+        client=client,
+    ).handle_intent(incoming)
+
+    assert result is not None
+    assert result.delivery_status == "suppressed"
+    assert result.transport_error_code == "notification_duplicate_repost_noop"
+    assert client.calls == 0
+    assert set(repository.plans) == {existing_plan_id}
+    assert repository.renders == []
+    assert repository.delivery_records == []
+
+
+@pytest.mark.asyncio
+async def test_same_plan_id_with_mismatched_identity_fails_closed() -> None:
+    repository, intent = repo_with_valid_case()
+    client = RaisingTelegramClient()
+    repository.plans[intent.notification_plan_id] = NotificationPlanDraft(
+        notification_plan_id=intent.notification_plan_id,
+        analysis_id=uuid4(),
+        candidate_group_id=uuid4(),
+        delivery_decision=intent.delivery_decision,
+        urgency_profile=intent.urgency_profile,
+        target_chat_id=intent.target_chat_id,
+        target_thread_id=intent.target_thread_id,
+        render_profile=intent.render_profile,
+        dedupe_subject_key="different-subject",
+        material_change_hash=intent.material_change_hash,
+        send_after=intent.send_after,
+        suppress_reason_code=intent.suppress_reason_code,
+    )
+
+    with pytest.raises(NotifierIdempotencyGuardError) as exc_info:
+        await service(
+            repository,
+            cfg=config(dry_run=False, enable_notification_send=True),
+            client=client,
+        ).handle_intent(intent)
+
+    assert exc_info.value.reason_code == "notification_plan_identity_mismatch"
+    assert client.calls == 0
+    assert repository.renders == []
+    assert repository.delivery_records == []
+
+
+@pytest.mark.asyncio
+async def test_different_plan_id_same_analysis_identity_mismatch_fails_closed() -> None:
+    repository, intent = repo_with_valid_case()
+    client = RaisingTelegramClient()
+    existing_plan_id = _add_plan(repository, intent, status="planned")
+    repository.plans[existing_plan_id] = replace(
+        repository.plans[existing_plan_id],
+        render_profile="different-render-profile",
+    )
+    incoming = replace(intent, notification_plan_id=uuid4())
+
+    with pytest.raises(NotifierIdempotencyGuardError) as exc_info:
+        await service(
+            repository,
+            cfg=config(dry_run=False, enable_notification_send=True),
+            client=client,
+        ).handle_intent(incoming)
+
+    assert exc_info.value.reason_code == "notification_plan_identity_mismatch"
+    assert client.calls == 0
+    assert repository.renders == []
+    assert repository.delivery_records == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_candidate_scoped_material_is_noop_for_canonical_repost() -> None:
+    repository, intent = repo_with_valid_case()
+    client = RaisingTelegramClient()
+    legacy_plan_id = _add_plan(
+        repository,
+        replace(
+            intent,
+            dedupe_subject_key=str(intent.candidate_group_id),
+            material_change_hash="legacy-candidate-material",
+        ),
+        status="planned",
+    )
+    candidate_group_id = uuid4()
+    analysis_id = uuid4()
+    repository.candidates[candidate_group_id] = replace(
+        repository.candidates[intent.candidate_group_id],
+        candidate_group_id=candidate_group_id,
+    )
+    repository.analyses[analysis_id] = replace(
+        repository.analyses[intent.analysis_id],
+        analysis_id=analysis_id,
+        candidate_group_id=candidate_group_id,
+    )
+    incoming = replace(
+        intent,
+        notification_plan_id=uuid4(),
+        analysis_id=analysis_id,
+        candidate_group_id=candidate_group_id,
+        dedupe_subject_key=repository.candidates[candidate_group_id].primary_canonical_id or "missing",
+        material_change_hash="canonical-subject-material",
+    )
+
+    result = await service(
+        repository,
+        cfg=config(dry_run=False, enable_notification_send=True),
+        client=client,
+    ).handle_intent(incoming)
+
+    assert result is not None
+    assert result.transport_error_code == "notification_duplicate_repost_noop"
+    assert client.calls == 0
+    assert set(repository.plans) == {legacy_plan_id}
+    assert repository.renders == []
+    assert repository.delivery_records == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cross_candidate_reposts_share_one_material_claim() -> None:
+    base_repository, first_intent = repo_with_valid_case()
+    repository = ConcurrentClaimRepository()
+    repository.__dict__.update(base_repository.__dict__)
+    candidate_group_id = uuid4()
+    analysis_id = uuid4()
+    repository.candidates[candidate_group_id] = replace(
+        repository.candidates[first_intent.candidate_group_id],
+        candidate_group_id=candidate_group_id,
+    )
+    repository.analyses[analysis_id] = replace(
+        repository.analyses[first_intent.analysis_id],
+        analysis_id=analysis_id,
+        candidate_group_id=candidate_group_id,
+    )
+    second_intent = replace(
+        first_intent,
+        notification_plan_id=uuid4(),
+        analysis_id=analysis_id,
+        candidate_group_id=candidate_group_id,
+    )
+    notifier = service(
+        repository,
+        cfg=config(dry_run=True, enable_notification_send=False),
+    )
+
+    results = await asyncio.gather(
+        notifier.handle_intent(first_intent),
+        notifier.handle_intent(second_intent),
+    )
+
+    assert all(result is not None for result in results)
+    assert {result.transport_error_code for result in results if result is not None} == {
+        "dry_run_skip_transport",
+        "notification_duplicate_repost_noop",
+    }
+    assert len(repository.plans) == 1
+    assert len(repository.renders) == 1
+    assert len(repository.delivery_records) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cross_analysis_digest_claim_uses_only_winner_plan_id() -> None:
+    base_repository, base_intent = repo_with_valid_case()
+    repository = ConcurrentClaimRepository()
+    repository.__dict__.update(base_repository.__dict__)
+    repository.analyses[base_intent.analysis_id] = replace(
+        repository.analyses[base_intent.analysis_id],
+        delivery_decision="send_digest",
+    )
+    first_intent = replace(
+        base_intent,
+        delivery_decision="send_digest",
+        urgency_profile="digest",
+        render_profile="telegram_digest_v1",
+    )
+    analysis_id = uuid4()
+    repository.analyses[analysis_id] = replace(
+        repository.analyses[first_intent.analysis_id],
+        analysis_id=analysis_id,
+    )
+    second_intent = replace(
+        first_intent,
+        notification_plan_id=uuid4(),
+        analysis_id=analysis_id,
+    )
+    notifier = service(repository, cfg=config(dry_run=True, enable_notification_send=False))
+
+    results = await asyncio.gather(
+        notifier.handle_intent(first_intent),
+        notifier.handle_intent(second_intent),
+    )
+
+    assert all(result is not None for result in results)
+    assert {result.transport_error_code for result in results if result is not None} == {
+        "notification_digest_deferred",
+        "notification_duplicate_repost_noop",
+    }
+    assert len(repository.plans) == 1
+    winner_plan_id = next(iter(repository.plans))
+    assert {transition["object_id"] for transition in repository.state_transitions} == {winner_plan_id}
+    assert repository.renders == []
+    assert repository.delivery_records == []
+
+
+@pytest.mark.asyncio
 async def test_existing_render_without_delivery_is_reused_without_duplicate_render() -> None:
     repository, intent = repo_with_valid_case()
     notifier = service(repository, cfg=config(dry_run=True, enable_notification_send=False))
@@ -301,3 +566,19 @@ class RecordingTelegramClient:
     async def edit_message_text(self, **kwargs):
         self.edit_message_text_calls += 1
         raise AssertionError("edit_message_text must not be called")
+
+
+class ConcurrentClaimRepository(FakeRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self._preclaim_reads = 0
+        self._preclaim_barrier = asyncio.Event()
+
+    async def load_existing_plan_by_subject_material(self, **kwargs):
+        if not self.plans and self._preclaim_reads < 2:
+            self._preclaim_reads += 1
+            if self._preclaim_reads == 2:
+                self._preclaim_barrier.set()
+            await self._preclaim_barrier.wait()
+            return None
+        return await super().load_existing_plan_by_subject_material(**kwargs)

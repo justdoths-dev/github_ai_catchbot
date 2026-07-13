@@ -84,15 +84,64 @@ class FakeRepository:
                 return _plan_row(plan)
         return None
 
+    async def load_existing_plan_by_subject_material(
+        self,
+        *,
+        dedupe_subject_key: str,
+        target_chat_id: int,
+        material_change_hash: str,
+    ):
+        for plan in self.plans.values():
+            if (
+                plan.dedupe_subject_key == dedupe_subject_key
+                and plan.target_chat_id == target_chat_id
+                and plan.material_change_hash == material_change_hash
+            ):
+                return _plan_row(plan)
+        return None
+
+    async def load_legacy_equivalent_plan(
+        self,
+        *,
+        analysis_id: UUID,
+        dedupe_subject_key: str,
+        target_chat_id: int,
+        delivery_decision: str,
+        urgency_profile: str,
+        render_profile: str | None,
+    ):
+        incoming = self.analyses.get(analysis_id)
+        if incoming is None:
+            return None
+        for plan in self.plans.values():
+            prior = self.analyses.get(plan.analysis_id)
+            prior_candidate = self.candidates.get(plan.candidate_group_id)
+            if prior is None or prior_candidate is None:
+                continue
+            stable_subject = prior_candidate.primary_canonical_id
+            if (
+                plan.dedupe_subject_key == str(plan.candidate_group_id)
+                and stable_subject == dedupe_subject_key
+                and plan.target_chat_id == target_chat_id
+                and plan.delivery_decision == delivery_decision
+                and plan.urgency_profile == urgency_profile
+                and plan.render_profile == render_profile
+                and prior.verdict == incoming.verdict
+                and prior.delivery_decision == incoming.delivery_decision
+                and prior.reason_codes_json == incoming.reason_codes_json
+                and prior.recommended_action_ko == incoming.recommended_action_ko
+                and prior.freshness_note_ko == incoming.freshness_note_ko
+            ):
+                return _plan_row(plan)
+        return None
+
     async def load_idempotency_plan_snapshots(self, intent: NotificationIntentJob):
         snapshots = []
         for plan in self.plans.values():
             if not (
                 plan.notification_plan_id == intent.notification_plan_id
                 or (
-                    plan.analysis_id == intent.analysis_id
-                    and plan.candidate_group_id == intent.candidate_group_id
-                    and plan.target_chat_id == intent.target_chat_id
+                    plan.target_chat_id == intent.target_chat_id
                     and plan.dedupe_subject_key == intent.dedupe_subject_key
                     and plan.material_change_hash == intent.material_change_hash
                 )
@@ -131,8 +180,18 @@ class FakeRepository:
         return snapshots
 
     async def insert_notification_plan(self, draft: NotificationPlanDraft) -> UUID:
-        existing = await self.load_existing_plan_by_material(
+        legacy_equivalent = await self.load_legacy_equivalent_plan(
             analysis_id=draft.analysis_id,
+            dedupe_subject_key=draft.dedupe_subject_key,
+            target_chat_id=draft.target_chat_id,
+            delivery_decision=draft.delivery_decision,
+            urgency_profile=draft.urgency_profile,
+            render_profile=draft.render_profile,
+        )
+        if legacy_equivalent is not None:
+            return UUID(str(legacy_equivalent["notification_plan_id"]))
+        existing = await self.load_existing_plan_by_subject_material(
+            dedupe_subject_key=draft.dedupe_subject_key,
             target_chat_id=draft.target_chat_id,
             material_change_hash=draft.material_change_hash,
         )

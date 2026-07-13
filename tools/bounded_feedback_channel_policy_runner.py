@@ -7,9 +7,11 @@ import json
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
+from uuid import UUID
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -17,10 +19,23 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.services.policy_engine.channel_override_policy import ChannelOverrideInput, ChannelOverridePolicy
-from src.services.policy_engine.feedback_eval import FeedbackEvalEngine, FeedbackRecord
+from src.services.policy_engine.feedback_eval import (
+    ALLOWED_FEEDBACK_LABELS,
+    ChannelFeedbackObservation,
+    ChannelFeedbackSample,
+    FeedbackEvalEngine,
+    FeedbackRecord,
+    FeedbackTargetContext,
+    NotificationFeedbackError,
+    NotificationFeedbackReadbackResult,
+    NotificationFeedbackRequest,
+    NotificationFeedbackService,
+    StoredNotificationFeedback,
+    channel_fp,
+)
 
 
-SCHEMA_VERSION = "bounded_feedback_channel_policy_runner_v1"
+SCHEMA_VERSION = "bounded_feedback_channel_policy_runner_v2"
 RUNNER_NAME = "bounded_feedback_channel_policy_runner"
 MODE_PLAN = "plan"
 MODE_EXECUTE = "execute"
@@ -53,8 +68,15 @@ class BoundedFeedbackChannelPolicyConfig:
     operator_approved: bool = False
     allow_runtime_config: bool = False
     allow_database_read: bool = False
+    allow_database_write: bool = False
     analysis_id_suffix: str | None = None
     candidate_group_id_suffix: str | None = None
+    analysis_id: UUID | None = None
+    notification_plan_id: UUID | None = None
+    notification_delivery_record_id: UUID | None = None
+    feedback_category: str | None = None
+    operator_action_key: str | None = None
+    confirm_feedback_write: bool = False
     feedback_jsonl: str | None = None
     allow_feedback_file_read: bool = False
     channel_policy_json: str | None = None
@@ -107,6 +129,36 @@ class FeedbackChannelPolicyReadbackRepository(Protocol):
         max_rows: int,
     ) -> list[PolicyReadbackRow]: ...
 
+    def transaction(self): ...
+
+    async def load_feedback_target(
+        self,
+        *,
+        analysis_id: UUID,
+        notification_plan_id: UUID | None,
+        notification_delivery_record_id: UUID | None,
+    ) -> FeedbackTargetContext | None: ...
+
+    async def load_feedback_by_action_key(
+        self,
+        operator_action_key: str,
+    ) -> StoredNotificationFeedback | None: ...
+
+    async def insert_notification_feedback(
+        self,
+        *,
+        request: NotificationFeedbackRequest,
+        target: FeedbackTargetContext,
+    ) -> StoredNotificationFeedback | None: ...
+
+    async def load_channel_feedback_sample(
+        self,
+        *,
+        channel_registry_id: UUID,
+        sample_limit: int,
+        window_days: int,
+    ) -> ChannelFeedbackSample: ...
+
 
 @dataclass(frozen=True, slots=True)
 class FeedbackChannelPolicyRepositoryHandle:
@@ -130,6 +182,13 @@ class SqlAlchemyFeedbackChannelPolicyRepository:
     def __init__(self, session: Any, state: BoundedFeedbackChannelPolicyState) -> None:
         self._session = session
         self._state = state
+
+    @asynccontextmanager
+    async def transaction(self):
+        if self._session.in_transaction():
+            raise BoundedFeedbackChannelPolicyError("feedback_transaction_already_active")
+        async with self._session.begin():
+            yield self._session
 
     async def load_policy_readbacks(
         self,
@@ -213,6 +272,287 @@ class SqlAlchemyFeedbackChannelPolicyRepository:
             )
         return rows
 
+    async def load_feedback_target(
+        self,
+        *,
+        analysis_id: UUID,
+        notification_plan_id: UUID | None,
+        notification_delivery_record_id: UUID | None,
+    ) -> FeedbackTargetContext | None:
+        self._state.database_read_attempted = True
+        from sqlalchemy import text
+
+        result = await self._session.execute(
+            text(
+                """
+                SELECT a.analysis_id,
+                       a.candidate_group_id,
+                       a.verdict::text AS verdict,
+                       a.delivery_decision::text AS delivery_decision,
+                       COALESCE(ar.artifact_type::text, 'unknown') AS primary_artifact_type,
+                       np.notification_plan_id,
+                       np.analysis_id AS plan_analysis_id,
+                       np.candidate_group_id AS plan_candidate_group_id,
+                       np.plan_match_count,
+                       ndr.notification_delivery_record_id,
+                       ndr.notification_plan_id AS delivery_plan_id,
+                       CASE WHEN channel_ref.registry_count = 1 THEN channel_ref.registry_id END AS channel_registry_id
+                FROM analyses a
+                JOIN candidate_group_proposals cgp
+                  ON cgp.candidate_group_id = a.candidate_group_id
+                JOIN source_messages sm
+                  ON sm.source_message_id = cgp.source_message_id
+                LEFT JOIN judge_outputs jo
+                  ON jo.judge_output_id = a.judge_output_id
+                LEFT JOIN judge_runs jr
+                  ON jr.judge_run_id = jo.judge_run_id
+                LEFT JOIN candidate_evidence_bundles ceb
+                  ON ceb.bundle_id = jr.bundle_id
+                LEFT JOIN artifact_registry ar
+                  ON ar.artifact_id = ceb.current_primary_artifact_id
+                LEFT JOIN notification_delivery_records requested_delivery
+                  ON requested_delivery.notification_delivery_record_id = CAST(:delivery_record_id AS uuid)
+                LEFT JOIN LATERAL (
+                    SELECT candidate_plan.notification_plan_id,
+                           candidate_plan.analysis_id,
+                           candidate_plan.candidate_group_id,
+                           COUNT(*) OVER ()::int AS plan_match_count
+                    FROM notification_plans candidate_plan
+                    WHERE candidate_plan.analysis_id = a.analysis_id
+                      AND candidate_plan.candidate_group_id = a.candidate_group_id
+                      AND (
+                          CAST(:notification_plan_id AS uuid) IS NULL
+                          OR candidate_plan.notification_plan_id = CAST(:notification_plan_id AS uuid)
+                      )
+                      AND (
+                          CAST(:delivery_record_id AS uuid) IS NULL
+                          OR candidate_plan.notification_plan_id = requested_delivery.notification_plan_id
+                      )
+                    ORDER BY candidate_plan.created_at DESC,
+                             candidate_plan.notification_plan_id DESC
+                    LIMIT 1
+                ) np ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT candidate_delivery.notification_delivery_record_id,
+                           candidate_delivery.notification_plan_id
+                    FROM notification_delivery_records candidate_delivery
+                    WHERE candidate_delivery.notification_plan_id = np.notification_plan_id
+                      AND (
+                          CAST(:delivery_record_id AS uuid) IS NULL
+                          OR candidate_delivery.notification_delivery_record_id = CAST(:delivery_record_id AS uuid)
+                      )
+                    ORDER BY candidate_delivery.created_at DESC,
+                             candidate_delivery.notification_delivery_record_id DESC
+                    LIMIT 1
+                ) ndr ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT MIN(tcr.registry_id::text)::uuid AS registry_id,
+                           COUNT(*)::int AS registry_count
+                    FROM telegram_channel_registry tcr
+                    WHERE tcr.chat_id = sm.chat_id
+                      AND tcr.desired_state <> 'removed'
+                ) channel_ref ON TRUE
+                WHERE a.analysis_id = CAST(:analysis_id AS uuid)
+                """
+            ),
+            {
+                "analysis_id": str(analysis_id),
+                "notification_plan_id": str(notification_plan_id) if notification_plan_id else None,
+                "delivery_record_id": (
+                    str(notification_delivery_record_id) if notification_delivery_record_id else None
+                ),
+            },
+        )
+        row = result.mappings().first()
+        if row is None:
+            return None
+
+        resolved_plan_id = _uuid_or_none(row["notification_plan_id"])
+        resolved_delivery_id = _uuid_or_none(row["notification_delivery_record_id"])
+        if int(row["plan_match_count"] or 0) > 1:
+            return None
+        if notification_plan_id is not None and resolved_plan_id != notification_plan_id:
+            return None
+        if notification_delivery_record_id is not None and resolved_delivery_id != notification_delivery_record_id:
+            return None
+        if resolved_plan_id is not None:
+            if _uuid_or_none(row["plan_analysis_id"]) != analysis_id:
+                return None
+            if _uuid_or_none(row["plan_candidate_group_id"]) != _uuid_or_none(row["candidate_group_id"]):
+                return None
+        if resolved_delivery_id is not None and _uuid_or_none(row["delivery_plan_id"]) != resolved_plan_id:
+            return None
+
+        channel_registry_id = _uuid_or_none(row["channel_registry_id"])
+        return FeedbackTargetContext(
+            analysis_id=analysis_id,
+            candidate_group_id=UUID(str(row["candidate_group_id"])),
+            notification_plan_id=resolved_plan_id,
+            notification_delivery_record_id=resolved_delivery_id,
+            channel_registry_id=channel_registry_id,
+            channel_fingerprint=channel_fp(channel_registry_id) if channel_registry_id else None,
+            verdict=str(row["verdict"]),
+            delivery_decision=str(row["delivery_decision"]),
+            primary_artifact_type=str(row["primary_artifact_type"] or "unknown"),
+        )
+
+    async def load_feedback_by_action_key(
+        self,
+        operator_action_key: str,
+    ) -> StoredNotificationFeedback | None:
+        self._state.database_read_attempted = True
+        from sqlalchemy import text
+
+        result = await self._session.execute(
+            text(
+                """
+                SELECT feedback_id,
+                       operator_action_key,
+                       feedback_category,
+                       analysis_id,
+                       candidate_group_id,
+                       notification_plan_id,
+                       notification_delivery_record_id,
+                       channel_registry_id,
+                       final_verdict::text AS verdict,
+                       delivery_decision::text AS delivery_decision,
+                       primary_artifact_type
+                FROM notification_feedback
+                WHERE operator_action_key = :operator_action_key
+                """
+            ),
+            {"operator_action_key": operator_action_key},
+        )
+        row = result.mappings().first()
+        return _stored_feedback_from_row(row) if row is not None else None
+
+    async def insert_notification_feedback(
+        self,
+        *,
+        request: NotificationFeedbackRequest,
+        target: FeedbackTargetContext,
+    ) -> StoredNotificationFeedback | None:
+        self._state.database_write_attempted = True
+        from sqlalchemy import text
+
+        result = await self._session.execute(
+            text(
+                """
+                INSERT INTO notification_feedback (
+                    operator_action_key,
+                    feedback_category,
+                    analysis_id,
+                    candidate_group_id,
+                    notification_plan_id,
+                    notification_delivery_record_id,
+                    channel_registry_id,
+                    final_verdict,
+                    delivery_decision,
+                    primary_artifact_type,
+                    created_at
+                ) VALUES (
+                    :operator_action_key,
+                    :feedback_category,
+                    CAST(:analysis_id AS uuid),
+                    CAST(:candidate_group_id AS uuid),
+                    CAST(:notification_plan_id AS uuid),
+                    CAST(:delivery_record_id AS uuid),
+                    CAST(:channel_registry_id AS uuid),
+                    CAST(:verdict AS verdict_enum),
+                    CAST(:delivery_decision AS delivery_decision_enum),
+                    :primary_artifact_type,
+                    now()
+                )
+                ON CONFLICT (operator_action_key) DO NOTHING
+                RETURNING feedback_id,
+                          operator_action_key,
+                          feedback_category,
+                          analysis_id,
+                          candidate_group_id,
+                          notification_plan_id,
+                          notification_delivery_record_id,
+                          channel_registry_id,
+                          final_verdict::text AS verdict,
+                          delivery_decision::text AS delivery_decision,
+                          primary_artifact_type
+                """
+            ),
+            {
+                "operator_action_key": request.operator_action_key,
+                "feedback_category": request.feedback_category,
+                "analysis_id": str(target.analysis_id),
+                "candidate_group_id": str(target.candidate_group_id),
+                "notification_plan_id": (
+                    str(target.notification_plan_id) if target.notification_plan_id else None
+                ),
+                "delivery_record_id": (
+                    str(target.notification_delivery_record_id)
+                    if target.notification_delivery_record_id
+                    else None
+                ),
+                "channel_registry_id": (
+                    str(target.channel_registry_id) if target.channel_registry_id else None
+                ),
+                "verdict": target.verdict,
+                "delivery_decision": target.delivery_decision,
+                "primary_artifact_type": target.primary_artifact_type,
+            },
+        )
+        row = result.mappings().first()
+        return _stored_feedback_from_row(row) if row is not None else None
+
+    async def load_channel_feedback_sample(
+        self,
+        *,
+        channel_registry_id: UUID,
+        sample_limit: int,
+        window_days: int,
+    ) -> ChannelFeedbackSample:
+        if not 1 <= sample_limit <= HARD_MAX_ROWS:
+            raise ValueError("sample_limit_out_of_range")
+        if not 1 <= window_days <= 365:
+            raise ValueError("window_days_out_of_range")
+        self._state.database_read_attempted = True
+        from sqlalchemy import text
+
+        result = await self._session.execute(
+            text(
+                """
+                SELECT feedback_category,
+                       final_verdict::text AS verdict,
+                       delivery_decision::text AS delivery_decision,
+                       primary_artifact_type,
+                       created_at
+                FROM notification_feedback
+                WHERE channel_registry_id = CAST(:channel_registry_id AS uuid)
+                  AND created_at >= now() - (:window_days * INTERVAL '1 day')
+                ORDER BY created_at DESC, feedback_id DESC
+                LIMIT :sample_limit
+                """
+            ),
+            {
+                "channel_registry_id": str(channel_registry_id),
+                "window_days": window_days,
+                "sample_limit": sample_limit,
+            },
+        )
+        observations = tuple(
+            ChannelFeedbackObservation(
+                feedback_category=str(row["feedback_category"]),
+                verdict=str(row["verdict"]),
+                delivery_decision=str(row["delivery_decision"]),
+                primary_artifact_type=str(row["primary_artifact_type"] or "unknown"),
+                created_at=row["created_at"],
+            )
+            for row in result.mappings().all()
+        )
+        return ChannelFeedbackSample(
+            channel_fingerprint=channel_fp(channel_registry_id),
+            observations=observations,
+            sample_limit=sample_limit,
+            window_days=window_days,
+        )
+
 
 async def build_default_repository(
     runtime_config: BoundedFeedbackChannelPolicyRuntimeConfig,
@@ -237,15 +577,22 @@ async def build_default_repository(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = JsonOnlyArgumentParser(
-        description="Read one exact policy target plus local operator feedback and simulate channel override policy.",
+        description="Capture or read back bounded durable feedback and evaluate channel policy without live authority.",
         add_help=False,
     )
     parser.add_argument("--mode", choices=(MODE_PLAN, MODE_EXECUTE), default=MODE_PLAN)
     parser.add_argument("--operator-approved", action="store_true")
     parser.add_argument("--allow-runtime-config", action="store_true")
     parser.add_argument("--allow-database-read", action="store_true")
+    parser.add_argument("--allow-database-write", action="store_true")
     parser.add_argument("--analysis-id-suffix")
     parser.add_argument("--candidate-group-id-suffix")
+    parser.add_argument("--analysis-id")
+    parser.add_argument("--notification-plan-id")
+    parser.add_argument("--notification-delivery-record-id")
+    parser.add_argument("--feedback-category", choices=sorted(ALLOWED_FEEDBACK_LABELS))
+    parser.add_argument("--operator-action-key")
+    parser.add_argument("--confirm-feedback-write", action="store_true")
     parser.add_argument("--feedback-jsonl")
     parser.add_argument("--allow-feedback-file-read", action="store_true")
     parser.add_argument("--channel-policy-json")
@@ -298,6 +645,8 @@ async def run_bounded_feedback_channel_policy(
     channel_policy_options: dict[str, Any] = {}
     channel_policy_file_status = "not_requested"
     policy_rows: list[PolicyReadbackRow] = []
+    durable_capture_result: dict[str, Any] | None = None
+    durable_readback_result: dict[str, Any] | None = None
     repository_handle: FeedbackChannelPolicyRepositoryHandle | None = None
 
     try:
@@ -318,7 +667,7 @@ async def run_bounded_feedback_channel_policy(
             channel_policy_file_status = "read"
             channel_policy_options = _read_channel_policy_options(config.channel_policy_json, state=state)
 
-        if config.analysis_id_suffix or config.candidate_group_id_suffix:
+        if config.analysis_id_suffix or config.candidate_group_id_suffix or config.analysis_id:
             try:
                 runtime_config = runtime_config_loader()
                 state.runtime_config_loaded = True
@@ -334,15 +683,46 @@ async def run_bounded_feedback_channel_policy(
                 )
 
             repository_handle = await (repository_builder or build_default_repository)(runtime_config, state)
-            policy_rows = await repository_handle.repository.load_policy_readbacks(
-                analysis_id_suffix=config.analysis_id_suffix,
-                candidate_group_id_suffix=config.candidate_group_id_suffix,
-                max_rows=config.max_rows,
-            )
-            selector_error = _selector_error(config, policy_rows)
-            if selector_error is not None:
-                return _base_report("blocked", selector_error, config=config, state=state)
+            if config.analysis_id_suffix or config.candidate_group_id_suffix:
+                policy_rows = await repository_handle.repository.load_policy_readbacks(
+                    analysis_id_suffix=config.analysis_id_suffix,
+                    candidate_group_id_suffix=config.candidate_group_id_suffix,
+                    max_rows=config.max_rows,
+                )
+                selector_error = _selector_error(config, policy_rows)
+                if selector_error is not None:
+                    return _base_report("blocked", selector_error, config=config, state=state)
+            if config.analysis_id is not None:
+                feedback_service = NotificationFeedbackService(repository_handle.repository)
+                if _capture_requested(config):
+                    capture = await feedback_service.capture(
+                        NotificationFeedbackRequest(
+                            operator_action_key=config.operator_action_key or "",
+                            feedback_category=config.feedback_category or "",
+                            analysis_id=config.analysis_id,
+                            notification_plan_id=config.notification_plan_id,
+                            notification_delivery_record_id=config.notification_delivery_record_id,
+                        )
+                    )
+                    durable_capture_result = capture.to_sanitized_dict()
+                    durable_readback_result = NotificationFeedbackReadbackResult(
+                        analysis_bound=capture.analysis_bound,
+                        notification_plan_bound=capture.notification_plan_bound,
+                        notification_delivery_record_bound=capture.notification_delivery_record_bound,
+                        candidate_group_bound=capture.candidate_group_bound,
+                        channel_bound=capture.channel_bound,
+                        aggregate=capture.aggregate,
+                    ).to_sanitized_dict()
+                else:
+                    readback = await feedback_service.readback(
+                        analysis_id=config.analysis_id,
+                        notification_plan_id=config.notification_plan_id,
+                        notification_delivery_record_id=config.notification_delivery_record_id,
+                    )
+                    durable_readback_result = readback.to_sanitized_dict()
     except BoundedFeedbackChannelPolicyError as exc:
+        return _base_report("blocked", exc.reason_code, config=config, state=state)
+    except NotificationFeedbackError as exc:
         return _base_report("blocked", exc.reason_code, config=config, state=state)
     except Exception as exc:
         return _base_report("blocked", "runner_error", config=config, state=state, error_class=type(exc).__name__)
@@ -359,13 +739,16 @@ async def run_bounded_feedback_channel_policy(
     )
     channel_result = _evaluate_channel_override(
         policy_rows=policy_rows,
-        feedback_records=enriched_feedback,
         channel_policy_options=channel_policy_options,
     )
     policy_distribution = _policy_distribution(policy_rows)
     report = _base_report(
         "pass",
-        "feedback_channel_policy_readback_complete",
+        (
+            "feedback_capture_and_channel_readback_complete"
+            if durable_capture_result is not None
+            else "feedback_channel_policy_readback_complete"
+        ),
         config=config,
         state=state,
     )
@@ -385,8 +768,21 @@ async def run_bounded_feedback_channel_policy(
             "delivery_record_count_bucket": _count_bucket(sum(row.delivery_record_count for row in policy_rows)),
             "sent_count_bucket": _count_bucket(sum(row.sent_count for row in policy_rows)),
             "suppressed_count_bucket": _count_bucket(sum(row.suppressed_count for row in policy_rows)),
-            "channel_tier_observed_or_unknown": _observed_channel_tier(policy_rows) or "unknown",
-            "channel_context_status": "unavailable_in_current_schema",
+            "channel_tier_observed_or_unknown": (
+                durable_readback_result["aggregate"]["channel_tier"]
+                if durable_readback_result is not None
+                else _observed_channel_tier(policy_rows) or "unknown"
+            ),
+            "channel_context_status": (
+                "durable_feedback_bound"
+                if durable_readback_result is not None
+                and durable_readback_result["identity_binding"]["channel_bound"] is True
+                else "durable_feedback_unbound"
+                if durable_readback_result is not None
+                else "unavailable_in_current_schema"
+            ),
+            "durable_feedback_capture": durable_capture_result,
+            "durable_feedback_readback": durable_readback_result,
             "feedback_distribution": feedback_result.to_sanitized_dict(),
             "usefulness_score_bucket": feedback_result.usefulness_score_average_bucket,
             "false_positive_bucket": feedback_result.false_positive_count_bucket,
@@ -429,13 +825,29 @@ def _config_from_args(args: argparse.Namespace) -> BoundedFeedbackChannelPolicyC
         max_rows = int(args.max_rows)
     except (TypeError, ValueError):
         return argument_error_report("invalid_max_rows")
+    analysis_id = _parse_optional_uuid(args.analysis_id)
+    if isinstance(analysis_id, dict):
+        return argument_error_report("invalid_analysis_id")
+    notification_plan_id = _parse_optional_uuid(args.notification_plan_id)
+    if isinstance(notification_plan_id, dict):
+        return argument_error_report("invalid_notification_plan_id")
+    delivery_record_id = _parse_optional_uuid(args.notification_delivery_record_id)
+    if isinstance(delivery_record_id, dict):
+        return argument_error_report("invalid_notification_delivery_record_id")
     return BoundedFeedbackChannelPolicyConfig(
         mode=str(args.mode),
         operator_approved=bool(args.operator_approved),
         allow_runtime_config=bool(args.allow_runtime_config),
         allow_database_read=bool(args.allow_database_read),
+        allow_database_write=bool(args.allow_database_write),
         analysis_id_suffix=analysis_suffix,
         candidate_group_id_suffix=candidate_suffix,
+        analysis_id=analysis_id,
+        notification_plan_id=notification_plan_id,
+        notification_delivery_record_id=delivery_record_id,
+        feedback_category=args.feedback_category,
+        operator_action_key=args.operator_action_key,
+        confirm_feedback_write=bool(args.confirm_feedback_write),
         feedback_jsonl=args.feedback_jsonl,
         allow_feedback_file_read=bool(args.allow_feedback_file_read),
         channel_policy_json=args.channel_policy_json,
@@ -449,7 +861,21 @@ def _gate_error(config: BoundedFeedbackChannelPolicyConfig) -> str | None:
         return "invalid_mode"
     if not 1 <= config.max_rows <= HARD_MAX_ROWS:
         return "invalid_max_rows"
-    if not (config.analysis_id_suffix or config.candidate_group_id_suffix or config.feedback_jsonl):
+    capture_requested = _capture_requested(config)
+    if config.analysis_id is not None and (config.analysis_id_suffix or config.candidate_group_id_suffix):
+        return "mixed_feedback_selector_modes"
+    target_requested = (
+        config.analysis_id is not None
+        or config.notification_plan_id is not None
+        or config.notification_delivery_record_id is not None
+    )
+    if not (
+        config.analysis_id_suffix
+        or config.candidate_group_id_suffix
+        or config.feedback_jsonl
+        or target_requested
+        or capture_requested
+    ):
         return "exact_selector_missing"
     if config.mode == MODE_EXECUTE and not config.operator_approved:
         return "operator_approval_missing"
@@ -461,6 +887,26 @@ def _gate_error(config: BoundedFeedbackChannelPolicyConfig) -> str | None:
         return "database_read_not_allowed"
     if (config.analysis_id_suffix or config.candidate_group_id_suffix) and not config.allow_runtime_config:
         return "runtime_config_not_allowed"
+    if (config.notification_plan_id or config.notification_delivery_record_id) and config.analysis_id is None:
+        return "feedback_target_analysis_required"
+    if config.analysis_id is not None:
+        if not config.allow_runtime_config:
+            return "runtime_config_not_allowed"
+        if not config.allow_database_read:
+            return "database_read_not_allowed"
+    if capture_requested:
+        if config.analysis_id is None or not config.feedback_category or not config.operator_action_key:
+            return "feedback_capture_fields_missing"
+        if config.mode != MODE_EXECUTE:
+            return "feedback_capture_execute_mode_required"
+        if not config.allow_runtime_config:
+            return "runtime_config_not_allowed"
+        if not config.allow_database_read:
+            return "database_read_not_allowed"
+        if not config.allow_database_write:
+            return "database_write_not_allowed"
+        if not config.confirm_feedback_write:
+            return "feedback_write_confirmation_missing"
     return None
 
 
@@ -559,14 +1005,12 @@ def _matching_policy_row(record: FeedbackRecord, policy_rows: list[PolicyReadbac
 def _evaluate_channel_override(
     *,
     policy_rows: list[PolicyReadbackRow],
-    feedback_records: tuple[FeedbackRecord, ...],
     channel_policy_options: Mapping[str, Any],
 ) -> dict[str, Any]:
     row = policy_rows[0] if policy_rows else None
-    feedback_tier = next((record.channel_tier for record in feedback_records if record.channel_tier), None)
-    tier = feedback_tier or str(channel_policy_options.get("default_channel_tier") or "B")
+    tier = str(channel_policy_options.get("default_channel_tier") or "B")
     reason_codes = row.reason_codes if row else ()
-    ai_noise_signal_count = _ai_noise_signal_count(reason_codes, feedback_records)
+    ai_noise_signal_count = _ai_noise_signal_count(reason_codes)
     artifact_type = row.primary_artifact_type if row else "unknown"
     external_evidence_present = artifact_type not in {"unknown", "text_idea"}
     result = ChannelOverridePolicy().evaluate(
@@ -640,6 +1084,8 @@ def _base_report(
         "target_candidate_group_fingerprint": None,
         "policy_distribution": _policy_distribution([]),
         "feedback_distribution": FeedbackEvalEngine().evaluate(()).to_sanitized_dict(),
+        "durable_feedback_capture": None,
+        "durable_feedback_readback": None,
         "usefulness_score_bucket": "none",
         "false_positive_bucket": "zero",
         "false_negative_bucket": "zero",
@@ -662,9 +1108,9 @@ def _base_report(
             "operator_approved": config.operator_approved,
             "runtime_config_allowed": config.allow_runtime_config,
             "database_read_allowed": config.allow_database_read,
+            "database_write_allowed": config.allow_database_write,
             "feedback_file_read_allowed": config.allow_feedback_file_read,
             "channel_policy_file_read_allowed": config.allow_channel_policy_file_read,
-            "database_write_allowed": False,
             "redis_allowed": False,
             "telegram_allowed": False,
             "openai_allowed": False,
@@ -708,6 +1154,52 @@ def _parse_optional_suffix(value: str | None) -> str | None | dict[str, Any]:
     if UUID_SUFFIX_RE.fullmatch(normalized):
         return normalized
     return argument_error_report("invalid_suffix")
+
+
+def _parse_optional_uuid(value: str | None) -> UUID | None | dict[str, Any]:
+    if value is None:
+        return None
+    try:
+        return UUID(value)
+    except (TypeError, ValueError, AttributeError):
+        return argument_error_report("invalid_uuid")
+
+
+def _capture_requested(config: BoundedFeedbackChannelPolicyConfig) -> bool:
+    return any(
+        value is not None and value is not False
+        for value in (
+            config.feedback_category,
+            config.operator_action_key,
+            config.confirm_feedback_write,
+            config.allow_database_write,
+        )
+    )
+
+
+def _stored_feedback_from_row(row: Mapping[str, Any]) -> StoredNotificationFeedback:
+    return StoredNotificationFeedback(
+        feedback_id=UUID(str(row["feedback_id"])),
+        operator_action_key=str(row["operator_action_key"]),
+        feedback_category=str(row["feedback_category"]),
+        analysis_id=UUID(str(row["analysis_id"])),
+        candidate_group_id=UUID(str(row["candidate_group_id"])),
+        notification_plan_id=_uuid_or_none(row["notification_plan_id"]),
+        notification_delivery_record_id=_uuid_or_none(row["notification_delivery_record_id"]),
+        channel_registry_id=_uuid_or_none(row["channel_registry_id"]),
+        verdict=str(row["verdict"]),
+        delivery_decision=str(row["delivery_decision"]),
+        primary_artifact_type=str(row["primary_artifact_type"] or "unknown"),
+    )
+
+
+def _uuid_or_none(value: Any) -> UUID | None:
+    if value is None:
+        return None
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def _safe_reason_codes(values: Any) -> tuple[str, ...]:
@@ -794,11 +1286,9 @@ def _observed_channel_tier(rows: list[PolicyReadbackRow]) -> str | None:
     return tiers[0] if len(tiers) == 1 else None
 
 
-def _ai_noise_signal_count(reason_codes: tuple[str, ...], feedback_records: tuple[FeedbackRecord, ...]) -> int:
+def _ai_noise_signal_count(reason_codes: tuple[str, ...]) -> int:
     noise_terms = ("ai_noise", "ai_only", "generic_ai", "weak_ai", "bad_channel_fit")
-    from_reason_codes = sum(1 for code in reason_codes if any(term in code for term in noise_terms))
-    from_feedback = sum(1 for record in feedback_records if record.label in {"hype", "bad_channel_fit"})
-    return from_reason_codes + from_feedback
+    return sum(1 for code in reason_codes if any(term in code for term in noise_terms))
 
 
 def _count_bucket(count: int) -> str:

@@ -9,7 +9,9 @@ from uuid import UUID
 
 import sqlalchemy as sa
 
+from .feedback_eval import ChannelFeedbackObservation, ChannelFeedbackSample, channel_fp
 from .models import (
+    AnalysisInsertResult,
     AnalysisDraft,
     AnalysisPolicyJob,
     BundlePolicyContext,
@@ -75,7 +77,8 @@ class PolicyEngineRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                SELECT candidate_group_id, current_bundle_id, current_analysis_id
+                SELECT candidate_group_id, current_bundle_id, current_analysis_id,
+                       dedupe_subject_key
                 FROM candidate_group_proposals
                 WHERE candidate_group_id = CAST(:candidate_group_id AS uuid)
                 """
@@ -89,6 +92,88 @@ class PolicyEngineRepository:
             candidate_group_id=UUID(str(row["candidate_group_id"])),
             current_bundle_id=_uuid_or_none(row["current_bundle_id"]),
             current_analysis_id=_uuid_or_none(row["current_analysis_id"]),
+            dedupe_subject_key=_string_or_none(row.get("dedupe_subject_key")),
+        )
+
+    async def load_channel_feedback_sample(
+        self,
+        candidate_group_id: UUID,
+        *,
+        sample_limit: int,
+        window_days: int,
+    ) -> ChannelFeedbackSample:
+        if not 1 <= sample_limit <= 100:
+            raise ValueError("sample_limit_out_of_range")
+        if not 1 <= window_days <= 365:
+            raise ValueError("window_days_out_of_range")
+
+        channel_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT CASE WHEN channel_ref.registry_count = 1
+                            THEN channel_ref.registry_id
+                       END AS channel_registry_id
+                FROM candidate_group_proposals cgp
+                JOIN source_messages sm
+                  ON sm.source_message_id = cgp.source_message_id
+                LEFT JOIN LATERAL (
+                    SELECT MIN(tcr.registry_id::text)::uuid AS registry_id,
+                           COUNT(*)::int AS registry_count
+                    FROM telegram_channel_registry tcr
+                    WHERE tcr.chat_id = sm.chat_id
+                      AND tcr.desired_state <> 'removed'
+                ) channel_ref ON TRUE
+                WHERE cgp.candidate_group_id = CAST(:candidate_group_id AS uuid)
+                """
+            ),
+            {"candidate_group_id": str(candidate_group_id)},
+        )
+        channel_row = channel_result.mappings().first()
+        channel_registry_id = _uuid_or_none(channel_row["channel_registry_id"]) if channel_row else None
+        if channel_registry_id is None:
+            return ChannelFeedbackSample(
+                channel_fingerprint=None,
+                observations=(),
+                sample_limit=sample_limit,
+                window_days=window_days,
+            )
+
+        feedback_result = await self._session.execute(
+            sa.text(
+                """
+                SELECT feedback_category,
+                       final_verdict::text AS verdict,
+                       delivery_decision::text AS delivery_decision,
+                       primary_artifact_type,
+                       created_at
+                FROM notification_feedback
+                WHERE channel_registry_id = CAST(:channel_registry_id AS uuid)
+                  AND created_at >= now() - (:window_days * INTERVAL '1 day')
+                ORDER BY created_at DESC, feedback_id DESC
+                LIMIT :sample_limit
+                """
+            ),
+            {
+                "channel_registry_id": str(channel_registry_id),
+                "window_days": window_days,
+                "sample_limit": sample_limit,
+            },
+        )
+        observations = tuple(
+            ChannelFeedbackObservation(
+                feedback_category=str(row["feedback_category"]),
+                verdict=str(row["verdict"]),
+                delivery_decision=str(row["delivery_decision"]),
+                primary_artifact_type=str(row["primary_artifact_type"] or "unknown"),
+                created_at=row["created_at"],
+            )
+            for row in feedback_result.mappings().all()
+        )
+        return ChannelFeedbackSample(
+            channel_fingerprint=channel_fp(channel_registry_id),
+            observations=observations,
+            sample_limit=sample_limit,
+            window_days=window_days,
         )
 
     async def load_judge_run(self, judge_run_id: UUID) -> JudgeRunPolicyContext | None:
@@ -198,7 +283,7 @@ class PolicyEngineRepository:
             delivery_policy_version=str(row["delivery_policy_version"]),
         )
 
-    async def insert_analysis(self, draft: AnalysisDraft) -> UUID:
+    async def insert_analysis_if_absent(self, draft: AnalysisDraft) -> AnalysisInsertResult:
         result = await self._session.execute(
             sa.text(
                 """
@@ -262,7 +347,7 @@ class PolicyEngineRepository:
         )
         analysis_id = result.scalar_one_or_none()
         if analysis_id is not None:
-            return UUID(str(analysis_id))
+            return AnalysisInsertResult(analysis_id=UUID(str(analysis_id)), created=True)
 
         existing = await self.load_existing_analysis(
             judge_output_id=draft.judge_output_id,
@@ -271,7 +356,10 @@ class PolicyEngineRepository:
         )
         if existing is None:
             raise RuntimeError("analysis insert conflicted but existing analysis was not found")
-        return existing.analysis_id
+        return AnalysisInsertResult(analysis_id=existing.analysis_id, created=False)
+
+    async def insert_analysis(self, draft: AnalysisDraft) -> UUID:
+        return (await self.insert_analysis_if_absent(draft)).analysis_id
 
     async def insert_state_transition(
         self,

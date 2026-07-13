@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from uuid import UUID, uuid4
 
 from services.policy_engine.config import PolicyEngineConfig
+from services.policy_engine.feedback_eval import ChannelFeedbackSample
 from services.policy_engine.models import (
     AnalysisDraft,
+    AnalysisInsertResult,
     AnalysisPolicyJob,
     BundlePolicyContext,
     CandidatePolicyContext,
@@ -38,6 +41,13 @@ class FakeRepository:
         self.analyses: list[tuple[UUID, AnalysisDraft]] = []
         self.state_transitions: list[dict] = []
         self.notification_outbox: list[NotificationPlanIntent] = []
+        self.feedback_samples: dict[UUID, ChannelFeedbackSample] = {}
+        self.conflict_on_next_analysis_insert = False
+        self.existing_analysis_lookups: list[tuple[UUID, str, str]] = []
+        self.analysis_insert_attempts: list[tuple[UUID, str, str]] = []
+        self._synchronized_analysis_lookup_target = 0
+        self._synchronized_analysis_lookup_count = 0
+        self._synchronized_analysis_lookups_ready = asyncio.Event()
 
     def transaction(self):
         return Tx()
@@ -48,6 +58,23 @@ class FakeRepository:
 
     async def load_candidate_context(self, candidate_group_id: UUID):
         return self.candidates.get(candidate_group_id)
+
+    async def load_channel_feedback_sample(
+        self,
+        candidate_group_id: UUID,
+        *,
+        sample_limit: int,
+        window_days: int,
+    ):
+        return self.feedback_samples.get(
+            candidate_group_id,
+            ChannelFeedbackSample(
+                channel_fingerprint=None,
+                observations=(),
+                sample_limit=sample_limit,
+                window_days=window_days,
+            ),
+        )
 
     async def load_judge_run(self, judge_run_id: UUID):
         return self.runs.get(judge_run_id)
@@ -65,27 +92,56 @@ class FakeRepository:
         policy_version: str,
         delivery_policy_version: str,
     ):
-        return self.existing.get((judge_output_id, policy_version, delivery_policy_version))
+        key = (judge_output_id, policy_version, delivery_policy_version)
+        self.existing_analysis_lookups.append(key)
+        if self._synchronized_analysis_lookup_count < self._synchronized_analysis_lookup_target:
+            existing = self.existing.get(key)
+            self._synchronized_analysis_lookup_count += 1
+            if self._synchronized_analysis_lookup_count == self._synchronized_analysis_lookup_target:
+                self._synchronized_analysis_lookups_ready.set()
+            await self._synchronized_analysis_lookups_ready.wait()
+            return existing
+        return self.existing.get(key)
 
-    async def insert_analysis(self, draft: AnalysisDraft) -> UUID:
-        existing = await self.load_existing_analysis(
-            judge_output_id=draft.judge_output_id,
-            policy_version=draft.policy_version,
-            delivery_policy_version=draft.delivery_policy_version,
-        )
-        if existing is not None:
-            return existing.analysis_id
-        analysis_id = uuid4()
-        self.existing[(draft.judge_output_id, draft.policy_version, draft.delivery_policy_version)] = (
-            ExistingAnalysisRecord(
+    def synchronize_next_analysis_lookups(self, count: int) -> None:
+        self._synchronized_analysis_lookup_target = count
+        self._synchronized_analysis_lookup_count = 0
+        self._synchronized_analysis_lookups_ready = asyncio.Event()
+
+    async def insert_analysis_if_absent(self, draft: AnalysisDraft) -> AnalysisInsertResult:
+        key = (draft.judge_output_id, draft.policy_version, draft.delivery_policy_version)
+        self.analysis_insert_attempts.append(key)
+        if self.conflict_on_next_analysis_insert:
+            self.conflict_on_next_analysis_insert = False
+            analysis_id = uuid4()
+            self.existing[key] = ExistingAnalysisRecord(
                 analysis_id=analysis_id,
                 judge_output_id=draft.judge_output_id,
                 policy_version=draft.policy_version,
                 delivery_policy_version=draft.delivery_policy_version,
             )
+        elif key not in self.existing:
+            analysis_id = uuid4()
+            self.existing[key] = ExistingAnalysisRecord(
+                analysis_id=analysis_id,
+                judge_output_id=draft.judge_output_id,
+                policy_version=draft.policy_version,
+                delivery_policy_version=draft.delivery_policy_version,
+            )
+            self.analyses.append((analysis_id, draft))
+            return AnalysisInsertResult(analysis_id=analysis_id, created=True)
+
+        existing = await self.load_existing_analysis(
+            judge_output_id=draft.judge_output_id,
+            policy_version=draft.policy_version,
+            delivery_policy_version=draft.delivery_policy_version,
         )
-        self.analyses.append((analysis_id, draft))
-        return analysis_id
+        if existing is None:
+            raise RuntimeError("analysis insert conflicted but existing analysis was not found")
+        return AnalysisInsertResult(analysis_id=existing.analysis_id, created=False)
+
+    async def insert_analysis(self, draft: AnalysisDraft) -> UUID:
+        return (await self.insert_analysis_if_absent(draft)).analysis_id
 
     async def insert_state_transition(self, **kwargs) -> None:
         self.state_transitions.append(kwargs)
@@ -203,6 +259,7 @@ def repo_with_valid_case(*, payload: dict | None = None) -> tuple[
         candidate_group_id=candidate_group_id,
         current_bundle_id=bundle_id,
         current_analysis_id=None,
+        dedupe_subject_key="github:repo:example/useful-repository",
     )
     repository.runs[judge_run_id] = run
     repository.outputs[judge_output_id] = output

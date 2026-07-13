@@ -58,3 +58,13 @@ def test_alembic_revision_ids_fit_default_version_column_and_form_valid_chain() 
     for migration_file, down_revisions in down_revisions_by_file.items():
         for down_revision in down_revisions:
             assert down_revision in revisions, migration_file
+
+
+def test_product_feedback_migration_preserves_legacy_notification_plan_history() -> None:
+    migration_source = (MIGRATION_DIR / "0005_product_feedback.py").read_text(encoding="utf-8")
+
+    assert '"notification_material_claims"' in migration_source
+    assert "uq_notification_material_claims_subject_target_material" in migration_source
+    assert "uq_notification_plans_subject_target_material" not in migration_source
+    assert "op.alter_column(\n        \"notification_plans\"" not in migration_source
+    assert "op.drop_table(\"notification_plans\")" not in migration_source

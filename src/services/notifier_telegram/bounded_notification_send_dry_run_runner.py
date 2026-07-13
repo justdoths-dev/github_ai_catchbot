@@ -969,16 +969,32 @@ async def _load_context(
     plan_action = "concretize"
     existing_status = None
     if existing_plan is not None:
+        identity_error = _claimed_plan_identity_error(existing_plan, intent)
+        if identity_error is not None:
+            return _error_context(trigger_event_id, event_row, identity_error, intent=intent)
         plan_id = UUID(str(existing_plan["notification_plan_id"]))
         existing_status = str(existing_plan.get("status") or "")
         plan_action = "reuse_existing_plan"
     else:
-        material_existing = await repository.load_existing_plan_by_material(
+        material_existing = await repository.load_legacy_equivalent_plan(
             analysis_id=intent.analysis_id,
+            dedupe_subject_key=intent.dedupe_subject_key,
             target_chat_id=intent.target_chat_id,
-            material_change_hash=intent.material_change_hash,
+            delivery_decision=intent.delivery_decision,
+            urgency_profile=intent.urgency_profile,
+            render_profile=intent.render_profile,
         )
+        if material_existing is None:
+            material_existing = await repository.load_existing_plan_by_subject_material(
+                dedupe_subject_key=intent.dedupe_subject_key,
+                target_chat_id=intent.target_chat_id,
+                material_change_hash=intent.material_change_hash,
+            )
         if material_existing is not None:
+            identity_error = _claimed_plan_identity_error(material_existing, intent)
+            if identity_error is not None:
+                return _error_context(trigger_event_id, event_row, identity_error, intent=intent)
+            existing_plan = material_existing
             plan_id = UUID(str(material_existing["notification_plan_id"]))
             existing_status = str(material_existing.get("status") or "")
             plan_action = "reuse_existing_material_plan"
@@ -1072,6 +1088,13 @@ async def _execute_context(
                 status="planned",
             )
         )
+        if plan_id != context.intent.notification_plan_id:
+            claimed_plan = await repository.load_notification_plan(plan_id)
+            if claimed_plan is None:
+                raise BoundedNotificationSendDryRunError("notification_plan_claim_readback_missing")
+            identity_error = _claimed_plan_identity_error(claimed_plan, context.intent)
+            if identity_error is not None:
+                raise BoundedNotificationSendDryRunError(identity_error)
         from_state = "planned"
     render = context.render_draft
     if render.notification_plan_id != plan_id:
@@ -1702,6 +1725,30 @@ def _effective_send_after(plan_row: Mapping[str, Any] | None, intent: Notificati
         if isinstance(value, datetime):
             return value
     return intent.send_after
+
+
+def _claimed_plan_identity_error(
+    plan_row: Mapping[str, Any],
+    intent: NotificationIntentJob,
+) -> str | None:
+    try:
+        if (
+            UUID(str(plan_row["analysis_id"])) != intent.analysis_id
+            or UUID(str(plan_row["candidate_group_id"])) != intent.candidate_group_id
+        ):
+            return "notification_duplicate_repost_noop"
+        identity_matches = (
+            str(plan_row["delivery_decision"]) == intent.delivery_decision
+            and str(plan_row["urgency_profile"]) == intent.urgency_profile
+            and int(plan_row["target_chat_id"]) == intent.target_chat_id
+            and plan_row.get("target_thread_id") == intent.target_thread_id
+            and plan_row.get("render_profile") == intent.render_profile
+            and str(plan_row["dedupe_subject_key"]) == intent.dedupe_subject_key
+            and str(plan_row["material_change_hash"]) == intent.material_change_hash
+        )
+    except (KeyError, TypeError, ValueError, AttributeError):
+        identity_matches = False
+    return None if identity_matches else "notification_plan_identity_mismatch"
 
 
 def _is_future(value: datetime | None) -> bool:

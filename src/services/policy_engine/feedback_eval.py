@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
 from json import JSONDecodeError
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Protocol
+from uuid import UUID
 
 
 ALLOWED_FEEDBACK_LABELS = frozenset(
     {
+        "useful",
         "useful_now",
         "useful_later",
         "false_positive",
         "false_negative",
         "hype",
         "duplicate",
+        "stale",
+        "wrong_priority",
         "wrong_primary",
         "insufficient_evidence",
         "bad_summary",
@@ -26,8 +32,38 @@ VERDICTS = ("inspect_now", "later", "skip")
 DELIVERY_DECISIONS = ("send_now", "send_digest", "suppress")
 URGENCY_PROFILES = ("high", "normal_silent", "digest", "suppressed")
 MAX_FEEDBACK_ROWS = 100
+MAX_FEEDBACK_WINDOW_DAYS = 365
+DEFAULT_FEEDBACK_WINDOW_DAYS = 90
+MIN_CHANNEL_POLICY_SAMPLE = 5
 SAFE_REASON_RE = re.compile(r"^[a-z][a-z0-9_:-]{0,63}$")
 SAFE_SUFFIX_RE = re.compile(r"^[0-9a-f-]{4,36}$")
+SAFE_OPERATOR_ACTION_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+SAFE_CHANNEL_FINGERPRINT_RE = re.compile(r"^fp_[0-9a-f]{12}$")
+ARTIFACT_TYPES = frozenset(
+    {
+        "github_repo",
+        "github_subpath",
+        "github_gist",
+        "github_repo_page",
+        "x_post",
+        "web_article",
+        "text_idea",
+        "unknown_link",
+        "short_url_unresolved",
+        "unknown",
+    }
+)
+USEFUL_FEEDBACK_LABELS = frozenset({"useful", "useful_now", "useful_later"})
+NOISE_FEEDBACK_LABELS = frozenset(
+    {
+        "false_positive",
+        "duplicate",
+        "stale",
+        "wrong_priority",
+        "hype",
+        "bad_channel_fit",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +147,226 @@ class FeedbackEvalResult:
             "invalid_reason_distribution": dict(self.invalid_reason_distribution),
             "reason_code_distribution": dict(self.reason_code_distribution),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class FeedbackTargetContext:
+    analysis_id: UUID
+    candidate_group_id: UUID
+    notification_plan_id: UUID | None
+    notification_delivery_record_id: UUID | None
+    channel_registry_id: UUID | None
+    channel_fingerprint: str | None
+    verdict: str
+    delivery_decision: str
+    primary_artifact_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredNotificationFeedback:
+    feedback_id: UUID
+    operator_action_key: str
+    feedback_category: str
+    analysis_id: UUID
+    candidate_group_id: UUID
+    notification_plan_id: UUID | None
+    notification_delivery_record_id: UUID | None
+    channel_registry_id: UUID | None
+    verdict: str
+    delivery_decision: str
+    primary_artifact_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationFeedbackRequest:
+    operator_action_key: str
+    feedback_category: str
+    analysis_id: UUID
+    notification_plan_id: UUID | None = None
+    notification_delivery_record_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelFeedbackObservation:
+    feedback_category: str
+    verdict: str
+    delivery_decision: str
+    primary_artifact_type: str
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelFeedbackSample:
+    channel_fingerprint: str | None
+    observations: tuple[ChannelFeedbackObservation, ...]
+    sample_limit: int = MAX_FEEDBACK_ROWS
+    window_days: int = DEFAULT_FEEDBACK_WINDOW_DAYS
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelFeedbackAggregate:
+    channel_fingerprint: str | None
+    sample_count: int
+    minimum_sample: int
+    sample_limit: int
+    window_days: int
+    sufficient_sample: bool
+    channel_tier: str
+    policy_active: bool
+    category_distribution: dict[str, int]
+    verdict_distribution: dict[str, int]
+    delivery_distribution: dict[str, int]
+    artifact_type_distribution: dict[str, int]
+    useful_rate_basis_points: int
+    noise_rate_basis_points: int
+
+    @classmethod
+    def neutral(
+        cls,
+        *,
+        channel_fingerprint: str | None = None,
+        sample_limit: int = MAX_FEEDBACK_ROWS,
+        window_days: int = DEFAULT_FEEDBACK_WINDOW_DAYS,
+        minimum_sample: int = MIN_CHANNEL_POLICY_SAMPLE,
+    ) -> ChannelFeedbackAggregate:
+        return cls(
+            channel_fingerprint=_safe_channel_fingerprint(channel_fingerprint),
+            sample_count=0,
+            minimum_sample=minimum_sample,
+            sample_limit=sample_limit,
+            window_days=window_days,
+            sufficient_sample=False,
+            channel_tier="B",
+            policy_active=False,
+            category_distribution={label: 0 for label in sorted(ALLOWED_FEEDBACK_LABELS)},
+            verdict_distribution={key: 0 for key in VERDICTS},
+            delivery_distribution={key: 0 for key in DELIVERY_DECISIONS},
+            artifact_type_distribution={},
+            useful_rate_basis_points=0,
+            noise_rate_basis_points=0,
+        )
+
+    def to_sanitized_dict(self) -> dict[str, Any]:
+        return {
+            "channel_fingerprint": self.channel_fingerprint,
+            "sample_count": self.sample_count,
+            "minimum_sample": self.minimum_sample,
+            "sample_limit": self.sample_limit,
+            "window_days": self.window_days,
+            "sufficient_sample": self.sufficient_sample,
+            "channel_tier": self.channel_tier,
+            "policy_active": self.policy_active,
+            "category_distribution": dict(self.category_distribution),
+            "verdict_distribution": dict(self.verdict_distribution),
+            "delivery_distribution": dict(self.delivery_distribution),
+            "artifact_type_distribution": dict(self.artifact_type_distribution),
+            "useful_rate_basis_points": self.useful_rate_basis_points,
+            "noise_rate_basis_points": self.noise_rate_basis_points,
+            "statistical_confidence_claimed": False,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationFeedbackCaptureResult:
+    created: bool
+    feedback_category: str
+    operator_action_fingerprint: str
+    analysis_bound: bool
+    notification_plan_bound: bool
+    notification_delivery_record_bound: bool
+    candidate_group_bound: bool
+    channel_bound: bool
+    aggregate: ChannelFeedbackAggregate
+
+    def to_sanitized_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "notification_feedback_capture_v1",
+            "status": "created" if self.created else "noop",
+            "reason_code": "feedback_created" if self.created else "feedback_idempotent_noop",
+            "feedback_category": self.feedback_category,
+            "operator_action_fingerprint": self.operator_action_fingerprint,
+            "identity_binding": {
+                "analysis_bound": self.analysis_bound,
+                "notification_plan_bound": self.notification_plan_bound,
+                "notification_delivery_record_bound": self.notification_delivery_record_bound,
+                "candidate_group_bound": self.candidate_group_bound,
+                "channel_bound": self.channel_bound,
+            },
+            "aggregate": self.aggregate.to_sanitized_dict(),
+            "side_effects": {
+                "historical_analysis_mutated": False,
+                "judge_output_mutated": False,
+                "evidence_bundle_mutated": False,
+                "delivery_record_mutated": False,
+                "send_triggered": False,
+                "retry_triggered": False,
+                "replay_triggered": False,
+                "provider_called": False,
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationFeedbackReadbackResult:
+    analysis_bound: bool
+    notification_plan_bound: bool
+    notification_delivery_record_bound: bool
+    candidate_group_bound: bool
+    channel_bound: bool
+    aggregate: ChannelFeedbackAggregate
+
+    def to_sanitized_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "notification_feedback_readback_v1",
+            "status": "pass",
+            "reason_code": "feedback_channel_readback_complete",
+            "identity_binding": {
+                "analysis_bound": self.analysis_bound,
+                "notification_plan_bound": self.notification_plan_bound,
+                "notification_delivery_record_bound": self.notification_delivery_record_bound,
+                "candidate_group_bound": self.candidate_group_bound,
+                "channel_bound": self.channel_bound,
+            },
+            "aggregate": self.aggregate.to_sanitized_dict(),
+        }
+
+
+class NotificationFeedbackError(ValueError):
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+class NotificationFeedbackRepositoryProtocol(Protocol):
+    def transaction(self): ...
+
+    async def load_feedback_target(
+        self,
+        *,
+        analysis_id: UUID,
+        notification_plan_id: UUID | None,
+        notification_delivery_record_id: UUID | None,
+    ) -> FeedbackTargetContext | None: ...
+
+    async def load_feedback_by_action_key(
+        self,
+        operator_action_key: str,
+    ) -> StoredNotificationFeedback | None: ...
+
+    async def insert_notification_feedback(
+        self,
+        *,
+        request: NotificationFeedbackRequest,
+        target: FeedbackTargetContext,
+    ) -> StoredNotificationFeedback | None: ...
+
+    async def load_channel_feedback_sample(
+        self,
+        *,
+        channel_registry_id: UUID,
+        sample_limit: int,
+        window_days: int,
+    ) -> ChannelFeedbackSample: ...
 
 
 class FeedbackEvalEngine:
@@ -205,6 +461,150 @@ class FeedbackEvalEngine:
             invalid_reason_distribution=dict(sorted((invalid_reason_distribution or {}).items())),
             reason_code_distribution=dict(sorted(reason_codes.items())),
         )
+
+    def aggregate_channel_sample(
+        self,
+        sample: ChannelFeedbackSample,
+        *,
+        minimum_sample: int = MIN_CHANNEL_POLICY_SAMPLE,
+    ) -> ChannelFeedbackAggregate:
+        if not 1 <= sample.sample_limit <= MAX_FEEDBACK_ROWS:
+            raise ValueError("sample_limit_out_of_range")
+        if not 1 <= sample.window_days <= MAX_FEEDBACK_WINDOW_DAYS:
+            raise ValueError("window_days_out_of_range")
+        if not 1 <= minimum_sample <= sample.sample_limit:
+            raise ValueError("minimum_sample_out_of_range")
+        if len(sample.observations) > sample.sample_limit:
+            raise ValueError("sample_limit_exceeded")
+
+        category_counts = Counter(observation.feedback_category for observation in sample.observations)
+        verdict_counts = Counter(observation.verdict for observation in sample.observations)
+        delivery_counts = Counter(observation.delivery_decision for observation in sample.observations)
+        artifact_counts = Counter(
+            _safe_artifact_type(observation.primary_artifact_type)
+            for observation in sample.observations
+        )
+        sample_count = len(sample.observations)
+        useful_count = sum(category_counts[label] for label in USEFUL_FEEDBACK_LABELS)
+        noise_count = sum(category_counts[label] for label in NOISE_FEEDBACK_LABELS)
+        useful_rate = _rate_basis_points(useful_count, sample_count)
+        noise_rate = _rate_basis_points(noise_count, sample_count)
+        sufficient_sample = sample_count >= minimum_sample
+
+        if sufficient_sample and noise_count >= 3 and noise_rate >= 5_000:
+            channel_tier = "C"
+        elif sufficient_sample and noise_count == 0 and useful_rate >= 7_500:
+            channel_tier = "A"
+        else:
+            channel_tier = "B"
+
+        return ChannelFeedbackAggregate(
+            channel_fingerprint=_safe_channel_fingerprint(sample.channel_fingerprint),
+            sample_count=sample_count,
+            minimum_sample=minimum_sample,
+            sample_limit=sample.sample_limit,
+            window_days=sample.window_days,
+            sufficient_sample=sufficient_sample,
+            channel_tier=channel_tier,
+            policy_active=sufficient_sample and channel_tier == "C",
+            category_distribution={
+                label: int(category_counts[label]) for label in sorted(ALLOWED_FEEDBACK_LABELS)
+            },
+            verdict_distribution={key: int(verdict_counts[key]) for key in VERDICTS},
+            delivery_distribution={key: int(delivery_counts[key]) for key in DELIVERY_DECISIONS},
+            artifact_type_distribution=dict(sorted(artifact_counts.items())),
+            useful_rate_basis_points=useful_rate,
+            noise_rate_basis_points=noise_rate,
+        )
+
+
+class NotificationFeedbackService:
+    def __init__(
+        self,
+        repository: NotificationFeedbackRepositoryProtocol,
+        *,
+        eval_engine: FeedbackEvalEngine | None = None,
+    ) -> None:
+        self._repository = repository
+        self._eval_engine = eval_engine or FeedbackEvalEngine()
+
+    async def capture(self, request: NotificationFeedbackRequest) -> NotificationFeedbackCaptureResult:
+        _validate_feedback_request(request)
+        async with self._repository.transaction():
+            existing = await self._repository.load_feedback_by_action_key(request.operator_action_key)
+            if existing is not None:
+                if not _feedback_request_matches(existing, request):
+                    raise NotificationFeedbackError("feedback_idempotency_conflict")
+                target = _feedback_target_from_stored(existing)
+                created = False
+            else:
+                target = await self._repository.load_feedback_target(
+                    analysis_id=request.analysis_id,
+                    notification_plan_id=request.notification_plan_id,
+                    notification_delivery_record_id=request.notification_delivery_record_id,
+                )
+                if target is None:
+                    raise NotificationFeedbackError("feedback_target_missing_or_mismatch")
+                inserted = await self._repository.insert_notification_feedback(request=request, target=target)
+                if inserted is None:
+                    inserted = await self._repository.load_feedback_by_action_key(request.operator_action_key)
+                    if inserted is None or not _feedback_request_matches(inserted, request):
+                        raise NotificationFeedbackError("feedback_idempotency_conflict")
+                    target = _feedback_target_from_stored(inserted)
+                    created = False
+                else:
+                    created = True
+
+            aggregate = await self._aggregate_for_target(target)
+
+        return NotificationFeedbackCaptureResult(
+            created=created,
+            feedback_category=request.feedback_category,
+            operator_action_fingerprint=_fingerprint(request.operator_action_key),
+            analysis_bound=True,
+            notification_plan_bound=target.notification_plan_id is not None,
+            notification_delivery_record_bound=target.notification_delivery_record_id is not None,
+            candidate_group_bound=True,
+            channel_bound=target.channel_registry_id is not None,
+            aggregate=aggregate,
+        )
+
+    async def readback(
+        self,
+        *,
+        analysis_id: UUID,
+        notification_plan_id: UUID | None = None,
+        notification_delivery_record_id: UUID | None = None,
+    ) -> NotificationFeedbackReadbackResult:
+        async with self._repository.transaction():
+            target = await self._repository.load_feedback_target(
+                analysis_id=analysis_id,
+                notification_plan_id=notification_plan_id,
+                notification_delivery_record_id=notification_delivery_record_id,
+            )
+            if target is None:
+                raise NotificationFeedbackError("feedback_target_missing_or_mismatch")
+            aggregate = await self._aggregate_for_target(target)
+        return NotificationFeedbackReadbackResult(
+            analysis_bound=True,
+            notification_plan_bound=target.notification_plan_id is not None,
+            notification_delivery_record_bound=target.notification_delivery_record_id is not None,
+            candidate_group_bound=True,
+            channel_bound=target.channel_registry_id is not None,
+            aggregate=aggregate,
+        )
+
+    async def _aggregate_for_target(self, target: FeedbackTargetContext) -> ChannelFeedbackAggregate:
+        if target.channel_registry_id is None:
+            return ChannelFeedbackAggregate.neutral(
+                channel_fingerprint=target.channel_fingerprint,
+            )
+        sample = await self._repository.load_channel_feedback_sample(
+            channel_registry_id=target.channel_registry_id,
+            sample_limit=MAX_FEEDBACK_ROWS,
+            window_days=DEFAULT_FEEDBACK_WINDOW_DAYS,
+        )
+        return self._eval_engine.aggregate_channel_sample(sample)
 
 
 def _parse_feedback_line(line: str, *, row_number: int) -> tuple[FeedbackRecord | None, str | None]:
@@ -303,3 +703,70 @@ def _count_bucket(count: int) -> str:
     if count <= 20:
         return "six_to_twenty"
     return "over_twenty"
+
+
+def _validate_feedback_request(request: NotificationFeedbackRequest) -> None:
+    if request.feedback_category not in ALLOWED_FEEDBACK_LABELS:
+        raise NotificationFeedbackError("invalid_feedback_category")
+    if not SAFE_OPERATOR_ACTION_KEY_RE.fullmatch(request.operator_action_key):
+        raise NotificationFeedbackError("invalid_operator_action_key")
+
+
+def _feedback_request_matches(
+    existing: StoredNotificationFeedback,
+    request: NotificationFeedbackRequest,
+) -> bool:
+    plan_matches = (
+        request.notification_plan_id is None
+        or existing.notification_plan_id == request.notification_plan_id
+    )
+    delivery_matches = (
+        request.notification_delivery_record_id is None
+        or existing.notification_delivery_record_id == request.notification_delivery_record_id
+    )
+    return (
+        existing.operator_action_key == request.operator_action_key
+        and existing.feedback_category == request.feedback_category
+        and existing.analysis_id == request.analysis_id
+        and plan_matches
+        and delivery_matches
+    )
+
+
+def _feedback_target_from_stored(existing: StoredNotificationFeedback) -> FeedbackTargetContext:
+    return FeedbackTargetContext(
+        analysis_id=existing.analysis_id,
+        candidate_group_id=existing.candidate_group_id,
+        notification_plan_id=existing.notification_plan_id,
+        notification_delivery_record_id=existing.notification_delivery_record_id,
+        channel_registry_id=existing.channel_registry_id,
+        channel_fingerprint=channel_fp(existing.channel_registry_id) if existing.channel_registry_id else None,
+        verdict=existing.verdict,
+        delivery_decision=existing.delivery_decision,
+        primary_artifact_type=existing.primary_artifact_type,
+    )
+
+
+def _rate_basis_points(numerator: int, denominator: int) -> int:
+    if denominator <= 0:
+        return 0
+    return numerator * 10_000 // denominator
+
+
+def _fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def channel_fp(value: UUID | str) -> str:
+    digest = hashlib.sha256(f"github-ai-catchbot:{value}".encode("utf-8")).hexdigest()
+    return f"fp_{digest[:12]}"
+
+
+def _safe_channel_fingerprint(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return value if SAFE_CHANNEL_FINGERPRINT_RE.fullmatch(value) else None
+
+
+def _safe_artifact_type(value: str) -> str:
+    return value if value in ARTIFACT_TYPES else "unknown"
