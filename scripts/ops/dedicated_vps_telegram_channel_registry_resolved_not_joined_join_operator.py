@@ -58,6 +58,25 @@ WHERE source_kind = 'public_username'
 ORDER BY priority_weight DESC, registry_id ASC
 LIMIT :limit
 """
+SELECT_EXACT_TARGET_ROWS_QUERY = """
+SELECT registry_id, source_value, source_kind, desired_state, access_state, chat_id
+FROM telegram_channel_registry
+WHERE source_kind = 'public_username'
+  AND lower(
+    regexp_replace(
+      regexp_replace(
+        source_value,
+        '^(https://t[.]me/|http://t[.]me/|t[.]me/)',
+        ''
+      ),
+      '^@',
+      ''
+    )
+  ) = :normalized_source_value
+  AND desired_state = 'active'
+ORDER BY registry_id ASC
+LIMIT 2
+"""
 UPDATE_JOIN_STATE_REGISTRY_ROW_QUERY = """
 UPDATE telegram_channel_registry
 SET
@@ -68,6 +87,53 @@ WHERE registry_id = :registry_id
   AND source_kind = 'public_username'
   AND desired_state = 'active'
   AND access_state = 'resolved_not_joined'
+  AND chat_id = :chat_id
+  AND chat_id IS NOT NULL
+"""
+UPDATE_EXACT_JOIN_STATE_REGISTRY_ROW_QUERY = """
+UPDATE telegram_channel_registry
+SET
+  access_state = 'joined',
+  last_join_attempt_at = :attempted_at,
+  updated_at = :attempted_at
+WHERE registry_id = :registry_id
+  AND source_kind = 'public_username'
+  AND source_value = :source_value
+  AND lower(
+    regexp_replace(
+      regexp_replace(
+        source_value,
+        '^(https://t[.]me/|http://t[.]me/|t[.]me/)',
+        ''
+      ),
+      '^@',
+      ''
+    )
+  ) = :normalized_source_value
+  AND desired_state = 'active'
+  AND access_state = 'resolved_not_joined'
+  AND chat_id = :chat_id
+  AND chat_id IS NOT NULL
+"""
+SELECT_EXACT_JOIN_READBACK_QUERY = """
+SELECT registry_id, source_value, source_kind, desired_state, access_state, chat_id
+FROM telegram_channel_registry
+WHERE registry_id = :registry_id
+  AND source_kind = 'public_username'
+  AND source_value = :source_value
+  AND lower(
+    regexp_replace(
+      regexp_replace(
+        source_value,
+        '^(https://t[.]me/|http://t[.]me/|t[.]me/)',
+        ''
+      ),
+      '^@',
+      ''
+    )
+  ) = :normalized_source_value
+  AND desired_state = 'active'
+  AND access_state = 'joined'
   AND chat_id = :chat_id
   AND chat_id IS NOT NULL
 """
@@ -208,6 +274,17 @@ class TargetRow:
 
 
 @dataclass(frozen=True, slots=True)
+class ExactTargetRow:
+    registry_id: str
+    source_value: str
+    normalized_source_value: str
+    source_kind: str
+    desired_state: str
+    access_state: str
+    chat_id: int
+
+
+@dataclass(frozen=True, slots=True)
 class JoinChatResult:
     status: str
     failure_class: str | None = None
@@ -324,6 +401,9 @@ if str(ROOT) not in sys.path:
 from scripts.ops import (  # noqa: E402
     dedicated_vps_tdlib_session_reuse_collector_readiness_preflight as session_preflight,
 )
+from src.services.collector_telegram import (  # noqa: E402
+    bounded_history_ingest_runner,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -343,7 +423,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
     )
     parser.add_argument("--approved-registry-join-mutation", action="store_true")
-    parser.add_argument("--limit", type=_positive_int, default=None)
+    target_selection = parser.add_mutually_exclusive_group()
+    target_selection.add_argument("--target-locator-path", default=None)
+    target_selection.add_argument("--limit", type=_positive_int, default=None)
     parser.add_argument(
         "--tdlib-auth-max-updates",
         type=_positive_int_named("tdlib-auth-max-updates"),
@@ -486,6 +568,25 @@ def _base_report(
     }
 
 
+def _initialize_exact_target_report(report: dict[str, Any]) -> None:
+    report.update(
+        {
+            "exact_target_mode": True,
+            "target_locator_present": True,
+            "target_locator_read": False,
+            "exact_target_match_count_bucket": "unknown",
+            "exact_target_noop": False,
+            "exact_target_durable_readback_matched": False,
+            "exact_target_mutation_outcome": "not_attempted",
+            "exact_target_cleanup_failure_codes": [],
+            "exact_target_read_rollback_succeeded": None,
+            "exact_target_mutation_rollback_succeeded": None,
+            "exact_target_transport_close_succeeded": None,
+            "exact_target_connection_cleanup_succeeded": None,
+        }
+    )
+
+
 def _set_status(report: dict[str, Any], status: str, check: str | None = None) -> None:
     report["contract_status"] = status
     if check is not None and check not in report["checks_failed"]:
@@ -506,6 +607,8 @@ def _allowed_read_statements() -> set[str]:
             COUNT_TARGET_ROWS_QUERY,
             SELECT_TARGET_ROWS_QUERY,
             SELECT_TARGET_ROWS_LIMIT_QUERY,
+            SELECT_EXACT_TARGET_ROWS_QUERY,
+            SELECT_EXACT_JOIN_READBACK_QUERY,
         )
     }
 
@@ -516,7 +619,10 @@ def _assert_read_sql(statement: str) -> None:
 
 
 def _assert_update_sql(statement: str) -> None:
-    if _normalize_sql(statement) != _normalize_sql(UPDATE_JOIN_STATE_REGISTRY_ROW_QUERY):
+    if _normalize_sql(statement) not in {
+        _normalize_sql(UPDATE_JOIN_STATE_REGISTRY_ROW_QUERY),
+        _normalize_sql(UPDATE_EXACT_JOIN_STATE_REGISTRY_ROW_QUERY),
+    }:
         raise ValueError(
             "SQL statement is not in the resolved-not-joined update allowlist"
         )
@@ -655,6 +761,128 @@ def _commit_transaction(transaction: Any | None) -> None:
 def _rollback_transaction(transaction: Any | None) -> None:
     if transaction is not None and hasattr(transaction, "rollback"):
         transaction.rollback()
+
+
+def _record_exact_cleanup_failure(report: dict[str, Any], code: str) -> None:
+    failures = report["exact_target_cleanup_failure_codes"]
+    if code not in failures:
+        failures.append(code)
+
+
+def _rollback_exact_transaction(
+    transaction: Any,
+    *,
+    report: dict[str, Any],
+    result_field: str,
+    failure_code: str,
+) -> bool:
+    try:
+        _rollback_transaction(transaction)
+    except Exception:
+        report[result_field] = False
+        _record_exact_cleanup_failure(report, failure_code)
+        return False
+    report[result_field] = True
+    return True
+
+
+def _close_exact_transport(
+    joiner: ResolvedNotJoinedJoiner,
+    *,
+    report: dict[str, Any],
+) -> None:
+    try:
+        asyncio.run(joiner.close())
+    except Exception:
+        report["exact_target_transport_close_succeeded"] = False
+        _record_exact_cleanup_failure(report, "transport_close_failed")
+        return
+    report["exact_target_transport_close_succeeded"] = True
+
+
+def _cleanup_exact_connection(
+    cleanup: Callable[[], None] | None,
+    connection: DatabaseConnection | None,
+    *,
+    report: dict[str, Any],
+) -> None:
+    if cleanup is None and connection is None:
+        return
+    try:
+        _close_connection(cleanup, connection)
+    except Exception:
+        report["exact_target_connection_cleanup_succeeded"] = False
+        _record_exact_cleanup_failure(report, "connection_cleanup_failed")
+        return
+    report["exact_target_connection_cleanup_succeeded"] = True
+
+
+def _finalize_exact_target_cleanup(
+    result: ScriptResult,
+    *,
+    report: dict[str, Any],
+    read_transaction: Any | None,
+    read_rollback_attempted: bool,
+    mutation_transaction: Any | None,
+    mutation_transaction_committed: bool,
+    joiner: ResolvedNotJoinedJoiner | None,
+    cleanup: Callable[[], None] | None,
+    connection: DatabaseConnection | None,
+) -> ScriptResult:
+    if read_transaction is not None and not read_rollback_attempted:
+        _rollback_exact_transaction(
+            read_transaction,
+            report=report,
+            result_field="exact_target_read_rollback_succeeded",
+            failure_code="read_rollback_failed",
+        )
+
+    if mutation_transaction is not None and not mutation_transaction_committed:
+        if _rollback_exact_transaction(
+            mutation_transaction,
+            report=report,
+            result_field="exact_target_mutation_rollback_succeeded",
+            failure_code="mutation_rollback_failed",
+        ):
+            report["exact_target_mutation_outcome"] = "rolled_back"
+        else:
+            report["exact_target_mutation_outcome"] = (
+                "unknown_after_rollback_failure"
+            )
+
+    if joiner is not None:
+        _close_exact_transport(joiner, report=report)
+    _cleanup_exact_connection(cleanup, connection, report=report)
+
+    failures = report["exact_target_cleanup_failure_codes"]
+    if not failures:
+        return result
+
+    if report["exact_target_read_rollback_succeeded"] is False:
+        _set_status(
+            report,
+            "blocked_exact_target_read_rollback_failed",
+            "exact_target.read_rollback_failed",
+        )
+    elif report["exact_target_mutation_rollback_succeeded"] is False:
+        _set_status(
+            report,
+            "blocked_exact_target_mutation_rollback_failed",
+            "exact_target.mutation_rollback_failed",
+        )
+    elif report["exact_target_mutation_outcome"] == "committed_durable":
+        _set_status(
+            report,
+            "exact_target_cleanup_failed_after_commit",
+            "exact_target.cleanup_failed_after_commit",
+        )
+    elif "connection_cleanup_failed" in failures:
+        _set_status(
+            report,
+            "blocked_exact_target_connection_cleanup_failed",
+            "exact_target.connection_cleanup_failed",
+        )
+    return ScriptResult(exit_code=1, report=report)
 
 
 def _close_connection(
@@ -930,6 +1158,138 @@ def _load_target_rows(
         )
     target_rows = [_target_row_from_db_row(row) for row in raw_rows]
     return tuple(row for row in target_rows if row is not None)
+
+
+def _normalize_exact_public_username(value: Any) -> str | None:
+    from scripts.ops import (  # noqa: PLC0415
+        dedicated_vps_telegram_channel_registry_public_username_resolve_operator
+        as resolve_operator,
+    )
+
+    normalized = resolve_operator._normalize_public_username(value)
+    if normalized is None:
+        return None
+    return normalized.lower()
+
+
+def _exact_target_row_from_db_row(
+    row: Any,
+    *,
+    locator_source_value: str,
+) -> tuple[ExactTargetRow | None, str | None]:
+    registry_id = _row_value(row, "registry_id", 0)
+    source_value = _row_value(row, "source_value", 1)
+    source_kind = _row_value(row, "source_kind", 2)
+    desired_state = _row_value(row, "desired_state", 3)
+    access_state = _row_value(row, "access_state", 4)
+    raw_chat_id = _row_value(row, "chat_id", 5)
+
+    normalized_source_value = _normalize_exact_public_username(source_value)
+    if normalized_source_value is None:
+        return None, "source_invalid"
+    if normalized_source_value != locator_source_value:
+        return None, "source_mismatch"
+    if not isinstance(source_value, str):
+        return None, "source_invalid"
+
+    try:
+        registry_id_text = str(uuid.UUID(str(registry_id)))
+    except (AttributeError, TypeError, ValueError):
+        return None, "registry_id_invalid"
+
+    if source_kind != "public_username":
+        return None, "source_kind_invalid"
+    if type(raw_chat_id) is not int or raw_chat_id == 0:
+        return None, "chat_id_invalid"
+    if desired_state != "active":
+        return None, "desired_state_invalid"
+    if not isinstance(access_state, str):
+        return None, "access_state_invalid"
+
+    return (
+        ExactTargetRow(
+            registry_id=registry_id_text,
+            source_value=source_value,
+            normalized_source_value=normalized_source_value,
+            source_kind=source_kind,
+            desired_state=desired_state,
+            access_state=access_state,
+            chat_id=raw_chat_id,
+        ),
+        None,
+    )
+
+
+def _load_exact_target_rows(
+    connection: DatabaseConnection,
+    *,
+    normalized_source_value: str,
+) -> tuple[Any, ...]:
+    return tuple(
+        _rows(
+            _execute_read(
+                connection,
+                SELECT_EXACT_TARGET_ROWS_QUERY,
+                {"normalized_source_value": normalized_source_value},
+            )
+        )
+    )
+
+
+def _update_exact_join_state_row(
+    connection: DatabaseConnection,
+    *,
+    row: ExactTargetRow,
+    attempted_at: datetime,
+) -> int:
+    result = _execute_update(
+        connection,
+        UPDATE_EXACT_JOIN_STATE_REGISTRY_ROW_QUERY,
+        {
+            "registry_id": row.registry_id,
+            "source_value": row.source_value,
+            "normalized_source_value": row.normalized_source_value,
+            "chat_id": row.chat_id,
+            "attempted_at": attempted_at,
+        },
+    )
+    return _rowcount(result)
+
+
+def _exact_join_readback_matches(
+    connection: DatabaseConnection,
+    *,
+    expected: ExactTargetRow,
+) -> bool:
+    raw_rows = _rows(
+        _execute_read(
+            connection,
+            SELECT_EXACT_JOIN_READBACK_QUERY,
+            {
+                "registry_id": expected.registry_id,
+                "source_value": expected.source_value,
+                "normalized_source_value": expected.normalized_source_value,
+                "chat_id": expected.chat_id,
+            },
+        )
+    )
+    if len(raw_rows) != 1:
+        return False
+    readback, error = _exact_target_row_from_db_row(
+        raw_rows[0],
+        locator_source_value=expected.normalized_source_value,
+    )
+    return bool(
+        error is None
+        and readback is not None
+        and readback.registry_id == expected.registry_id
+        and readback.source_value == expected.source_value
+        and readback.normalized_source_value == expected.normalized_source_value
+        and readback.source_kind == expected.source_kind == "public_username"
+        and readback.desired_state == "active"
+        and readback.access_state == "joined"
+        and readback.chat_id == expected.chat_id
+    )
 
 
 def _update_join_state_row(
@@ -1304,12 +1664,356 @@ def _final_success_status(
     return "resolved_not_joined_join_completed_no_mutation"
 
 
+def _generate_exact_target_report(
+    *,
+    target_locator_path: str | Path,
+    runtime_env_path: str | Path,
+    dry_run: bool,
+    approved_tdlib_join_resolved_not_joined: bool,
+    approved_registry_join_mutation: bool,
+    limit: int | None,
+    tdlib_auth_max_updates: int,
+    tdlib_receive_timeout_sec: float,
+    tdlib_overall_timeout_sec: float,
+    tdlib_join_rpc_max_updates: int,
+    tdlib_join_rpc_receive_timeout_sec: float,
+    tdlib_join_rpc_max_duration_sec: float,
+    runtime_env_reader: RuntimeEnvReader | None,
+    database_connection_factory: DatabaseConnectionFactory | None,
+    resolved_not_joined_joiner_factory: ResolvedNotJoinedJoinerFactory | None,
+) -> ScriptResult:
+    effective_dry_run = bool(dry_run or not approved_tdlib_join_resolved_not_joined)
+    report = _base_report(
+        dry_run=effective_dry_run,
+        approved_tdlib_join_resolved_not_joined=(
+            approved_tdlib_join_resolved_not_joined
+        ),
+        approved_registry_join_mutation=approved_registry_join_mutation,
+    )
+    _initialize_exact_target_report(report)
+
+    if limit is not None:
+        _set_status(
+            report,
+            "blocked_exact_target_selection_ambiguous",
+            "exact_target.limit_not_allowed",
+        )
+        return ScriptResult(exit_code=1, report=report)
+    if (
+        dry_run
+        or not approved_tdlib_join_resolved_not_joined
+        or not approved_registry_join_mutation
+    ):
+        _set_status(
+            report,
+            "blocked_exact_target_approval_required",
+            "approval.exact_target_join_and_mutation_required",
+        )
+        return ScriptResult(exit_code=1, report=report)
+
+    try:
+        locator = bounded_history_ingest_runner._read_target_locator(
+            target_locator_path
+        )
+    except Exception:
+        _set_status(
+            report,
+            "blocked_exact_target_locator_invalid",
+            "exact_target.locator_invalid",
+        )
+        return ScriptResult(exit_code=1, report=report)
+    report["target_locator_read"] = True
+
+    locator_source_value = locator.get("source_value")
+    normalized_locator_source = _normalize_exact_public_username(locator_source_value)
+    if (
+        not isinstance(locator_source_value, str)
+        or normalized_locator_source is None
+        or normalized_locator_source != locator_source_value
+    ):
+        _set_status(
+            report,
+            "blocked_exact_target_locator_invalid",
+            "exact_target.locator_source_invalid",
+        )
+        return ScriptResult(exit_code=1, report=report)
+
+    try:
+        values = _read_runtime_env(runtime_env_path, runtime_env_reader)
+    except Exception:
+        _set_status(report, "blocked_runtime_env_unreadable", "runtime_env.unreadable")
+        return ScriptResult(exit_code=1, report=report)
+    report["runtime_env_read"] = True
+
+    database_url = values.get("DATABASE_URL")
+    if not database_url or not database_url.strip():
+        _set_status(report, "blocked_database_unavailable", "database.url_missing")
+        return ScriptResult(exit_code=1, report=report)
+    if not _database_url_is_supported(database_url):
+        _set_status(report, "blocked_database_unavailable", "database.url_unsupported")
+        return ScriptResult(exit_code=1, report=report)
+
+    connection: DatabaseConnection | None = None
+    cleanup: Callable[[], None] | None = None
+    read_transaction: Any | None = None
+    read_rollback_attempted = False
+    mutation_transaction: Any | None = None
+    mutation_transaction_committed = False
+    joiner: ResolvedNotJoinedJoiner | None = None
+
+    def _run_exact_target_operation() -> ScriptResult:
+        nonlocal connection
+        nonlocal cleanup
+        nonlocal read_transaction
+        nonlocal read_rollback_attempted
+        nonlocal mutation_transaction
+        nonlocal mutation_transaction_committed
+        nonlocal joiner
+
+        try:
+            try:
+                connection, cleanup = _open_database_connection(
+                    database_url,
+                    database_connection_factory,
+                )
+                read_transaction = connection.begin()
+                _execute_read(connection, SET_TRANSACTION_READ_ONLY_QUERY)
+                _execute_read(connection, SELECT_ONE_QUERY)
+                report["database_connected"] = True
+                table_available = bool(
+                    _scalar(
+                        _execute_read(
+                            connection,
+                            TABLE_AVAILABLE_QUERY,
+                            {
+                                "qualified_table_name": (
+                                    "public.telegram_channel_registry"
+                                )
+                            },
+                        )
+                    )
+                )
+                if not table_available:
+                    _set_status(
+                        report,
+                        "blocked_database_unavailable",
+                        "database.channel_registry_table_unavailable",
+                    )
+                    return ScriptResult(exit_code=1, report=report)
+                raw_rows = _load_exact_target_rows(
+                    connection,
+                    normalized_source_value=normalized_locator_source,
+                )
+            except Exception:
+                _set_status(
+                    report,
+                    "blocked_database_unavailable",
+                    "database.connection",
+                )
+                return ScriptResult(exit_code=1, report=report)
+            finally:
+                if read_transaction is not None:
+                    read_rollback_attempted = True
+                    _rollback_exact_transaction(
+                        read_transaction,
+                        report=report,
+                        result_field="exact_target_read_rollback_succeeded",
+                        failure_code="read_rollback_failed",
+                    )
+
+            if report["exact_target_read_rollback_succeeded"] is False:
+                _set_status(
+                    report,
+                    "blocked_exact_target_read_rollback_failed",
+                    "exact_target.read_rollback_failed",
+                )
+                return ScriptResult(exit_code=1, report=report)
+
+            report["target_rows_checked"] = True
+            report["target_row_count_bucket"] = _bucket_count(len(raw_rows))
+            report["exact_target_match_count_bucket"] = _bucket_count(len(raw_rows))
+            if not raw_rows:
+                _set_status(
+                    report,
+                    "blocked_exact_target_missing",
+                    "exact_target.missing",
+                )
+                return ScriptResult(exit_code=1, report=report)
+            if len(raw_rows) != 1:
+                _set_status(
+                    report,
+                    "blocked_exact_target_ambiguous",
+                    "exact_target.multiple",
+                )
+                return ScriptResult(exit_code=1, report=report)
+
+            row, row_error = _exact_target_row_from_db_row(
+                raw_rows[0],
+                locator_source_value=normalized_locator_source,
+            )
+            if row_error == "source_mismatch":
+                _set_status(
+                    report,
+                    "blocked_exact_target_source_mismatch",
+                    "exact_target.source_mismatch",
+                )
+                return ScriptResult(exit_code=1, report=report)
+            if row is None:
+                _set_status(
+                    report,
+                    "blocked_exact_target_row_invalid",
+                    "exact_target.row_invalid",
+                )
+                return ScriptResult(exit_code=1, report=report)
+            if row.access_state == "joined":
+                report["exact_target_noop"] = True
+                _set_status(report, "exact_target_already_joined_noop")
+                report["operator_next_action"] = (
+                    "The exact active registry target is already joined; no TDLib "
+                    "RPC or registry mutation was performed."
+                )
+                return ScriptResult(exit_code=0, report=report)
+            if row.access_state != "resolved_not_joined":
+                _set_status(
+                    report,
+                    "blocked_exact_target_state_invalid",
+                    "exact_target.access_state_invalid",
+                )
+                return ScriptResult(exit_code=1, report=report)
+
+            try:
+                if resolved_not_joined_joiner_factory is None:
+                    joiner = _default_joiner_factory(
+                        values,
+                        auth_max_updates=tdlib_auth_max_updates,
+                        receive_timeout_sec=tdlib_receive_timeout_sec,
+                        overall_timeout_sec=tdlib_overall_timeout_sec,
+                        join_rpc_max_updates=tdlib_join_rpc_max_updates,
+                        join_rpc_receive_timeout_sec=(
+                            tdlib_join_rpc_receive_timeout_sec
+                        ),
+                        join_rpc_max_duration_sec=tdlib_join_rpc_max_duration_sec,
+                    )
+                else:
+                    joiner = resolved_not_joined_joiner_factory(values)
+                asyncio.run(joiner.initialize())
+                report["side_effects"]["tdlib_initialized"] = True
+                _merge_joiner_side_effects(report, joiner)
+            except TDLibNotReady:
+                _set_status(report, "blocked_tdlib_not_ready", "tdlib.not_ready")
+                report["side_effects"]["tdlib_initialized"] = True
+                _merge_joiner_side_effects(report, joiner)
+                return ScriptResult(exit_code=1, report=report)
+            except Exception:
+                _set_status(
+                    report,
+                    "blocked_tdlib_transport_unavailable",
+                    "tdlib.transport_unavailable",
+                )
+                _merge_joiner_side_effects(report, joiner)
+                return ScriptResult(exit_code=1, report=report)
+
+            report["tdlib_join_attempted"] = True
+            report["side_effects"]["telegram_api_called"] = True
+            report["side_effects"]["tdlib_send_called"] = True
+            report["side_effects"]["tdlib_join_called"] = True
+            try:
+                joined = asyncio.run(joiner.join_chat(row.chat_id))
+                report["side_effects"]["tdlib_receive_called"] = True
+            except TDLibNotReady:
+                joined = _join_failure_result("authorization_lost")
+            except TDLibTransportUnavailable:
+                joined = _join_failure_result("transport_error")
+            except Exception:
+                joined = _join_failure_result("unknown_error")
+            _merge_joiner_side_effects(report, joiner)
+
+            if not isinstance(joined, JoinChatResult):
+                joined = _join_failure_result("response_shape_error")
+            counters = JoinReportCounters()
+            joined = counters.record(joined)
+            if joined.status != "joined":
+                counters.skipped_count = 1
+                _apply_count_buckets(report, counters=counters)
+                _set_status(
+                    report,
+                    "exact_target_join_completed_no_mutation",
+                    f"join.{joined.status}",
+                )
+                report["operator_next_action"] = (
+                    "The exact join result was not canonical joined; no registry "
+                    "mutation was attempted."
+                )
+                return ScriptResult(exit_code=1, report=report)
+
+            mutation_transaction = connection.begin()
+            attempted_at = datetime.now(timezone.utc)
+            if (
+                _update_exact_join_state_row(
+                    connection,
+                    row=row,
+                    attempted_at=attempted_at,
+                )
+                != 1
+            ):
+                counters.skipped_count = 1
+                _apply_count_buckets(report, counters=counters)
+                _set_status(
+                    report,
+                    "blocked_exact_target_concurrent_mismatch",
+                    "exact_target.guarded_update_count_mismatch",
+                )
+                return ScriptResult(exit_code=1, report=report)
+            if not _exact_join_readback_matches(connection, expected=row):
+                counters.skipped_count = 1
+                _apply_count_buckets(report, counters=counters)
+                _set_status(
+                    report,
+                    "blocked_exact_target_readback_mismatch",
+                    "exact_target.durable_readback_mismatch",
+                )
+                return ScriptResult(exit_code=1, report=report)
+
+            _commit_transaction(mutation_transaction)
+            mutation_transaction_committed = True
+            report["exact_target_mutation_outcome"] = "committed_durable"
+            counters.updated_count = 1
+            _apply_count_buckets(report, counters=counters)
+            report["exact_target_durable_readback_matched"] = True
+            report["registry_join_mutation_performed"] = True
+            report["side_effects"]["database_mutation_performed"] = True
+            report["side_effects"]["telegram_channel_registry_updated"] = True
+            _set_status(report, "exact_target_join_registry_updated")
+            report["operator_next_action"] = (
+                "The exact source-bound registry target was durably read back as active "
+                "and joined after one guarded update."
+            )
+            return ScriptResult(exit_code=0, report=report)
+        except Exception:
+            _set_status(report, "blocked_unexpected_error", "unexpected_error")
+            return ScriptResult(exit_code=1, report=report)
+
+    result = _run_exact_target_operation()
+    return _finalize_exact_target_cleanup(
+        result,
+        report=report,
+        read_transaction=read_transaction,
+        read_rollback_attempted=read_rollback_attempted,
+        mutation_transaction=mutation_transaction,
+        mutation_transaction_committed=mutation_transaction_committed,
+        joiner=joiner,
+        cleanup=cleanup,
+        connection=connection,
+    )
+
+
 def generate_report(
     *,
     runtime_env_path: str | Path = DEFAULT_RUNTIME_ENV_PATH,
     dry_run: bool = True,
     approved_tdlib_join_resolved_not_joined: bool = False,
     approved_registry_join_mutation: bool = False,
+    target_locator_path: str | Path | None = None,
     limit: int | None = None,
     tdlib_auth_max_updates: int = DEFAULT_TDLIB_AUTH_MAX_UPDATES,
     tdlib_receive_timeout_sec: float = DEFAULT_TDLIB_RECEIVE_TIMEOUT_SEC,
@@ -1325,6 +2029,28 @@ def generate_report(
         ResolvedNotJoinedJoinerFactory | None
     ) = None,
 ) -> ScriptResult:
+    if target_locator_path is not None:
+        return _generate_exact_target_report(
+            target_locator_path=target_locator_path,
+            runtime_env_path=runtime_env_path,
+            dry_run=dry_run,
+            approved_tdlib_join_resolved_not_joined=(
+                approved_tdlib_join_resolved_not_joined
+            ),
+            approved_registry_join_mutation=approved_registry_join_mutation,
+            limit=limit,
+            tdlib_auth_max_updates=tdlib_auth_max_updates,
+            tdlib_receive_timeout_sec=tdlib_receive_timeout_sec,
+            tdlib_overall_timeout_sec=tdlib_overall_timeout_sec,
+            tdlib_join_rpc_max_updates=tdlib_join_rpc_max_updates,
+            tdlib_join_rpc_receive_timeout_sec=(
+                tdlib_join_rpc_receive_timeout_sec
+            ),
+            tdlib_join_rpc_max_duration_sec=tdlib_join_rpc_max_duration_sec,
+            runtime_env_reader=runtime_env_reader,
+            database_connection_factory=database_connection_factory,
+            resolved_not_joined_joiner_factory=resolved_not_joined_joiner_factory,
+        )
     effective_dry_run = bool(dry_run or not approved_tdlib_join_resolved_not_joined)
     report = _base_report(
         dry_run=effective_dry_run,
@@ -1560,23 +2286,46 @@ def render_json(report: Mapping[str, Any]) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    result = generate_report(
-        runtime_env_path=args.runtime_env_path,
-        dry_run=args.dry_run,
-        approved_tdlib_join_resolved_not_joined=(
-            args.approved_tdlib_join_resolved_not_joined
-        ),
-        approved_registry_join_mutation=args.approved_registry_join_mutation,
-        limit=args.limit,
-        tdlib_auth_max_updates=args.tdlib_auth_max_updates,
-        tdlib_receive_timeout_sec=args.tdlib_receive_timeout_sec,
-        tdlib_overall_timeout_sec=args.tdlib_overall_timeout_sec,
-        tdlib_join_rpc_max_updates=args.tdlib_join_rpc_max_updates,
-        tdlib_join_rpc_receive_timeout_sec=(
-            args.tdlib_join_rpc_receive_timeout_sec
-        ),
-        tdlib_join_rpc_max_duration_sec=args.tdlib_join_rpc_max_duration_sec,
-    )
+    exact_target_mode = args.target_locator_path is not None
+    try:
+        result = generate_report(
+            runtime_env_path=args.runtime_env_path,
+            dry_run=args.dry_run,
+            approved_tdlib_join_resolved_not_joined=(
+                args.approved_tdlib_join_resolved_not_joined
+            ),
+            approved_registry_join_mutation=args.approved_registry_join_mutation,
+            target_locator_path=args.target_locator_path,
+            limit=args.limit,
+            tdlib_auth_max_updates=args.tdlib_auth_max_updates,
+            tdlib_receive_timeout_sec=args.tdlib_receive_timeout_sec,
+            tdlib_overall_timeout_sec=args.tdlib_overall_timeout_sec,
+            tdlib_join_rpc_max_updates=args.tdlib_join_rpc_max_updates,
+            tdlib_join_rpc_receive_timeout_sec=(
+                args.tdlib_join_rpc_receive_timeout_sec
+            ),
+            tdlib_join_rpc_max_duration_sec=args.tdlib_join_rpc_max_duration_sec,
+        )
+    except Exception:
+        if not exact_target_mode:
+            raise
+        emergency_report = _base_report(
+            dry_run=bool(
+                args.dry_run
+                or not args.approved_tdlib_join_resolved_not_joined
+            ),
+            approved_tdlib_join_resolved_not_joined=(
+                args.approved_tdlib_join_resolved_not_joined
+            ),
+            approved_registry_join_mutation=args.approved_registry_join_mutation,
+        )
+        _initialize_exact_target_report(emergency_report)
+        _set_status(
+            emergency_report,
+            "blocked_exact_target_unhandled_failure",
+            "exact_target.unhandled_failure",
+        )
+        result = ScriptResult(exit_code=1, report=emergency_report)
     sys.stdout.write(render_json(result.report))
     sys.stdout.write("\n")
     return result.exit_code

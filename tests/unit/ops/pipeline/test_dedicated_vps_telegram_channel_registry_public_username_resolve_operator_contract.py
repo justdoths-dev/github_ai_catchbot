@@ -30,6 +30,21 @@ RAW_PUBLIC_USERNAME = "PrivateAlphaChannel"
 RAW_PUBLIC_USERNAME_TWO = "PrivateBetaChannel"
 RAW_PUBLIC_USERNAME_THREE = "PrivateGammaChannel"
 RAW_CHAT_ID = 9876543210123
+RAW_OLD_CHAT_ID = -1001234567890
+RAW_NEW_CHAT_ID = -1009876543210
+RAW_REGISTRY_ID = "11111111-1111-4111-8111-111111111111"
+RAW_LOCATOR_PATH = "/private/unit/exact-target-locator.json"
+CLEANUP_EXCEPTION_SENTINELS = (
+    "postgresql://user:secret@host/database",
+    "redis://:secret@host/0",
+    "/private/exact-target-locator.json",
+    "raw-public-source",
+    "raw-registry-id",
+    "raw-chat-id",
+    "raw-message-id",
+    "raw-telegram-secret",
+)
+CLEANUP_EXCEPTION_MESSAGE = " ".join(CLEANUP_EXCEPTION_SENTINELS)
 READY_PROBE_FIELD_NAMES = (
     "tdlib_ready_probe_attempted",
     "tdlib_ready_probe_status",
@@ -176,15 +191,49 @@ class FakeResult:
 
 
 class FakeTransaction:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        connection: "FakeDatabaseConnection | None" = None,
+        *,
+        label: str = "transaction",
+        rollback_failure: Exception | None = None,
+    ) -> None:
+        self.connection = connection
+        self.label = label
+        self.rollback_failure = rollback_failure
+        self.commit_called = False
         self.committed = False
+        self.rollback_attempted = False
+        self.rollback_succeeded: bool | None = None
         self.rolled_back = False
+        self._rows_snapshot = (
+            [dict(row) for row in connection.rows] if connection is not None else []
+        )
+        self._updated_rows_snapshot = (
+            connection.updated_rows if connection is not None else 0
+        )
 
     def commit(self) -> None:
+        self.commit_called = True
         self.committed = True
+        if self.connection is not None:
+            self.connection.events.append("transaction:commit")
 
     def rollback(self) -> None:
+        if self.committed or self.rolled_back:
+            return
+        self.rollback_attempted = True
+        if self.connection is not None:
+            self.connection.events.append(f"transaction:{self.label}:rollback_attempt")
+        if self.rollback_failure is not None:
+            self.rollback_succeeded = False
+            raise self.rollback_failure
         self.rolled_back = True
+        self.rollback_succeeded = True
+        if self.connection is not None:
+            self.connection.rows[:] = [dict(row) for row in self._rows_snapshot]
+            self.connection.updated_rows = self._updated_rows_snapshot
+            self.connection.events.append("transaction:rollback")
 
 
 class FakeDatabaseConnection:
@@ -195,19 +244,51 @@ class FakeDatabaseConnection:
         table_available: bool = True,
         fail_select_1: bool = False,
         break_update_guard_for: set[str] | None = None,
+        events: list[str] | None = None,
+        exact_select_source_value_override: str | None = None,
+        break_exact_update_guard: bool = False,
+        exact_update_rowcount_override: int | None = None,
+        break_exact_readback: bool = False,
+        fail_read_rollback: bool = False,
+        fail_mutation_rollback: bool = False,
+        fail_close: bool = False,
     ) -> None:
         self.rows = rows or []
         self.table_available = table_available
         self.fail_select_1 = fail_select_1
         self.break_update_guard_for = break_update_guard_for or set()
+        self.events = events if events is not None else []
+        self.exact_select_source_value_override = exact_select_source_value_override
+        self.break_exact_update_guard = break_exact_update_guard
+        self.exact_update_rowcount_override = exact_update_rowcount_override
+        self.break_exact_readback = break_exact_readback
+        self.fail_read_rollback = fail_read_rollback
+        self.fail_mutation_rollback = fail_mutation_rollback
+        self.fail_close = fail_close
         self.statements: list[str] = []
         self.params: list[dict[str, Any]] = []
         self.closed = False
+        self.close_attempted = False
         self.transaction = FakeTransaction()
+        self.transactions: list[FakeTransaction] = []
         self.update_attempts = 0
         self.updated_rows = 0
 
     def begin(self) -> FakeTransaction:
+        transaction_index = len(self.transactions)
+        label = "read" if transaction_index == 0 else "mutation"
+        rollback_failure = None
+        if transaction_index == 0 and self.fail_read_rollback:
+            rollback_failure = RuntimeError(CLEANUP_EXCEPTION_MESSAGE)
+        elif transaction_index > 0 and self.fail_mutation_rollback:
+            rollback_failure = RuntimeError(CLEANUP_EXCEPTION_MESSAGE)
+        self.transaction = FakeTransaction(
+            self,
+            label=label,
+            rollback_failure=rollback_failure,
+        )
+        self.transactions.append(self.transaction)
+        self.events.append("transaction:begin")
         return self.transaction
 
     def execute(self, statement: str, params: dict[str, Any] | None = None) -> FakeResult:
@@ -249,6 +330,31 @@ class FakeDatabaseConnection:
                 ]
             )
 
+        if normalized == _normalize(module.SELECT_EXACT_TARGET_ROWS_QUERY):
+            self.events.append("database:exact_select")
+            rows = [
+                row
+                for row in self.rows
+                if row["source_kind"] == "public_username"
+                and row["desired_state"] == "active"
+                and module._normalize_exact_source_identity(row["source_value"])
+                == params["normalized_source_value"]
+            ][:2]
+            selected_rows = []
+            for row in rows:
+                selected = {
+                    "registry_id": row["registry_id"],
+                    "source_value": row["source_value"],
+                    "source_kind": row["source_kind"],
+                    "desired_state": row["desired_state"],
+                    "access_state": row["access_state"],
+                    "chat_id": row["chat_id"],
+                }
+                if self.exact_select_source_value_override is not None:
+                    selected["source_value"] = self.exact_select_source_value_override
+                selected_rows.append(selected)
+            return FakeResult(rows=selected_rows)
+
         if normalized == _normalize(module.UPDATE_RESOLVED_REGISTRY_ROW_QUERY):
             self.update_attempts += 1
             registry_id = params["registry_id"]
@@ -275,9 +381,76 @@ class FakeDatabaseConnection:
                     return FakeResult(rowcount=1)
             return FakeResult(rowcount=0)
 
+        if normalized == _normalize(module.UPDATE_EXACT_JOINED_REGISTRY_ROW_QUERY):
+            self.events.append("database:exact_update")
+            self.update_attempts += 1
+            if self.break_exact_update_guard:
+                for row in self.rows:
+                    if row["registry_id"] == params["registry_id"]:
+                        row["access_state"] = "forbidden"
+            for row in self.rows:
+                if (
+                    row["registry_id"] == params["registry_id"]
+                    and row["source_kind"] == "public_username"
+                    and row["source_value"] == params["source_value"]
+                    and module._normalize_exact_source_identity(row["source_value"])
+                    == params["normalized_source_value"]
+                    and row["desired_state"] == "active"
+                    and row["access_state"] == "joined"
+                    and row["chat_id"] == params["old_chat_id"]
+                ):
+                    row["chat_id"] = params["chat_id"]
+                    row["username_snapshot"] = params["username_snapshot"]
+                    if params["title_snapshot"] is not None:
+                        row["title_snapshot"] = params["title_snapshot"]
+                    if params["chat_type"] is not None:
+                        row["chat_type"] = params["chat_type"]
+                    row["last_resolved_at"] = params["resolved_at"]
+                    row["access_state"] = "resolved_not_joined"
+                    row["updated_at"] = params["resolved_at"]
+                    self.updated_rows += 1
+                    rowcount = self.exact_update_rowcount_override
+                    return FakeResult(rowcount=1 if rowcount is None else rowcount)
+            return FakeResult(
+                rowcount=(
+                    0
+                    if self.exact_update_rowcount_override is None
+                    else self.exact_update_rowcount_override
+                )
+            )
+
+        if normalized == _normalize(module.SELECT_EXACT_RESOLVED_READBACK_QUERY):
+            self.events.append("database:exact_readback")
+            if self.break_exact_readback:
+                return FakeResult(rows=[])
+            rows = [
+                {
+                    "registry_id": row["registry_id"],
+                    "source_value": row["source_value"],
+                    "source_kind": row["source_kind"],
+                    "desired_state": row["desired_state"],
+                    "access_state": row["access_state"],
+                    "chat_id": row["chat_id"],
+                }
+                for row in self.rows
+                if row["registry_id"] == params["registry_id"]
+                and row["source_kind"] == "public_username"
+                and row["source_value"] == params["source_value"]
+                and module._normalize_exact_source_identity(row["source_value"])
+                == params["normalized_source_value"]
+                and row["desired_state"] == "active"
+                and row["access_state"] == "resolved_not_joined"
+                and row["chat_id"] == params["chat_id"]
+            ]
+            return FakeResult(rows=rows)
+
         raise AssertionError(f"unexpected SQL: {statement}")
 
     def close(self) -> None:
+        self.close_attempted = True
+        self.events.append("database:close_attempt")
+        if self.fail_close:
+            raise RuntimeError(CLEANUP_EXCEPTION_MESSAGE)
         self.closed = True
 
     def _target_rows(self) -> list[dict[str, Any]]:
@@ -299,13 +472,18 @@ class FakeResolver:
         fail_initialize: Exception | None = None,
         drain_summary: Any | None = None,
         fail_drain: Exception | None = None,
+        fail_close: bool = False,
+        events: list[str] | None = None,
     ) -> None:
         self.responses = responses
         self.fail_initialize = fail_initialize
         self.drain_summary = drain_summary
         self.fail_drain = fail_drain
+        self.fail_close = fail_close
+        self.events = events if events is not None else []
         self.initialized = False
         self.closed = False
+        self.close_attempted = False
         self.calls: list[str] = []
         self.drain_calls = 0
         self.auth_code_called = False
@@ -315,6 +493,7 @@ class FakeResolver:
         self.diagnostic_calls: list[str] = []
 
     async def initialize(self) -> None:
+        self.events.append("resolver:initialize")
         if self.fail_initialize is not None:
             raise self.fail_initialize
         self.initialized = True
@@ -330,6 +509,7 @@ class FakeResolver:
         return summary
 
     async def resolve_public_username(self, username: str) -> Any:
+        self.events.append("resolver:resolve")
         self.calls.append(username)
         response = self.responses.get(username)
         if isinstance(response, Exception):
@@ -358,6 +538,10 @@ class FakeResolver:
         return summary
 
     async def close(self) -> None:
+        self.close_attempted = True
+        self.events.append("resolver:close_attempt")
+        if self.fail_close:
+            raise RuntimeError(CLEANUP_EXCEPTION_MESSAGE)
         self.closed = True
 
 
@@ -366,10 +550,17 @@ TransportPayloadFactory = Any
 
 
 class FakeTDLibTransport:
-    def __init__(self, payloads: list[TransportPayload | TransportPayloadFactory]) -> None:
+    def __init__(
+        self,
+        payloads: list[TransportPayload | TransportPayloadFactory],
+        *,
+        fail_close: bool = False,
+    ) -> None:
         self.payloads = list(payloads)
+        self.fail_close = fail_close
         self.initialized = False
         self.closed = False
+        self.close_attempted = False
         self.sent_requests: list[dict[str, Any]] = []
         self.receive_timeouts: list[float] = []
         self.events: list[str] = []
@@ -401,6 +592,9 @@ class FakeTDLibTransport:
         return payload
 
     async def close(self) -> None:
+        self.close_attempted = True
+        if self.fail_close:
+            raise RuntimeError(CLEANUP_EXCEPTION_MESSAGE)
         self.closed = True
 
 
@@ -462,6 +656,23 @@ def _registry_row(
     }
 
 
+def _exact_registry_row(
+    *,
+    source_value: str = RAW_PUBLIC_USERNAME,
+    access_state: str = "joined",
+    chat_id: int | None = RAW_OLD_CHAT_ID,
+    registry_id: str = RAW_REGISTRY_ID,
+    desired_state: str = "active",
+) -> dict[str, Any]:
+    return _registry_row(
+        registry_id,
+        source_value,
+        desired_state=desired_state,
+        access_state=access_state,
+        chat_id=chat_id,
+    )
+
+
 def _resolved(
     *,
     chat_id: int = RAW_CHAT_ID,
@@ -518,6 +729,65 @@ def _run_report(
         ),
     )
     return result.report, fake_db, fake_resolver
+
+
+def _run_exact_report(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    db: FakeDatabaseConnection | None = None,
+    resolver: FakeResolver | None = None,
+    locator_source_value: str = "privatealphachannel",
+    dry_run: bool = False,
+    approved_tdlib: bool = True,
+    approved_mutation: bool = True,
+    limit: int | None = None,
+    diagnose_single_resolve_rpc: bool = False,
+    diagnose_tdlib_post_ready_sync_settle: bool = False,
+    result_holder: list[Any] | None = None,
+) -> tuple[
+    dict[str, Any],
+    FakeDatabaseConnection,
+    FakeResolver,
+    list[object],
+    list[str],
+]:
+    module = _module()
+    events = db.events if db is not None else []
+    fake_db = db or FakeDatabaseConnection([_exact_registry_row()], events=events)
+    fake_resolver = resolver or FakeResolver(
+        {locator_source_value: _resolved(chat_id=RAW_NEW_CHAT_ID)},
+        events=events,
+    )
+    fake_resolver.events = events
+    locator_calls: list[object] = []
+
+    def strict_locator_reader(path: object) -> dict[str, Any]:
+        locator_calls.append(path)
+        return {"source_value": locator_source_value}
+
+    monkeypatch.setattr(
+        module.bounded_history_ingest_runner,
+        "_read_target_locator",
+        strict_locator_reader,
+    )
+    result = module.generate_report(
+        runtime_env_path="/safe/unit/runtime.env",
+        target_locator_path=RAW_LOCATOR_PATH,
+        dry_run=dry_run,
+        approved_tdlib_public_username_resolve=approved_tdlib,
+        approved_registry_resolve_mutation=approved_mutation,
+        limit=limit,
+        diagnose_single_resolve_rpc=diagnose_single_resolve_rpc,
+        diagnose_tdlib_post_ready_sync_settle=(
+            diagnose_tdlib_post_ready_sync_settle
+        ),
+        runtime_env_reader=_runtime_env,
+        database_connection_factory=lambda _database_url: fake_db,
+        public_username_resolver_factory=lambda _values: fake_resolver,
+    )
+    if result_holder is not None:
+        result_holder.append(result)
+    return result.report, fake_db, fake_resolver, locator_calls, events
 
 
 def _run_report_with_tdlib_transport(
@@ -782,7 +1052,12 @@ def _render(report: dict[str, Any]) -> str:
 
 def _assert_sensitive_values_absent(rendered: str, tmp_path: Path | None = None) -> None:
     assert RAW_PUBLIC_USERNAME not in rendered
+    assert RAW_PUBLIC_USERNAME.lower() not in rendered
     assert str(RAW_CHAT_ID) not in rendered
+    assert str(RAW_OLD_CHAT_ID) not in rendered
+    assert str(RAW_NEW_CHAT_ID) not in rendered
+    assert RAW_REGISTRY_ID not in rendered
+    assert RAW_LOCATOR_PATH not in rendered
     assert FAKE_DATABASE_URL not in rendered
     assert FAKE_REDIS_URL not in rendered
     assert FAKE_DATABASE_PASSWORD not in rendered
@@ -790,6 +1065,8 @@ def _assert_sensitive_values_absent(rendered: str, tmp_path: Path | None = None)
     assert RAW_TDLIB_PAYLOAD_VALUE not in rendered
     assert "fake-tdlib-key" not in rendered
     assert "ZmFrZS10ZGxpYi1rZXk=" not in rendered
+    for sentinel in CLEANUP_EXCEPTION_SENTINELS:
+        assert sentinel not in rendered
     if tmp_path is not None:
         assert str(tmp_path) not in rendered
 
@@ -1461,6 +1738,52 @@ def test_tdlib_ready_update_allows_public_username_resolve_without_mutation(
     assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
     assert report["side_effects"]["database_mutation_performed"] is False
     assert report["side_effects"]["telegram_channel_registry_updated"] is False
+
+
+def test_production_resolver_close_failure_preserves_broad_primary_result(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    transport = FakeTDLibTransport(
+        [
+            _auth_update("authorizationStateReady"),
+            _public_chat_response(),
+        ],
+        fail_close=True,
+    )
+
+    report, db, resolver = _run_report_with_tdlib_transport(
+        tmp_path=tmp_path,
+        transport=transport,
+        approved_mutation=False,
+    )
+    captured = capsys.readouterr()
+    rendered = _render(report)
+    observed_output = "\n".join((rendered, captured.out, captured.err))
+
+    assert report["contract_status"] == "public_username_resolve_completed_no_mutation"
+    assert report["exact_target_mode"] is False
+    assert transport.initialized is True
+    assert transport.close_attempted is True
+    assert transport.closed is False
+    assert resolver.tdlib_send_called is True
+    assert resolver.tdlib_receive_called is True
+    assert _sent_request_types(transport) == ["searchPublicChat"]
+    assert db.update_attempts == 0
+    assert db.transaction.rolled_back is True
+    assert report["tdlib_resolve_attempted"] is True
+    assert report["side_effects"]["tdlib_public_username_resolve_called"] is True
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert captured.out == ""
+    assert captured.err == ""
+    for unsafe_text in (
+        "RuntimeError",
+        "TDLibTransportError",
+        "Traceback",
+        "Failed to close TDLib transport",
+    ):
+        assert unsafe_text not in observed_output
+    _assert_sensitive_values_absent(observed_output, tmp_path)
 
 
 def test_tdlib_auth_ready_helper_update_allows_resolve_without_local_probe(
@@ -3512,3 +3835,811 @@ def test_cli_invalid_runtime_env_output_has_no_secret_or_stderr(tmp_path: Path) 
     assert str(missing_runtime) not in result.stdout
     assert FAKE_DATABASE_URL not in result.stdout
     assert FAKE_TELEGRAM_SECRET not in result.stdout
+
+
+def test_exact_mode_cli_is_source_selection_exclusive_and_reuses_strict_locator_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    parsed = module.build_parser().parse_args(
+        [
+            "--runtime-env-path",
+            "/safe/unit/runtime.env",
+            "--target-locator-path",
+            RAW_LOCATOR_PATH,
+            "--approved-tdlib-public-username-resolve",
+            "--approved-registry-resolve-mutation",
+        ]
+    )
+    assert parsed.target_locator_path == RAW_LOCATOR_PATH
+    with pytest.raises(SystemExit):
+        module.build_parser().parse_args(
+            [
+                "--runtime-env-path",
+                "/safe/unit/runtime.env",
+                "--target-locator-path",
+                RAW_LOCATOR_PATH,
+                "--limit",
+                "1",
+            ]
+        )
+
+    report, _db, _resolver, locator_calls, _events = _run_exact_report(monkeypatch)
+    assert report["contract_status"] == "exact_target_resolved_not_joined_updated"
+    assert locator_calls == [RAW_LOCATOR_PATH]
+
+    tree = ast.parse(SCRIPT.read_text(encoding="utf-8"))
+    assert not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_read_target_locator"
+        for node in ast.walk(tree)
+    )
+    assert "bounded_history_ingest_runner._read_target_locator" in SCRIPT.read_text(
+        encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("dry_run", "approved_tdlib", "approved_mutation"),
+    (
+        (True, True, True),
+        (False, False, True),
+        (False, True, False),
+    ),
+)
+def test_exact_mode_requires_non_dry_run_and_both_existing_approvals(
+    monkeypatch: pytest.MonkeyPatch,
+    dry_run: bool,
+    approved_tdlib: bool,
+    approved_mutation: bool,
+) -> None:
+    report, db, resolver, locator_calls, _events = _run_exact_report(
+        monkeypatch,
+        dry_run=dry_run,
+        approved_tdlib=approved_tdlib,
+        approved_mutation=approved_mutation,
+    )
+
+    assert report["contract_status"] == "blocked_approval_required"
+    assert locator_calls == []
+    assert resolver.initialized is False
+    assert resolver.calls == []
+    assert db.transactions == []
+    assert db.update_attempts == 0
+
+
+def test_exact_locator_validation_error_is_sanitized_and_precedes_runtime_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+
+    def invalid_locator(_path: object) -> dict[str, Any]:
+        raise module.bounded_history_ingest_runner.BoundedHistoryIngestError(
+            f"invalid {RAW_LOCATOR_PATH} {RAW_PUBLIC_USERNAME} {RAW_REGISTRY_ID}"
+        )
+
+    monkeypatch.setattr(
+        module.bounded_history_ingest_runner,
+        "_read_target_locator",
+        invalid_locator,
+    )
+    result = module.generate_report(
+        runtime_env_path="/safe/unit/runtime.env",
+        target_locator_path=RAW_LOCATOR_PATH,
+        dry_run=False,
+        approved_tdlib_public_username_resolve=True,
+        approved_registry_resolve_mutation=True,
+        runtime_env_reader=lambda _path: (_ for _ in ()).throw(
+            AssertionError("runtime env must not be read after invalid locator")
+        ),
+    )
+    rendered = _render(result.report)
+
+    assert result.report["contract_status"] == "blocked_target_locator_invalid"
+    assert result.report["runtime_env_read"] is False
+    assert result.report["target_locator_read"] is False
+    _assert_sensitive_values_absent(rendered)
+
+
+@pytest.mark.parametrize(
+    "diagnostic_kwargs",
+    (
+        {"diagnose_single_resolve_rpc": True},
+        {"diagnose_tdlib_post_ready_sync_settle": True},
+    ),
+)
+def test_exact_mode_blocks_broad_diagnostics_before_locator_or_db(
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic_kwargs: dict[str, bool],
+) -> None:
+    report, db, resolver, locator_calls, _events = _run_exact_report(
+        monkeypatch,
+        **diagnostic_kwargs,
+    )
+
+    assert report["contract_status"] == "blocked_exact_target_mode_conflict"
+    assert locator_calls == []
+    assert db.transactions == []
+    assert resolver.calls == []
+
+
+def test_broad_mode_never_reads_locator_and_keeps_existing_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+
+    def forbidden_reader(_path: object) -> dict[str, Any]:
+        raise AssertionError("broad mode must not read a target locator")
+
+    monkeypatch.setattr(
+        module.bounded_history_ingest_runner,
+        "_read_target_locator",
+        forbidden_reader,
+    )
+    report, db, resolver = _run_report(
+        resolver=FakeResolver({RAW_PUBLIC_USERNAME: _resolved()}),
+        dry_run=False,
+        approved_tdlib=True,
+        approved_mutation=True,
+    )
+
+    assert report["contract_status"] == "public_username_resolve_registry_updated"
+    assert report["exact_target_mode"] is False
+    assert resolver is not None and resolver.calls == [RAW_PUBLIC_USERNAME]
+    assert db.update_attempts == 1
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected_status"),
+    (
+        ([], "blocked_exact_target_missing"),
+        (
+            [
+                _exact_registry_row(),
+                _exact_registry_row(
+                    registry_id="22222222-2222-4222-8222-222222222222"
+                ),
+            ],
+            "blocked_exact_target_ambiguous",
+        ),
+        (
+            [_exact_registry_row(registry_id="not-a-valid-registry-uuid")],
+            "blocked_exact_target_invalid",
+        ),
+        (
+            [_exact_registry_row(chat_id=None)],
+            "blocked_exact_target_invalid",
+        ),
+        (
+            [_exact_registry_row(access_state="forbidden")],
+            "blocked_exact_target_invalid",
+        ),
+    ),
+)
+def test_exact_selection_cardinality_and_invalid_rows_block_before_tdlib(
+    monkeypatch: pytest.MonkeyPatch,
+    rows: list[dict[str, Any]],
+    expected_status: str,
+) -> None:
+    db = FakeDatabaseConnection(rows)
+    report, db, resolver, locator_calls, _events = _run_exact_report(
+        monkeypatch,
+        db=db,
+    )
+
+    assert report["contract_status"] == expected_status
+    assert locator_calls == [RAW_LOCATOR_PATH]
+    assert resolver.initialized is False
+    assert resolver.calls == []
+    assert db.update_attempts == 0
+    assert len(db.transactions) == 1
+    assert db.transactions[0].rolled_back is True
+
+
+def test_exact_locator_and_db_source_mismatch_blocks_before_tdlib(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = FakeDatabaseConnection(
+        [_exact_registry_row()],
+        exact_select_source_value_override="DifferentPublicChannel",
+    )
+    report, db, resolver, _locator_calls, _events = _run_exact_report(
+        monkeypatch,
+        db=db,
+    )
+
+    assert report["contract_status"] == "blocked_exact_target_source_mismatch"
+    assert resolver.initialized is False
+    assert resolver.calls == []
+    assert db.update_attempts == 0
+
+
+@pytest.mark.parametrize(
+    ("stored_source_value", "resolved_chat_id"),
+    (
+        (RAW_PUBLIC_USERNAME, RAW_OLD_CHAT_ID),
+        (RAW_PUBLIC_USERNAME, RAW_NEW_CHAT_ID),
+        ("https://t.me/PrivateAlphaChannel", RAW_NEW_CHAT_ID),
+        ("http://t.me/PrivateAlphaChannel", RAW_NEW_CHAT_ID),
+        ("t.me/@PrivateAlphaChannel", RAW_NEW_CHAT_ID),
+        ("@PrivateAlphaChannel", RAW_NEW_CHAT_ID),
+    ),
+)
+def test_exact_resolve_same_or_changed_chat_commits_guarded_source_bound_readback(
+    monkeypatch: pytest.MonkeyPatch,
+    stored_source_value: str,
+    resolved_chat_id: int,
+) -> None:
+    events: list[str] = []
+    unrelated = _registry_row(
+        "33333333-3333-4333-8333-333333333333",
+        RAW_PUBLIC_USERNAME_TWO,
+        access_state="joined",
+        chat_id=-1005555555555,
+    )
+    db = FakeDatabaseConnection(
+        [_exact_registry_row(source_value=stored_source_value), unrelated],
+        events=events,
+    )
+    resolver = FakeResolver(
+        {"privatealphachannel": _resolved(chat_id=resolved_chat_id)},
+        events=events,
+    )
+
+    report, db, resolver, locator_calls, events = _run_exact_report(
+        monkeypatch,
+        db=db,
+        resolver=resolver,
+    )
+
+    assert report["contract_status"] == "exact_target_resolved_not_joined_updated"
+    assert report["exact_target_durable_readback_matched"] is True
+    assert report["exact_target_mutation_outcome"] == "committed_durable"
+    assert report["exact_target_cleanup_failure_codes"] == []
+    assert report["exact_target_read_rollback_succeeded"] is True
+    assert report["exact_target_mutation_rollback_succeeded"] is None
+    assert report["exact_target_transport_close_succeeded"] is True
+    assert report["exact_target_connection_cleanup_succeeded"] is True
+    assert report["registry_resolve_mutation_performed"] is True
+    assert locator_calls == [RAW_LOCATOR_PATH]
+    assert resolver.calls == ["privatealphachannel"]
+    assert db.update_attempts == 1
+    assert db.updated_rows == 1
+    assert db.rows[0]["registry_id"] == RAW_REGISTRY_ID
+    assert db.rows[0]["chat_id"] == resolved_chat_id
+    assert db.rows[0]["access_state"] == "resolved_not_joined"
+    assert db.rows[1] == unrelated
+    assert len(db.transactions) == 2
+    assert db.transactions[0].rolled_back is True
+    assert db.transactions[0].committed is False
+    assert db.transactions[1].committed is True
+    assert events.index("transaction:rollback") < events.index("resolver:initialize")
+    assert events.index("resolver:initialize") < events.index("resolver:resolve")
+    transaction_begin_indexes = [
+        index for index, event in enumerate(events) if event == "transaction:begin"
+    ]
+    assert len(transaction_begin_indexes) == 2
+    assert events.index("resolver:resolve") < transaction_begin_indexes[1]
+    assert transaction_begin_indexes[1] < events.index("database:exact_update")
+    assert events.index("database:exact_update") < events.index("database:exact_readback")
+    assert events.index("database:exact_readback") < events.index("transaction:commit")
+
+    update_query = _module().UPDATE_EXACT_JOINED_REGISTRY_ROW_QUERY
+    update_index = db.statements.index(_normalize(update_query))
+    update_params = db.params[update_index]
+    assert update_params["registry_id"] == RAW_REGISTRY_ID
+    assert update_params["source_value"] == stored_source_value
+    assert update_params["normalized_source_value"] == "privatealphachannel"
+    assert update_params["old_chat_id"] == RAW_OLD_CHAT_ID
+    assert update_params["chat_id"] == resolved_chat_id
+
+    update_sql = _normalize(update_query).upper()
+    assert "WHERE REGISTRY_ID = :REGISTRY_ID" in update_sql
+    assert "SOURCE_VALUE = :SOURCE_VALUE" in update_sql
+    assert ":NORMALIZED_SOURCE_VALUE" in update_sql
+    assert "DESIRED_STATE = 'ACTIVE'" in update_sql
+    assert "ACCESS_STATE = 'JOINED'" in update_sql
+    assert "CHAT_ID = :OLD_CHAT_ID" in update_sql
+    for prefix in ("HTTPS://T[.]ME/", "HTTP://T[.]ME/", "T[.]ME/", "^@"):
+        assert prefix in update_sql
+
+    readback_sql = _normalize(_module().SELECT_EXACT_RESOLVED_READBACK_QUERY).upper()
+    assert "REGISTRY_ID = :REGISTRY_ID" in readback_sql
+    assert "SOURCE_VALUE = :SOURCE_VALUE" in readback_sql
+    assert ":NORMALIZED_SOURCE_VALUE" in readback_sql
+    assert "ACCESS_STATE = 'RESOLVED_NOT_JOINED'" in readback_sql
+    _assert_sensitive_values_absent(_render(report))
+
+
+@pytest.mark.parametrize(
+    "failure_class",
+    (
+        "not_found",
+        "access_denied",
+        "unsupported_chat_type",
+        "response_timeout",
+        "transport_error",
+        "tdlib_error",
+        "response_shape_error",
+        "authorization_lost",
+        "unknown_error",
+    ),
+)
+def test_every_exact_resolve_failure_class_has_no_mutation_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_class: str,
+) -> None:
+    module = _module()
+    resolver = FakeResolver(
+        {
+            "privatealphachannel": module.PublicUsernameResolveResult(
+                status=failure_class,
+                failure_class=failure_class,
+            )
+        }
+    )
+
+    report, db, resolver, _locator_calls, events = _run_exact_report(
+        monkeypatch,
+        resolver=resolver,
+    )
+
+    assert report["contract_status"] == "exact_target_resolve_failed"
+    assert report[f"resolve_{failure_class}_count_bucket"] == "one"
+    assert resolver.calls == ["privatealphachannel"]
+    assert db.update_attempts == 0
+    assert len(db.transactions) == 1
+    assert db.transactions[0].rolled_back is True
+    assert "database:exact_update" not in events
+    assert report["side_effects"]["database_mutation_performed"] is False
+
+
+@pytest.mark.parametrize(
+    ("db_kwargs", "expected_status"),
+    (
+        (
+            {"break_exact_update_guard": True},
+            "blocked_exact_target_concurrent_mismatch",
+        ),
+        (
+            {"exact_update_rowcount_override": 2},
+            "blocked_exact_target_concurrent_mismatch",
+        ),
+        (
+            {"break_exact_readback": True},
+            "blocked_exact_target_readback_mismatch",
+        ),
+    ),
+)
+def test_exact_update_count_concurrency_and_readback_failures_roll_back(
+    monkeypatch: pytest.MonkeyPatch,
+    db_kwargs: dict[str, Any],
+    expected_status: str,
+) -> None:
+    db = FakeDatabaseConnection([_exact_registry_row()], **db_kwargs)
+    report, db, _resolver, _locator_calls, _events = _run_exact_report(
+        monkeypatch,
+        db=db,
+    )
+
+    assert report["contract_status"] == expected_status
+    assert db.update_attempts == 1
+    assert len(db.transactions) == 2
+    assert db.transactions[1].rolled_back is True
+    assert db.transactions[1].committed is False
+    assert report["exact_target_mutation_outcome"] == "rolled_back"
+    assert report["exact_target_cleanup_failure_codes"] == []
+    assert report["exact_target_mutation_rollback_succeeded"] is True
+    assert db.rows[0]["chat_id"] == RAW_OLD_CHAT_ID
+    assert db.rows[0]["access_state"] == "joined"
+    assert db.updated_rows == 0
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert report["exact_target_durable_readback_matched"] is False
+    _assert_sensitive_values_absent(_render(report))
+
+
+def test_exact_resolved_not_joined_rerun_is_sanitized_no_rpc_no_mutation_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = FakeDatabaseConnection(
+        [_exact_registry_row(access_state="resolved_not_joined", chat_id=RAW_NEW_CHAT_ID)]
+    )
+    report, db, resolver, locator_calls, events = _run_exact_report(
+        monkeypatch,
+        db=db,
+    )
+    rendered = _render(report)
+
+    assert report["contract_status"] == "exact_target_already_resolved_not_joined_noop"
+    assert report["exact_target_noop"] is True
+    assert report["exact_target_mutation_outcome"] == "not_attempted"
+    assert report["exact_target_cleanup_failure_codes"] == []
+    assert report["exact_target_read_rollback_succeeded"] is True
+    assert report["exact_target_mutation_rollback_succeeded"] is None
+    assert report["exact_target_transport_close_succeeded"] is None
+    assert report["exact_target_connection_cleanup_succeeded"] is True
+    assert locator_calls == [RAW_LOCATOR_PATH]
+    assert resolver.initialized is False
+    assert resolver.calls == []
+    assert db.update_attempts == 0
+    assert len(db.transactions) == 1
+    assert db.transactions[0].rolled_back is True
+    assert "resolver:initialize" not in events
+    assert "resolver:resolve" not in events
+    assert "database:exact_update" not in events
+    _assert_sensitive_values_absent(rendered)
+
+
+def test_exact_read_rollback_failure_blocks_resolver_and_reports_sanitized_cleanup_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = FakeDatabaseConnection([_exact_registry_row()], fail_read_rollback=True)
+    result_holder: list[Any] = []
+    report, db, resolver, _locator_calls, events = _run_exact_report(
+        monkeypatch,
+        db=db,
+        result_holder=result_holder,
+    )
+
+    assert result_holder[0].exit_code != 0
+    assert report["contract_status"] == "blocked_exact_target_read_rollback_failed"
+    assert report["exact_target_mutation_outcome"] == "not_attempted"
+    assert report["exact_target_cleanup_failure_codes"] == ["read_rollback_failed"]
+    assert report["exact_target_read_rollback_succeeded"] is False
+    assert report["exact_target_mutation_rollback_succeeded"] is None
+    assert report["exact_target_transport_close_succeeded"] is None
+    assert report["exact_target_connection_cleanup_succeeded"] is True
+    assert db.transactions[0].rollback_attempted is True
+    assert db.transactions[0].rollback_succeeded is False
+    assert resolver.initialized is False
+    assert resolver.calls == []
+    assert resolver.close_attempted is False
+    assert len(db.transactions) == 1
+    assert db.update_attempts == 0
+    assert "resolver:initialize" not in events
+    assert "resolver:resolve" not in events
+    assert "database:exact_update" not in events
+    _assert_sensitive_values_absent(_render(report))
+
+
+def test_exact_update_mismatch_rollback_failure_reports_unknown_sanitized_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = FakeDatabaseConnection(
+        [_exact_registry_row()],
+        exact_update_rowcount_override=2,
+        fail_mutation_rollback=True,
+    )
+    result_holder: list[Any] = []
+    report, db, _resolver, _locator_calls, _events = _run_exact_report(
+        monkeypatch,
+        db=db,
+        result_holder=result_holder,
+    )
+
+    mutation_transaction = db.transactions[1]
+    assert result_holder[0].exit_code != 0
+    assert (
+        report["contract_status"]
+        == "blocked_exact_target_mutation_rollback_failed"
+    )
+    assert report["exact_target_mutation_outcome"] == "unknown_after_rollback_failure"
+    assert report["exact_target_cleanup_failure_codes"] == [
+        "mutation_rollback_failed"
+    ]
+    assert report["exact_target_mutation_rollback_succeeded"] is False
+    assert mutation_transaction.commit_called is False
+    assert mutation_transaction.rollback_attempted is True
+    assert mutation_transaction.rollback_succeeded is False
+    assert db.rows[0]["access_state"] == "resolved_not_joined"
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert report["exact_target_durable_readback_matched"] is False
+    _assert_sensitive_values_absent(_render(report))
+
+
+def test_exact_readback_mismatch_rollback_failure_reports_unknown_sanitized_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = FakeDatabaseConnection(
+        [_exact_registry_row()],
+        break_exact_readback=True,
+        fail_mutation_rollback=True,
+    )
+    result_holder: list[Any] = []
+    report, db, _resolver, _locator_calls, _events = _run_exact_report(
+        monkeypatch,
+        db=db,
+        result_holder=result_holder,
+    )
+
+    mutation_transaction = db.transactions[1]
+    assert result_holder[0].exit_code != 0
+    assert (
+        report["contract_status"]
+        == "blocked_exact_target_mutation_rollback_failed"
+    )
+    assert report["exact_target_mutation_outcome"] == "unknown_after_rollback_failure"
+    assert report["exact_target_cleanup_failure_codes"] == [
+        "mutation_rollback_failed"
+    ]
+    assert report["exact_target_mutation_rollback_succeeded"] is False
+    assert mutation_transaction.commit_called is False
+    assert mutation_transaction.rollback_attempted is True
+    assert mutation_transaction.rollback_succeeded is False
+    assert db.rows[0]["access_state"] == "resolved_not_joined"
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    assert report["exact_target_durable_readback_matched"] is False
+    _assert_sensitive_values_absent(_render(report))
+
+
+def test_production_resolver_close_failure_reaches_exact_cleanup_wrapper(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _module()
+    transport = FakeTDLibTransport([], fail_close=True)
+    resolver = module.TDLibPublicUsernameResolver(
+        _runtime_env_for_tdlib_transport(tmp_path),
+        transport=transport,
+    )
+    report: dict[str, Any] = {
+        "exact_target_cleanup_failure_codes": [],
+        "exact_target_transport_close_succeeded": None,
+    }
+
+    module._attempt_exact_target_transport_close(report, resolver)
+    captured = capsys.readouterr()
+    rendered = module.render_json(report)
+    observed_output = "\n".join((rendered, captured.out, captured.err))
+
+    assert transport.close_attempted is True
+    assert transport.closed is False
+    assert report["exact_target_transport_close_succeeded"] is False
+    assert report["exact_target_cleanup_failure_codes"] == [
+        "transport_close_failed"
+    ]
+    assert captured.out == ""
+    assert captured.err == ""
+    for unsafe_text in (
+        "RuntimeError",
+        "TDLibTransportError",
+        "Traceback",
+        "Failed to close TDLib transport",
+    ):
+        assert unsafe_text not in observed_output
+    _assert_sensitive_values_absent(observed_output, tmp_path)
+
+
+def test_exact_resolver_close_failure_before_commit_preserves_primary_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolver = FakeResolver(
+        {"privatealphachannel": _not_found()},
+        fail_close=True,
+    )
+    result_holder: list[Any] = []
+    report, db, resolver, _locator_calls, _events = _run_exact_report(
+        monkeypatch,
+        resolver=resolver,
+        result_holder=result_holder,
+    )
+
+    assert result_holder[0].exit_code != 0
+    assert report["contract_status"] == "exact_target_resolve_failed"
+    assert report["exact_target_mutation_outcome"] == "not_attempted"
+    assert report["exact_target_cleanup_failure_codes"] == ["transport_close_failed"]
+    assert report["exact_target_read_rollback_succeeded"] is True
+    assert report["exact_target_mutation_rollback_succeeded"] is None
+    assert report["exact_target_transport_close_succeeded"] is False
+    assert report["exact_target_connection_cleanup_succeeded"] is True
+    assert resolver.close_attempted is True
+    assert db.close_attempted is True
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(_render(report))
+
+
+def test_exact_connection_cleanup_failure_before_commit_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = FakeDatabaseConnection([_exact_registry_row()], fail_close=True)
+    resolver = FakeResolver({"privatealphachannel": _not_found()})
+    result_holder: list[Any] = []
+    report, db, resolver, _locator_calls, _events = _run_exact_report(
+        monkeypatch,
+        db=db,
+        resolver=resolver,
+        result_holder=result_holder,
+    )
+
+    assert result_holder[0].exit_code != 0
+    assert (
+        report["contract_status"]
+        == "blocked_exact_target_connection_cleanup_failed"
+    )
+    assert report["exact_target_mutation_outcome"] == "not_attempted"
+    assert report["exact_target_cleanup_failure_codes"] == [
+        "connection_cleanup_failed"
+    ]
+    assert report["exact_target_read_rollback_succeeded"] is True
+    assert report["exact_target_mutation_rollback_succeeded"] is None
+    assert report["exact_target_transport_close_succeeded"] is True
+    assert report["exact_target_connection_cleanup_succeeded"] is False
+    assert resolver.close_attempted is True
+    assert db.close_attempted is True
+    assert db.update_attempts == 0
+    _assert_sensitive_values_absent(_render(report))
+
+
+def test_exact_resolver_close_failure_after_commit_preserves_durable_success_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    original_transport_close = module._attempt_exact_target_transport_close
+    transport_close_calls: list[Any] = []
+
+    def track_exact_transport_close(
+        report: dict[str, Any],
+        resolver: Any,
+    ) -> None:
+        transport_close_calls.append(resolver)
+        original_transport_close(report, resolver)
+
+    monkeypatch.setattr(
+        module,
+        "_attempt_exact_target_transport_close",
+        track_exact_transport_close,
+    )
+    resolver = FakeResolver(
+        {"privatealphachannel": _resolved(chat_id=RAW_NEW_CHAT_ID)},
+        fail_close=True,
+    )
+    result_holder: list[Any] = []
+    report, db, resolver, _locator_calls, _events = _run_exact_report(
+        monkeypatch,
+        resolver=resolver,
+        result_holder=result_holder,
+    )
+
+    assert result_holder[0].exit_code != 0
+    assert report["contract_status"] == "exact_target_cleanup_failed_after_commit"
+    assert report["exact_target_mutation_outcome"] == "committed_durable"
+    assert report["exact_target_cleanup_failure_codes"] == ["transport_close_failed"]
+    assert report["exact_target_durable_readback_matched"] is True
+    assert report["registry_resolve_mutation_performed"] is True
+    assert report["side_effects"]["database_mutation_performed"] is True
+    assert report["side_effects"]["telegram_channel_registry_updated"] is True
+    assert report["exact_target_transport_close_succeeded"] is False
+    assert report["exact_target_connection_cleanup_succeeded"] is True
+    assert db.transactions[1].commit_called is True
+    assert db.transactions[1].committed is True
+    assert db.transactions[1].rollback_attempted is False
+    assert resolver.close_attempted is True
+    assert transport_close_calls == [resolver]
+    _assert_sensitive_values_absent(_render(report))
+
+
+def test_exact_connection_cleanup_failure_after_commit_preserves_durable_success_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = FakeDatabaseConnection([_exact_registry_row()], fail_close=True)
+    result_holder: list[Any] = []
+    report, db, resolver, _locator_calls, _events = _run_exact_report(
+        monkeypatch,
+        db=db,
+        result_holder=result_holder,
+    )
+
+    assert result_holder[0].exit_code != 0
+    assert report["contract_status"] == "exact_target_cleanup_failed_after_commit"
+    assert report["exact_target_mutation_outcome"] == "committed_durable"
+    assert report["exact_target_cleanup_failure_codes"] == [
+        "connection_cleanup_failed"
+    ]
+    assert report["exact_target_durable_readback_matched"] is True
+    assert report["registry_resolve_mutation_performed"] is True
+    assert report["side_effects"]["database_mutation_performed"] is True
+    assert report["side_effects"]["telegram_channel_registry_updated"] is True
+    assert report["exact_target_transport_close_succeeded"] is True
+    assert report["exact_target_connection_cleanup_succeeded"] is False
+    assert db.transactions[1].commit_called is True
+    assert db.transactions[1].committed is True
+    assert db.transactions[1].rollback_attempted is False
+    assert resolver.close_attempted is True
+    assert db.close_attempted is True
+    _assert_sensitive_values_absent(_render(report))
+
+
+def test_exact_multiple_cleanup_failures_collect_deterministic_codes_and_attempt_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    db = FakeDatabaseConnection(
+        [_exact_registry_row()],
+        events=events,
+        break_exact_readback=True,
+        fail_mutation_rollback=True,
+        fail_close=True,
+    )
+    resolver = FakeResolver(
+        {"privatealphachannel": _resolved(chat_id=RAW_NEW_CHAT_ID)},
+        fail_close=True,
+        events=events,
+    )
+    result_holder: list[Any] = []
+    report, db, resolver, _locator_calls, events = _run_exact_report(
+        monkeypatch,
+        db=db,
+        resolver=resolver,
+        result_holder=result_holder,
+    )
+
+    assert result_holder[0].exit_code != 0
+    assert (
+        report["contract_status"]
+        == "blocked_exact_target_mutation_rollback_failed"
+    )
+    assert report["exact_target_mutation_outcome"] == "unknown_after_rollback_failure"
+    assert report["exact_target_cleanup_failure_codes"] == [
+        "mutation_rollback_failed",
+        "transport_close_failed",
+        "connection_cleanup_failed",
+    ]
+    assert report["exact_target_mutation_rollback_succeeded"] is False
+    assert report["exact_target_transport_close_succeeded"] is False
+    assert report["exact_target_connection_cleanup_succeeded"] is False
+    assert db.transactions[1].commit_called is False
+    assert db.transactions[1].rollback_attempted is True
+    assert db.transactions[1].rollback_succeeded is False
+    assert resolver.close_attempted is True
+    assert db.close_attempted is True
+    assert events.index("transaction:mutation:rollback_attempt") < events.index(
+        "resolver:close_attempt"
+    )
+    assert events.index("resolver:close_attempt") < events.index(
+        "database:close_attempt"
+    )
+    assert db.rows[0]["access_state"] == "resolved_not_joined"
+    assert report["registry_resolve_mutation_performed"] is False
+    assert report["side_effects"]["database_mutation_performed"] is False
+    _assert_sensitive_values_absent(_render(report))
+
+
+def test_exact_cli_emergency_firewall_emits_one_sanitized_json_object_without_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _module()
+
+    def fail_generate_report(**_kwargs: Any) -> Any:
+        raise RuntimeError(CLEANUP_EXCEPTION_MESSAGE)
+
+    monkeypatch.setattr(module, "generate_report", fail_generate_report)
+
+    with pytest.raises(RuntimeError):
+        module.main(["--runtime-env-path", "/safe/unit/runtime.env"])
+    capsys.readouterr()
+
+    exit_code = module.main(
+        [
+            "--runtime-env-path",
+            "/safe/unit/runtime.env",
+            "--target-locator-path",
+            RAW_LOCATOR_PATH,
+            "--approved-tdlib-public-username-resolve",
+            "--approved-registry-resolve-mutation",
+        ]
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert exit_code != 0
+    assert report["contract_status"] == "blocked_exact_target_unhandled_failure"
+    assert report["exact_target_mutation_outcome"] == "not_attempted"
+    assert report["exact_target_cleanup_failure_codes"] == []
+    assert captured.out.endswith("\n")
+    assert captured.err == ""
+    assert "Traceback" not in captured.out
+    _assert_sensitive_values_absent(captured.out)
