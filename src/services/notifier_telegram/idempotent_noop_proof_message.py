@@ -25,12 +25,14 @@ EXPECTED_STAGE_NAME = "notify"
 EXPECTED_ROOT_OBJECT_TYPE = "analysis"
 EVENT_TYPE = "notification.plan.created.v1"
 PROOF_KIND = "idempotent_noop_reprocess_v1"
+DEDICATED_WORKER_ONCE_CONSUMER_NAME = "bounded-notifier-idempotent-noop-proof"
 DEFAULT_CONSUMER_GROUP = "notifier-telegram"
 DEFAULT_CONSUMER_NAME = RUNNER_NAME
 DEFAULT_XADD_MAXLEN = 10000
 UUID_SUFFIX_RE = re.compile(r"^[0-9a-f]{8}$")
 PROOF_KEY_SUFFIX_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 ACK_SAFE_CLASSIFICATIONS = {"existing_plan_sent", "existing_terminal_delivery"}
+MAX_STREAM_ID_PART = (1 << 64) - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +43,8 @@ class BoundedNotifierIdempotentNoopProofMessageConfig:
     allow_redis_read: bool = False
     allow_redis_publish: bool = False
     allow_proof_message_publish: bool = False
+    allow_atomic_redis_claim: bool = False
+    atomic_claim_for_worker_once: bool = False
     require_telegram_disabled: bool = False
     mode: str = "preview"
     queue_name: str = QUEUE_NAME
@@ -92,6 +96,15 @@ class RedisProofQueueInspection:
     stream_tail_count: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class ProofMessagePublishOutcome:
+    message_id: str | None
+    claimed_for_worker_once: bool = False
+    error_code: str | None = None
+    outcome_unknown: bool = False
+    message_id_hint: str | None = None
+
+
 class BoundedNotifierIdempotentNoopProofMessageRuntime(Protocol):
     async def load_intents_by_event_suffix(
         self,
@@ -104,7 +117,12 @@ class BoundedNotifierIdempotentNoopProofMessageRuntime(Protocol):
         self,
         config: BoundedNotifierIdempotentNoopProofMessageConfig,
     ) -> RedisProofQueueInspection: ...
-    async def publish_proof_message(self, fields: Mapping[str, str]) -> str: ...
+    async def publish_proof_message(
+        self,
+        fields: Mapping[str, str],
+        *,
+        atomic_claim_for_worker_once: bool,
+    ) -> ProofMessagePublishOutcome: ...
     async def close(self) -> None: ...
 
 
@@ -133,6 +151,8 @@ class BoundedNotifierIdempotentNoopProofMessageResult:
     proof_message_fields: Mapping[str, str] | None = None
     proof_message_id_suffix: str | None = None
     proof_message_published: bool = False
+    proof_message_claimed_for_worker_once: bool = False
+    atomic_claim_outcome_unknown: bool = False
 
     def to_sanitized_dict(self) -> dict[str, Any]:
         readback = self.readback
@@ -155,6 +175,8 @@ class BoundedNotifierIdempotentNoopProofMessageResult:
             "redis_read_allowed": self.config.allow_redis_read,
             "redis_publish_allowed": self.config.allow_redis_publish,
             "proof_message_publish_allowed": self.config.allow_proof_message_publish,
+            "atomic_redis_claim_allowed": self.config.allow_atomic_redis_claim,
+            "atomic_claim_for_worker_once": self.config.atomic_claim_for_worker_once,
             "require_telegram_disabled": self.config.require_telegram_disabled,
             "runtime_config_loaded": self.state.runtime_config_loaded,
             "database_session_opened": self.state.database_session_opened,
@@ -179,6 +201,8 @@ class BoundedNotifierIdempotentNoopProofMessageResult:
             "pre_suppressed_delivery_count": _count(readback, "suppressed_delivery_count"),
             "proof_publish_safe": self.proof_publish_safe,
             "proof_message_published": self.proof_message_published,
+            "proof_message_claimed_for_worker_once": self.proof_message_claimed_for_worker_once,
+            "atomic_claim_outcome_unknown": self.atomic_claim_outcome_unknown,
             "proof_message_id_suffix": self.proof_message_id_suffix,
             "proof_message_stage_name": fields.get("stage_name"),
             "proof_message_root_object_type": fields.get("root_object_type"),
@@ -322,7 +346,29 @@ class DefaultBoundedNotifierIdempotentNoopProofMessageRuntime:
         lag = _safe_int(group.get("lag"))
         entries = await self._redis_client.xrevrange(self._queue_name, max="+", min="-", count=1)
         tail_count = len(entries or [])
-        if pending not in (0, None):
+        if pending is None:
+            return RedisProofQueueInspection(
+                status="blocked",
+                error_code="redis_group_pending_unavailable",
+                queue_type=queue_type,
+                consumer_group_present=True,
+                group_lag=lag,
+                group_pending=None,
+                stream_tail_checked=True,
+                stream_tail_count=tail_count,
+            )
+        if lag is None:
+            return RedisProofQueueInspection(
+                status="blocked",
+                error_code="redis_group_lag_unavailable",
+                queue_type=queue_type,
+                consumer_group_present=True,
+                group_lag=None,
+                group_pending=pending,
+                stream_tail_checked=True,
+                stream_tail_count=tail_count,
+            )
+        if pending != 0:
             return RedisProofQueueInspection(
                 status="blocked",
                 error_code="redis_pending_messages_present",
@@ -333,7 +379,7 @@ class DefaultBoundedNotifierIdempotentNoopProofMessageRuntime:
                 stream_tail_checked=True,
                 stream_tail_count=tail_count,
             )
-        if lag not in (0, None):
+        if lag != 0:
             return RedisProofQueueInspection(
                 status="blocked",
                 error_code="redis_existing_unconsumed_messages_present",
@@ -355,18 +401,172 @@ class DefaultBoundedNotifierIdempotentNoopProofMessageRuntime:
             stream_tail_count=tail_count,
         )
 
-    async def publish_proof_message(self, fields: Mapping[str, str]) -> str:
+    async def publish_proof_message(
+        self,
+        fields: Mapping[str, str],
+        *,
+        atomic_claim_for_worker_once: bool,
+    ) -> ProofMessagePublishOutcome:
         self._state.redis_publish_attempted = True
-        if self._xadd_maxlen is None:
-            message_id = await self._redis_client.xadd(self._queue_name, dict(fields))
-        else:
+        xadd_kwargs: dict[str, Any] = {}
+        if self._xadd_maxlen is not None:
+            xadd_kwargs = {"maxlen": self._xadd_maxlen, "approximate": True}
+        if not atomic_claim_for_worker_once:
             message_id = await self._redis_client.xadd(
                 self._queue_name,
                 dict(fields),
-                maxlen=self._xadd_maxlen,
-                approximate=True,
+                **xadd_kwargs,
             )
-        return _decode_redis_value(message_id)
+            return ProofMessagePublishOutcome(message_id=_decode_redis_value(message_id))
+
+        planned_message_id: str | None = None
+        execute_started = False
+        try:
+            async with self._redis_client.pipeline(transaction=True) as pipeline:
+                await pipeline.watch(self._queue_name)
+                queue_type = _decode_redis_value(await pipeline.type(self._queue_name)).strip().lower()
+                if queue_type != "stream":
+                    return ProofMessagePublishOutcome(
+                        message_id=None,
+                        error_code="redis_atomic_claim_stream_unavailable",
+                    )
+                group = _find_group(await pipeline.xinfo_groups(self._queue_name), self._consumer_group)
+                if group is None:
+                    return ProofMessagePublishOutcome(
+                        message_id=None,
+                        error_code="redis_atomic_claim_group_missing",
+                    )
+                pending = _safe_int(group.get("pending"))
+                lag = _safe_int(group.get("lag"))
+                if pending is None:
+                    return ProofMessagePublishOutcome(
+                        message_id=None,
+                        error_code="redis_group_pending_unavailable",
+                    )
+                if lag is None:
+                    return ProofMessagePublishOutcome(
+                        message_id=None,
+                        error_code="redis_group_lag_unavailable",
+                    )
+                if pending != 0 or lag != 0:
+                    return ProofMessagePublishOutcome(
+                        message_id=None,
+                        error_code="redis_atomic_claim_precondition_changed",
+                    )
+                stream_info = await pipeline.xinfo_stream(self._queue_name)
+                planned_message_id = _next_explicit_stream_id(stream_info)
+                if planned_message_id is None:
+                    return ProofMessagePublishOutcome(
+                        message_id=None,
+                        error_code="redis_atomic_claim_stream_id_unavailable",
+                    )
+                pipeline.multi()
+                pipeline.xadd(
+                    self._queue_name,
+                    dict(fields),
+                    id=planned_message_id,
+                    **xadd_kwargs,
+                )
+                pipeline.xreadgroup(
+                    self._consumer_group,
+                    DEDICATED_WORKER_ONCE_CONSUMER_NAME,
+                    {self._queue_name: ">"},
+                    count=1,
+                )
+                self._state.redis_consume_called = True
+                execute_started = True
+                responses = await pipeline.execute(raise_on_error=False)
+        except Exception as exc:
+            if type(exc).__name__ == "WatchError":
+                return ProofMessagePublishOutcome(
+                    message_id=None,
+                    error_code="redis_atomic_claim_race",
+                )
+            if not execute_started or planned_message_id is None:
+                return ProofMessagePublishOutcome(
+                    message_id=None,
+                    error_code="redis_atomic_claim_preflight_failed",
+                )
+            recovered_message_id = await self._recover_atomic_claim(
+                dict(fields),
+                expected_message_id=planned_message_id,
+            )
+            if recovered_message_id is not None:
+                return ProofMessagePublishOutcome(
+                    message_id=recovered_message_id,
+                    claimed_for_worker_once=True,
+                )
+            return ProofMessagePublishOutcome(
+                message_id=None,
+                error_code="redis_atomic_claim_outcome_unknown",
+                outcome_unknown=True,
+                message_id_hint=planned_message_id,
+            )
+        message_id = _published_message_id(responses)
+        claimed_message_ids = _xreadgroup_message_ids(responses[1] if len(responses) > 1 else None)
+        claimed = bool(
+            message_id is not None
+            and message_id == planned_message_id
+            and len(claimed_message_ids) == 1
+            and claimed_message_ids[0] == message_id
+        )
+        return ProofMessagePublishOutcome(
+            message_id=message_id,
+            claimed_for_worker_once=claimed,
+            error_code=None if claimed else "proof_message_atomic_claim_failed",
+        )
+
+    async def _recover_atomic_claim(
+        self,
+        expected_fields: Mapping[str, str],
+        *,
+        expected_message_id: str,
+    ) -> str | None:
+        try:
+            group = _find_group(
+                await self._redis_client.xinfo_groups(self._queue_name),
+                self._consumer_group,
+            )
+            if group is None:
+                return None
+            if _safe_int(group.get("pending")) != 1 or _safe_int(group.get("lag")) != 0:
+                return None
+            pending_entries = await self._redis_client.xpending_range(
+                self._queue_name,
+                self._consumer_group,
+                min="-",
+                max="+",
+                count=2,
+                consumername=DEDICATED_WORKER_ONCE_CONSUMER_NAME,
+            )
+            claims = _pending_claim_records(pending_entries)
+            if len(claims) != 1:
+                return None
+            message_id, consumer_name, times_delivered = claims[0]
+            if (
+                message_id != expected_message_id
+                or consumer_name != DEDICATED_WORKER_ONCE_CONSUMER_NAME
+                or times_delivered != 1
+            ):
+                return None
+            entries = await self._redis_client.xrange(
+                self._queue_name,
+                min=message_id,
+                max=message_id,
+                count=2,
+            )
+            if not isinstance(entries, (list, tuple)) or len(entries) != 1:
+                return None
+            recovered_id, recovered_fields = entries[0]
+            decoded_fields = {
+                _decode_redis_value(key): _decode_redis_value(value)
+                for key, value in dict(recovered_fields).items()
+            }
+            if _decode_redis_value(recovered_id) != message_id or decoded_fields != dict(expected_fields):
+                return None
+            return message_id
+        except Exception:
+            return None
 
     async def close(self) -> None:
         await self._session.close()
@@ -541,7 +741,10 @@ async def run_bounded_notifier_idempotent_noop_proof_message(
             )
 
         try:
-            message_id = await runtime.publish_proof_message(proof_fields)
+            publish_outcome = await runtime.publish_proof_message(
+                proof_fields,
+                atomic_claim_for_worker_once=config.atomic_claim_for_worker_once,
+            )
         except Exception as exc:
             return _result(
                 "failed",
@@ -554,6 +757,46 @@ async def run_bounded_notifier_idempotent_noop_proof_message(
                 proof_publish_safe=True,
                 proof_message_fields=proof_fields,
             )
+        message_id = publish_outcome.message_id
+        message_id_for_report = message_id or publish_outcome.message_id_hint or ""
+        if publish_outcome.error_code is not None:
+            return _result(
+                "failed" if message_id is not None else "blocked",
+                publish_outcome.error_code,
+                config=config,
+                state=state,
+                readback=readback,
+                redis_inspection=redis_inspection,
+                proof_publish_safe=True,
+                proof_message_fields=proof_fields,
+                proof_message_id_suffix=_message_id_suffix(message_id_for_report),
+                proof_message_published=message_id is not None,
+                atomic_claim_outcome_unknown=publish_outcome.outcome_unknown,
+            )
+        if message_id is None:
+            return _result(
+                "failed",
+                "redis_xadd_result_invalid",
+                config=config,
+                state=state,
+                readback=readback,
+                redis_inspection=redis_inspection,
+                proof_publish_safe=True,
+                proof_message_fields=proof_fields,
+            )
+        if config.atomic_claim_for_worker_once and not publish_outcome.claimed_for_worker_once:
+            return _result(
+                "failed",
+                "proof_message_atomic_claim_failed",
+                config=config,
+                state=state,
+                readback=readback,
+                redis_inspection=redis_inspection,
+                proof_publish_safe=True,
+                proof_message_fields=proof_fields,
+                proof_message_id_suffix=_message_id_suffix(message_id),
+                proof_message_published=True,
+            )
         return _result(
             "pass",
             None,
@@ -565,6 +808,7 @@ async def run_bounded_notifier_idempotent_noop_proof_message(
             proof_message_fields=proof_fields,
             proof_message_id_suffix=_message_id_suffix(message_id),
             proof_message_published=True,
+            proof_message_claimed_for_worker_once=publish_outcome.claimed_for_worker_once,
         )
     except Exception as exc:
         return _result(
@@ -638,6 +882,10 @@ def _authority_gate_error(config: BoundedNotifierIdempotentNoopProofMessageConfi
             return "redis_publish_not_allowed"
         if not config.allow_proof_message_publish:
             return "proof_message_publish_not_allowed"
+        if config.atomic_claim_for_worker_once and not config.allow_atomic_redis_claim:
+            return "atomic_redis_claim_not_allowed"
+    if config.allow_atomic_redis_claim and not config.atomic_claim_for_worker_once:
+        return "atomic_redis_claim_not_requested"
     return None
 
 
@@ -664,6 +912,14 @@ def _proof_publish_safety_error(
         return redis_inspection.error_code
     if redis_inspection.status != "matched":
         return "redis_state_not_publish_safe"
+    if redis_inspection.group_pending is None:
+        return "redis_group_pending_unavailable"
+    if redis_inspection.group_lag is None:
+        return "redis_group_lag_unavailable"
+    if redis_inspection.group_pending != 0:
+        return "redis_pending_messages_present"
+    if redis_inspection.group_lag != 0:
+        return "redis_existing_unconsumed_messages_present"
     return None
 
 
@@ -700,6 +956,8 @@ def _result(
     proof_message_fields: Mapping[str, str] | None = None,
     proof_message_id_suffix: str | None = None,
     proof_message_published: bool = False,
+    proof_message_claimed_for_worker_once: bool = False,
+    atomic_claim_outcome_unknown: bool = False,
 ) -> BoundedNotifierIdempotentNoopProofMessageResult:
     return BoundedNotifierIdempotentNoopProofMessageResult(
         status=status,
@@ -714,6 +972,8 @@ def _result(
         proof_message_fields=proof_message_fields,
         proof_message_id_suffix=proof_message_id_suffix,
         proof_message_published=proof_message_published,
+        proof_message_claimed_for_worker_once=proof_message_claimed_for_worker_once,
+        atomic_claim_outcome_unknown=atomic_claim_outcome_unknown,
     )
 
 
@@ -731,6 +991,70 @@ def _decode_redis_value(value: object) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return str(value)
+
+
+def _published_message_id(responses: object) -> str | None:
+    if not isinstance(responses, (list, tuple)) or not responses:
+        return None
+    value = responses[0]
+    if not isinstance(value, (str, bytes)):
+        return None
+    message_id = _decode_redis_value(value)
+    return message_id if re.fullmatch(r"[0-9]+-[0-9]+", message_id) else None
+
+
+def _next_explicit_stream_id(stream_info: object) -> str | None:
+    if not isinstance(stream_info, Mapping):
+        return None
+    last_generated_id = _decode_redis_value(
+        stream_info.get("last-generated-id", stream_info.get(b"last-generated-id"))
+    )
+    match = re.fullmatch(r"([0-9]+)-([0-9]+)", last_generated_id)
+    if match is None:
+        return None
+    milliseconds = int(match.group(1))
+    sequence = int(match.group(2))
+    if milliseconds > MAX_STREAM_ID_PART or sequence > MAX_STREAM_ID_PART:
+        return None
+    if milliseconds == MAX_STREAM_ID_PART:
+        if sequence == MAX_STREAM_ID_PART:
+            return None
+        return f"{milliseconds}-{sequence + 1}"
+    return f"{milliseconds + 1}-0"
+
+
+def _xreadgroup_message_ids(raw: object) -> list[str]:
+    message_ids: list[str] = []
+    if not isinstance(raw, (list, tuple)):
+        return message_ids
+    for stream_entry in raw:
+        if not isinstance(stream_entry, (list, tuple)) or len(stream_entry) != 2:
+            continue
+        messages = stream_entry[1]
+        if not isinstance(messages, (list, tuple)):
+            continue
+        for message_entry in messages:
+            if not isinstance(message_entry, (list, tuple)) or len(message_entry) != 2:
+                continue
+            message_id = _decode_redis_value(message_entry[0])
+            if re.fullmatch(r"[0-9]+-[0-9]+", message_id):
+                message_ids.append(message_id)
+    return message_ids
+
+
+def _pending_claim_records(entries: object) -> list[tuple[str, str, int | None]]:
+    records: list[tuple[str, str, int | None]] = []
+    for entry in entries or []:  # type: ignore[union-attr]
+        if not isinstance(entry, Mapping):
+            continue
+        message_id = _decode_redis_value(entry.get("message_id", entry.get(b"message_id")))
+        consumer_name = _decode_redis_value(entry.get("consumer", entry.get(b"consumer")))
+        times_delivered = _safe_int(
+            entry.get("times_delivered", entry.get(b"times_delivered"))
+        )
+        if re.fullmatch(r"[0-9]+-[0-9]+", message_id):
+            records.append((message_id, consumer_name, times_delivered))
+    return records
 
 
 def _count(readback: NotifierIdempotencyReadback | None, attr_name: str) -> int | None:

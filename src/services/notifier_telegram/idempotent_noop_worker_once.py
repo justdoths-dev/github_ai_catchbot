@@ -12,6 +12,10 @@ from uuid import UUID
 
 from .config import NotifierTelegramConfig, NotifierTelegramConfigurationError
 from .idempotency import classify_notifier_idempotency_state
+from .idempotent_noop_proof_message import (
+    DEDICATED_WORKER_ONCE_CONSUMER_NAME,
+    PROOF_KIND,
+)
 from .models import (
     DeliveryResult,
     NotificationIntentJob,
@@ -41,6 +45,27 @@ ACK_SAFE_NOOP_REASONS = {
     "notification_already_delivered_noop",
     "notification_duplicate_terminal_noop",
 }
+NOTIFIER_OWNED_WRITE_COUNTER_NAMES = (
+    "notification_plans_insert_calls",
+    "notification_renders_insert_calls",
+    "notification_delivery_records_insert_calls",
+    "notification_plans_status_update_calls",
+    "state_transitions_insert_calls",
+    "event_outbox_delivery_result_insert_calls",
+)
+ATOMIC_PRECLAIMED_ACK_SCRIPT = """
+local pending = redis.call(
+    'XPENDING', KEYS[1], ARGV[1], ARGV[3], ARGV[3], 2, ARGV[2]
+)
+if #pending ~= 1 then
+    return 0
+end
+local item = pending[1]
+if item[1] ~= ARGV[3] or item[2] ~= ARGV[2] or tonumber(item[4]) ~= 1 then
+    return 0
+end
+return redis.call('XACK', KEYS[1], ARGV[1], ARGV[3])
+""".strip()
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +83,7 @@ class BoundedNotifierIdempotentNoopWorkerOnceConfig:
     redis_message_id_suffix: str | None = None
     trigger_event_suffix: str | None = None
     analysis_suffix: str | None = None
+    expect_preclaimed_message: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +104,7 @@ class BoundedNotifierIdempotentNoopWorkerOnceState:
     redis_client_created: bool = False
     redis_read_attempted: bool = False
     redis_consume_called: bool = False
+    redis_preclaimed_message_read: bool = False
     redis_ack_attempted: bool = False
     notifier_called: bool = False
     telegram_send_called: bool = False
@@ -104,6 +131,9 @@ class RedisTargetSelection:
     message_root_object_type: str | None = None
     trigger_event_id_present: bool = False
     analysis_id_present: bool = False
+    preclaimed_message: bool = False
+    preclaimed_owner_matched: bool = False
+    preclaimed_delivery_count: int | None = None
 
 
 class BoundedNotifierIdempotentNoopRuntime(Protocol):
@@ -121,7 +151,7 @@ class BoundedNotifierIdempotentNoopRuntime(Protocol):
     async def invoke_notifier(self, trigger_event_id: UUID) -> tuple[DeliveryResult | None, Mapping[str, int]]: ...
     async def commit_database(self) -> None: ...
     async def rollback_database(self) -> None: ...
-    async def ack(self, message_id: str) -> int: ...
+    async def ack(self, message_id: str, *, expect_preclaimed_message: bool) -> int: ...
     async def close(self) -> None: ...
 
 
@@ -154,6 +184,7 @@ class BoundedNotifierIdempotentNoopWorkerOnceResult:
     ack_safe_candidate: bool = False
     ack_safe: bool = False
     ack_attempted: bool = False
+    ack_outcome_unknown: bool = False
     acked: bool = False
 
     def to_sanitized_dict(self) -> dict[str, Any]:
@@ -187,6 +218,7 @@ class BoundedNotifierIdempotentNoopWorkerOnceResult:
             "redis_consume_allowed": self.config.allow_redis_consume,
             "redis_ack_allowed": self.config.allow_redis_ack,
             "require_telegram_disabled": self.config.require_telegram_disabled,
+            "expect_preclaimed_message": self.config.expect_preclaimed_message,
             "runtime_config_loaded": self.state.runtime_config_loaded,
             "database_session_opened": self.state.database_session_opened,
             "database_read_attempted": self.state.database_read_attempted,
@@ -196,6 +228,7 @@ class BoundedNotifierIdempotentNoopWorkerOnceResult:
             "redis_client_created": self.state.redis_client_created,
             "redis_read_attempted": self.state.redis_read_attempted,
             "redis_consume_called": self.state.redis_consume_called,
+            "redis_preclaimed_message_read": self.state.redis_preclaimed_message_read,
             "redis_ack_attempted": self.state.redis_ack_attempted,
             "redis_message_count": selection.redis_message_count if selection else 0,
             "redis_group_lag": selection.group_lag if selection else None,
@@ -204,6 +237,9 @@ class BoundedNotifierIdempotentNoopWorkerOnceResult:
             "message_root_object_type": selection.message_root_object_type if selection else None,
             "trigger_event_id_present": selection.trigger_event_id_present if selection else False,
             "analysis_id_present": selection.analysis_id_present if selection else False,
+            "preclaimed_message": selection.preclaimed_message if selection else False,
+            "preclaimed_owner_matched": selection.preclaimed_owner_matched if selection else False,
+            "preclaimed_delivery_count": selection.preclaimed_delivery_count if selection else None,
             "notifier_called": self.state.notifier_called,
             "handled_result_status": self.handled_result_status,
             "handled_transport_error_code": self.handled_transport_error_code,
@@ -237,6 +273,7 @@ class BoundedNotifierIdempotentNoopWorkerOnceResult:
             "ack_safe_candidate": self.ack_safe_candidate,
             "ack_safe": self.ack_safe,
             "ack_attempted": self.ack_attempted,
+            "ack_outcome_unknown": self.ack_outcome_unknown,
             "acked": self.acked,
             "telegram_send_called": self.state.telegram_send_called,
             "telegram_edit_called": self.state.telegram_edit_called,
@@ -285,14 +322,7 @@ class ForbiddenTelegramNoopProbe:
 class CountingNotifierNoopRepository:
     def __init__(self, wrapped: NotifierTelegramRepository) -> None:
         self._wrapped = wrapped
-        self.write_counts = {
-            "notification_plans_insert_calls": 0,
-            "notification_renders_insert_calls": 0,
-            "notification_delivery_records_insert_calls": 0,
-            "notification_plans_status_update_calls": 0,
-            "state_transitions_insert_calls": 0,
-            "event_outbox_delivery_result_insert_calls": 0,
-        }
+        self.write_counts = {name: 0 for name in NOTIFIER_OWNED_WRITE_COUNTER_NAMES}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._wrapped, name)
@@ -355,10 +385,16 @@ class RedisExactNextNotificationConsumer:
             return _selection_error("consumer_group_missing")
         pending = _safe_int(group.get("pending"))
         lag = _safe_int(group.get("lag"))
+        if pending is None:
+            return _selection_error("redis_group_pending_unavailable", group_lag=lag)
+        if lag is None:
+            return _selection_error("redis_group_lag_unavailable", group_pending=pending)
+        if config.expect_preclaimed_message:
+            return await self._inspect_preclaimed_target(config, group_pending=pending, group_lag=lag)
         last_delivered_id = _decode_redis_value(
             group.get("last-delivered-id") or group.get(b"last-delivered-id") or "0-0"
         )
-        if pending not in (0, None):
+        if pending != 0:
             return _selection_error("redis_pending_messages_present", group_pending=pending, group_lag=lag)
         if lag != 1:
             return _selection_error("redis_unconsumed_target_not_exact", group_pending=pending, group_lag=lag)
@@ -371,6 +407,19 @@ class RedisExactNextNotificationConsumer:
         expected: StreamMessage,
         config: BoundedNotifierIdempotentNoopWorkerOnceConfig,
     ) -> RedisTargetSelection:
+        if config.expect_preclaimed_message:
+            self._state.redis_preclaimed_message_read = True
+            selection = await self.inspect_target(config)
+            if selection.message is None:
+                return selection
+            if selection.message.message_id != expected.message_id:
+                return _selection_error(
+                    "redis_preclaimed_target_mismatch",
+                    group_pending=selection.group_pending,
+                    group_lag=selection.group_lag,
+                    redis_message_count=selection.redis_message_count,
+                )
+            return selection
         self._state.redis_consume_called = True
         raw = await self._client.xreadgroup(
             self._consumer_group,
@@ -392,8 +441,97 @@ class RedisExactNextNotificationConsumer:
             )
         return selection
 
-    async def ack(self, message_id: str) -> int:
+    async def _inspect_preclaimed_target(
+        self,
+        config: BoundedNotifierIdempotentNoopWorkerOnceConfig,
+        *,
+        group_pending: int,
+        group_lag: int,
+    ) -> RedisTargetSelection:
+        if group_pending != 1:
+            return _selection_error(
+                "redis_preclaimed_pending_not_exact",
+                group_pending=group_pending,
+                group_lag=group_lag,
+            )
+        if group_lag != 0:
+            return _selection_error(
+                "redis_preclaimed_lag_not_zero",
+                group_pending=group_pending,
+                group_lag=group_lag,
+            )
+        pending_entries = await self._client.xpending_range(
+            self._queue_name,
+            self._consumer_group,
+            min="-",
+            max="+",
+            count=2,
+            consumername=DEDICATED_WORKER_ONCE_CONSUMER_NAME,
+        )
+        pending_claims = _pending_claim_records(pending_entries)
+        if len(pending_claims) != 1:
+            return _selection_error(
+                "redis_preclaimed_target_not_owned",
+                redis_message_count=len(pending_claims),
+                group_pending=group_pending,
+                group_lag=group_lag,
+            )
+        message_id, consumer_name, times_delivered = pending_claims[0]
+        if consumer_name != DEDICATED_WORKER_ONCE_CONSUMER_NAME:
+            return _selection_error(
+                "redis_preclaimed_owner_mismatch",
+                redis_message_count=1,
+                group_pending=group_pending,
+                group_lag=group_lag,
+                preclaimed_message=True,
+                preclaimed_delivery_count=times_delivered,
+            )
+        if times_delivered != 1:
+            return _selection_error(
+                "redis_preclaimed_delivery_count_not_one",
+                redis_message_count=1,
+                group_pending=group_pending,
+                group_lag=group_lag,
+                preclaimed_message=True,
+                preclaimed_owner_matched=True,
+                preclaimed_delivery_count=times_delivered,
+            )
+        if not config.redis_message_id_suffix or not message_id.endswith(config.redis_message_id_suffix):
+            return _selection_error(
+                "redis_message_id_mismatch",
+                redis_message_count=1,
+                group_pending=group_pending,
+                group_lag=group_lag,
+            )
+        entries = await self._client.xrange(
+            self._queue_name,
+            min=message_id,
+            max=message_id,
+            count=2,
+        )
+        messages = [_stream_message_from_xrange(self._queue_name, entry) for entry in entries or []]
+        return _select_exact_message(
+            config,
+            messages,
+            group_pending=group_pending,
+            group_lag=group_lag,
+            preclaimed_message=True,
+            preclaimed_owner_matched=True,
+            preclaimed_delivery_count=times_delivered,
+        )
+
+    async def ack(self, message_id: str, *, expect_preclaimed_message: bool) -> int:
         self._state.redis_ack_attempted = True
+        if expect_preclaimed_message:
+            result = await self._client.eval(
+                ATOMIC_PRECLAIMED_ACK_SCRIPT,
+                1,
+                self._queue_name,
+                self._consumer_group,
+                DEDICATED_WORKER_ONCE_CONSUMER_NAME,
+                message_id,
+            )
+            return int(result or 0)
         result = await self._client.xack(self._queue_name, self._consumer_group, message_id)
         return int(result or 0)
 
@@ -464,8 +602,11 @@ class DefaultBoundedNotifierIdempotentNoopRuntime:
         self._database_closed = True
         self._state.database_rolled_back = True
 
-    async def ack(self, message_id: str) -> int:
-        return await self._redis_consumer.ack(message_id)
+    async def ack(self, message_id: str, *, expect_preclaimed_message: bool) -> int:
+        return await self._redis_consumer.ack(
+            message_id,
+            expect_preclaimed_message=expect_preclaimed_message,
+        )
 
     async def close(self) -> None:
         if not self._database_closed:
@@ -509,6 +650,7 @@ async def build_default_bounded_notifier_idempotent_noop_runtime(
         runtime_config.notifier_config,
         repository=repository,  # type: ignore[arg-type]
         telegram_client=ForbiddenTelegramNoopProbe(state),  # type: ignore[arg-type]
+        record_idempotency_noop_transitions=False,
         logger=logger,
     )
     return DefaultBoundedNotifierIdempotentNoopRuntime(
@@ -683,7 +825,7 @@ async def run_bounded_notifier_idempotent_noop_worker_once(
                 notifier_owned_write_counts=write_counts,
             )
         after = await runtime.load_readback(intent)
-        safety_error = _ack_safety_error(before, after, delivery_result, state)
+        safety_error = _ack_safety_error(before, after, delivery_result, write_counts, state)
         if safety_error is not None:
             return _result(
                 "failed",
@@ -700,8 +842,52 @@ async def run_bounded_notifier_idempotent_noop_worker_once(
                 ack_safe_candidate=True,
             )
 
+        if config.expect_preclaimed_message:
+            post_readback_selection = await runtime.inspect_target(config)
+            if (
+                post_readback_selection.message is None
+                or post_readback_selection.message.message_id != consumed.message.message_id
+            ):
+                return _result(
+                    "failed",
+                    post_readback_selection.error_code or "redis_preclaimed_post_readback_mismatch",
+                    config=config,
+                    state=state,
+                    redis_selection=post_readback_selection,
+                    idempotency_before=before,
+                    idempotency_after=after,
+                    handled_result_status=str(delivery_result.delivery_status),
+                    handled_transport_error_code=_safe_token(delivery_result.transport_error_code),
+                    handled_result_edited=bool(delivery_result.edited),
+                    notifier_owned_write_counts=write_counts,
+                    ack_safe_candidate=True,
+                )
+
         await runtime.commit_database()
-        ack_count = await runtime.ack(consumed.message.message_id)
+        try:
+            ack_count = await runtime.ack(
+                consumed.message.message_id,
+                expect_preclaimed_message=config.expect_preclaimed_message,
+            )
+        except Exception as exc:
+            return _result(
+                "failed",
+                "redis_ack_outcome_unknown",
+                error_class=_safe_exception_class(exc),
+                config=config,
+                state=state,
+                redis_selection=consumed,
+                idempotency_before=before,
+                idempotency_after=after,
+                handled_result_status=str(delivery_result.delivery_status),
+                handled_transport_error_code=_safe_token(delivery_result.transport_error_code),
+                handled_result_edited=bool(delivery_result.edited),
+                notifier_owned_write_counts=write_counts,
+                ack_safe_candidate=True,
+                ack_safe=True,
+                ack_attempted=True,
+                ack_outcome_unknown=True,
+            )
         acked = ack_count == 1
         return _result(
             "pass" if acked else "failed",
@@ -802,6 +988,8 @@ def _target_suffix_error(config: BoundedNotifierIdempotentNoopWorkerOnceConfig) 
         return "suffix_ambiguous_or_missing"
     if config.redis_message_id_suffix and not MESSAGE_ID_SUFFIX_RE.fullmatch(config.redis_message_id_suffix):
         return "redis_message_id_suffix_invalid"
+    if config.expect_preclaimed_message and not config.redis_message_id_suffix:
+        return "preclaimed_message_suffix_missing"
     return None
 
 
@@ -815,6 +1003,9 @@ def _select_exact_message(
     *,
     group_pending: int | None,
     group_lag: int | None,
+    preclaimed_message: bool = False,
+    preclaimed_owner_matched: bool = False,
+    preclaimed_delivery_count: int | None = None,
 ) -> RedisTargetSelection:
     if len(messages) != 1:
         return _selection_error(
@@ -822,6 +1013,9 @@ def _select_exact_message(
             redis_message_count=len(messages),
             group_pending=group_pending,
             group_lag=group_lag,
+            preclaimed_message=preclaimed_message,
+            preclaimed_owner_matched=preclaimed_owner_matched,
+            preclaimed_delivery_count=preclaimed_delivery_count,
         )
     message = messages[0]
     fields = message.fields
@@ -833,6 +1027,9 @@ def _select_exact_message(
         "message_root_object_type": fields.get("root_object_type"),
         "trigger_event_id_present": bool(str(fields.get("trigger_event_id") or "").strip()),
         "analysis_id_present": bool(str(fields.get("root_object_id") or "").strip()),
+        "preclaimed_message": preclaimed_message,
+        "preclaimed_owner_matched": preclaimed_owner_matched,
+        "preclaimed_delivery_count": preclaimed_delivery_count,
     }
     if message.stream != config.queue_name:
         return _selection_error("queue_name_not_allowed", **base)
@@ -842,6 +1039,10 @@ def _select_exact_message(
         return _selection_error("message_stage_mismatch", **base)
     if fields.get("root_object_type") != EXPECTED_ROOT_OBJECT_TYPE:
         return _selection_error("root_object_type_mismatch", **base)
+    if fields.get("proof_kind") != PROOF_KIND:
+        return _selection_error("proof_kind_mismatch", **base)
+    if not str(fields.get("idempotency_key") or "").startswith(f"{PROOF_KIND}:"):
+        return _selection_error("proof_idempotency_key_mismatch", **base)
     trigger_event_id = str(fields.get("trigger_event_id") or "")
     if not trigger_event_id.endswith(str(config.trigger_event_suffix)):
         return _selection_error("trigger_event_id_mismatch", **base)
@@ -861,6 +1062,9 @@ def _selection_error(
     message_root_object_type: str | None = None,
     trigger_event_id_present: bool = False,
     analysis_id_present: bool = False,
+    preclaimed_message: bool = False,
+    preclaimed_owner_matched: bool = False,
+    preclaimed_delivery_count: int | None = None,
 ) -> RedisTargetSelection:
     return RedisTargetSelection(
         status="blocked",
@@ -872,6 +1076,9 @@ def _selection_error(
         message_root_object_type=message_root_object_type,
         trigger_event_id_present=trigger_event_id_present,
         analysis_id_present=analysis_id_present,
+        preclaimed_message=preclaimed_message,
+        preclaimed_owner_matched=preclaimed_owner_matched,
+        preclaimed_delivery_count=preclaimed_delivery_count,
     )
 
 
@@ -883,6 +1090,7 @@ def _ack_safety_error(
     before: NotifierIdempotencyReadback,
     after: NotifierIdempotencyReadback,
     result: DeliveryResult,
+    notifier_owned_write_counts: Mapping[str, int],
     state: BoundedNotifierIdempotentNoopWorkerOnceState,
 ) -> str | None:
     if result.delivery_status in {"sent", "edited"} or result.edited:
@@ -891,14 +1099,18 @@ def _ack_safety_error(
         return "result_not_idempotent_noop"
     if state.telegram_send_called or state.telegram_edit_called:
         return "telegram_transport_called"
+    if set(notifier_owned_write_counts) != set(NOTIFIER_OWNED_WRITE_COUNTER_NAMES):
+        return "notifier_owned_write_count_shape_mismatch"
+    if any(count != 0 for count in notifier_owned_write_counts.values()):
+        return "notifier_owned_write_detected"
     if after.primary_classification not in ACK_SAFE_CLASSIFICATIONS:
         return "post_readback_not_ack_safe"
     if (
-        after.plan_count > before.plan_count
-        or after.render_count > before.render_count
-        or after.delivery_record_count > before.delivery_record_count
+        after.plan_count != before.plan_count
+        or after.render_count != before.render_count
+        or after.delivery_record_count != before.delivery_record_count
     ):
-        return "post_readback_count_increased"
+        return "post_readback_count_changed"
     return None
 
 
@@ -919,6 +1131,7 @@ def _result(
     ack_safe_candidate: bool = False,
     ack_safe: bool = False,
     ack_attempted: bool = False,
+    ack_outcome_unknown: bool = False,
     acked: bool = False,
 ) -> BoundedNotifierIdempotentNoopWorkerOnceResult:
     return BoundedNotifierIdempotentNoopWorkerOnceResult(
@@ -938,6 +1151,7 @@ def _result(
         ack_safe_candidate=ack_safe_candidate,
         ack_safe=ack_safe,
         ack_attempted=ack_attempted,
+        ack_outcome_unknown=ack_outcome_unknown,
         acked=acked,
     )
 
@@ -964,6 +1178,21 @@ def _stream_messages_from_xreadgroup(raw: object) -> list[StreamMessage]:
                 )
             )
     return messages
+
+
+def _pending_claim_records(entries: object) -> list[tuple[str, str, int | None]]:
+    records: list[tuple[str, str, int | None]] = []
+    for entry in entries or []:  # type: ignore[union-attr]
+        if not isinstance(entry, Mapping):
+            continue
+        message_id = _decode_redis_value(entry.get("message_id", entry.get(b"message_id")))
+        if re.fullmatch(r"[0-9]+-[0-9]+", message_id):
+            consumer_name = _decode_redis_value(entry.get("consumer", entry.get(b"consumer")))
+            times_delivered = _safe_int(
+                entry.get("times_delivered", entry.get(b"times_delivered"))
+            )
+            records.append((message_id, consumer_name, times_delivered))
+    return records
 
 
 def _find_group(groups: object, consumer_group: str) -> dict[Any, Any] | None:

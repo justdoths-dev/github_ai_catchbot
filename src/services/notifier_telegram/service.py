@@ -92,12 +92,14 @@ class NotifierTelegramService:
         repository: NotifierTelegramRepositoryProtocol,
         renderer: NotificationRenderer | None = None,
         telegram_client: TelegramTransport | None = None,
+        record_idempotency_noop_transitions: bool = True,
         logger: logging.Logger | None = None,
     ) -> None:
         self._config = config
         self._repository = repository
         self._renderer = renderer or NotificationRenderer(max_message_chars=config.max_message_chars)
         self._telegram_client = telegram_client
+        self._record_idempotency_noop_transitions = record_idempotency_noop_transitions
         self._logger = logger or logging.getLogger(__name__)
 
     async def handle_trigger_event(self, trigger_event_id: str | UUID) -> DeliveryResult | None:
@@ -144,12 +146,16 @@ class NotifierTelegramService:
             raise NotifierIdempotencyGuardError("duplicate_existing_state")
         if should_noop_before_concretization(idempotency_readback) and not stale_suppressed_history_only:
             reason_code = idempotency_noop_reason(idempotency_readback)
-            transition_plan_id = idempotency_transition_plan_id(idempotency_snapshots, intent.notification_plan_id)
-            await self._transition_for_plan_id(
-                transition_plan_id,
-                to_state=idempotency_readback.primary_classification,
-                reason_code=reason_code,
-            )
+            if self._record_idempotency_noop_transitions:
+                transition_plan_id = idempotency_transition_plan_id(
+                    idempotency_snapshots,
+                    intent.notification_plan_id,
+                )
+                await self._transition_for_plan_id(
+                    transition_plan_id,
+                    to_state=idempotency_readback.primary_classification,
+                    reason_code=reason_code,
+                )
             return DeliveryResult(
                 delivery_status="suppressed",
                 telegram_chat_id=intent.target_chat_id,

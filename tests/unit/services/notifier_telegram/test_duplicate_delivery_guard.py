@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 
 from services.notifier_telegram.models import NotificationPlanDraft
-from services.notifier_telegram.service import NotifierIdempotencyGuardError
+from services.notifier_telegram.service import NotifierIdempotencyGuardError, NotifierTelegramService
 from tests.component.services.notifier_telegram._fakes import (
     FakeRepository,
     RaisingTelegramClient,
@@ -32,6 +32,42 @@ async def test_same_material_already_delivered_is_noop_without_transport() -> No
     assert client.calls == 0
     assert len(repository.delivery_records) == 1
     assert repository.state_transitions[-1]["reason_code"] == "notification_duplicate_noop"
+
+
+@pytest.mark.asyncio
+async def test_terminal_duplicate_proof_mode_is_read_only_without_transport() -> None:
+    repository, intent = repo_with_valid_case()
+    client = RaisingTelegramClient()
+
+    await service(repository, cfg=config(dry_run=True, enable_notification_send=True), client=client).handle_intent(intent)
+    repository.delivery_records[0]["result_status"] = "sent"
+    repository.delivery_records[0]["telegram_message_id"] = 777
+    counts_before = (
+        len(repository.plans),
+        len(repository.renders),
+        len(repository.delivery_records),
+        len(repository.state_transitions),
+        len(repository.delivery_outbox),
+    )
+
+    result = await NotifierTelegramService(
+        config(dry_run=False, enable_notification_send=False),
+        repository=repository,
+        telegram_client=client,
+        record_idempotency_noop_transitions=False,
+    ).handle_intent(intent)
+
+    assert result is not None
+    assert result.delivery_status == "suppressed"
+    assert result.transport_error_code == "notification_duplicate_noop"
+    assert client.calls == 0
+    assert (
+        len(repository.plans),
+        len(repository.renders),
+        len(repository.delivery_records),
+        len(repository.state_transitions),
+        len(repository.delivery_outbox),
+    ) == counts_before
 
 
 @pytest.mark.asyncio
