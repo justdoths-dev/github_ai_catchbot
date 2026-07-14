@@ -5,7 +5,10 @@ import json
 import pytest
 
 from services.maintenance import main as maintenance_main
-from tests.component.services.maintenance._batch_recovery_fakes import FakeSelectedPlanReplayRepository
+from tests.component.services.maintenance._batch_recovery_fakes import (
+    AtomicReplayInsertSession,
+    FakeSelectedPlanReplayRepository,
+)
 from tests.unit.services.maintenance.test_batch_recovery_validation import _row
 
 
@@ -44,9 +47,10 @@ async def test_missing_operator_confirmation_blocks_writes_and_emits_json_result
 
 
 @pytest.mark.asyncio
-async def test_confirmed_replay_selected_creates_replay_request_only() -> None:
+async def test_confirmed_replay_selected_creates_atomic_request_and_event() -> None:
     row = _row(delivery_status="suppressed", send_disabled=True)
-    repository = FakeSelectedPlanReplayRepository([row])
+    session = AtomicReplayInsertSession()
+    repository = FakeSelectedPlanReplayRepository([row], atomic_session=session)
     emitted: list[str] = []
     args = maintenance_main.build_parser().parse_args(
         [
@@ -60,7 +64,12 @@ async def test_confirmed_replay_selected_creates_replay_request_only() -> None:
         ]
     )
 
-    exit_code = await maintenance_main.run_replay_selected_batch_recovery(args, repository, emit_json=emitted.append)
+    async with repository.transaction():
+        exit_code = await maintenance_main.run_replay_selected_batch_recovery(
+            args,
+            repository,
+            emit_json=emitted.append,
+        )
     payload = json.loads(emitted[0])
 
     assert exit_code == 0
@@ -70,16 +79,15 @@ async def test_confirmed_replay_selected_creates_replay_request_only() -> None:
     assert payload["skipped_count"] == 0
     assert payload["results"][0]["notification_plan_id"] == str(row.notification_plan_id)
     assert payload["results"][0]["replay_request_created"] is True
-    assert repository.replay_requests == [
-        {
-            "replay_type": "delivery",
-            "root_object_type": "notification_plan",
-            "root_object_id": row.notification_plan_id,
-            "requested_by": "test/operator",
-            "status": "requested",
-        }
-    ]
-    assert repository.event_outbox == []
+    assert len(repository.replay_requests) == 1
+    replay_request = repository.replay_requests[0]
+    assert replay_request["root_object_id"] == row.notification_plan_id
+    assert replay_request["status"] == "requested"
+    assert len(repository.event_outbox) == 1
+    replay_event = repository.event_outbox[0]
+    assert replay_event["event_type"] == "replay.requested.v1"
+    assert replay_event["aggregate_id"] == replay_request["replay_request_id"]
+    assert replay_event["status"] == "pending"
     assert repository.job_attempts == []
     assert repository.notification_plan_mutations == []
     assert repository.notification_delivery_record_mutations == []

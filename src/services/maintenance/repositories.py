@@ -979,32 +979,67 @@ class MaintenanceRepository:
         result = await self._session.execute(
             sa.text(
                 """
-                INSERT INTO replay_requests (
-                    replay_type, root_object_type, root_object_id, requested_by, requested_at, status
-                )
-                SELECT 'delivery'::replay_type_enum,
-                       'notification_plan',
-                       src.notification_plan_id,
-                       :requested_by,
-                       now(),
-                       'requested'
-                FROM (
+                WITH requested_plans AS (
                     SELECT DISTINCT unnest(CAST(:plan_ids AS uuid[])) AS notification_plan_id
-                ) src
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM replay_requests rr
-                    WHERE rr.replay_type = 'delivery'::replay_type_enum
-                      AND rr.root_object_type = 'notification_plan'
-                      AND rr.root_object_id = src.notification_plan_id
-                      AND rr.status IN ('requested', 'dispatched', 'pending')
+                ),
+                inserted_replay_requests AS (
+                    INSERT INTO replay_requests (
+                        replay_type, root_object_type, root_object_id, requested_by, requested_at, status
+                    )
+                    SELECT 'delivery'::replay_type_enum,
+                           'notification_plan',
+                           src.notification_plan_id,
+                           :requested_by,
+                           now(),
+                           'requested'
+                    FROM requested_plans src
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM replay_requests rr
+                        WHERE rr.replay_type = 'delivery'::replay_type_enum
+                          AND rr.root_object_type = 'notification_plan'
+                          AND rr.root_object_id = src.notification_plan_id
+                          AND rr.status IN ('requested', 'dispatched', 'pending')
+                    )
+                    RETURNING replay_request_id, root_object_id
+                ),
+                inserted_replay_events AS (
+                    INSERT INTO event_outbox (
+                        event_type,
+                        aggregate_type,
+                        aggregate_id,
+                        dedupe_key,
+                        payload_json,
+                        status
+                    )
+                    SELECT 'replay.requested.v1',
+                           'replay_request',
+                           replay_request_id,
+                           'maintenance:replay-requested:v1:' || replay_request_id::text,
+                           jsonb_build_object(
+                               'replay_request_id', replay_request_id::text,
+                               'replay_type', 'delivery',
+                               'root_object_type', 'notification_plan',
+                               'root_object_id', root_object_id::text,
+                               'replay_reason', 'batch_recovery_replay_selected'
+                           ),
+                           'pending'::outbox_status_enum
+                    FROM inserted_replay_requests
+                    ON CONFLICT ON CONSTRAINT uq_event_outbox_dedupe_key DO NOTHING
+                    RETURNING aggregate_id
                 )
-                RETURNING replay_request_id
+                SELECT (SELECT count(*) FROM inserted_replay_requests) AS replay_request_count,
+                       (SELECT count(*) FROM inserted_replay_events) AS replay_event_count
                 """
             ),
             {"plan_ids": [str(plan_id) for plan_id in plan_ids], "requested_by": requested_by},
         )
-        return len(result.fetchall())
+        counts = result.mappings().one()
+        replay_request_count = int(counts["replay_request_count"])
+        replay_event_count = int(counts["replay_event_count"])
+        if replay_request_count != replay_event_count:
+            raise RuntimeError("replay_request_outbox_atomicity_mismatch")
+        return replay_request_count
 
     async def insert_manual_retry_intent_outbox(
         self,
