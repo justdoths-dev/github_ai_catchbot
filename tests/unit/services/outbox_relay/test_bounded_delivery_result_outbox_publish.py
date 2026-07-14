@@ -248,6 +248,53 @@ async def test_success_publishes_exact_delivery_result_to_q_maintenance_then_mar
 
 
 @pytest.mark.asyncio
+async def test_zero_attempt_send_disabled_suppressed_result_publishes_to_q_maintenance() -> None:
+    operation_log: list[str] = []
+    target = _row(
+        event_id=UUID("11111111-1111-4111-8111-222222222222"),
+        payload_json=_payload(
+            delivery_status="suppressed",
+            attempt_count=0,
+            transport_error_code="notification_send_flag_disabled",
+        ),
+    )
+    repository = FakeRepository(rows=[target], operation_log=operation_log)
+    repository_builder = FakeRepositoryBuilder(repository)
+    publisher = FakeRedisPublisher(operation_log=operation_log)
+
+    result = await run_bounded_delivery_result_outbox_publish(
+        _approved_config(target_event_id=target.event_id),
+        runtime_config_loader=_runtime_config,
+        repository_builder=repository_builder,
+        redis_publisher_builder=FakeRedisPublisherBuilder(publisher),
+    )
+    report = result.to_sanitized_dict()
+
+    assert report["status"] == "pass"
+    assert report["ok"] is True
+    assert report["queue_name"] == "q.maintenance"
+    assert report["stage_name"] == "maintenance"
+    assert report["payload_delivery_status"] == "suppressed"
+    assert report["payload_attempt_count_present"] is True
+    assert report["redis_xadd_count"] == 1
+    assert report["event_outbox_marked_published"] is True
+    assert report["job_attempt_inserted"] is True
+    assert operation_log == ["fetch_by_id", "publish", "mark_published", "insert_job_attempt"]
+    assert repository_builder.close_commits == [True]
+    assert repository.mark_published_calls == [target.event_id]
+    assert repository.job_attempt_calls == [
+        {
+            "stage_name": "maintenance",
+            "queue_name": "q.maintenance",
+            "root_object_type": "notification_plan",
+            "root_object_id": PLAN_ID,
+            "attempt_status": "succeeded",
+            "error_code": None,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_redis_fields_are_id_only_and_do_not_include_delivery_payload_or_secrets() -> None:
     row = _row()
     publisher = FakeRedisPublisher()
@@ -406,6 +453,59 @@ async def test_missing_or_malformed_payload_rejects_before_redis(payload: dict[s
 
     assert result.error_code == "malformed_event_payload"
     assert result.state.redis_xadd_attempted is False
+    assert publisher_builder.calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _payload(
+            delivery_status="sent",
+            attempt_count=0,
+            transport_error_code="notification_send_flag_disabled",
+        ),
+        _payload(
+            delivery_status="edited",
+            attempt_count=0,
+            transport_error_code="notification_send_flag_disabled",
+        ),
+        _payload(
+            delivery_status="failed_retryable",
+            attempt_count=0,
+            transport_error_code="notification_send_flag_disabled",
+        ),
+        _payload(
+            delivery_status="failed_terminal",
+            attempt_count=0,
+            transport_error_code="notification_send_flag_disabled",
+        ),
+        _payload(delivery_status="suppressed", attempt_count=0, transport_error_code=None),
+        _payload(delivery_status="suppressed", attempt_count=0, transport_error_code=""),
+        _payload(delivery_status="suppressed", attempt_count=0, transport_error_code="another_reason"),
+        _payload(attempt_count=-1),
+    ],
+)
+async def test_invalid_zero_or_negative_attempt_combinations_reject_before_redis(
+    payload: dict[str, object],
+) -> None:
+    row = _row(payload_json=payload)
+    repository = FakeRepository(rows=[row])
+    repository_builder = FakeRepositoryBuilder(repository)
+    publisher_builder = FakeRedisPublisherBuilder(FakeRedisPublisher())
+
+    result = await run_bounded_delivery_result_outbox_publish(
+        _approved_config(target_event_id=row.event_id),
+        runtime_config_loader=_runtime_config,
+        repository_builder=repository_builder,
+        redis_publisher_builder=publisher_builder,
+    )
+
+    assert result.error_code == "malformed_event_payload"
+    assert result.state.redis_xadd_attempted is False
+    assert repository.mark_published_calls == []
+    assert repository.job_attempt_calls == []
+    assert repository_builder.close_commits == [False]
     assert publisher_builder.calls == 0
 
 

@@ -628,12 +628,30 @@ def _target_event_error(row: OutboxEventRow, identity: DeliveryResultPayloadIden
         or identity.notification_delivery_record_id is None
         or identity.delivery_status is None
         or identity.attempt_count is None
-        or identity.attempt_count < 1
+        or identity.attempt_count < 0
+        or (
+            identity.attempt_count == 0
+            and not _is_valid_send_disabled_zero_attempt(row, identity)
+        )
     ):
         return "malformed_event_payload"
     if identity.notification_plan_id != row.aggregate_id:
         return "payload_notification_plan_id_mismatch"
     return None
+
+
+def _is_valid_send_disabled_zero_attempt(
+    row: OutboxEventRow,
+    identity: DeliveryResultPayloadIdentity,
+) -> bool:
+    payload = row.payload_json if isinstance(row.payload_json, Mapping) else {}
+    raw_attempt_count = payload.get("attempt_count")
+    return (
+        type(raw_attempt_count) is int
+        and raw_attempt_count == 0
+        and identity.delivery_status == "suppressed"
+        and _payload_string(payload, "transport_error_code") == "notification_send_flag_disabled"
+    )
 
 
 def _blocked_selected(
