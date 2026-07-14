@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .config import MaintenanceConfig
+from .models import DeliveryReplayDecision, DeliveryResultWorkerResult
 from .redis_streams import RedisStreamConsumer
 from .repositories import MaintenanceRepository
 from .service import MaintenanceService
@@ -440,15 +441,21 @@ def build_worker_runtime_components(
             replay_consumer = _NoCreateGroupConsumer(replay_consumer)
 
         class SessionBackedService:
-            async def handle_maintenance_trigger_event(self, trigger_event_id: str) -> None:
+            async def handle_maintenance_trigger_event(
+                self,
+                trigger_event_id: str,
+            ) -> DeliveryResultWorkerResult | None:
                 async with session_factory.begin() as session:
                     service = MaintenanceService(config, repository=MaintenanceRepository(session), logger=logger)
-                    await service.handle_maintenance_trigger_event(trigger_event_id)
+                    return await service.handle_maintenance_trigger_event(trigger_event_id)
 
-            async def handle_replay_trigger_event(self, trigger_event_id: str) -> None:
+            async def handle_replay_trigger_event(
+                self,
+                trigger_event_id: str,
+            ) -> DeliveryReplayDecision | None:
                 async with session_factory.begin() as session:
                     service = MaintenanceService(config, repository=MaintenanceRepository(session), logger=logger)
-                    await service.handle_replay_trigger_event(trigger_event_id)
+                    return await service.handle_replay_trigger_event(trigger_event_id)
 
             async def promote_due_retries_once(self, limit: int | None = None) -> int:
                 async with session_factory.begin() as session:

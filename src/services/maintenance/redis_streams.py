@@ -70,24 +70,24 @@ class RedisStreamConsumer:
         return [_stream_message_from_entry(self._queue_name, entry) for entry in raw or []]
 
     async def read_batch(self) -> list[StreamMessage]:
+        pending = await self._read_batch(stream_id="0", block=None)
+        if pending:
+            return pending
+        return await self._read_batch(stream_id=">", block=self._block_ms)
+
+    async def _read_batch(self, *, stream_id: str, block: int | None) -> list[StreamMessage]:
         raw = await self._client.xreadgroup(
             self._consumer_group,
             self._consumer_name,
-            {self._queue_name: ">"},
+            {self._queue_name: stream_id},
             count=self._batch_size,
-            block=self._block_ms,
+            block=block,
         )
         messages: list[StreamMessage] = []
         for stream_name, entries in raw or []:
             stream = _decode_value(stream_name)
-            for message_id, fields in entries:
-                messages.append(
-                    StreamMessage(
-                        stream=stream,
-                        message_id=_decode_value(message_id),
-                        fields={_decode_value(key): _decode_value(value) for key, value in fields.items()},
-                    )
-                )
+            for entry in entries:
+                messages.append(_stream_message_from_entry(stream, entry))
         return messages
 
     async def ack(self, message_id: str) -> None:

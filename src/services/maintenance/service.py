@@ -176,6 +176,16 @@ class MaintenanceService:
         replay_reason: str | None = None,
     ) -> DeliveryReplayDecision | None:
         replay_request = await self._repository.load_replay_request(replay_request_id)
+        if (
+            replay_request is not None
+            and replay_request.replay_type == "delivery"
+            and replay_request.root_object_type == "notification_plan"
+            and replay_request.status == "completed"
+        ):
+            return DeliveryReplayDecision(
+                action="already_completed_noop",
+                reason_code="replay_request_already_completed_noop",
+            )
         plan = None
         if replay_request is not None and replay_request.root_object_type == "notification_plan":
             plan = await self._repository.load_notification_plan(replay_request.root_object_id)

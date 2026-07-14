@@ -46,6 +46,7 @@ class FakeRepository:
         self.latest_delivery_records: dict[UUID, LatestDeliveryRecord] = {}
         self.delivery_attempt_counts: dict[UUID, int] = {}
         self.plan_created_outbox: list[dict] = []
+        self.plan_created_outbox_insert_calls = 0
         self.dead_letters: list[dict] = []
         self.replay_requests: dict[UUID, ReplayRequestRecord] = {}
         self.replay_status_updates: list[tuple[UUID, str]] = []
@@ -111,6 +112,7 @@ class FakeRepository:
         return candidates
 
     async def insert_plan_created_outbox(self, *, notification_plan_id: UUID, dedupe_key: str, payload_json: dict):
+        self.plan_created_outbox_insert_calls += 1
         if any(row["dedupe_key"] == dedupe_key for row in self.plan_created_outbox):
             return False
         aggregate_id = UUID(str(payload_json["analysis_id"])) if payload_json.get("analysis_id") else notification_plan_id

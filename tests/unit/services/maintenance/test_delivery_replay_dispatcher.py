@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 
+from services.maintenance.ack_decision import replay_result_allows_ack
 from services.maintenance.models import ReplayRequestRecord
 from services.maintenance.service import MaintenanceService
 from tests.component.services.maintenance._fakes import FakeRepository, config, outbox_event, plan
@@ -14,13 +15,14 @@ def _replay_request(
     root_object_id,
     replay_type: str = "delivery",
     root_object_type: str = "notification_plan",
+    status: str = "requested",
 ):
     return ReplayRequestRecord(
         replay_request_id=uuid4(),
         replay_type=replay_type,
         root_object_type=root_object_type,
         root_object_id=root_object_id,
-        status="requested",
+        status=status,
         requested_by="operator",
     )
 
@@ -51,8 +53,11 @@ async def test_delivery_replay_request_for_notification_plan_emits_replay_intent
     repository.events[event.event_id] = event
     service = MaintenanceService(config(app_env="test"), repository=repository)
 
-    await service.handle_replay_trigger_event(event.event_id)
+    first_decision = await service.handle_replay_trigger_event(event.event_id)
 
+    assert first_decision is not None
+    assert first_decision.action == "emit_replay_intent"
+    assert replay_result_allows_ack(first_decision) is True
     assert repository.replay_status_updates == [
         (request.replay_request_id, "dispatched"),
         (request.replay_request_id, "completed"),
@@ -70,6 +75,26 @@ async def test_delivery_replay_request_for_notification_plan_emits_replay_intent
     assert emitted["payload_json"]["replay_reason"] == "explicit_delivery_replay"
     assert emitted["payload_json"]["replay_request_id"] == str(request.replay_request_id)
     assert repository.upstream_recompute_calls == 0
+    assert repository.plan_created_outbox_insert_calls == 1
+    assert len(repository.job_attempts) == 1
+    assert repository.job_attempts[0]["attempt_status"] == "succeeded"
+    assert repository.plans[notification_plan.notification_plan_id] == notification_plan
+
+    second_decision = await service.handle_replay_trigger_event(event.event_id)
+
+    assert second_decision is not None
+    assert second_decision.action == "already_completed_noop"
+    assert second_decision.reason_code == "replay_request_already_completed_noop"
+    assert replay_result_allows_ack(second_decision) is True
+    assert repository.replay_status_updates == [
+        (request.replay_request_id, "dispatched"),
+        (request.replay_request_id, "completed"),
+    ]
+    assert repository.plan_created_outbox_insert_calls == 1
+    assert len(repository.plan_created_outbox) == 1
+    assert len(repository.job_attempts) == 1
+    assert repository.plans[notification_plan.notification_plan_id] == notification_plan
+    assert repository.upstream_recompute_calls == 0
 
 
 @pytest.mark.asyncio
@@ -83,8 +108,11 @@ async def test_prod_env_guard_rejects_delivery_replay_without_explicit_opt_in() 
     repository.events[event.event_id] = event
     service = MaintenanceService(config(app_env="prod", enable_replay_to_prod_db=False), repository=repository)
 
-    await service.handle_replay_trigger_event(event.event_id)
+    decision = await service.handle_replay_trigger_event(event.event_id)
 
+    assert decision is not None
+    assert decision.action == "reject"
+    assert replay_result_allows_ack(decision) is False
     assert repository.replay_status_updates == [(request.replay_request_id, "rejected_by_env_guard")]
     assert repository.plan_created_outbox == []
     assert len(repository.job_attempts) == 1
@@ -102,8 +130,11 @@ async def test_prod_env_guard_allows_delivery_replay_with_explicit_opt_in() -> N
     repository.events[event.event_id] = event
     service = MaintenanceService(config(app_env="prod", enable_replay_to_prod_db=True), repository=repository)
 
-    await service.handle_replay_trigger_event(event.event_id)
+    decision = await service.handle_replay_trigger_event(event.event_id)
 
+    assert decision is not None
+    assert decision.action == "emit_replay_intent"
+    assert replay_result_allows_ack(decision) is True
     assert repository.replay_status_updates[-1] == (request.replay_request_id, "completed")
     assert len(repository.plan_created_outbox) == 1
 
@@ -117,12 +148,51 @@ async def test_non_delivery_replay_request_is_rejected_without_downstream_emit()
     repository.events[event.event_id] = event
     service = MaintenanceService(config(app_env="test"), repository=repository)
 
-    await service.handle_replay_trigger_event(event.event_id)
+    decision = await service.handle_replay_trigger_event(event.event_id)
 
+    assert decision is not None
+    assert decision.action == "reject"
+    assert replay_result_allows_ack(decision) is False
     assert repository.replay_status_updates == [(request.replay_request_id, "unsupported_in_stage41")]
     assert repository.plan_created_outbox == []
     assert len(repository.job_attempts) == 1
     assert repository.job_attempts[0]["error_code"] == "unsupported_replay_type"
+
+
+@pytest.mark.asyncio
+async def test_completed_unsupported_replay_is_still_rejected_and_not_ack_safe() -> None:
+    repository = FakeRepository()
+    request = _replay_request(replay_type="source", root_object_id=uuid4(), status="completed")
+    repository.replay_requests[request.replay_request_id] = request
+    service = MaintenanceService(config(app_env="test"), repository=repository)
+
+    decision = await service.dispatch_delivery_replay_request(request.replay_request_id)
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert decision.reason_code == "unsupported_replay_type"
+    assert replay_result_allows_ack(decision) is False
+    assert repository.replay_status_updates == [(request.replay_request_id, "unsupported_in_stage41")]
+    assert repository.plan_created_outbox_insert_calls == 0
+    assert repository.plan_created_outbox == []
+    assert len(repository.job_attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_missing_replay_request_is_rejected_without_durable_mutation_or_ack() -> None:
+    repository = FakeRepository()
+    service = MaintenanceService(config(app_env="test"), repository=repository)
+
+    decision = await service.dispatch_delivery_replay_request(uuid4())
+
+    assert decision is not None
+    assert decision.action == "reject"
+    assert decision.reason_code == "replay_request_missing"
+    assert replay_result_allows_ack(decision) is False
+    assert repository.replay_status_updates == []
+    assert repository.plan_created_outbox_insert_calls == 0
+    assert repository.plan_created_outbox == []
+    assert repository.job_attempts == []
 
 
 @pytest.mark.asyncio

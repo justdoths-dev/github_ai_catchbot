@@ -10,6 +10,7 @@ import pytest
 
 from services.evidence_assembler.config import EvidenceAssemblerConfig
 from services.evidence_assembler.models import (
+    AnalysisRequestedOutboxRecord,
     BundleRefreshTarget,
     CandidateGroupRecord,
     CandidateMemberRecord,
@@ -340,11 +341,13 @@ class UpstreamHotPathLedger:
         judge_profile: str,
         escalation_allowed: bool,
     ):
-        self.append_event(
+        dedupe_key = f"analysis-request:{candidate_group_id}:{bundle_id}"
+        created = dedupe_key not in self._outbox_dedupe_keys
+        event_id = self.append_event(
             event_type="analysis.requested.v1",
             aggregate_type="candidate_group",
             aggregate_id=candidate_group_id,
-            dedupe_key=f"analysis-request:{candidate_group_id}:{bundle_id}",
+            dedupe_key=dedupe_key,
             payload_json={
                 "candidate_group_id": str(candidate_group_id),
                 "bundle_id": str(bundle_id),
@@ -352,6 +355,7 @@ class UpstreamHotPathLedger:
                 "escalation_allowed": escalation_allowed,
             },
         )
+        return AnalysisRequestedOutboxRecord(event_id=event_id, created=created)
 
 
 def _router_config() -> RouterNormalizerConfig:

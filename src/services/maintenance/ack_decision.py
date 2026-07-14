@@ -14,4 +14,11 @@ def maintenance_result_allows_ack(result: DeliveryResultWorkerResult | None) -> 
 
 
 def replay_result_allows_ack(result: DeliveryReplayDecision | None) -> bool:
-    return result is not None and result.action == "emit_replay_intent"
+    if result is None:
+        return False
+    if result.action == "emit_replay_intent":
+        return True
+    return (
+        result.action == "already_completed_noop"
+        and result.reason_code == "replay_request_already_completed_noop"
+    )

@@ -7,7 +7,7 @@ from uuid import UUID
 
 
 DeliveryRetryAction = Literal["noop", "emit_retry_intent", "dead_letter_retry_ceiling"]
-ReplayAction = Literal["reject", "emit_replay_intent"]
+ReplayAction = Literal["reject", "emit_replay_intent", "already_completed_noop"]
 GateMode = Literal["restricted", "full"]
 GateStatus = Literal["pass", "fail", "warn"]
 MvpReadinessMode = Literal["restricted"]

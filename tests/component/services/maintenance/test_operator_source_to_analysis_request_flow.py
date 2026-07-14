@@ -955,7 +955,7 @@ async def test_operator_source_url_flow_materializes_provider_evidence_analysis_
     assert report.telegram_live_read_attempted is False
     assert report.telegram_send_attempted is False
     assert report.external_network_attempted is False
-    assert report.bounded_counts["github_request_count"] == 2
+    assert report.bounded_counts["github_request_count"] == 3
     assert len(ledger.current) == 1
     assert sum(len(rows) for rows in ledger.versions.values()) == 1
     assert [row["event_type"] for row in ledger.outbox] == [

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -10,6 +11,8 @@ import pytest
 
 from services.maintenance import main as maintenance_main
 from services.maintenance import worker_runtime_crash_probe
+from services.maintenance.models import DeliveryReplayDecision, DeliveryResultWorkerResult
+from services.maintenance.repositories import MaintenanceRepository
 from services.maintenance.worker_runtime_crash_probe import (
     DUE_RETRY_PROMOTION_WORKER_LABEL,
     FATAL_REPORT_SCHEMA_VERSION,
@@ -18,6 +21,7 @@ from services.maintenance.worker_runtime_crash_probe import (
     WORKER_TASK_LABELS,
     WorkerRuntimeCrashProbeRequest,
     WorkerRuntimeTaskResult,
+    build_worker_runtime_components,
     read_worker_runtime_fatal_report,
     run_worker_runtime_crash_probe,
     write_worker_runtime_fatal_report,
@@ -126,6 +130,114 @@ def _worker_factory(label: str, behavior, created: list[FakeRuntimeWorker] | Non
         return worker
 
     return factory
+
+
+@pytest.mark.asyncio
+async def test_runtime_component_session_adapter_preserves_results_and_transaction_failures(monkeypatch) -> None:
+    maintenance_result = DeliveryResultWorkerResult(
+        processed=True,
+        classification="terminal_success",
+        action="mark_terminal_success",
+        reason_code="delivery_result_terminal_success",
+    )
+    replay_result = DeliveryReplayDecision(
+        action="emit_replay_intent",
+        reason_code="explicit_delivery_replay",
+    )
+    constructed_repositories: list[MaintenanceRepository] = []
+    captured_services: dict[str, object] = {}
+
+    class Transaction:
+        def __init__(self, owner) -> None:
+            self._owner = owner
+            self._session = object()
+
+        async def __aenter__(self):
+            self._owner.entered += 1
+            return self._session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            del exc, tb
+            self._owner.exit_types.append(exc_type)
+            return False
+
+    class SessionFactory:
+        def __init__(self) -> None:
+            self.entered = 0
+            self.exit_types: list[type[BaseException] | None] = []
+
+        def begin(self):
+            return Transaction(self)
+
+    async def handle_maintenance_trigger_event(service, trigger_event_id: str):
+        assert isinstance(service._repository, MaintenanceRepository)
+        constructed_repositories.append(service._repository)
+        if trigger_event_id == "raise":
+            raise RuntimeError("redacted adapter handler failure")
+        return maintenance_result
+
+    async def handle_replay_trigger_event(service, trigger_event_id: str):
+        del trigger_event_id
+        assert isinstance(service._repository, MaintenanceRepository)
+        constructed_repositories.append(service._repository)
+        return replay_result
+
+    async def promote_due_retries_once(service, limit: int | None = None) -> int:
+        assert isinstance(service._repository, MaintenanceRepository)
+        constructed_repositories.append(service._repository)
+        assert limit == 7
+        return 3
+
+    def capture_factory(label: str):
+        def factory(config_arg, **kwargs):
+            del config_arg
+            captured_services[label] = kwargs["service"]
+            return object()
+
+        return factory
+
+    session_factory = SessionFactory()
+    monkeypatch.setattr(
+        worker_runtime_crash_probe.MaintenanceService,
+        "handle_maintenance_trigger_event",
+        handle_maintenance_trigger_event,
+    )
+    monkeypatch.setattr(
+        worker_runtime_crash_probe.MaintenanceService,
+        "handle_replay_trigger_event",
+        handle_replay_trigger_event,
+    )
+    monkeypatch.setattr(
+        worker_runtime_crash_probe.MaintenanceService,
+        "promote_due_retries_once",
+        promote_due_retries_once,
+    )
+    components = build_worker_runtime_components(
+        config=_config(),
+        logger=logging.getLogger(__name__),
+        engine_factory=lambda database_url: FakeEngine(),
+        session_factory_builder=lambda engine: session_factory,
+        redis_client_factory=lambda redis_url: FakeRedis(),
+        consumer_factory=lambda *args, **kwargs: object(),
+        maintenance_worker_factory=capture_factory("maintenance"),
+        replay_worker_factory=capture_factory("replay"),
+        due_retry_worker_factory=capture_factory("due_retry"),
+    )
+
+    service = captured_services["maintenance"]
+    assert service is captured_services["replay"]
+    assert service is captured_services["due_retry"]
+    assert await service.handle_maintenance_trigger_event("maintenance") is maintenance_result
+    assert await service.handle_replay_trigger_event("replay") is replay_result
+    assert await service.promote_due_retries_once(limit=7) == 3
+
+    with pytest.raises(RuntimeError, match="redacted adapter handler failure"):
+        await service.handle_maintenance_trigger_event("raise")
+
+    assert components.engine.dispose_called is False
+    assert len(constructed_repositories) == 4
+    assert session_factory.entered == 4
+    assert session_factory.exit_types == [None, None, None, RuntimeError]
 
 
 async def _wait_forever(worker: FakeRuntimeWorker):
