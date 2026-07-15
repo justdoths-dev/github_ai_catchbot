@@ -138,16 +138,86 @@ def test_invalid_env_line_blocks_without_printing_raw_line(tmp_path: Path) -> No
     assert "THIS IS NOT AN ENV LINE" not in rendered
 
 
-def test_too_open_permissions_block_where_supported(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", [0o600, 0o400])
+def test_owner_only_permissions_pass_where_supported(tmp_path: Path, mode: int) -> None:
     if os.name == "nt":
         pytest.skip("POSIX permission bits are not stable on Windows")
-    path = _write_env(tmp_path, _integrated_env_body(), mode=0o644)
+    path = _write_env(tmp_path, _integrated_env_body(), mode=mode)
 
     result = build_collector_runtime_env_overlay(path)
 
+    assert result.ok is True
+    assert result.reason_code == "collector_runtime_env_overlay_ready"
+    assert result.to_sanitized_dict()["file_permission_checked"] is True
+    assert result.to_sanitized_dict()["file_permission_mode"] == f"{mode:04o}"
+
+
+@pytest.mark.parametrize("membership_source", ["effective", "supplementary"])
+def test_restricted_group_read_only_permissions_pass_for_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, membership_source: str
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX permission bits are not stable on Windows")
+    path = _write_env(tmp_path, _integrated_env_body(), mode=0o640)
+    file_gid = path.stat().st_gid
+    non_member_gid = file_gid + 1
+    if membership_source == "effective":
+        monkeypatch.setattr(os, "getegid", lambda: file_gid)
+        monkeypatch.setattr(os, "getgroups", lambda: [])
+    else:
+        monkeypatch.setattr(os, "getegid", lambda: non_member_gid)
+        monkeypatch.setattr(os, "getgroups", lambda: [file_gid])
+
+    result = build_collector_runtime_env_overlay(path)
+
+    assert result.ok is True
+    assert result.reason_code == "collector_runtime_env_overlay_ready"
+    assert result.to_sanitized_dict()["file_permission_checked"] is True
+    assert result.to_sanitized_dict()["file_permission_mode"] == "0640"
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o660, 0o650, 0o641, 0o664])
+def test_unsafe_group_or_other_permissions_block_where_supported(tmp_path: Path, mode: int) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX permission bits are not stable on Windows")
+    path = _write_env(tmp_path, _integrated_env_body(), mode=mode)
+
+    result = build_collector_runtime_env_overlay(path)
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
     assert result.ok is False
     assert result.reason_code == "runtime_env_file_permissions_too_open"
-    assert result.to_sanitized_dict()["file_permission_checked"] is True
+    assert report["file_permission_checked"] is True
+    assert report["file_permission_mode"] == f"{mode:04o}"
+    assert report["runtime_env_values_printed"] is False
+    assert report["runtime_env_file_contents_printed"] is False
+    assert report["runtime_env_file_path_printed"] is False
+    for value in SENTINEL_VALUES:
+        assert value not in rendered
+
+
+def test_group_read_only_permissions_block_for_non_member_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name == "nt":
+        pytest.skip("POSIX permission bits are not stable on Windows")
+    path = _write_env(tmp_path, _integrated_env_body(), mode=0o640)
+    file_gid = path.stat().st_gid
+    non_member_gid = file_gid + 1
+    monkeypatch.setattr(os, "getegid", lambda: non_member_gid)
+    monkeypatch.setattr(os, "getgroups", lambda: [non_member_gid])
+
+    result = build_collector_runtime_env_overlay(path)
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert result.reason_code == "runtime_env_file_permissions_too_open"
+    assert report["file_permission_checked"] is True
+    assert report["file_permission_mode"] == "0640"
+    assert report["runtime_env_values_printed"] is False
+    assert report["runtime_env_file_contents_printed"] is False
+    assert report["runtime_env_file_path_printed"] is False
 
 
 def test_missing_file_blocks() -> None:

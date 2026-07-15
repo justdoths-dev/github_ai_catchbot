@@ -221,13 +221,22 @@ def build_collector_runtime_env_overlay(runtime_env_file: str | os.PathLike[str]
 def _runtime_env_file_status(path: Path) -> CollectorRuntimeEnvOverlayResult | None:
     if not path.is_file():
         return _blocked("runtime_env_file_missing")
-    mode = stat.S_IMODE(path.stat().st_mode)
-    if os.name != "nt" and mode & (stat.S_IRWXG | stat.S_IRWXO):
-        return _blocked(
-            "runtime_env_file_permissions_too_open",
-            file_permission_checked=True,
-            file_permission_mode=f"{mode:04o}",
-        )
+    file_stat = path.stat()
+    mode = stat.S_IMODE(file_stat.st_mode)
+    if os.name != "nt":
+        group_permissions = mode & stat.S_IRWXG
+        other_permissions = mode & stat.S_IRWXO
+        permissions_too_open = bool(other_permissions)
+        if group_permissions:
+            group_read_only = group_permissions == stat.S_IRGRP
+            process_groups = {os.getegid(), *os.getgroups()} if group_read_only else set()
+            permissions_too_open = permissions_too_open or file_stat.st_gid not in process_groups
+        if permissions_too_open:
+            return _blocked(
+                "runtime_env_file_permissions_too_open",
+                file_permission_checked=True,
+                file_permission_mode=f"{mode:04o}",
+            )
     return None
 
 
