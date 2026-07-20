@@ -237,8 +237,21 @@ class _FakeProofRepository:
 class _FakeProofHistoryClient:
     def __init__(self) -> None:
         self.calls: list[dict[str, int]] = []
+        self.public_chat_hydration_calls = 0
+        self.operation_order: list[str] = []
+
+    async def hydrate_public_chat(
+        self,
+        *,
+        source_value: str,
+        expected_chat_id: int,
+    ) -> None:
+        del source_value, expected_chat_id
+        self.public_chat_hydration_calls += 1
+        self.operation_order.append("hydrate_public_chat")
 
     async def fetch_newest_history_messages(self, *, chat_id: int, limit: int) -> Sequence[Mapping[str, Any]]:
+        self.operation_order.append("get_chat_history")
         self.calls.append({"chat_id": chat_id, "limit": limit})
         return (
             {
@@ -377,6 +390,8 @@ def build_restricted_live_collector_one_channel_source_read_rollout_packet(
     packet["actual_attempted_operations"].update(
         {
             "collector_bounded_runner_invoked": True,
+            "fake_public_chat_hydration_attempted": bool(lower.get("public_chat_hydration_attempted")),
+            "fake_public_chat_hydration_calls": runtime_builder.history_client.public_chat_hydration_calls,
             "fake_telegram_history_read_attempted": bool(lower.get("telegram_read_attempted")),
             "fake_telegram_history_read_calls": len(runtime_builder.history_client.calls),
             "fake_repository_write_attempted": bool(lower.get("database_write_attempted")),
@@ -388,6 +403,8 @@ def build_restricted_live_collector_one_channel_source_read_rollout_packet(
         }
     )
     packet["readback"] = {
+        "fake_public_chat_hydration_before_history": runtime_builder.history_client.operation_order
+        == ["hydrate_public_chat", "get_chat_history"],
         "fake_source_read_messages_observed": int(lower.get("messages_seen") or 0),
         "fake_source_messages_created_or_reused": int(
             (lower.get("readback") or {}).get("source_current_found_count") or 0
@@ -728,6 +745,8 @@ def _base_packet(
         },
         "actual_attempted_operations": {
             "collector_bounded_runner_invoked": False,
+            "fake_public_chat_hydration_attempted": False,
+            "fake_public_chat_hydration_calls": 0,
             "fake_telegram_history_read_attempted": False,
             "fake_telegram_history_read_calls": 0,
             "fake_repository_write_attempted": False,
@@ -742,6 +761,7 @@ def _base_packet(
             "docker_or_systemd_called": False,
         },
         "readback": {
+            "fake_public_chat_hydration_before_history": False,
             "fake_source_read_messages_observed": 0,
             "fake_source_messages_created_or_reused": 0,
             "fake_source_versions_created_or_reused": 0,

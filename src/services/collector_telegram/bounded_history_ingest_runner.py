@@ -182,6 +182,10 @@ _SEARCH_REASON_CODES = frozenset(
         "tdlib_not_authorized",
         "tdlib_auth_state_invalid",
         "tdlib_auth_ready_timeout",
+        "telegram_public_chat_hydration_failed",
+        "telegram_public_chat_hydration_response_invalid",
+        "telegram_public_chat_hydration_timeout",
+        "telegram_public_chat_identity_mismatch",
         "telegram_history_read_failed",
         "telegram_history_response_invalid",
         "telegram_history_read_timeout",
@@ -290,6 +294,13 @@ class BoundedHistoryRepository(Protocol):
 
 
 class BoundedHistoryClient(Protocol):
+    async def hydrate_public_chat(
+        self,
+        *,
+        source_value: str,
+        expected_chat_id: int,
+    ) -> None: ...
+
     async def fetch_newest_history_messages(
         self,
         *,
@@ -349,6 +360,10 @@ class BoundedTelegramCollectorHistoryIngestState:
     registry_targets_seen_count: int = 0
     history_window_attempts: int = 0
     history_request_count: int = 0
+    public_chat_hydration_attempted: bool = False
+    public_chat_hydration_succeeded: bool = False
+    public_chat_hydration_request_count: int = 0
+    public_chat_identity_match_confirmed: bool = False
     tdlib_auth_ready_checked: bool = False
     tdlib_auth_ready: bool = False
     tdlib_parameters_submitted: bool = False
@@ -530,6 +545,7 @@ class BoundedTelegramCollectorHistoryIngestResult:
         }
         bounded_counts = {
             "registry_targets": self.state.registry_targets_seen_count,
+            "public_chat_hydration_requests": self.state.public_chat_hydration_request_count,
             "source_messages_created": self.source_messages_created_count,
             "source_versions_created": self.source_versions_appended_count,
             "source_created_events": self.source_created_events_count,
@@ -606,6 +622,10 @@ class BoundedTelegramCollectorHistoryIngestResult:
             "status": _report_status(self.status, self.ok),
             "reason_code": self.error_code or "ok",
             "history_read_failure_cause_bucket": self.history_read_failure_cause_bucket,
+            "public_chat_hydration_attempted": self.state.public_chat_hydration_attempted,
+            "public_chat_hydration_succeeded": self.state.public_chat_hydration_succeeded,
+            "public_chat_hydration_request_count": self.state.public_chat_hydration_request_count,
+            "public_chat_identity_match_confirmed": self.state.public_chat_identity_match_confirmed,
             "exact_message_read_attempted": self.state.exact_message_read_attempted,
             "exact_message_read_succeeded": self.state.exact_message_read_succeeded,
             "exact_message_read_failure_cause_bucket": self.state.exact_message_read_failure_cause_bucket
@@ -807,6 +827,10 @@ class BoundedTelegramCollectorGitHubSearchResult:
                 "regex": self.selected_regex_match,
             },
             "history_request_count": self.state.history_request_count,
+            "public_chat_hydration_attempted": self.state.public_chat_hydration_attempted,
+            "public_chat_hydration_succeeded": self.state.public_chat_hydration_succeeded,
+            "public_chat_hydration_request_count": self.state.public_chat_hydration_request_count,
+            "public_chat_identity_match_confirmed": self.state.public_chat_identity_match_confirmed,
             "telegram_read_attempted": self.state.telegram_read_attempted,
             "telegram_read_called": self.state.telegram_read_called,
             "telegram_read_succeeded": self.state.telegram_read_succeeded,
@@ -919,6 +943,9 @@ class _TargetSourceLastExecution:
     target: _ResolvedTarget
     messages_seen: int = 0
     history_window_attempts: int = 0
+    public_chat_hydration_attempted: bool = False
+    public_chat_hydration_succeeded: bool = False
+    public_chat_identity_match_confirmed: bool = False
     exact_message_read_attempted: bool = False
     exact_message_read_succeeded: bool = False
     exact_message_read_failure_cause_bucket: str | None = None
@@ -977,6 +1004,54 @@ class _TDLibBoundedHistoryClient:
         self._timeout_sec = timeout_sec
         self._auth_ready_timeout_sec = auth_ready_timeout_sec
         self._require_native_log_suppression = require_native_log_suppression
+
+    async def hydrate_public_chat(
+        self,
+        *,
+        source_value: str,
+        expected_chat_id: int,
+    ) -> None:
+        await self._ensure_ready_for_history_read()
+        request = self._tdlib.build_search_public_chat_request(source_value)
+        payload = dict(request.payload)
+        extra = f"{RUNNER_NAME}:public_chat_hydration:{uuid4()}"
+        payload["@extra"] = extra
+        try:
+            await self._tdlib.send(payload)
+        except TDLibTransportError as exc:
+            raise BoundedHistoryIngestError(
+                "telegram_public_chat_hydration_failed",
+                history_read_failure_cause_bucket=HISTORY_READ_CAUSE_RUNTIME_TDLIB_ACCESS_ISSUE,
+            ) from exc
+
+        deadline = time.monotonic() + self._timeout_sec
+        while time.monotonic() < deadline:
+            receive_timeout = min(HISTORY_RECEIVE_TIMEOUT_SEC, max(0.0, deadline - time.monotonic()))
+            try:
+                response = await self._tdlib.receive(receive_timeout)
+            except TDLibTransportError as exc:
+                raise BoundedHistoryIngestError(
+                    "telegram_public_chat_hydration_failed",
+                    history_read_failure_cause_bucket=HISTORY_READ_CAUSE_RUNTIME_TDLIB_ACCESS_ISSUE,
+                ) from exc
+            if response is None:
+                continue
+            if response.get("@extra") != extra:
+                continue
+            if response.get("@type") == "error":
+                raise BoundedHistoryIngestError(
+                    "telegram_public_chat_hydration_failed",
+                    history_read_failure_cause_bucket=_classify_tdlib_history_read_error_cause(response),
+                )
+            if response.get("@type") != "chat":
+                raise BoundedHistoryIngestError("telegram_public_chat_hydration_response_invalid")
+            resolved_chat_id = response.get("id")
+            if type(resolved_chat_id) is not int:
+                raise BoundedHistoryIngestError("telegram_public_chat_hydration_response_invalid")
+            if resolved_chat_id != expected_chat_id:
+                raise BoundedHistoryIngestError("telegram_public_chat_identity_mismatch")
+            return
+        raise BoundedHistoryIngestError("telegram_public_chat_hydration_timeout")
 
     async def fetch_newest_history_messages(
         self,
@@ -1063,6 +1138,8 @@ class _TDLibBoundedHistoryClient:
         await self._tdlib.close()
 
     async def _ensure_ready_for_history_read(self) -> None:
+        if self._state.tdlib_auth_ready:
+            return
         try:
             await self._tdlib.initialize()
         except TDLibTransportError as exc:
@@ -1298,6 +1375,22 @@ async def _fetch_history_for_target(
     if latest_bounded_window_history_failure is not None:
         raise latest_bounded_window_history_failure
     return ()
+
+
+async def _hydrate_public_chat_for_target(
+    *,
+    history_client: BoundedHistoryClient,
+    target: _ResolvedTarget,
+    state: BoundedTelegramCollectorHistoryIngestState,
+) -> None:
+    state.public_chat_hydration_attempted = True
+    state.public_chat_hydration_request_count += 1
+    await history_client.hydrate_public_chat(
+        source_value=target.source_value_surface,
+        expected_chat_id=target.chat_id,
+    )
+    state.public_chat_hydration_succeeded = True
+    state.public_chat_identity_match_confirmed = True
 
 
 class HistoryMessageIngestProcessor:
@@ -1621,6 +1714,11 @@ async def _run_bounded_telegram_collector_github_search(
         registry_target_fingerprint = _target_fingerprint(target)
 
         state.telegram_read_attempted = True
+        await _hydrate_public_chat_for_target(
+            history_client=runtime.history_client,
+            target=target,
+            state=state,
+        )
         request_count_before = state.history_request_count
         messages = await runtime.history_client.fetch_newest_history_messages(
             chat_id=target.chat_id,
@@ -2397,6 +2495,9 @@ async def _execute_target_source_last(
     readback = SourceLastReadbackResult()
     source_commit_durable = False
     history_window_attempts = 0
+    public_chat_hydration_attempted = False
+    public_chat_hydration_succeeded = False
+    public_chat_identity_match_confirmed = False
     exact_message_read_attempted = False
     exact_message_read_succeeded = False
     exact_message_read_failure_cause_bucket: str | None = None
@@ -2406,6 +2507,9 @@ async def _execute_target_source_last(
             target=target,
             messages_seen=len(selected_messages),
             history_window_attempts=history_window_attempts,
+            public_chat_hydration_attempted=public_chat_hydration_attempted,
+            public_chat_hydration_succeeded=public_chat_hydration_succeeded,
+            public_chat_identity_match_confirmed=public_chat_identity_match_confirmed,
             exact_message_read_attempted=exact_message_read_attempted,
             exact_message_read_succeeded=exact_message_read_succeeded,
             exact_message_read_failure_cause_bucket=exact_message_read_failure_cause_bucket
@@ -2426,6 +2530,14 @@ async def _execute_target_source_last(
 
     try:
         state.telegram_read_attempted = True
+        public_chat_hydration_attempted = True
+        await _hydrate_public_chat_for_target(
+            history_client=runtime.history_client,
+            target=target,
+            state=state,
+        )
+        public_chat_hydration_succeeded = True
+        public_chat_identity_match_confirmed = True
         attempt_start = state.history_window_attempts
         exact_attempted_before = state.exact_message_read_attempted
         try:
@@ -2681,6 +2793,15 @@ def _channel_report(
         "messages_requested": history_limit,
         "messages_seen": 0 if execution is None else execution.messages_seen,
         "history_window_attempts": 0 if execution is None else execution.history_window_attempts,
+        "public_chat_hydration_attempted": False
+        if execution is None
+        else execution.public_chat_hydration_attempted,
+        "public_chat_hydration_succeeded": False
+        if execution is None
+        else execution.public_chat_hydration_succeeded,
+        "public_chat_identity_match_confirmed": False
+        if execution is None
+        else execution.public_chat_identity_match_confirmed,
         "exact_message_read_attempted": False if execution is None else execution.exact_message_read_attempted,
         "exact_message_read_succeeded": False if execution is None else execution.exact_message_read_succeeded,
         "exact_message_read_failure_cause_bucket": None

@@ -367,6 +367,7 @@ class FakeHistoryClient:
         messages_by_chat: dict[int, list[dict[str, Any]]] | None = None,
         failure_by_chat: dict[int, Exception] | None = None,
         responses_by_call: list[list[dict[str, Any]] | Exception] | None = None,
+        hydration_responses_by_call: list[Exception | None] | None = None,
         exact_message_response: dict[str, Any] | None | object = _DEFAULT_EXACT_MESSAGE_RESPONSE,
         exact_responses_by_call: list[dict[str, Any] | None | Exception] | None = None,
     ) -> None:
@@ -374,11 +375,24 @@ class FakeHistoryClient:
         self.messages_by_chat = messages_by_chat or {}
         self.failure_by_chat = failure_by_chat or {}
         self.responses_by_call = list(responses_by_call or [])
+        self.hydration_responses_by_call = list(hydration_responses_by_call or [])
         self.exact_message_response = exact_message_response
         self.exact_responses_by_call = list(exact_responses_by_call or [])
         self.calls: list[dict[str, int]] = []
+        self.public_chat_hydration_calls: list[dict[str, Any]] = []
+        self.operation_order: list[str] = []
         self.exact_calls: list[dict[str, int]] = []
         self.closed = False
+
+    async def hydrate_public_chat(self, *, source_value: str, expected_chat_id: int) -> None:
+        self.operation_order.append("hydrate_public_chat")
+        self.public_chat_hydration_calls.append(
+            {"source_value": source_value, "expected_chat_id": expected_chat_id}
+        )
+        if self.hydration_responses_by_call:
+            response = self.hydration_responses_by_call.pop(0)
+            if isinstance(response, Exception):
+                raise response
 
     async def fetch_newest_history_messages(
         self,
@@ -388,6 +402,7 @@ class FakeHistoryClient:
         from_message_id: int = 0,
         offset: int = 0,
     ):
+        self.operation_order.append("get_chat_history")
         call = {"chat_id": chat_id, "limit": limit}
         if from_message_id:
             call["from_message_id"] = from_message_id
@@ -404,6 +419,7 @@ class FakeHistoryClient:
         return tuple(deepcopy(self.messages_by_chat.get(chat_id, self.messages)))
 
     async def read_exact_message(self, *, chat_id: int, message_id: int):
+        self.operation_order.append("get_message")
         self.exact_calls.append({"chat_id": chat_id, "message_id": message_id})
         if self.exact_responses_by_call:
             response = self.exact_responses_by_call.pop(0)
@@ -480,8 +496,10 @@ class FakeTDLibTransport:
         auth_payloads: list[dict[str, Any]] | None = None,
         history_messages: list[dict[str, Any]] | None = None,
         history_response: dict[str, Any] | None = None,
+        public_chat_response: dict[str, Any] | None = None,
         exact_message_response: dict[str, Any] | None = None,
         append_history_response: bool = True,
+        append_public_chat_response: bool = True,
         append_exact_message_response: bool = True,
         log_suppression_attempted: bool = True,
         log_suppression_confirmed: bool = True,
@@ -489,8 +507,12 @@ class FakeTDLibTransport:
         self.auth_payloads = list(auth_payloads or [])
         self.history_messages = list(history_messages or [_message()])
         self.history_response = deepcopy(history_response) if history_response is not None else None
+        self.public_chat_response = (
+            deepcopy(public_chat_response) if public_chat_response is not None else None
+        )
         self.exact_message_response = deepcopy(exact_message_response) if exact_message_response is not None else None
         self.append_history_response = append_history_response
+        self.append_public_chat_response = append_public_chat_response
         self.append_exact_message_response = append_exact_message_response
         self.log_suppression_attempted = log_suppression_attempted
         self.log_suppression_confirmed = log_suppression_confirmed
@@ -503,6 +525,17 @@ class FakeTDLibTransport:
 
     async def send(self, request: dict[str, Any]) -> None:
         self.sent_requests.append(dict(request))
+        if request.get("@type") == "searchPublicChat":
+            if not self.append_public_chat_response:
+                return
+            extra = request.get("@extra")
+            response = (
+                deepcopy(self.public_chat_response)
+                if self.public_chat_response is not None
+                else {"@type": "chat", "id": RAW_CHAT_ID}
+            )
+            response["@extra"] = extra
+            self.auth_payloads.append(response)
         if request.get("@type") == "getChatHistory":
             if not self.append_history_response:
                 return
@@ -628,6 +661,10 @@ class FakeDefaultHistoryClient:
         self.state = state
         self.close_calls = 0
         self.close_error: Exception | None = None
+
+    async def hydrate_public_chat(self, *, source_value: str, expected_chat_id: int) -> None:
+        del source_value, expected_chat_id
+        raise AssertionError("default runtime close tests do not hydrate public chats")
 
     async def fetch_newest_history_messages(self, *, chat_id: int, limit: int):
         del chat_id, limit
@@ -1363,6 +1400,7 @@ async def test_successful_run_with_implicit_transaction_persists_on_close_commit
     assert report["source_created_events_count"] == 1
     assert report["bounded_counts"] == {
         "registry_targets": 1,
+        "public_chat_hydration_requests": 1,
         "source_messages_created": 1,
         "source_versions_created": 1,
         "source_created_events": 1,
@@ -1379,6 +1417,14 @@ async def test_successful_run_with_implicit_transaction_persists_on_close_commit
         "exact_runner_completed": True,
     }
     assert repository.registry_lookups == ["trendingrepo"]
+    assert history.public_chat_hydration_calls == [
+        {"source_value": "trendingrepo", "expected_chat_id": RAW_CHAT_ID}
+    ]
+    assert history.operation_order == ["hydrate_public_chat", "get_chat_history"]
+    assert report["public_chat_hydration_attempted"] is True
+    assert report["public_chat_hydration_succeeded"] is True
+    assert report["public_chat_hydration_request_count"] == 1
+    assert report["public_chat_identity_match_confirmed"] is True
     assert repository.transaction_enters == 3
     assert builder.commit_calls == 2
     assert builder.pre_commit_committed_counts == [(0, 0, 0), (1, 1, 1)]
@@ -1677,11 +1723,19 @@ async def test_search_uses_one_exact_history_read_selects_later_match_and_never_
     assert report["messages_returned"] == 2
     assert report["messages_examined"] == 2
     assert report["history_request_count"] == 1
+    assert report["public_chat_hydration_attempted"] is True
+    assert report["public_chat_hydration_succeeded"] is True
+    assert report["public_chat_hydration_request_count"] == 1
+    assert report["public_chat_identity_match_confirmed"] is True
     assert report["selected_message_fingerprint"] == _target_message_fingerprint(RAW_MESSAGE_ID + 1)
     assert repository.registry_lookups == ["trendingrepo"]
     assert history.search_calls == [
         {"chat_id": RAW_CHAT_ID, "limit": 2, "from_message_id": 0, "offset": 0}
     ]
+    assert history.public_chat_hydration_calls == [
+        {"source_value": "trendingrepo", "expected_chat_id": RAW_CHAT_ID}
+    ]
+    assert history.operation_order == ["hydrate_public_chat", "get_chat_history"]
     assert history.exact_calls == []
     assert repository.upsert_calls == 0
     assert repository.messages == {}
@@ -1700,6 +1754,43 @@ async def test_search_uses_one_exact_history_read_selects_later_match_and_never_
         "commit_requested": False,
         "commit_called": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_search_public_chat_hydration_failure_is_preserved_and_never_reads_or_writes() -> None:
+    history = SearchHistoryClient(
+        [_search_message("https://github.com/example/repo")],
+        hydration_responses_by_call=[
+            BoundedHistoryIngestError(
+                "telegram_public_chat_hydration_failed",
+                history_read_failure_cause_bucket=HISTORY_READ_CAUSE_TARGET_UNAVAILABLE,
+            )
+        ],
+    )
+    repository = SearchWriteBombRepository()
+    result, _loader, builder, repository, history = await _run(
+        _approved_search_config(),
+        repository=repository,
+        history=history,
+        commit_error=AssertionError("search must not commit"),
+    )
+    report = result.to_sanitized_dict()
+
+    assert result.ok is False
+    assert report["reason_code"] == "telegram_public_chat_hydration_failed"
+    assert report["safe_failure_bucket"] == HISTORY_READ_CAUSE_TARGET_UNAVAILABLE
+    assert report["public_chat_hydration_attempted"] is True
+    assert report["public_chat_hydration_succeeded"] is False
+    assert report["public_chat_hydration_request_count"] == 1
+    assert report["history_request_count"] == 0
+    assert history.operation_order == ["hydrate_public_chat"]
+    assert history.search_calls == []
+    assert repository.messages == {}
+    assert repository.versions == {}
+    assert repository.outbox == []
+    assert repository.cursor_updates == []
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
 
 
 @pytest.mark.asyncio
@@ -3372,6 +3463,16 @@ async def test_direct_exact_message_fallback_after_all_bounded_history_failures_
         {"chat_id": RAW_CHAT_ID, "limit": 3, "from_message_id": target_message_id, "offset": -2},
         {"chat_id": RAW_CHAT_ID, "limit": 3},
     ]
+    assert len(history.public_chat_hydration_calls) == 1
+    assert history.operation_order == [
+        "hydrate_public_chat",
+        "get_chat_history",
+        "get_chat_history",
+        "get_chat_history",
+        "get_chat_history",
+        "get_message",
+    ]
+    assert report["public_chat_hydration_request_count"] == 1
     assert history.exact_calls == [{"chat_id": RAW_CHAT_ID, "message_id": target_message_id}]
     assert builder.close_commits == [True]
     assert report["raw_values_printed"]["raw_id"] is False
@@ -4135,6 +4236,18 @@ async def test_three_channel_execute_processes_each_channel_once_with_sanitized_
         {"chat_id": RAW_CHAT_ID + 1, "limit": 1},
         {"chat_id": RAW_CHAT_ID + 2, "limit": 1},
     ]
+    assert len(history.public_chat_hydration_calls) == 3
+    assert history.operation_order == [
+        "hydrate_public_chat",
+        "get_chat_history",
+        "hydrate_public_chat",
+        "get_chat_history",
+        "hydrate_public_chat",
+        "get_chat_history",
+    ]
+    assert report["public_chat_hydration_request_count"] == 3
+    assert report["public_chat_hydration_succeeded"] is True
+    assert report["public_chat_identity_match_confirmed"] is True
     assert len(repository.messages) == 3
     assert len(repository.outbox) == 3
     assert len(repository.cursor_updates) == 3
@@ -4856,6 +4969,195 @@ async def test_invalid_existing_source_message_id_fails_closed_before_database_w
     assert repository.upsert_calls == 0
     assert repository.outbox == []
     assert builder.close_commits == [False]
+
+
+@pytest.mark.asyncio
+async def test_public_chat_identity_mismatch_blocks_source_last_before_history_and_writes() -> None:
+    history = FakeHistoryClient(
+        [_message()],
+        hydration_responses_by_call=[
+            BoundedHistoryIngestError("telegram_public_chat_identity_mismatch")
+        ],
+    )
+    result, _loader, builder, repository, history = await _run(
+        _approved_config(),
+        history=history,
+    )
+    report = result.to_sanitized_dict()
+    rendered = json.dumps(report, sort_keys=True)
+
+    assert result.ok is False
+    assert report["reason_code"] == "telegram_public_chat_identity_mismatch"
+    assert report["public_chat_hydration_attempted"] is True
+    assert report["public_chat_hydration_succeeded"] is False
+    assert report["public_chat_hydration_request_count"] == 1
+    assert report["public_chat_identity_match_confirmed"] is False
+    assert report["per_channel_results"][0]["public_chat_hydration_attempted"] is True
+    assert report["per_channel_results"][0]["public_chat_hydration_succeeded"] is False
+    assert history.operation_order == ["hydrate_public_chat"]
+    assert history.calls == []
+    assert history.exact_calls == []
+    assert repository.messages == {}
+    assert repository.versions == {}
+    assert repository.outbox == []
+    assert repository.cursor_updates == []
+    assert builder.commit_calls == 0
+    assert builder.close_commits == [False]
+    assert report["source_message_write_attempted"] is False
+    assert report["channel_cursor_write_attempted"] is False
+    assert report["redis_publish_attempted"] is False
+    for raw_value in (str(RAW_CHAT_ID), RAW_MESSAGE_TEXT, DB_URL, RAW_SECRET):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_tdlib_public_chat_hydration_precedes_history_with_matching_identity() -> None:
+    state = BoundedTelegramCollectorHistoryIngestState()
+    transport = FakeTDLibTransport(auth_payloads=[{"@type": "authorizationStateReady"}])
+    client = _TDLibBoundedHistoryClient(
+        TDLibClient(_runtime_config(), transport=transport),
+        state=state,
+        auth_ready_timeout_sec=0.1,
+    )
+    target = runner_module._ResolvedTarget(
+        chat_id=RAW_CHAT_ID,
+        registry_id="11111111-1111-1111-1111-111111111111",
+        source_value_surface="@trendingrepo",
+        joined=True,
+        chat_id_present=True,
+    )
+
+    await runner_module._hydrate_public_chat_for_target(
+        history_client=client,
+        target=target,
+        state=state,
+    )
+    messages = await client.fetch_newest_history_messages(chat_id=RAW_CHAT_ID, limit=1)
+
+    assert [request["@type"] for request in transport.sent_requests] == [
+        "getAuthorizationState",
+        "searchPublicChat",
+        "getChatHistory",
+    ]
+    assert transport.sent_requests[1]["username"] == "trendingrepo"
+    assert transport.sent_requests[1]["@extra"].startswith(
+        "bounded_collector_history_ingest_runner:public_chat_hydration:"
+    )
+    assert state.public_chat_hydration_attempted is True
+    assert state.public_chat_hydration_succeeded is True
+    assert state.public_chat_hydration_request_count == 1
+    assert state.public_chat_identity_match_confirmed is True
+    assert state.history_request_count == 1
+    assert messages[0]["id"] == RAW_MESSAGE_ID
+
+
+@pytest.mark.asyncio
+async def test_tdlib_public_chat_identity_mismatch_blocks_before_history_request() -> None:
+    state = BoundedTelegramCollectorHistoryIngestState()
+    transport = FakeTDLibTransport(
+        auth_payloads=[{"@type": "authorizationStateReady"}],
+        public_chat_response={"@type": "chat", "id": RAW_CHAT_ID + 1},
+    )
+    client = _TDLibBoundedHistoryClient(
+        TDLibClient(_runtime_config(), transport=transport),
+        state=state,
+        auth_ready_timeout_sec=0.1,
+    )
+
+    with pytest.raises(BoundedHistoryIngestError) as exc_info:
+        await client.hydrate_public_chat(source_value="trendingrepo", expected_chat_id=RAW_CHAT_ID)
+
+    assert exc_info.value.error_code == "telegram_public_chat_identity_mismatch"
+    assert [request["@type"] for request in transport.sent_requests] == [
+        "getAuthorizationState",
+        "searchPublicChat",
+    ]
+    assert state.history_request_count == 0
+
+
+@pytest.mark.asyncio
+async def test_tdlib_public_chat_error_is_sanitized_and_blocks_before_history_request() -> None:
+    state = BoundedTelegramCollectorHistoryIngestState()
+    transport = FakeTDLibTransport(
+        auth_payloads=[{"@type": "authorizationStateReady"}],
+        public_chat_response={
+            "@type": "error",
+            "code": 404,
+            "message": f"CHAT_NOT_FOUND {RAW_CHAT_ID}",
+            "source_text": RAW_MESSAGE_TEXT,
+            "debug_detail": EXCEPTION_DETAIL,
+        },
+    )
+    client = _TDLibBoundedHistoryClient(
+        TDLibClient(_runtime_config(), transport=transport),
+        state=state,
+        auth_ready_timeout_sec=0.1,
+    )
+
+    with pytest.raises(BoundedHistoryIngestError) as exc_info:
+        await client.hydrate_public_chat(source_value="trendingrepo", expected_chat_id=RAW_CHAT_ID)
+
+    rendered = json.dumps(
+        {
+            "error_code": exc_info.value.error_code,
+            "history_read_failure_cause_bucket": exc_info.value.history_read_failure_cause_bucket,
+        },
+        sort_keys=True,
+    )
+    assert exc_info.value.error_code == "telegram_public_chat_hydration_failed"
+    assert exc_info.value.history_read_failure_cause_bucket == HISTORY_READ_CAUSE_TARGET_UNAVAILABLE
+    assert [request["@type"] for request in transport.sent_requests] == [
+        "getAuthorizationState",
+        "searchPublicChat",
+    ]
+    assert state.history_request_count == 0
+    for raw_value in (str(RAW_CHAT_ID), RAW_MESSAGE_TEXT, EXCEPTION_DETAIL):
+        assert raw_value not in rendered
+
+
+@pytest.mark.asyncio
+async def test_tdlib_public_chat_invalid_response_and_timeout_fail_closed_before_history() -> None:
+    invalid_state = BoundedTelegramCollectorHistoryIngestState()
+    invalid_transport = FakeTDLibTransport(
+        auth_payloads=[{"@type": "authorizationStateReady"}],
+        public_chat_response={"@type": "chat", "id": True},
+    )
+    invalid_client = _TDLibBoundedHistoryClient(
+        TDLibClient(_runtime_config(), transport=invalid_transport),
+        state=invalid_state,
+        auth_ready_timeout_sec=0.1,
+    )
+
+    with pytest.raises(BoundedHistoryIngestError) as invalid_exc:
+        await invalid_client.hydrate_public_chat(source_value="trendingrepo", expected_chat_id=RAW_CHAT_ID)
+
+    timeout_state = BoundedTelegramCollectorHistoryIngestState()
+    timeout_transport = FakeTDLibTransport(
+        auth_payloads=[{"@type": "authorizationStateReady"}],
+        append_public_chat_response=False,
+    )
+    timeout_client = _TDLibBoundedHistoryClient(
+        TDLibClient(_runtime_config(), transport=timeout_transport),
+        state=timeout_state,
+        timeout_sec=0.01,
+        auth_ready_timeout_sec=0.1,
+    )
+
+    with pytest.raises(BoundedHistoryIngestError) as timeout_exc:
+        await timeout_client.hydrate_public_chat(source_value="trendingrepo", expected_chat_id=RAW_CHAT_ID)
+
+    assert invalid_exc.value.error_code == "telegram_public_chat_hydration_response_invalid"
+    assert timeout_exc.value.error_code == "telegram_public_chat_hydration_timeout"
+    assert [request["@type"] for request in invalid_transport.sent_requests] == [
+        "getAuthorizationState",
+        "searchPublicChat",
+    ]
+    assert [request["@type"] for request in timeout_transport.sent_requests] == [
+        "getAuthorizationState",
+        "searchPublicChat",
+    ]
+    assert invalid_state.history_request_count == 0
+    assert timeout_state.history_request_count == 0
 
 
 @pytest.mark.asyncio

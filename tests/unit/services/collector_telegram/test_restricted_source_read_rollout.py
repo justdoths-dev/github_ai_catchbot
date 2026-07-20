@@ -85,11 +85,14 @@ def test_one_channel_source_read_rollout_packet_uses_fake_collector_path_without
     assert report["runtime_authority_opened_in_this_run"]["production_database_write"] is False
     assert report["runtime_authority_opened_in_this_run"]["redis_mutation"] is False
     assert report["actual_attempted_operations"]["collector_bounded_runner_invoked"] is True
+    assert report["actual_attempted_operations"]["fake_public_chat_hydration_attempted"] is True
+    assert report["actual_attempted_operations"]["fake_public_chat_hydration_calls"] == 1
     assert report["actual_attempted_operations"]["fake_telegram_history_read_attempted"] is True
     assert report["actual_attempted_operations"]["fake_telegram_history_read_calls"] == 1
     assert report["actual_attempted_operations"]["fake_repository_write_attempted"] is True
     assert report["actual_attempted_operations"]["redis_publish_attempted"] is False
     assert report["readback"]["fake_source_read_messages_observed"] == 1
+    assert report["readback"]["fake_public_chat_hydration_before_history"] is True
     assert report["readback"]["fake_source_messages_created_or_reused"] == 1
     assert report["readback"]["fake_source_versions_created_or_reused"] == 1
     assert report["readback"]["fake_source_outbox_events_created_or_reused"] == 1
