@@ -1,0 +1,18 @@
+# Cline exposure-reduction ignores. These do not replace repository inspection.
+venv/
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+*.pyo
+.env
+.env.*
+runtime.env
+*.log
+logs/
+state/
+tmp/
+temp/
+codex-review-bundles/

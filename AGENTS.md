@@ -1,8 +1,8 @@
-# Codex Operating Instructions: github_ai_catchbot
+# Automated Worker Operating Instructions: github_ai_catchbot
 
 These instructions apply to the whole repository. They are the canonical
-repo-local operating contract for Codex and other automated agents working on
-`justdoths-dev/github_ai_catchbot`.
+repo-local operating contract for authorized automated workers and the
+operator working on `justdoths-dev/github_ai_catchbot`.
 
 ## Project Mission
 
@@ -26,7 +26,8 @@ Known project-source and historical references:
 - `docs/project-source/02_normalization_enrichment_design_stage4_stage5_bundle_v0_1.md`
 - `docs/project-source/03_judge_delivery_operations_stage6_stage10_bundle_v0_1.md`
 - `docs/project-source/04_execution_contracts_migrations_stage11_stage12_bundle_v0_1.md`
-- `github_ai_catchbot_chatgpt_master_roadmap_progress_authority_completion_v3.md`, if present as an active local/project-source doc
+- `github_ai_catchbot_plus_gpt56_high_handoff_master_roadmap_v5.md`, when present as an active local source
+- `github_ai_catchbot_chatgpt_project_source_refresh_progress_delta_2026-07-23.md`, when present as the current local progress delta
 - `docs/project-source/README_replacement_consolidated_v0_20.md` as a historical index only
 - `docs/project-source/05_migration_code_drafts_stage13_stage16_bundle_v0_1.md`
 - `docs/project-source/06_collector_implementation_stage17_stage25_bundle_v0_1.md`
@@ -63,35 +64,106 @@ files, commands, schemas, policy names, hooks, or runtime surfaces.
 
 ## Source of Truth
 
-Read before substantive implementation or review:
+Mandatory read order when required sources are available:
 
-1. `AGENTS.md`
-2. `.codex/config.toml`, if present
-3. `.codex/review-bundle-template.md`, if present
-4. current repo HEAD: code, tests, migrations, `AGENTS.md`, `.codex/*`, and commits
-5. PASS Review Bundles and VPS/runtime readbacks when available to the task
-6. `github_ai_catchbot_chatgpt_master_roadmap_progress_authority_completion_v3.md`, if present as active project source/local doc
-7. locked project-source bundles `00` through `04` for architecture and ownership references
+1. operator-provided current project instructions and exact Task Packet
+2. agent-llm-wiki global workflow, source-of-truth, Task Packet, and review contracts
+3. `agent-llm-wiki/projects/github_ai_catchbot/`: `INDEX`, `PROJECT_PURPOSE`, `CURRENT_STATE`, `ROADMAP`, `OPERATIONS`, `DECISIONS`, and latest Won Verdict
+4. root/scoped `AGENTS.md`
+5. `.codex/config.toml` and `.codex/review-bundle-template.md`
+6. current repository HEAD, source, tests, migrations, commits, and harness files
+7. accepted task-related Review Bundles and runtime readbacks
+8. active v5 roadmap and current progress delta
+9. locked bundles `00` through `04`
+10. archaeology only when explicitly requested
 
-Apply this priority order:
+Mandatory read order and conflict-resolution priority are different contracts.
 
-1. Current repo HEAD: code, tests, migrations, `AGENTS.md`, `.codex/*`, and commits
-2. PASS Review Bundles and VPS/runtime readbacks
-3. `github_ai_catchbot_chatgpt_master_roadmap_progress_authority_completion_v3.md`, if present as active project source/local doc
-4. Locked design bundles `00` through `04`
-5. Historical/archaeology docs only when explicitly requested
+Conflict-resolution/source priority:
+
+1. current repository/runtime evidence
+2. accepted Review Bundle/runtime readback
+3. agent-llm-wiki accepted state
+4. active v5/progress delta
+5. locked bundles `00` through `04`
+6. archaeology
 
 `README_replacement_consolidated_v0_20.md` is a historical index only.
 Implementation bundles `05` through `10` are not active next-step authority.
 `03_GitHub_AI_application_plan.md` is advisory only. These documents do not
-override current code/tests, reviewed PASS bundles/readbacks, active v3
-authority, locked bundles `00` through `04`, service ownership, or contracts
-unless the current task explicitly asks for archaeology.
+override current code/tests, accepted task-related Review Bundles/readbacks,
+actual agent-llm-wiki state, active v5/progress authority, locked bundles `00`
+through `04`, service ownership, or contracts unless the current task explicitly
+asks for archaeology.
 
 `OPEN`, `UX_OPEN`, `AUTHORITY_OPEN`, or `ROLLOUT_OPEN` never means code is
 absent. Re-check current HEAD and reviewed readbacks before adding a new
 surface. If sources conflict and the conflict blocks the bounded task, stop and
 report it.
+
+During a GitHub synchronization outage, the local-only exception permits only
+narrow repair/review work and requires all of: explicit operator approval;
+exact local branch/HEAD/origin relation; known worktree/index/untracked state;
+exact defect, test failure, or demonstrated contract gap; bounded allowed files
+and commands; no new authority; and closed publication and final-verdict
+authority. This is an outage-specific exception, not a normal Wiki bypass.
+
+## Automated Worker Authority, Routes, And Recovery
+
+Won/operator owns architecture, contracts, task scope, the final review verdict,
+and publication approval. A worker owns only bounded implementation, authorized
+tests, and Review Bundle evidence.
+
+Workers may claim only:
+
+```text
+IMPLEMENTED_FOR_REVIEW
+BLOCKED
+INTERRUPTED
+TESTS_FAILED
+```
+
+Only Won/operator may issue:
+
+```text
+PASS_PENDING_PUBLICATION
+CONDITIONAL
+FAIL
+FINAL_PASS
+```
+
+Select the implementation route, provider, and model immediately before work in
+this exact order:
+
+```text
+1. Codex
+2. Cline + ClinePass + operator-selected hosted coding model
+3. Cline + direct hosted provider + operator-selected model
+4. local model + Ollama/Cline
+```
+
+- Do not permanently assume a provider offers a particular model or version.
+- Never perform automatic provider/model fallback.
+- Do not ask again when the operator already selected the route.
+- Do not pass a hosted-model Task Packet unchanged to a local model.
+- Do not automatically inherit dirty state between providers or models.
+
+Every worker execution and Review Bundle must record: executor; provider;
+provider_route; `exact_model_id` or `model_id_unavailable`; display_model_name;
+reasoning_effort; Plan/Act mode; auto_approve_state; Cline version when
+applicable; workspace; repository; branch; HEAD; local origin relation; initial
+worktree, index, and untracked state; and Task Packet SHA-256.
+
+Repository-modification Cline tasks default to `auto-approve=off`. An exception
+must be explicitly operator-approved, task-specific, and recorded in both the
+Task Packet and Review Bundle. It must not expand allowed files, commands,
+network, secret, runtime, DB, systemd, Git publication, or product authority.
+
+For `INTERRUPTED`, the worker must provide the partial diff, `git status`, index
+state, untracked state, tests attempted and results, actual provider/model
+metadata, and the last completed action. Won/operator must then choose one of:
+continue, revert, discard, or a smaller route-specific Task Packet. No automatic
+dirty-state handoff is allowed.
 
 ## Architecture Invariants
 
@@ -161,7 +233,7 @@ Do not treat garbled pasted shell text as failure if JSON/test output and final
 git status are complete. If command semantics are ambiguous, rerun the smallest
 read-only verification.
 
-For `AGENTS.md`-only slices:
+For repo-operations and `AGENTS.md`-only slices:
 
 - Do not run pytest.
 - Do not run compileall.
@@ -170,7 +242,7 @@ For `AGENTS.md`-only slices:
 
 ## Review Bundle Lifecycle
 
-Full Codex Review Bundles must be written first to:
+Full external Review Bundles must be written first to:
 
 ```text
 /mnt/c/Users/dev/Desktop/codex-review-bundles/01_new
@@ -182,12 +254,14 @@ Windows equivalent:
 C:\Users\dev\Desktop\codex-review-bundles\01_new
 ```
 
-Do not write newly generated Review Bundles directly to `02_reviewed_pass`.
+Do not write newly generated Review Bundles directly to `02_reviewed_pass`. The
+directory name `codex-review-bundles` is a compatibility path; it does not prove
+that Codex was the executor.
 
 Lifecycle folders:
 
-- `01_new`: newly generated full Review Bundles before ChatGPT review.
-- `02_reviewed_pass`: only Review Bundles manually moved after ChatGPT PASS.
+- `01_new`: newly generated full Review Bundles before Won/operator review.
+- `02_reviewed_pass`: only Review Bundles manually moved after Won/operator review.
 - `03_captured_finish`: Review Bundles whose capture/archive lifecycle is complete.
 - `04_quarantine`: FAIL, CONDITIONAL, non-full, malformed, ambiguous, or wrong-project artifacts.
 
@@ -215,7 +289,7 @@ A Review Bundle must include:
 - full diff or no-index diff for untracked files
 - full changed file contents
 - boundary check
-- status: PASS / FAIL / CONDITIONAL
+- worker outcome and empty reviewer-only verdict fields
 - explicit no staging/commit/push statement
 
 Review bundle generation must not run `git add`, `git commit`, or `git push`.
@@ -224,11 +298,12 @@ normal `git diff` omits them.
 
 ## Git / Staging Policy
 
-- Do not stage, commit, or push unless the user explicitly asks after ChatGPT review.
+- Do not stage, commit, or push unless the operator explicitly authorizes exact-file publication after Won review.
 - Never use git add .
 - Never use git add -A.
 - Stage exact files only.
-- After ChatGPT PASS, the expected staging command for this file is `git add -- AGENTS.md`.
+- After explicit Won/operator staging approval, use only an exact reviewed-file
+  staging command, such as `git add -- AGENTS.md` when that file alone is approved.
 
 Do not stage:
 
@@ -295,23 +370,24 @@ DO-NOT-PASTE file and report sanitized stdout JSON only.
 
 ## Done Criteria
 
-A task is done only when:
+### Worker Review-Stage Completion
 
-- bounded scope is satisfied
-- architecture boundaries are preserved
-- secrets/raw values are not exposed
-- focused tests pass
-- relevant adjacent tests pass
-- git status is clean or only expected untracked files remain
-- Review Bundle is generated in `01_new`
-- ChatGPT can review it as PASS / FAIL / CONDITIONAL
+A worker may complete a task for review only when:
 
-For live/VPS steps, done requires:
+- only exact task-authorized tracked and untracked changes exist
+- the index is clean unless staging was explicitly authorized
+- no unexpected path exists
+- required validation passed
+- an external Review Bundle was generated
+- the worker returned one allowed worker outcome
 
-- Desktop commit/push completed if code changed
-- VPS pull/validation passed
-- default no-approval readiness passed before approved write
-- approved write used all explicit flags
-- read-only post-write audit passed when the task contract requires it, when a new live boundary is first exercised, or when concrete defect/security evidence exists
-- no downstream step was run unless explicitly in scope
-- no repeated post-write audits for already closed gates without new failing evidence
+### Publication And Final Closure
+
+Publication and final closure are distinct from worker review-stage completion.
+When publication or runtime execution is required, closure requires:
+
+- exact reviewed files were staged and committed only after operator approval
+- push/origin readback completed when publication is required
+- required runtime readback completed when applicable
+- the final worktree and index are clean after publication
+- only Won/operator may issue `FINAL_PASS`
